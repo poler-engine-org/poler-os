@@ -151,6 +151,7 @@ var first_block: ?*Block = null;
 const vtable = std.mem.Allocator.VTable{
     .alloc = alloc,
     .resize = resize,
+    .remap = std.mem.Allocator.noRemap,
     .free = free,
 };
 
@@ -323,15 +324,16 @@ fn getBlockFromPayload(ptr: [*]u8) ?*Block {
 fn alloc(
     ctx: *anyopaque,
     len: usize,
-    ptr_align: u8,
+    ptr_align: std.mem.Alignment,
     ret_addr: usize,
 ) ?[*]u8 {
 
     // v6 FIX (Bug #8): kmalloc(0) should return null
     if (len == 0) return null;
 
-    const alignment = @as(usize, 1) << @as(u6, @intCast(ptr_align));
+    const alignment = ptr_align.toByteUnits();
     // v6 FIX (Bug #4): Integer overflow check for aligned_len
+
     // If len is very large, alignUp could overflow u64
     const aligned_len = alignUp(len, 16);
     if (aligned_len < len) return null; // overflow detected
@@ -473,7 +475,7 @@ test "placeholder" {}
 fn resize(
     ctx: *anyopaque,
     buf: []u8,
-    buf_align: u8,
+    buf_align: std.mem.Alignment,
     new_len: usize,
     ret_addr: usize,
 ) bool {
@@ -481,18 +483,24 @@ fn resize(
     _ = buf_align;
     _ = ret_addr;
 
-    const block = getBlockFromPayload(buf.ptr) orelse return false;
+    if (buf.len == 0) return false;
+    if (new_len == 0) return false;
+
     const aligned_new_len = alignUp(new_len, 16);
+    if (aligned_new_len < new_len) return false;
 
     hal.cli();
     defer hal.sti();
 
+    const block = getBlockFromPayload(buf.ptr) orelse return false;
+
     if (aligned_new_len <= block.size) {
-        // Shrink block
-        if (block.size - aligned_new_len >= @sizeOf(Block) + 16) {
-            const next_block_addr = @intFromPtr(block) + @sizeOf(Block) + aligned_new_len;
-            const next_block: *Block = @ptrFromInt(next_block_addr);
-            next_block.size = block.size - aligned_new_len - @sizeOf(Block);
+        // Shrink block: if remaining space >= Block + 16, split it
+        const remaining = block.size - aligned_new_len;
+        if (remaining >= @sizeOf(Block) + 16) {
+            const next_addr = @intFromPtr(block) + @sizeOf(Block) + aligned_new_len;
+            const next_block: *Block = @ptrFromInt(next_addr);
+            next_block.size = remaining - @sizeOf(Block);
             next_block.free = true;
             next_block.next = block.next;
             next_block.padding = 0;
@@ -580,14 +588,14 @@ fn freeInternal(ptr: [*]u8) bool {
 fn free(
     ctx: *anyopaque,
     buf: []u8,
-    buf_align: u8,
+    buf_align: std.mem.Alignment,
     ret_addr: usize,
 ) void {
     _ = ctx;
     _ = buf_align;
     _ = ret_addr;
 
-    if (buf.ptr == undefined) return;
+    if (buf.len == 0) return;
 
     hal.cli();
     defer hal.sti();

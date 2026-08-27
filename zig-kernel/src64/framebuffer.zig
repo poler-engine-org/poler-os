@@ -416,13 +416,14 @@ pub fn draw_char(ch: u8, px: u32, py: u32, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u
             const bits = glyph[row];
             const screen_y = py + row;
             if (screen_y >= fb_height) break;
-            const row_start = screen_y * fb_pitch_pixels + px;
+            const row_byte_offset = @as(usize, screen_y) * @as(usize, fb_pitch_bytes);
+            const row_ptr: [*]volatile u32 = @ptrCast(@alignCast(fb_ptr8 + row_byte_offset));
             
             var col: u32 = 0;
             while (col < CHAR_W) : (col += 1) {
                 if (px + col >= fb_width) break;
                 const bit_set = (bits & (@as(u8, 1) << @intCast(7 - col))) != 0;
-                fb_ptr32[row_start + col] = if (bit_set) fg_pixel else bg_pixel;
+                row_ptr[px + col] = if (bit_set) fg_pixel else bg_pixel;
             }
         }
     } else {
@@ -449,21 +450,25 @@ pub fn puts(str: []const u8) void {
     
     for (str) |ch| {
         // Skip UTF-8 continuation bytes (0x80-0xBF).
-        // UTF-8 multi-byte characters (like ╔═╗║╚╝) are 3 bytes each,
-        // but we only render ASCII (0x00-0x7F). Without this skip,
-        // the cursor would advance 3x per Unicode character.
         if (ch >= 0x80 and ch <= 0xBF) continue;
         
-        if (ch == '\n') {
+        if (ch == '\r') {
+            cursor_x = 0;
+        } else if (ch == '\n') {
             cursor_x = 0;
             cursor_y += CHAR_H;
+        } else if (ch == '\t') {
+            cursor_x = (cursor_x + CHAR_W * 4) & ~@as(u32, CHAR_W * 4 - 1);
+            if (cursor_x >= fb_width) {
+                cursor_x = 0;
+                cursor_y += CHAR_H;
+            }
         } else if (ch == '\x08') {
             if (cursor_x >= CHAR_W) {
                 cursor_x -= CHAR_W;
                 draw_char(' ', cursor_x, cursor_y, 0xD4, 0xD4, 0xD4, 0x0B, 0x11, 0x20);
             }
         } else if (ch >= 0xC0) {
-            // UTF-8 lead byte (0xC0-0xFF): draw ONE blank cell
             draw_char(' ', cursor_x, cursor_y, 0xD4, 0xD4, 0xD4, 0x0B, 0x11, 0x20);
             cursor_x += CHAR_W;
             if (cursor_x >= fb_width) {
@@ -494,9 +499,17 @@ pub fn puts_color(str: []const u8, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g:
     for (str) |ch| {
         if (ch >= 0x80 and ch <= 0xBF) continue;
         
-        if (ch == '\n') {
+        if (ch == '\r') {
+            cursor_x = 0;
+        } else if (ch == '\n') {
             cursor_x = 0;
             cursor_y += CHAR_H;
+        } else if (ch == '\t') {
+            cursor_x = (cursor_x + CHAR_W * 4) & ~@as(u32, CHAR_W * 4 - 1);
+            if (cursor_x >= fb_width) {
+                cursor_x = 0;
+                cursor_y += CHAR_H;
+            }
         } else if (ch == '\x08') {
             if (cursor_x >= CHAR_W) {
                 cursor_x -= CHAR_W;
@@ -524,6 +537,7 @@ pub fn puts_color(str: []const u8, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g:
         }
     }
 }
+
 
 /// Scroll framebuffer up by one character row — optimized for 32bpp
 fn scroll_up() void {
