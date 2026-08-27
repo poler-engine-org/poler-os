@@ -71,7 +71,9 @@ fn vga_init() void {
 
 fn vga_puts(str: []const u8) void {
     for (str) |ch| {
-        if (ch == '\n') {
+        if (ch == '\r') {
+            vga_col = 0;
+        } else if (ch == '\n') {
             vga_col = 0;
             vga_row += 1;
         } else if (ch == '\x08') {

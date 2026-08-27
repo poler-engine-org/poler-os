@@ -416,14 +416,13 @@ pub fn draw_char(ch: u8, px: u32, py: u32, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u
             const bits = glyph[row];
             const screen_y = py + row;
             if (screen_y >= fb_height) break;
-            const row_byte_offset = @as(usize, screen_y) * @as(usize, fb_pitch_bytes);
-            const row_ptr: [*]volatile u32 = @ptrCast(@alignCast(fb_ptr8 + row_byte_offset));
+            const row_start = screen_y * fb_pitch_pixels + px;
             
             var col: u32 = 0;
             while (col < CHAR_W) : (col += 1) {
                 if (px + col >= fb_width) break;
                 const bit_set = (bits & (@as(u8, 1) << @intCast(7 - col))) != 0;
-                row_ptr[px + col] = if (bit_set) fg_pixel else bg_pixel;
+                fb_ptr32[row_start + col] = if (bit_set) fg_pixel else bg_pixel;
             }
         }
     } else {
