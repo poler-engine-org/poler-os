@@ -420,9 +420,12 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
             }
         },
         33 => {
+            // Bio-пул: единственная энтропия — момент нажатия (TSC).
+            // ВНИМАНИЕ: port 0x60 читает ТОЛЬКО handleKeyboard — чтение 8042
+            // output buffer потребляет сканкод. Кража байта здесь ломала
+            // всю клавиатуру (v0.7.2 regression, fixed in v0.7.3).
             if (bio_entropy_sink) |bio_sink| {
-                const kbd_tsc = readMsr(0x10);
-                bio_sink(kbd_tsc ^ (@as(u64, inb(0x60)) << 48));
+                bio_sink(readMsr(0x10));
             }
             handleKeyboard(frame);
         },
@@ -488,6 +491,16 @@ fn handleTimer(frame: *InterruptFrame) void {
 
 fn handleKeyboard(frame: *InterruptFrame) void {
     _ = frame;
+    // v0.7.3: Guard against spurious IRQ1. The 8042 IRQ line is wired to BOTH
+    // the PIC and the IO-APIC on i440FX — with both unmasked each scancode
+    // caused TWO vector-33 deliveries and the second (empty) inb(0x60) read
+    // returned the SAME byte again (QEMU keeps the data register), duplicating
+    // every keystroke. Only consume the port when OBF is set and the byte is
+    // keyboard (not mouse AUX) data.
+    const status = inb(0x64);
+    if ((status & 0x01) == 0) return; // OBF clear — nothing to read
+    if ((status & 0x20) != 0) return; // AUX bit — mouse byte, skip
+
     const scan = inb(0x60);
 
     // Debug: show raw scancode on serial (helps diagnose translation issues)
@@ -577,10 +590,12 @@ pub const PIC = struct {
         outb(PIC1_DATA, ICW4_8086);
         outb(PIC2_DATA, ICW4_8086);
 
-        // Mask all PIC interrupts — we use APIC timer (vector 32)
-        // and IO-APIC for keyboard. Only unmask IRQ1 (keyboard) as fallback.
-        // IRQ0 (PIT) is masked because APIC timer replaces it.
-        outb(PIC1_DATA, 0xFD); // Mask all except IRQ1 (keyboard)
+        // Mask ALL PIC interrupts — v0.7.3: the keyboard is routed via the
+        // IO-APIC (IRQ1 -> vector 33, see IOAPIC.init) and the timer via the
+        // Local APIC (vector 48). Keeping IRQ1 unmasked here as well caused
+        // dual delivery of every scancode (PIC + IO-APIC are both wired to the
+        // 8042 IRQ line). PIC stays initialized but fully masked.
+        outb(PIC1_DATA, 0xFF); // Mask all master lines (keyboard via IO-APIC)
         outb(PIC2_DATA, 0xFF); // Mask all slave
     }
 
@@ -750,11 +765,19 @@ var kbd_ctrl: bool = false;
 var kbd_alt: bool = false;
 var kbd_extended: bool = false;
 
+// v0.7.3: CORRECT Set 1 layout. The old table was shifted by one position
+// from 0x10 onward (Tab at 0x10 instead of 0x0F), which zeroed 'a'/'s'/'d'
+// (scan 0x1E-0x20 mapped to 0) and made Enter map to ']' and Ctrl to '\n'.
 const scan_to_ascii = [128]u8{
-    0, 0x1B, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\x08', 0,
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 0,
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 0,
-    'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0, 0,
+    // 0x00-0x0F: 0, ESC, 1-9, 0, -, =, Backspace, Tab
+    0, 0x1B, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\x08', '\t',
+    // 0x10-0x1F: q..p, [, ], Enter, LCtrl, a, s
+    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 'a', 's',
+    // 0x20-0x2F: d..l, ;, ', `, LShift, \, z, x, c, v
+    'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',
+    // 0x30-0x3F: b, n, m, comma, dot, slash, RShift, keypad-*, LAlt, Space
+    'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0,
+    // 0x40-0x7F: unused in base Set 1
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -762,10 +785,15 @@ const scan_to_ascii = [128]u8{
 };
 
 const scan_to_ascii_shift = [128]u8{
-    0, 0x1B, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\x08', 0,
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0, 0,
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0, '|', 0,
-    'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ', 0, 0,
+    // 0x00-0x0F
+    0, 0x1B, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\x08', '\t',
+    // 0x10-0x1F
+    'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0, 'A', 'S',
+    // 0x20-0x2F
+    'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0, '|', 'Z', 'X', 'C', 'V',
+    // 0x30-0x3F
+    'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0,
+    // 0x40-0x7F
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -776,18 +804,27 @@ var kbd_buffer: [256]u8 = undefined;
 var kbd_head: usize = 0;
 var kbd_tail: usize = 0;
 
+// v0.7.3: kbd_head/kbd_tail are shared between the IRQ1 handler (producer,
+// handleKeyboard → kbd_push) and the shell task (consumer, kbd_poll loop →
+// kbd_pop). Plain loads could be cached in a register across the polling
+// loop by the compiler (it cannot see async interrupt writes). Atomics are
+// also the correct compiler barrier here.
 pub fn kbd_push(ch: u8) void {
-    const next = (kbd_head + 1) % kbd_buffer.len;
-    if (next != kbd_tail) {
-        kbd_buffer[kbd_head] = ch;
-        kbd_head = next;
+    const head = @atomicLoad(usize, &kbd_head, .monotonic);
+    const tail = @atomicLoad(usize, &kbd_tail, .monotonic);
+    const next = (head + 1) % kbd_buffer.len;
+    if (next != tail) {
+        kbd_buffer[head] = ch;
+        @atomicStore(usize, &kbd_head, next, .release);
     }
 }
 
 pub fn kbd_pop() u8 {
-    if (kbd_head == kbd_tail) return 0;
-    const ch = kbd_buffer[kbd_tail];
-    kbd_tail = (kbd_tail + 1) % kbd_buffer.len;
+    const tail = @atomicLoad(usize, &kbd_tail, .monotonic);
+    const head = @atomicLoad(usize, &kbd_head, .acquire);
+    if (head == tail) return 0;
+    const ch = kbd_buffer[tail];
+    @atomicStore(usize, &kbd_tail, (tail + 1) % kbd_buffer.len, .release);
     return ch;
 }
 

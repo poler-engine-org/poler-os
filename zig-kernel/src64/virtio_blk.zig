@@ -769,7 +769,13 @@ pub fn writeSectors(sector: u64, num_sectors: u32, buffer: []const u8) VblkError
 
     const t_write_start = hal.readMsr(0x10);
     const completed = waitForCompletion(50_000_000) orelse {
-        hal.Serial.puts("[VBLK-WRITE] TIMEOUT!\n");
+        // Debug: dump virtqueue state on timeout (restored — v0.7.2 regression)
+        const used_dbg = getUsed();
+        hal.Serial.puts("[VBLK-WRITE] TIMEOUT! used.idx=");
+        hal.Serial.putHex(used_dbg.idx);
+        hal.Serial.puts(" last_used=");
+        hal.Serial.putHex(vblk_state.last_used_idx);
+        hal.Serial.puts("\n");
         freeDescChain(head);
         return VblkError.Timeout;
     };

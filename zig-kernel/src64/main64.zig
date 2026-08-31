@@ -431,8 +431,10 @@ fn onBusEntropy(sample: u64) void {
 fn onIrqEntropy(sample: u64) void {
     if (entropy_hub_ready) {
         entropy_hub.feedIrq(sample);
-        // Каждые 64 прерывания вплетаем накопленную энтропию всех пулов в PRNG
-        if (entropy_hub.total_samples % 64 == 0) {
+        // Каждые 64 прерывания вплетаем накопленную энтропию всех пулов в PRNG.
+        // Считаем именно события IRQ-пула (total_samples включает bus/bio —
+        // их каденс не должен влиять на пере-сиивание).
+        if (entropy_hub.irq_pool.events > 0 and entropy_hub.irq_pool.events % 64 == 0) {
             entropy_hub.foldAll(&kernel_seed);
             kernel_rng = puf.prngFromSeed(kernel_seed);
         }
@@ -758,15 +760,14 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
 extern fn syscall_entry() void;
 
 // User space system call helper
+// v0.7.3: Kernel tasks (shell, workers) run in Ring 0 — they MUST NOT use
+// the SYSCALL/SYSRET path: SYSRET always restores CPL=3, so a kernel task
+// would return to Ring 3 running kernel code and #PF on the next access
+// to supervisor pages (lesson from the orphaned v1.2.0 chain, 228f9fdc).
+// The shell wrappers below are now kernel-direct calls. The syscall
+// mechanism stays registered for future Ring 3 user tasks.
 fn sys_print(str: []const u8) void {
-    asm volatile (
-        "syscall"
-        :
-        : [num] "{rax}" (@as(u64, 1)),
-          [arg1] "{rdi}" (@intFromPtr(str.ptr)),
-          [arg2] "{rsi}" (str.len),
-        : "rcx", "r11", "memory"
-    );
+    puts(str); // VGA/framebuffer + serial mirror
 }
 
 fn task1() noreturn {
@@ -804,28 +805,21 @@ fn task1() noreturn {
             // Yield CPU (prevent 100% host core usage under softemu)
             var i: usize = 0;
             while (i < 50000) : (i += 1) {
-                asm volatile ("nop");
+                asm volatile ("pause");
             }
         }
     }
 }
 
 fn sys_read_key() u8 {
-    return asm volatile (
-        "syscall"
-        : [ret] "={rax}" (-> u8),
-        : [num] "{rax}" (@as(u64, 2)),
-        : "rcx", "r11", "memory"
-    );
+    // v0.7.3: kernel-direct read of the PS/2 scancode->ASCII ring buffer
+    // (filled by handleKeyboard / IRQ1). See sys_print comment above.
+    return hal.kbd_pop();
 }
 
 fn sys_clear_screen() void {
-    asm volatile (
-        "syscall"
-        :
-        : [num] "{rax}" (@as(u64, 3)),
-        : "rcx", "r11", "memory"
-    );
+    // v0.7.3: kernel-direct screen clear (see sys_print comment above).
+    clear_screen();
 }
 
 fn execute_command(cmd: []const u8) void {
@@ -1014,6 +1008,28 @@ fn cmd_cat(filename: []const u8) void {
     pmm.freePage(buf_phys);
 }
 
+fn printDec(val: u64) void {
+    var buf: [20]u8 = undefined;
+    var len: usize = 0;
+    var v = val;
+    if (v == 0) {
+        sys_print("0");
+        return;
+    }
+    while (v > 0) : (v /= 10) {
+        buf[len] = '0' + @as(u8, @intCast(v % 10));
+        len += 1;
+    }
+    // цифры собрались в обратном порядке — разворачиваем
+    var i: usize = 0;
+    while (i < len / 2) : (i += 1) {
+        const tmp = buf[i];
+        buf[i] = buf[len - 1 - i];
+        buf[len - 1 - i] = tmp;
+    }
+    sys_print(buf[0..len]);
+}
+
 fn cmd_entropy() void {
     sys_print("=== POLER-OS Hardware Entropy Multi-Pool Status ===\n");
     sys_print("Architecture: Post-Quantum Anti-Surveillance Hardware Inversion\n");
@@ -1022,68 +1038,21 @@ fn cmd_entropy() void {
         return;
     }
 
-    sys_print("[Pool 1/4] Phase Pool (PUF & Silicon TSC Jitter):\n");
-    sys_print("  Events mixed: ");
-    var buf1: [16]u8 = undefined;
-    var len1: usize = 0;
-    var val1 = entropy_hub.phase_pool.events;
-    if (val1 == 0) { buf1[0] = '0'; len1 = 1; } else {
-        var tmp1: [16]u8 = undefined; var t1: usize = 0;
-        while (val1 > 0) { tmp1[t1] = '0' + @as(u8, @intCast(val1 % 10)); val1 /= 10; t1 += 1; }
-        while (t1 > 0) { t1 -= 1; buf1[len1] = tmp1[t1]; len1 += 1; }
+    const pools = .{
+        .{ "[Pool 1/4] Phase Pool (PUF & Silicon TSC Jitter):", entropy_hub.phase_pool.events },
+        .{ "[Pool 2/4] Bus Pool (PCIe & VirtIO DMA Timings):", entropy_hub.bus_pool.events },
+        .{ "[Pool 3/4] IRQ Pool (APIC Timer & Hardware Interrupts):", entropy_hub.irq_pool.events },
+        .{ "[Pool 4/4] Bio Pool (User Keystroke Dynamics):", entropy_hub.bio_pool.events },
+    };
+    inline for (pools) |p| {
+        sys_print(p[0]);
+        sys_print("\n  Events mixed: ");
+        printDec(p[1]);
+        sys_print("\n");
     }
-    sys_print(buf1[0..len1]);
-    sys_print("\n");
-
-    sys_print("[Pool 2/4] Bus Pool (PCIe & VirtIO DMA Timings):\n");
-    sys_print("  Events mixed: ");
-    var buf2: [16]u8 = undefined;
-    var len2: usize = 0;
-    var val2 = entropy_hub.bus_pool.events;
-    if (val2 == 0) { buf2[0] = '0'; len2 = 1; } else {
-        var tmp2: [16]u8 = undefined; var t2: usize = 0;
-        while (val2 > 0) { tmp2[t2] = '0' + @as(u8, @intCast(val2 % 10)); val2 /= 10; t2 += 1; }
-        while (t2 > 0) { t2 -= 1; buf2[len2] = tmp2[t2]; len2 += 1; }
-    }
-    sys_print(buf2[0..len2]);
-    sys_print("\n");
-
-    sys_print("[Pool 3/4] IRQ Pool (APIC Timer & Hardware Interrupts):\n");
-    sys_print("  Events mixed: ");
-    var buf3: [16]u8 = undefined;
-    var len3: usize = 0;
-    var val3 = entropy_hub.irq_pool.events;
-    if (val3 == 0) { buf3[0] = '0'; len3 = 1; } else {
-        var tmp3: [16]u8 = undefined; var t3: usize = 0;
-        while (val3 > 0) { tmp3[t3] = '0' + @as(u8, @intCast(val3 % 10)); val3 /= 10; t3 += 1; }
-        while (t3 > 0) { t3 -= 1; buf3[len3] = tmp3[t3]; len3 += 1; }
-    }
-    sys_print(buf3[0..len3]);
-    sys_print("\n");
-
-    sys_print("[Pool 4/4] Bio Pool (User Keystroke Dynamics):\n");
-    sys_print("  Events mixed: ");
-    var buf4: [16]u8 = undefined;
-    var len4: usize = 0;
-    var val4 = entropy_hub.bio_pool.events;
-    if (val4 == 0) { buf4[0] = '0'; len4 = 1; } else {
-        var tmp4: [16]u8 = undefined; var t4: usize = 0;
-        while (val4 > 0) { tmp4[t4] = '0' + @as(u8, @intCast(val4 % 10)); val4 /= 10; t4 += 1; }
-        while (t4 > 0) { t4 -= 1; buf4[len4] = tmp4[t4]; len4 += 1; }
-    }
-    sys_print(buf4[0..len4]);
-    sys_print("\n");
 
     sys_print("Total Entropy Samples: ");
-    var buf_tot: [20]u8 = undefined;
-    var len_tot: usize = 0;
-    var val_tot = entropy_hub.total_samples;
-    if (val_tot == 0) { buf_tot[0] = '0'; len_tot = 1; } else {
-        var tmp_tot: [20]u8 = undefined; var t_tot: usize = 0;
-        while (val_tot > 0) { tmp_tot[t_tot] = '0' + @as(u8, @intCast(val_tot % 10)); val_tot /= 10; t_tot += 1; }
-        while (t_tot > 0) { t_tot -= 1; buf_tot[len_tot] = tmp_tot[t_tot]; len_tot += 1; }
-    }
-    sys_print(buf_tot[0..len_tot]);
+    printDec(entropy_hub.total_samples);
     sys_print("\n");
 }
 

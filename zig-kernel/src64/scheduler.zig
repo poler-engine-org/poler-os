@@ -84,6 +84,13 @@ pub fn init() void {
     // Breaks circular dependency hal.zig ↔ scheduler.zig via function pointer.
     hal.exitCallback = exitCurrentTask;
 
+    // v0.7.3: Register timer tick callback — APIC timer (vector 48) calls
+    // schedule() on every tick. This is the heart of preemptive multitasking:
+    // without this wiring, kernel tasks are created but NEVER scheduled and
+    // the interactive shell never starts (regression since the v0.7.0 rewrite;
+    // the fix existed in the orphaned July v1.2.0 chain, commit 228f9fdc).
+    hal.timerTickCallback = schedule;
+
     hal.Serial.puts("[SCHED] Scheduler initialized (v0.7.0 Ring 3 + exit syscall)\n");
 }
 
@@ -145,7 +152,12 @@ pub fn createTask(entry_point: u64) !usize {
     frame_ptr.rip = entry_point;
     frame_ptr.cs = 0x08; // Kernel code segment selector (Ring 0)
     frame_ptr.rflags = 0x202; // IF (Interrupt Enable Flag) set
-    frame_ptr.rsp = kstack_top - 176; // Use stack below the frame as the task's RSP
+    // v0.7.3: Stack alignment — System V AMD64 ABI requires RSP 16-byte
+    // aligned after the function prologue (push rbp = -8). kstack_top is
+    // 16-aligned and 176 % 16 == 0, so (kstack_top - 176) is 16-aligned;
+    // subtracting 8 makes RSP properly aligned AFTER push rbp, keeping
+    // movaps from faulting (from the orphaned v1.2.0 chain, 228f9fdc).
+    frame_ptr.rsp = kstack_top - 176 - 8;
     frame_ptr.ss = 0x10; // Kernel data segment selector (Ring 0)
     frame_ptr.vector = 48; // APIC timer vector (matches actual interrupt source)
     frame_ptr.error_code = 0;
