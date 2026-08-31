@@ -14,6 +14,7 @@ PHDRS
     text    PT_LOAD FLAGS(5);           /* RX — kernel code */
     rodata  PT_LOAD FLAGS(4);           /* R  — read-only data */
     data    PT_LOAD FLAGS(6);           /* RW — data + bss */
+    note    PT_NOTE FLAGS(4);           /* R  — PVH ELF note (QEMU≥11 -kernel) */
 }
 
 SECTIONS
@@ -48,6 +49,16 @@ SECTIONS
         stack_top = .;
         *(.bss.boot)
     } :boot
+
+    /* ========================================================================
+     * PVH ELF Note — байты эмитит boot64.S (секция .note.pvh, SHT_NOTE),
+     * сюда попадает input-секция и уходит в PT_NOTE-сегмент. Данные
+     * команды в самом скрипте (LONG/ASCII) lld не поддерживает — поэтому
+     * ассемблер. Vaddr==Paddr → значение pvh_entry = физический адрес.
+     * ======================================================================== */
+    .note.pvh ALIGN(4) : {
+        *(.note.pvh)
+    } :note
 
     _kernel_start = .;
 
@@ -89,7 +100,7 @@ SECTIONS
      * ======================================================================== */
     /DISCARD/ : {
         *(.comment)
-        *(.note.*)
+        *(.note.gnu*)
         *(.eh_frame*)
         *(.gnu.hash)
     }

@@ -23,32 +23,44 @@ pub fn init(mbi_ptr: u64) void {
     // 1. Mark all memory as reserved initially
     @memset(&bitmap, 0xFF);
 
-    const parser = multiboot2.Parser.init(mbi_ptr);
+    if (mbi_ptr != 0) {
+        const parser = multiboot2.Parser.init(mbi_ptr);
 
-    // 2. Parse basic memory info tag if present
-    if (parser.findTag(4)) |tag_addr| {
-        const mem_tag: *const multiboot2.BasicMemTag = @ptrFromInt(tag_addr);
-        total_ram_bytes = @as(u64, mem_tag.mem_upper) * 1024 + 1024 * 1024;
-    }
+        // 2. Parse basic memory info tag if present
+        if (parser.findTag(4)) |tag_addr| {
+            const mem_tag: *const multiboot2.BasicMemTag = @ptrFromInt(tag_addr);
+            total_ram_bytes = @as(u64, mem_tag.mem_upper) * 1024 + 1024 * 1024;
+        }
 
-    // 3. Parse memory map tag (type 6) — mark usable regions as free
-    if (parser.findTag(6)) |tag_addr| {
-        const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
-        const entries = mmap_tag.getEntries();
+        // 3. Parse memory map tag (type 6) — mark usable regions as free
+        if (parser.findTag(6)) |tag_addr| {
+            const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
+            const entries = mmap_tag.getEntries();
 
-        for (entries) |entry| {
-            if (entry.entry_type == 1) {
-                var addr = entry.addr;
-                const end_addr = entry.addr + entry.len;
-                addr = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            for (entries) |entry| {
+                if (entry.entry_type == 1) {
+                    var addr = entry.addr;
+                    const end_addr = entry.addr + entry.len;
+                    addr = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-                while (addr + PAGE_SIZE <= end_addr) : (addr += PAGE_SIZE) {
-                    if (addr < MAX_MEM_SUPPORTED) {
-                        freePageInternal(addr);
-                        usable_pages += 1;
+                    while (addr + PAGE_SIZE <= end_addr) : (addr += PAGE_SIZE) {
+                        if (addr < MAX_MEM_SUPPORTED) {
+                            freePageInternal(addr);
+                            usable_pages += 1;
+                        }
                     }
                 }
             }
+        }
+    } else {
+        // PVH direct boot (QEMU -kernel, ELF note) — карты памяти нет.
+        // Консервативный fallback: 2..128 MB usable (QEMU -m >= 128M).
+        // Ядро целиком ниже 128MB, дыр нет: рабочая гипотеза для TCG/KVM.
+        total_ram_bytes = 128 * 1024 * 1024;
+        var addr: u64 = 2 * 1024 * 1024;
+        while (addr < total_ram_bytes) : (addr += PAGE_SIZE) {
+            freePageInternal(addr);
+            usable_pages += 1;
         }
     }
 
@@ -67,14 +79,16 @@ pub fn init(mbi_ptr: u64) void {
         setPageInternal(addr);
     }
 
-    // 6. Protect the Multiboot2 info structure
-    const mbi_header: *const multiboot2.InfoHeader = @ptrFromInt(mbi_ptr);
-    const mbi_size = mbi_header.total_size;
-    const mbi_end = (mbi_ptr + mbi_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    addr = mbi_ptr & ~(PAGE_SIZE - 1);
-    while (addr < mbi_end) : (addr += PAGE_SIZE) {
-        if (addr < MAX_MEM_SUPPORTED) {
-            setPageInternal(addr);
+    // 6. Protect the Multiboot2 info structure (при PVH: mbi==0 — пропускаем)
+    if (mbi_ptr != 0) {
+        const mbi_header: *const multiboot2.InfoHeader = @ptrFromInt(mbi_ptr);
+        const mbi_size = mbi_header.total_size;
+        const mbi_end = (mbi_ptr + mbi_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        addr = mbi_ptr & ~(PAGE_SIZE - 1);
+        while (addr < mbi_end) : (addr += PAGE_SIZE) {
+            if (addr < MAX_MEM_SUPPORTED) {
+                setPageInternal(addr);
+            }
         }
     }
 

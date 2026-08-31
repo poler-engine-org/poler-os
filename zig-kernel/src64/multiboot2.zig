@@ -82,6 +82,10 @@ pub const Parser = struct {
     info_ptr: u64,
 
     pub fn init(info_ptr: u64) Parser {
+        // PVH/нулевой указатель: не кастуем 0 в non-optional указатель
+        // (Zig safety: «cast causes pointer to be null»), отдаём пустой
+        // парсер — все find* вернут null через mbInfoLooksValid.
+        if (info_ptr == 0) return Parser{ .total_size = 0, .info_ptr = 0 };
         const header: *const InfoHeader = @ptrFromInt(info_ptr);
         return Parser{
             .total_size = header.total_size,
@@ -89,7 +93,16 @@ pub const Parser = struct {
         };
     }
 
+    /// Санитарная проверка MBI: корректная структура занимает 8 байт..1 МБ.
+    /// Защита от мусорного указателя (например, PVH EBX ≠ 0 без мagic-гейта)
+    /// и от повреждённого total_size, которые раньше давали бесконечный
+    //  цикл в findTag (диагностировано по QEMU -d int: RIP в findTag:103).
+    fn mbInfoLooksValid(self: *const Parser) bool {
+        return self.total_size >= 8 and self.total_size <= 0x100000;
+    }
+
     pub fn findTag(self: *const Parser, tag_type: u32) ?u64 {
+        if (!self.mbInfoLooksValid()) return null;
         var offset: u64 = 8; // skip InfoHeader
         while (offset < self.total_size) {
             const tag: *const Tag = @ptrFromInt(self.info_ptr + offset);
@@ -99,6 +112,8 @@ pub const Parser = struct {
             if (tag.type == 0 and tag.size == 8) {
                 break; // End tag
             }
+            // Malformed-тег (size<8) — гарантия прогресса цикла
+            if (tag.size < 8) break;
             // Align tag size to 8-byte boundary
             offset += (tag.size + 7) & ~@as(u32, 7);
         }
@@ -106,12 +121,14 @@ pub const Parser = struct {
     }
 
     pub fn findModuleTag(self: *const Parser, start_offset: *u64) ?*const ModuleTag {
+        if (!self.mbInfoLooksValid()) return null;
         var offset = start_offset.*;
         while (offset < self.total_size) {
             const tag: *const Tag = @ptrFromInt(self.info_ptr + offset);
             if (tag.type == 0 and tag.size == 8) {
                 break; // End tag
             }
+            if (tag.size < 8) break; // malformed — гарантия прогресса
             const next_offset = offset + ((tag.size + 7) & ~@as(u32, 7));
             if (tag.type == 3) {
                 start_offset.* = next_offset;

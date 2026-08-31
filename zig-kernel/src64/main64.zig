@@ -357,21 +357,23 @@ fn printMemoryInfo(mbi: u64) void {
     putDecimal(stats.usable_pages * 4);
     puts(" KB)\n");
 
-    // 4. Dump Multiboot2 Memory Map if available
-    const parser = multiboot2.Parser.init(mbi);
-    if (parser.findTag(6)) |tag_addr| {
-        const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
-        const entries = mmap_tag.getEntries();
-        puts("  Multiboot2 Memory Map:\n");
-        for (entries) |entry| {
-            puts("    - [");
-            putHex(entry.addr);
-            puts(" .. ");
-            putHex(entry.addr + entry.len);
-            puts("] type=");
-            putDecimal(entry.entry_type);
-            if (entry.entry_type == 1) puts(" (Usable)");
-            puts("\n");
+    // 4. Dump Multiboot2 Memory Map if available (не при PVH: mbi==0)
+    if (mbi != 0) {
+        const parser = multiboot2.Parser.init(mbi);
+        if (parser.findTag(6)) |tag_addr| {
+            const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
+            const entries = mmap_tag.getEntries();
+            puts("  Multiboot2 Memory Map:\n");
+            for (entries) |entry| {
+                puts("    - [");
+                putHex(entry.addr);
+                puts(" .. ");
+                putHex(entry.addr + entry.len);
+                puts("] type=");
+                putDecimal(entry.entry_type);
+                if (entry.entry_type == 1) puts(" (Usable)");
+                puts("\n");
+            }
         }
     }
 }
@@ -511,21 +513,26 @@ fn pufBootInit() void {
 // ============================================================================
 
 export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(.C) void {
+    const have_mb2 = multiboot_magic == 0x36D76289;
+
     // 0. Detect and Initialize Framebuffer if available from Multiboot2
-    const parser = multiboot2.Parser.init(multiboot_info);
-    if (parser.findTag(8)) |tag_addr| {
-        const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
-        if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
-            framebuffer.init_from_multiboot(
-                fb_tag.fb_addr,
-                fb_tag.fb_pitch,
-                fb_tag.fb_width,
-                fb_tag.fb_height,
-                fb_tag.fb_bpp,
-                fb_tag.fb_type,
-            );
-            framebuffer.clear();
-            use_fb = true;
+    // (только при mb2-загрузке: при PVH info-указатель равен 0)
+    if (have_mb2) {
+        const parser = multiboot2.Parser.init(multiboot_info);
+        if (parser.findTag(8)) |tag_addr| {
+            const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
+            if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
+                framebuffer.init_from_multiboot(
+                    fb_tag.fb_addr,
+                    fb_tag.fb_pitch,
+                    fb_tag.fb_width,
+                    fb_tag.fb_height,
+                    fb_tag.fb_bpp,
+                    fb_tag.fb_type,
+                );
+                framebuffer.clear();
+                use_fb = true;
+            }
         }
     }
 
@@ -540,6 +547,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 3. Verify Multiboot2 magic
     if (multiboot_magic == 0x36D76289) {
         puts("[BOOT] Multiboot2 loaded successfully\n");
+    } else if (multiboot_magic == 0) {
+        // PVH: грузимся без информации загрузчика (карта памяти — fallback)
+        puts("[BOOT] PVH direct boot (QEMU -kernel via ELF note, no Multiboot2 info)\n");
     } else {
         vga_setcolor(0x0C);
         puts("[BOOT] WARNING: Unknown bootloader (magic=");
@@ -1008,6 +1018,7 @@ fn cmd_cat(filename: []const u8) void {
     pmm.freePage(buf_phys);
 }
 
+/// Десятичный вывод u64 (без аллокатора, freestanding).
 fn printDec(val: u64) void {
     var buf: [20]u8 = undefined;
     var len: usize = 0;

@@ -60,11 +60,22 @@ mb2_header_start:
 mb2_header_end:
 
 // ============================================================================
-// 32-bit Entry Point (Multiboot2 загружает нас сюда)
+// 32-bit Entry Points (Multiboot2 и PVH)
 // ============================================================================
 .section .text.boot32, "ax", @progbits
+.global pvh_entry
 .global _start
 .code32
+
+// PVH-точка входа (QEMU >=11 `-kernel`, Xen PVH). Вход: 32-bit protected
+// mode, paging off, flat segments. Информации Multiboot2 нет — зануляем
+// EAX (magic) и EBX (MBI; QEMU-PVH кладёт туда hvm_start_info — для нас
+// мусор): _start прочитает EBP=0 как «PVH, без mb2-info».
+pvh_entry:
+    cli
+    xorl %eax, %eax
+    xorl %ebx, %ebx
+    jmp _start
 
 _start:
     // Сохраняем Multiboot2 info в регистры (EBP = magic, EBX = MBI)
@@ -102,10 +113,15 @@ _start:
     movb $'A', %al
     outb %al, %dx
 
-    // Проверяем Multiboot2 magic (из сохранённого регистра EBP)
+    // Проверяем Multiboot2 magic (из сохранённого регистра EBP).
+    // EBP==0 → PVH-загрузка (информации загрузчика нет, но грузимся),
+    // EBP==MB2_BOOTLOADER_MAGIC → обычный GRUB-путь, иначе — hang.
     cmpl $MB2_BOOTLOADER_MAGIC, %ebp
-    jne .hang
-
+    je 1f
+    testl %ebp, %ebp
+    jz 1f
+    jmp .hang
+1:
     // Output 'C' (magic OK)
     movb $'C', %al
     outb %al, %dx
@@ -318,3 +334,19 @@ gdt64_ptr:
 
 
 // BSS markers (defined by linker script)
+
+// ============================================================================
+// PVH ELF Note — QEMU>=11 принимает 64-bit ELF в -kernel только при наличии
+// ноты: name "Linux\0", type 18 = XEN_ELFNOTE_PHYS32_ENTRY,
+// desc = 32-битный ФИЗИЧЕСКИЙ адрес точки входа (vaddr==paddr → символ уже
+// физический). Секция SHT_NOTE ловится линкер-скриптом в PT_NOTE (:note).
+// ============================================================================
+.section .note.pvh, "a", @note
+.align 4
+    .long 6                      /* namesz: "Linux\0" (6 байт с NUL)   */
+    .long 4                      /* descsz: u32 entry address          */
+    .long 18                     /* type: XEN_ELFNOTE_PHYS32_ENTRY     */
+    .asciz "Linux"
+    .balign 4
+    .long pvh_entry              /* desc: 32-bit physical entry        */
+    .balign 4
