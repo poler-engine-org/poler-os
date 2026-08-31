@@ -238,6 +238,12 @@ pub fn prngFromSeed(seed: [SEED_WORDS]u32) poler.PolerPrng {
     return poler.PolerPrng.init(state, epsilon, key);
 }
 
+// ── Доменное разделение для всех пулов энтропии (Спека §1-2) ───────────────
+pub const DOMAIN_POOL_PHASE: u64 = 0x5055_4650_4841_5345; // "PUFPHASE" - Кремниевый шум & TSC
+pub const DOMAIN_POOL_BUS: u64   = 0x5055_4642_5553_2121; // "PUFBUS!!" - Латентность шины PCIe & VirtIO
+pub const DOMAIN_POOL_IRQ: u64   = 0x5055_4649_5251_2121; // "PUFIRQ!!" - APIC/HPET тайминги прерываний
+pub const DOMAIN_POOL_BIO: u64   = 0x5055_4642_494F_2121; // "PUFBIO!!" - Биодинамика оператора (клавиатура)
+
 // ── LivePool: подмешивание живой энтропии в рантайме ──────────────────────
 
 /// Пул живой энтропии (спека §2.1: TSC-джиттер, IRQ-микроинтервалы).
@@ -246,9 +252,10 @@ pub fn prngFromSeed(seed: [SEED_WORDS]u32) poler.PolerPrng {
 pub const LivePool = struct {
     sponge: Sponge,
     events: u32,
+    domain: u64,
 
-    pub fn init(nonce: u64) LivePool {
-        return .{ .sponge = Sponge.init(DOMAIN_LIVE, nonce), .events = 0 };
+    pub fn init(domain: u64, nonce: u64) LivePool {
+        return .{ .sponge = Sponge.init(domain, nonce), .events = 0, .domain = domain };
     }
 
     /// Смешать одно событие (дельту TSC, интервал IRQ и т.п.).
@@ -270,6 +277,64 @@ pub const LivePool = struct {
             );
             w.* = mixed ^ fin;
         }
+    }
+};
+
+// ── Multi-Pool Architecture (Спека §1: Все 4 физических пула) ──────────────
+
+/// Объединённый энтропийный хаб (Entropy Hub) ядра POLER-OS.
+/// Аккумулирует 4 независимых потока физической энтропии:
+///   1. PhasePool: кремниевый фазовый джиттер и TSC флуктуации
+///   2. BusPool: задержки транзакций шины PCIe / DMA / VirtIO
+///   3. IrqPool: интервалы аппаратных прерываний (APIC Timer, IRQ)
+///   4. BioPool: биодинамика оператора (интервалы нажатия клавиш)
+pub const UnifiedEntropyHub = struct {
+    phase_pool: LivePool,
+    bus_pool: LivePool,
+    irq_pool: LivePool,
+    bio_pool: LivePool,
+    total_samples: u64,
+
+    pub fn init(nonce: u64) UnifiedEntropyHub {
+        return .{
+            .phase_pool = LivePool.init(DOMAIN_POOL_PHASE, nonce ^ 0x01),
+            .bus_pool   = LivePool.init(DOMAIN_POOL_BUS,   nonce ^ 0x02),
+            .irq_pool   = LivePool.init(DOMAIN_POOL_IRQ,   nonce ^ 0x03),
+            .bio_pool   = LivePool.init(DOMAIN_POOL_BIO,   nonce ^ 0x04),
+            .total_samples = 0,
+        };
+    }
+
+    /// 1. Кремниевый шум & фазовые задержки (PUF/TSC)
+    pub fn feedPhase(self: *UnifiedEntropyHub, sample: u64) void {
+        self.phase_pool.mix(sample);
+        self.total_samples +%= 1;
+    }
+
+    /// 2. Задержки шины и накопителя (PCIe / VirtIO I/O latency)
+    pub fn feedBus(self: *UnifiedEntropyHub, sample: u64) void {
+        self.bus_pool.mix(sample);
+        self.total_samples +%= 1;
+    }
+
+    /// 3. Тайминги аппаратных прерываний (APIC timer / IRQ)
+    pub fn feedIrq(self: *UnifiedEntropyHub, sample: u64) void {
+        self.irq_pool.mix(sample);
+        self.total_samples +%= 1;
+    }
+
+    /// 4. Биодинамика пользователя (клавиатурные интервалы)
+    pub fn feedBio(self: *UnifiedEntropyHub, sample: u64) void {
+        self.bio_pool.mix(sample);
+        self.total_samples +%= 1;
+    }
+
+    /// Вплетает все 4 пула в единый криптографический сид ядра
+    pub fn foldAll(self: *const UnifiedEntropyHub, seed: *[SEED_WORDS]u32) void {
+        self.phase_pool.foldInto(seed);
+        self.bus_pool.foldInto(seed);
+        self.irq_pool.foldInto(seed);
+        self.bio_pool.foldInto(seed);
     }
 };
 
@@ -621,7 +686,7 @@ test "LivePool: подмешивание меняет сид и детермин
     const b = try bindRaw(&raw, 0);
 
     var seed_a = b.seed;
-    var pool = LivePool.init(0);
+    var pool = LivePool.init(DOMAIN_POOL_PHASE, 0);
     pool.mix(0x1111_2222_3333_4444);
     pool.mix(0x5555_6666_7777_8888);
     pool.foldInto(&seed_a);
@@ -629,11 +694,33 @@ test "LivePool: подмешивание меняет сид и детермин
 
     // Детерминизм: тот же поток событий → то же вплетение.
     var seed_b = b.seed;
-    var pool2 = LivePool.init(0);
+    var pool2 = LivePool.init(DOMAIN_POOL_PHASE, 0);
     pool2.mix(0x1111_2222_3333_4444);
     pool2.mix(0x5555_6666_7777_8888);
     pool2.foldInto(&seed_b);
     try testing.expectEqualSlices(u32, &seed_a, &seed_b);
+}
+
+test "UnifiedEntropyHub: все 4 пула вплетаются и изменяют состояние сида" {
+    var raw: [1024]u8 = undefined;
+    fillPseudo(&raw, 400);
+    const b = try bindRaw(&raw, 0);
+
+    var hub = UnifiedEntropyHub.init(12345);
+    hub.feedPhase(0xAAAA_BBBB_CCCC_DDDD);
+    hub.feedBus(0x1234_5678_9ABC_DEF0);
+    hub.feedIrq(0xFEED_FACE_CAFE_BEEF);
+    hub.feedBio(0x0102_0304_0506_0708);
+
+    try testing.expectEqual(@as(u64, 4), hub.total_samples);
+    try testing.expectEqual(@as(u32, 1), hub.phase_pool.events);
+    try testing.expectEqual(@as(u32, 1), hub.bus_pool.events);
+    try testing.expectEqual(@as(u32, 1), hub.irq_pool.events);
+    try testing.expectEqual(@as(u32, 1), hub.bio_pool.events);
+
+    var seed_mixed = b.seed;
+    hub.foldAll(&seed_mixed);
+    try testing.expect(!std.mem.eql(u32, &seed_mixed, &b.seed));
 }
 
 test "rawDistance/ctEqual: базовые свойства" {

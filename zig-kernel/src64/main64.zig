@@ -31,10 +31,6 @@ const fat32 = @import("fat32.zig");
 
 var use_fb: bool = false;
 
-// PUF: PRNG ядра, высеянный из аппаратной энтропии при загрузке (puf.zig).
-var kernel_rng: poler.PolerPrng = undefined;
-var kernel_rng_ready: bool = false;
-
 /// Случайное u32 для ядра (планировщик/крипто/соль). До привязки PUF — 0.
 fn krand() u32 {
     if (kernel_rng_ready) return kernel_rng.next();
@@ -400,9 +396,12 @@ fn testPolerCore() void {
     puts("\n");
 }
 
-// ============================================================================
-// PUF — привязка аппаратной энтропии при загрузке (puf.zig)
-// ============================================================================
+// PUF: PRNG ядра и объединенный хаб всех аппаратных пулов энтропии (puf.zig).
+var kernel_rng: poler.PolerPrng = undefined;
+var kernel_rng_ready: bool = false;
+var kernel_seed: [puf.SEED_WORDS]u32 = undefined;
+var entropy_hub: puf.UnifiedEntropyHub = undefined;
+var entropy_hub_ready: bool = false;
 
 /// Сбор живого TSC-джиттера: 128 замеров IA32_TSC; между замерами
 /// io-чтение LSR COM1 (гипервизор/устройство вносит вариативность).
@@ -421,12 +420,37 @@ fn harvestTscJitter(out: *[1024]u8) u64 {
     return base;
 }
 
-/// Привязка PUF: собрать джиттер → health-check → сид PRNG ядра +
-/// печать identity (256 бит) и качества источника. Анти-клон-гейт
-/// (bindEnrolled против записанной регистрации) — v0.8 (нужен носитель
-/// для хранения Enrollment; спека §4).
+// ── Callbacks для аппаратных пулов энтропии (Спека §1-2) ───────────────────
+
+fn onBusEntropy(sample: u64) void {
+    if (entropy_hub_ready) {
+        entropy_hub.feedBus(sample);
+    }
+}
+
+fn onIrqEntropy(sample: u64) void {
+    if (entropy_hub_ready) {
+        entropy_hub.feedIrq(sample);
+        // Каждые 64 прерывания вплетаем накопленную энтропию всех пулов в PRNG
+        if (entropy_hub.total_samples % 64 == 0) {
+            entropy_hub.foldAll(&kernel_seed);
+            kernel_rng = puf.prngFromSeed(kernel_seed);
+        }
+    }
+}
+
+fn onBioEntropy(sample: u64) void {
+    if (entropy_hub_ready) {
+        entropy_hub.feedBio(sample);
+        // Немедленно подмешиваем биодинамику в кремниевый пул фаз
+        entropy_hub.feedPhase(sample ^ 0xB10D_14A1_C0DE_5555);
+    }
+}
+
+/// Привязка PUF и запуск всех 4 пулов аппаратной энтропии:
+/// Phase (PUF/TSC) + Bus (VirtIO/PCIe) + IRQ (APIC/HPET) + Bio (клавиатура).
 fn pufBootInit() void {
-    puts("[PUF] Hardware entropy binding...\n");
+    puts("[PUF] Initializing Multi-Pool Hardware Entropy Hub (v1.0)...\n");
     var raw: [1024]u8 = undefined;
     const base = harvestTscJitter(&raw);
     const binding = puf.bindRaw(&raw, base) catch |err| {
@@ -437,8 +461,24 @@ fn pufBootInit() void {
         kernel_rng_ready = true;
         return;
     };
+    kernel_seed = binding.seed;
     kernel_rng = binding.prng();
     kernel_rng_ready = true;
+
+    // Инициализация хаба энтропии со всеми 4 пулами
+    entropy_hub = puf.UnifiedEntropyHub.init(base);
+    entropy_hub_ready = true;
+
+    // Подключение аппаратных синков в подсистемы HAL и VirtIO
+    virtio_blk.bus_entropy_sink = &onBusEntropy;
+    hal.irq_entropy_sink = &onIrqEntropy;
+    hal.bio_entropy_sink = &onBioEntropy;
+
+    puts("  [Pool 1/4] Phase Pool: Active (Silicon PUF / TSC Jitter)\n");
+    puts("  [Pool 2/4] Bus Pool:   Active (PCIe / VirtIO-BLK DMA Latency)\n");
+    puts("  [Pool 3/4] IRQ Pool:   Active (APIC Timer / Hardware Interrupts)\n");
+    puts("  [Pool 4/4] Bio Pool:   Active (User Keystroke Dynamics)\n");
+
     puts("  quality: ");
     puts(@tagName(binding.quality));
     puts(" (events=");
@@ -458,7 +498,7 @@ fn pufBootInit() void {
         if (w < 3) puts(" ");
     }
     puts("\n");
-    puts("  first PRNG sample: ");
+    puts("  initial PRNG sample: ");
     putHex(krand());
     puts("\n");
 }
@@ -803,15 +843,18 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  write <f> <text> - Write text to a file\n");
         sys_print("  rm <f>    - Delete a file\n");
         sys_print("  disk      - Show disk info\n");
+        sys_print("  entropy   - Show all hardware entropy pools status (PUF, Bus, IRQ, Bio)\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.7.0 (x86_64 Long Mode)\n");
-        sys_print("Cognitive Semantic Runtime Environment.\n");
+        sys_print("POLER-OS v0.7.2 (x86_64 Long Mode)\n");
+        sys_print("Cognitive Semantic Runtime Environment (PUF Multi-Pool Active).\n");
     } else if (eq(cmd, "clear")) {
         sys_clear_screen();
     } else if (eq(cmd, "poler")) {
         sys_print("Running POLER core PND mix...\n");
         sys_print("pndMix(42, 17, 1) = 0x6448728B\n");
         sys_print("pndMixAlt(42, 17, 1) = 0x000002CD\n");
+    } else if (eq(cmd, "entropy")) {
+        cmd_entropy();
     } else if (eq(cmd, "ls")) {
         cmd_ls("");
     } else if (startsWith(cmd, "ls ")) {
@@ -969,6 +1012,79 @@ fn cmd_cat(filename: []const u8) void {
     }
 
     pmm.freePage(buf_phys);
+}
+
+fn cmd_entropy() void {
+    sys_print("=== POLER-OS Hardware Entropy Multi-Pool Status ===\n");
+    sys_print("Architecture: Post-Quantum Anti-Surveillance Hardware Inversion\n");
+    if (!entropy_hub_ready) {
+        sys_print("Entropy Hub: NOT INITIALIZED\n");
+        return;
+    }
+
+    sys_print("[Pool 1/4] Phase Pool (PUF & Silicon TSC Jitter):\n");
+    sys_print("  Events mixed: ");
+    var buf1: [16]u8 = undefined;
+    var len1: usize = 0;
+    var val1 = entropy_hub.phase_pool.events;
+    if (val1 == 0) { buf1[0] = '0'; len1 = 1; } else {
+        var tmp1: [16]u8 = undefined; var t1: usize = 0;
+        while (val1 > 0) { tmp1[t1] = '0' + @as(u8, @intCast(val1 % 10)); val1 /= 10; t1 += 1; }
+        while (t1 > 0) { t1 -= 1; buf1[len1] = tmp1[t1]; len1 += 1; }
+    }
+    sys_print(buf1[0..len1]);
+    sys_print("\n");
+
+    sys_print("[Pool 2/4] Bus Pool (PCIe & VirtIO DMA Timings):\n");
+    sys_print("  Events mixed: ");
+    var buf2: [16]u8 = undefined;
+    var len2: usize = 0;
+    var val2 = entropy_hub.bus_pool.events;
+    if (val2 == 0) { buf2[0] = '0'; len2 = 1; } else {
+        var tmp2: [16]u8 = undefined; var t2: usize = 0;
+        while (val2 > 0) { tmp2[t2] = '0' + @as(u8, @intCast(val2 % 10)); val2 /= 10; t2 += 1; }
+        while (t2 > 0) { t2 -= 1; buf2[len2] = tmp2[t2]; len2 += 1; }
+    }
+    sys_print(buf2[0..len2]);
+    sys_print("\n");
+
+    sys_print("[Pool 3/4] IRQ Pool (APIC Timer & Hardware Interrupts):\n");
+    sys_print("  Events mixed: ");
+    var buf3: [16]u8 = undefined;
+    var len3: usize = 0;
+    var val3 = entropy_hub.irq_pool.events;
+    if (val3 == 0) { buf3[0] = '0'; len3 = 1; } else {
+        var tmp3: [16]u8 = undefined; var t3: usize = 0;
+        while (val3 > 0) { tmp3[t3] = '0' + @as(u8, @intCast(val3 % 10)); val3 /= 10; t3 += 1; }
+        while (t3 > 0) { t3 -= 1; buf3[len3] = tmp3[t3]; len3 += 1; }
+    }
+    sys_print(buf3[0..len3]);
+    sys_print("\n");
+
+    sys_print("[Pool 4/4] Bio Pool (User Keystroke Dynamics):\n");
+    sys_print("  Events mixed: ");
+    var buf4: [16]u8 = undefined;
+    var len4: usize = 0;
+    var val4 = entropy_hub.bio_pool.events;
+    if (val4 == 0) { buf4[0] = '0'; len4 = 1; } else {
+        var tmp4: [16]u8 = undefined; var t4: usize = 0;
+        while (val4 > 0) { tmp4[t4] = '0' + @as(u8, @intCast(val4 % 10)); val4 /= 10; t4 += 1; }
+        while (t4 > 0) { t4 -= 1; buf4[len4] = tmp4[t4]; len4 += 1; }
+    }
+    sys_print(buf4[0..len4]);
+    sys_print("\n");
+
+    sys_print("Total Entropy Samples: ");
+    var buf_tot: [20]u8 = undefined;
+    var len_tot: usize = 0;
+    var val_tot = entropy_hub.total_samples;
+    if (val_tot == 0) { buf_tot[0] = '0'; len_tot = 1; } else {
+        var tmp_tot: [20]u8 = undefined; var t_tot: usize = 0;
+        while (val_tot > 0) { tmp_tot[t_tot] = '0' + @as(u8, @intCast(val_tot % 10)); val_tot /= 10; t_tot += 1; }
+        while (t_tot > 0) { t_tot -= 1; buf_tot[len_tot] = tmp_tot[t_tot]; len_tot += 1; }
+    }
+    sys_print(buf_tot[0..len_tot]);
+    sys_print("\n");
 }
 
 fn cmd_disk() void {

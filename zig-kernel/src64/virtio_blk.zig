@@ -18,6 +18,9 @@ const hal = @import("hal.zig");
 const pmm = @import("pmm64.zig");
 const pci = @import("pci.zig");
 
+// Bus entropy callback — registered by kernel to feed BusPool (DMA/PCIe timing)
+pub var bus_entropy_sink: ?*const fn (u64) void = null;
+
 // ============================================================================
 // VirtIO PCI Register Offsets (Legacy / Transitional)
 // ============================================================================
@@ -659,6 +662,7 @@ pub fn readSectors(sector: u64, num_sectors: u32, buffer: []u8) VblkError!void {
     hal.Serial.putHex(data_phys);
     hal.Serial.puts("\n");
 
+    const t_start = hal.readMsr(0x10); // TSC start for Bus Pool entropy
     const completed = waitForCompletion(50_000_000) orelse {
         // Debug: dump virtqueue state on timeout
         const used_dbg = getUsed();
@@ -683,6 +687,10 @@ pub fn readSectors(sector: u64, num_sectors: u32, buffer: []u8) VblkError!void {
         freeDescChain(head);
         return VblkError.Timeout;
     };
+    const t_end = hal.readMsr(0x10); // TSC end
+    if (bus_entropy_sink) |sink| {
+        sink(t_end -% t_start ^ (@as(u64, sector) << 32));
+    }
 
     _ = completed;
 
@@ -759,16 +767,16 @@ pub fn writeSectors(sector: u64, num_sectors: u32, buffer: []const u8) VblkError
     hal.Serial.putHex(num_sectors);
     hal.Serial.puts("\n");
 
+    const t_write_start = hal.readMsr(0x10);
     const completed = waitForCompletion(50_000_000) orelse {
-        const used_dbg = getUsed();
-        hal.Serial.puts("[VBLK-WRITE] TIMEOUT! used.idx=");
-        hal.Serial.putHex(used_dbg.idx);
-        hal.Serial.puts(" last_used=");
-        hal.Serial.putHex(vblk_state.last_used_idx);
-        hal.Serial.puts("\n");
+        hal.Serial.puts("[VBLK-WRITE] TIMEOUT!\n");
         freeDescChain(head);
         return VblkError.Timeout;
     };
+    const t_write_end = hal.readMsr(0x10);
+    if (bus_entropy_sink) |sink| {
+        sink(t_write_end -% t_write_start ^ (@as(u64, sector) << 32) ^ 0x57524954); // 'WRIT'
+    }
 
     _ = completed;
 

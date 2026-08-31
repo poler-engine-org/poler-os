@@ -209,6 +209,17 @@ zig-kernel/
 
 ## История версий
 
+### v0.7.2 — Multi-Pool Hardware Entropy Hub
+- Полная реализация всех 4 пулов физической энтропии по спецификации `POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md`:
+  1. **Phase Pool** (`DOMAIN_POOL_PHASE`): кремниевый PUF-джиттер и TSC флуктуации
+  2. **Bus Pool** (`DOMAIN_POOL_BUS`): задержки транзакций шины PCIe / VirtIO DMA I/O
+  3. **IRQ Pool** (`DOMAIN_POOL_IRQ`): интервалы аппаратных прерываний (APIC Timer / IO-APIC)
+  4. **Bio Pool** (`DOMAIN_POOL_BIO`): биодинамика пользователя (тайминги нажатия клавиш клавиатуры)
+- Модуль `UnifiedEntropyHub` в `src64/puf.zig` — синхронное аккумулирование и свертка всех пулов через SipHash-диффузию
+- Инструментирование HAL и VirtIO: `hal.irq_entropy_sink`, `hal.bio_entropy_sink`, `virtio_blk.bus_entropy_sink`
+- Автоматическая регенерация PRNG ядра каждые 64 аппаратных прерывания
+- Команда интерактивного шелла `entropy` для мониторинга в реальном времени
+
 ### v0.7.1 — PUF Hardware Entropy Binding
 - Модуль `src64/puf.zig`: экстрактор аппаратной энтропии (SipHash-губка
   с доменным разделением: сид / identity / live-пул)

@@ -7,6 +7,10 @@
 // Breaks circular dependency: hal.zig ↔ scheduler.zig
 pub var timerTickCallback: ?*const fn (u64) callconv(.C) u64 = null;
 
+// Multi-pool hardware entropy callbacks (Spec §1-2)
+pub var irq_entropy_sink: ?*const fn (u64) void = null; // IRQ pool (APIC timer / hardware interrupt intervals)
+pub var bio_entropy_sink: ?*const fn (u64) void = null; // Bio pool (keystroke interval bio-dynamics)
+
 // Simple spinlock for protecting shared resources (e.g. serial output)
 pub var serial_lock: u32 = 0;
 
@@ -398,6 +402,11 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
         PIC.sendEOI(@intCast(frame.vector - 32));
     }
 
+    const irq_tsc = readMsr(0x10);
+    if (irq_entropy_sink) |sink| {
+        sink(irq_tsc ^ (@as(u64, frame.vector) << 32));
+    }
+
     switch (frame.vector) {
         48 => {
             // APIC Timer tick — scheduler preemption
@@ -410,7 +419,13 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                 next_frame = @ptrFromInt(cb(@intFromPtr(frame)));
             }
         },
-        33 => handleKeyboard(frame),
+        33 => {
+            if (bio_entropy_sink) |bio_sink| {
+                const kbd_tsc = readMsr(0x10);
+                bio_sink(kbd_tsc ^ (@as(u64, inb(0x60)) << 48));
+            }
+            handleKeyboard(frame);
+        },
         36 => handleSerial(frame),
         else => {}, // Unknown interrupt — ignore for now
     }
