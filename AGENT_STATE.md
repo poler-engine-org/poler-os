@@ -6,9 +6,9 @@
 updated_utc: 2026-08-31T17:50:00Z
 repo: poler-os
 branch: main
-commit: pending
+commit: 63e9b615
 tag: v0.7.2
-pushed: false
+pushed: true
 tests: zig build test 34/34 (нативно, Zig 0.14.0) — все 4 пула протестированы
 current_task: —
 current_task_note: v0.7.2 Multi-Pool Entropy Hub shipped — Phase (PUF/TSC), Bus (VirtIO/PCIe), IRQ (APIC/HPET), Bio (Клавиатура) + авто-регенерация PRNG + шелл-команда entropy
