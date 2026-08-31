@@ -68,13 +68,14 @@ mb2_header_end:
 .code32
 
 // PVH-точка входа (QEMU >=11 `-kernel`, Xen PVH). Вход: 32-bit protected
-// mode, paging off, flat segments. Информации Multiboot2 нет — зануляем
-// EAX (magic) и EBX (MBI; QEMU-PVH кладёт туда hvm_start_info — для нас
-// мусор): _start прочитает EBP=0 как «PVH, без mb2-info».
+// mode, paging off, flat segments. Multiboot2-магии нет: EAX = 0 → «PVH».
+// EBX НЕ зануляем: QEMU-PVH кладёт туда физ. адрес hvm_start_info — v0.9.0
+// ядро парсит его (initrd-модули, cmdline). MB2-парсер при magic=0 не
+// активируется (гейт have_mb2 в main64.zig), мусор не читается.
 pvh_entry:
     cli
-    xorl %eax, %eax
-    xorl %ebx, %ebx
+    xorl %eax, %eax          // magic = 0 → PVH-ветка в poler_kernel_main
+    // EBX = paddr(hvm_start_info) — проходит через r13d → RSI (2-й аргумент)
     jmp _start
 
 _start:

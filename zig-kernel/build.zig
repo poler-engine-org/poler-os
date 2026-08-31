@@ -145,6 +145,10 @@ pub fn build(b: *std.Build) void {
     run64_iso_blk_step.dependOn(&run64_iso_blk_cmd.step);
 
     // ═══ POLER Core Tests (native x86_64 linux) ════════════════════════════
+    // ⚠ Инвариант (урок v0.9.0): тесты обязаны ЗАПУСКАТЬСЯ (addRunArtifact),
+    // а не только компилироваться. Зависимость только от Step.Compile даёт
+    // «зелёный» build при падающем/паникующем тест-бинарнике — панки
+    // (@alignCast, SIGABRT, #GP) не ловились вообще.
     const test_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .linux,
@@ -180,11 +184,37 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
-    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF)");
-    test_step.dependOn(&poler_core32_tests.step);
-    test_step.dependOn(&poler_core64_tests.step);
-    test_step.dependOn(&rsa_oaep64_tests.step);
-    test_step.dependOn(&puf64_tests.step);
+    // 64-bit PE/COFF parser tests (Crash-Driven Development, v0.9.0):
+    // парсинг реального PE64 (testdata/curl.exe — 274 импорта из 22 DLL)
+    const pe64_tests = b.addTest(.{
+        .root_source_file = b.path("src64/pe.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
+    // 64-bit Win32 stub dispatcher tests: полный CDD-цикл — генерация стабов,
+    // патч IAT, вызов импорта через слот, фиксация имени функции
+    const win32_stubs_tests = b.addTest(.{
+        .root_source_file = b.path("src64/win32_stubs.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
+    // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
+    const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
+    const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
+    const run_rsa_oaep64_tests = b.addRunArtifact(rsa_oaep64_tests);
+    const run_puf64_tests = b.addRunArtifact(puf64_tests);
+    const run_pe64_tests = b.addRunArtifact(pe64_tests);
+    const run_win32_stubs_tests = b.addRunArtifact(win32_stubs_tests);
+
+    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs)");
+    test_step.dependOn(&run_poler_core32_tests.step);
+    test_step.dependOn(&run_poler_core64_tests.step);
+    test_step.dependOn(&run_rsa_oaep64_tests.step);
+    test_step.dependOn(&run_puf64_tests.step);
+    test_step.dependOn(&run_pe64_tests.step);
+    test_step.dependOn(&run_win32_stubs_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{

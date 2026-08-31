@@ -26,10 +26,129 @@ const framebuffer = @import("framebuffer.zig");
 const pci = @import("pci.zig");
 const virtio_blk = @import("virtio_blk.zig");
 const fat32 = @import("fat32.zig");
+const pe = @import("pe.zig");
+const win32 = @import("win32_stubs.zig");
 
 
 
 var use_fb: bool = false;
+
+// ============================================================================
+// PVH boot protocol (hvm_start_info) — v0.9.0
+// QEMU ≥11 при `-kernel` (PVH ELF note) кладёт в EBX физ. адрес структуры
+// hvm_start_info: initrd-модули передаются через её modlist. Без этого
+// PVH-загрузка не видит файлов — а initrd нужен для PE-фикстур (peinfo).
+// Спека: Xen PVH boot protocol, docs/pe-reference/ (и include/xen/interface).
+// ============================================================================
+const PVH_START_MAGIC: u32 = 0x336D5142; // "xen" HVM_START_MAGIC (спека Xen)
+// QEMU 11 (pvh.bin/qboot.rom) кладёт ДРУГУЮ магию — 0x336EC578
+// (найдено эмпирически: константа в share/qemu/pvh.bin @0x1dd; Xen-магии
+// в блобе нет). Принимаем обе — не ломаем ни спеку, ни реальность QEMU.
+const PVH_START_MAGIC_QEMU11: u32 = 0x336EC578;
+
+const HvmStartInfo = extern struct {
+    magic: u32,
+    version: u32,
+    flags: u32,
+    nr_modules: u32,
+    mods_addr: u64, // физ. адрес массива HvmModListEntry
+    cmdline_paddr: u64,
+    rsdp_addr: u64,
+};
+
+const HvmModListEntry = extern struct {
+    addr: u64, // физ. адрес модуля
+    size: u64,
+    cmdline_paddr: u64,
+    reserved: u64,
+};
+
+/// Initrd (cpio-архив) из любого загрузчика: mb2-модуль или PVH modlist[0].
+/// Хранится глобально для шелл-команд peinfo/pestubs/cat.
+var initrd_archive: ?[]const u8 = null;
+
+fn parsePvhStartInfo(si_paddr: u64) void {
+    if (si_paddr == 0) {
+        puts("[PVH] start_info не передан (EBX=0) — initrd недоступен\n");
+        return;
+    }
+    // identity-map покрывает 0..4ГБ — физ. адрес разыменовываем напрямую
+    if (si_paddr + @sizeOf(HvmStartInfo) > (4 << 30)) {
+        puts("[PVH] start_info вне 4ГБ identity-map — игнорируем\n");
+        return;
+    }
+    const si: *const HvmStartInfo = @ptrFromInt(si_paddr);
+    if (si.magic != PVH_START_MAGIC and si.magic != PVH_START_MAGIC_QEMU11) {
+        puts("[PVH] start_info @0x");
+        putHex(si_paddr);
+        puts(": неверная магия (0x");
+        putHex(si.magic);
+        puts(") — initrd недоступен\n");
+        return;
+    }
+    puts("[PVH] start_info: v");
+    putDecimal(si.version);
+    puts(", modules=");
+    putDecimal(si.nr_modules);
+    puts("\n");
+
+    if (si.nr_modules == 0 or si.mods_addr == 0) return;
+    // только 1-й модуль (initrd); лимит sanity — 64 модуля
+    const n = @min(si.nr_modules, 64);
+    const mods: [*]const HvmModListEntry = @ptrFromInt(si.mods_addr);
+    for (mods[0..n]) |*m| {
+        if (m.addr == 0 or m.size == 0 or m.size > 256 * 1024 * 1024) continue;
+        puts("[PVH] module: paddr=0x");
+        putHex(m.addr);
+        puts(" size=");
+        putDecimal(m.size);
+        puts("\n");
+        if (initrd_archive == null) {
+            initrd_archive = @as([*]const u8, @ptrFromInt(m.addr))[0..m.size];
+        }
+    }
+}
+
+/// Разбор cpio-архива initrd: список файлов + глобальный поиск по имени.
+fn parseInitrdCpio(archive: []const u8, source: []const u8) void {
+    puts("[INITRD] Источник: ");
+    puts(source);
+    puts(", размер ");
+    putDecimal(archive.len);
+    puts(" байт\n");
+
+    var cpio_parser = cpio.CpioParser.init(archive);
+    var file_count: usize = 0;
+    while (cpio_parser.next()) |file| {
+        puts("  - File: ");
+        puts(file.name);
+        puts(" Size: ");
+        putDecimal(file.size);
+        puts(" bytes\n");
+
+        if (std.mem.endsWith(u8, file.name, ".txt")) {
+            puts("    Content: \"");
+            const limit = if (file.data.len > 64) 64 else file.data.len;
+            puts(file.data[0..limit]);
+            if (file.data.len > 64) puts("...");
+            puts("\"\n");
+        }
+        file_count += 1;
+    }
+    puts("[INITRD] Total files parsed: ");
+    putDecimal(file_count);
+    puts("\n");
+}
+
+/// Поиск файла в initrd-cpio по имени (для peinfo/pestubs).
+fn initrdFindFile(name: []const u8) ?[]const u8 {
+    const arch = initrd_archive orelse return null;
+    var cpio_parser = cpio.CpioParser.init(arch);
+    while (cpio_parser.next()) |file| {
+        if (std.mem.eql(u8, file.name, name)) return file.data;
+    }
+    return null;
+}
 
 /// Случайное u32 для ядра (планировщик/крипто/соль). До привязки PUF — 0.
 fn krand() u32 {
@@ -548,8 +667,10 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     if (multiboot_magic == 0x36D76289) {
         puts("[BOOT] Multiboot2 loaded successfully\n");
     } else if (multiboot_magic == 0) {
-        // PVH: грузимся без информации загрузчика (карта памяти — fallback)
-        puts("[BOOT] PVH direct boot (QEMU -kernel via ELF note, no Multiboot2 info)\n");
+        // PVH: грузимся без mb2-информации (карта памяти — PMM-fallback).
+        // 2-й аргумент = физ. адрес hvm_start_info (initrd-модули — ниже)
+        puts("[BOOT] PVH direct boot (QEMU -kernel via ELF note)\n");
+        parsePvhStartInfo(multiboot_info);
     } else {
         vga_setcolor(0x0C);
         puts("[BOOT] WARNING: Unknown bootloader (magic=");
@@ -573,7 +694,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
 
     // 7. Memory info
     puts("[BOOT] Memory layout:\n");
-    printMemoryInfo(multiboot_info);
+    // При PVH 2-й аргумент — start_info (НЕ MBI): PMM должен получить 0,
+    // иначе mb2-парсер начнёт читать мусор и не найдёт ни одной страницы
+    printMemoryInfo(if (have_mb2) multiboot_info else 0);
 
     // 8. Test POLER Core
     testPolerCore();
@@ -679,52 +802,31 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     }
 
     // 8.7. Initialize and parse Initrd/CPIO modules
+    // mb2: модуль из тега (GRUB ISO-загрузка); PVH: modlist[0] из
+    // hvm_start_info (уже разобран в parsePvhStartInfo).
     puts("[BOOT] Checking for initrd modules...\n");
-    const mb_parser = multiboot2.Parser.init(multiboot_info);
-    var mod_offset: u64 = 8;
-    if (mb_parser.findModuleTag(&mod_offset)) |mod| {
-        const mod_size = mod.mod_end - mod.mod_start;
-        if (mod_size == 0 or mod.mod_start == 0) {
-            puts("[INITRD] Empty initrd module, skipping.\n");
-        } else {
-            puts("[INITRD] Module found: ");
-            puts(mod.getCmdline());
-            puts("\n");
-
-            puts("[INITRD] Start Phys: ");
-            putHex(mod.mod_start);
-            puts(", End Phys: ");
-            putHex(mod.mod_end);
-            puts(", Size: ");
-            putDecimal(mod_size);
-            puts(" bytes\n");
-
-            const archive_slice: []const u8 = @as([*]const u8, @ptrFromInt(mod.mod_start))[0..mod_size];
-
-            var cpio_parser = cpio.CpioParser.init(archive_slice);
-            var file_count: usize = 0;
-            while (cpio_parser.next()) |file| {
-                puts("  - File: ");
-                puts(file.name);
-                puts(" Size: ");
-                putDecimal(file.size);
-                puts(" bytes\n");
-                
-                // Print text file contents (e.g. hello.txt)
-                if (std.mem.endsWith(u8, file.name, ".txt")) {
-                    puts("    Content: \"");
-                    const limit = if (file.data.len > 64) 64 else file.data.len;
-                    puts(file.data[0..limit]);
-                    if (file.data.len > 64) puts("...");
-                    puts("\"\n");
-                }
-                file_count += 1;
+    if (have_mb2) {
+        const mb_parser = multiboot2.Parser.init(multiboot_info);
+        var mod_offset: u64 = 8;
+        if (mb_parser.findModuleTag(&mod_offset)) |mod| {
+            const mod_size = mod.mod_end - mod.mod_start;
+            if (mod_size == 0 or mod.mod_start == 0) {
+                puts("[INITRD] Empty initrd module, skipping.\n");
+            } else {
+                puts("[INITRD] Module found: ");
+                puts(mod.getCmdline());
+                puts("\n");
+                puts("[INITRD] Start Phys: ");
+                putHex(mod.mod_start);
+                puts(", End Phys: ");
+                putHex(mod.mod_end);
+                puts("\n");
+                initrd_archive = @as([*]const u8, @ptrFromInt(mod.mod_start))[0..mod_size];
             }
-
-            puts("[INITRD] Total files parsed: ");
-            putDecimal(file_count);
-            puts("\n");
         }
+    }
+    if (initrd_archive) |arch| {
+        parseInitrdCpio(arch, if (have_mb2) "multiboot2 module" else "PVH hvm_start_info module");
     } else {
         puts("[INITRD] No initrd modules loaded by bootloader.\n");
     }
@@ -848,6 +950,8 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  rm <f>    - Delete a file\n");
         sys_print("  disk      - Show disk info\n");
         sys_print("  entropy   - Show all hardware entropy pools status (PUF, Bus, IRQ, Bio)\n");
+        sys_print("  peinfo <f> - Analyze PE/COFF executable from initrd (headers, sections, imports)\n");
+        sys_print("  pestubs <f> - Generate Win32 stub table for PE executable (CDD: log+int3)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.7.2 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF Multi-Pool Active).\n");
@@ -859,6 +963,14 @@ fn execute_command(cmd: []const u8) void {
         sys_print("pndMixAlt(42, 17, 1) = 0x000002CD\n");
     } else if (eq(cmd, "entropy")) {
         cmd_entropy();
+    } else if (startsWith(cmd, "peinfo ")) {
+        cmd_peinfo(cmd[7..]);
+    } else if (eq(cmd, "peinfo")) {
+        cmd_peinfo("");
+    } else if (startsWith(cmd, "pestubs ")) {
+        cmd_pestubs(cmd[8..]);
+    } else if (eq(cmd, "pestubs")) {
+        cmd_pestubs("");
     } else if (eq(cmd, "ls")) {
         cmd_ls("");
     } else if (startsWith(cmd, "ls ")) {
@@ -1065,6 +1177,213 @@ fn cmd_entropy() void {
     sys_print("Total Entropy Samples: ");
     printDec(entropy_hub.total_samples);
     sys_print("\n");
+}
+
+// ============================================================================
+// PE/COFF команды (v0.9.0, Crash-Driven Development)
+//   peinfo <file>  — заголовки PE32+ + секции + таблица импортов (IAT)
+//   pestubs <file> — генерация Win32-заглушек: лог имени + int3-стоп (CDD)
+// Файлы ищутся в initrd (cpio): mb2-модуль или PVH modlist[0].
+// ============================================================================
+
+/// Статические буферы стабов (ядро без аллокаций): curl.exe — 274 импорта,
+/// лимита 1024 хватает для тяжёлых CDD-кандидатов.
+var kstub_entries: [win32.MAX_STUB_ENTRIES]win32.StubEntry = undefined;
+var kstub_code: [win32.MAX_STUB_ENTRIES * win32.STUB_CODE_SIZE]u8 align(16) = undefined;
+var kdisp: win32.Dispatcher = undefined;
+
+/// Лог-хук диспетчера: форматированная строка → VGA+serial (как весь шелл).
+fn win32LogHook(_: ?*anyopaque, msg: []const u8) void {
+    sys_print(msg);
+}
+
+fn cmd_peinfo(args: []const u8) void {
+    if (args.len == 0) {
+        sys_print("Usage: peinfo <file-in-initrd>   (e.g. peinfo curl.exe)\n");
+        return;
+    }
+    const data = initrdFindFile(args) orelse {
+        sys_print("File not found in initrd: ");
+        sys_print(args);
+        sys_print("\n");
+        return;
+    };
+
+    sys_print("=== PE/COFF Analysis: ");
+    sys_print(args);
+    sys_print(" ===\n");
+    sys_print("File size: ");
+    printDec(data.len);
+    sys_print(" bytes\n");
+
+    const image = pe.Pe.parse(data) catch |err| {
+        sys_print("Parse error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+
+    sys_print("Machine: 0x");
+    putHex(image.machine());
+    sys_print(" (AMD64/x86_64), PE32+ (64-bit)\n");
+    sys_print("Subsystem: ");
+    printDec(image.subsystem());
+    if (image.isConsole()) {
+        sys_print(" (Console)");
+    } else {
+        sys_print(" (GUI)");
+    }
+    sys_print(", Timestamp: 0x");
+    putHex(image.timestamp());
+    sys_print("\n");
+
+    sys_print("Entry point: RVA 0x");
+    putHex(image.entryPointRva());
+    sys_print(" (VA 0x");
+    putHex(image.entryPointVa());
+    sys_print(")\n");
+    sys_print("Image base: 0x");
+    putHex(image.imageBase());
+    sys_print(", SizeOfImage: 0x");
+    putHex(image.sizeOfImage());
+    sys_print(", Headers: 0x");
+    putHex(image.sizeOfHeaders());
+    sys_print("\n");
+    sys_print("Stack reserve: 0x");
+    putHex(image.stackReserve());
+    sys_print(", Heap reserve: 0x");
+    putHex(image.heapReserve());
+    sys_print("\n");
+
+    // Секции
+    sys_print("Sections: ");
+    printDec(image.numSections());
+    sys_print("\n");
+    for (image.sections) |*sec| {
+        sys_print("  ");
+        sys_print(sec.nameSlice());
+        sys_print(" VA=0x");
+        putHex(sec.virtual_address);
+        sys_print(" VSize=0x");
+        putHex(sec.virtual_size);
+        sys_print(" Raw=0x");
+        putHex(sec.pointer_to_raw_data);
+        sys_print("..0x");
+        putHex(sec.pointer_to_raw_data + sec.size_of_raw_data);
+        if (sec.isExecutable()) sys_print(" X");
+        if (sec.isWritable()) sys_print(" W");
+        sys_print("\n");
+    }
+
+    // Импорты (IAT) — ядро Crash-Driven Development
+    const counts = image.countImports();
+    sys_print("Imports: ");
+    printDec(counts.dlls);
+    sys_print(" DLLs, ");
+    printDec(counts.functions);
+    sys_print(" functions\n");
+
+    var dlls = image.importDlls() catch {
+        sys_print("  (import directory error)\n");
+        return;
+    };
+    while (dlls.next()) |dll| {
+        sys_print("  ");
+        sys_print(dll.name);
+        sys_print(": ");
+        printDec(dll.countFunctions());
+        sys_print(" imports\n");
+        // первые функции каждой DLL — «что просит приложение»
+        var shown: usize = 0;
+        var fns = dll.functions;
+        while (fns.next()) |f| {
+            if (shown >= 6) {
+                sys_print("    ... (см. pestubs для полной таблицы)\n");
+                break;
+            }
+            sys_print("    ");
+            switch (f) {
+                .by_name => |n| sys_print(n),
+                .by_ordinal => |ord| {
+                    sys_print("ordinal#");
+                    printDec(ord);
+                },
+            }
+            sys_print("\n");
+            shown += 1;
+        }
+    }
+}
+
+fn cmd_pestubs(args: []const u8) void {
+    if (args.len == 0) {
+        sys_print("Usage: pestubs <file-in-initrd>   (generate Win32 stub table)\n");
+        return;
+    }
+    const data = initrdFindFile(args) orelse {
+        sys_print("File not found in initrd: ");
+        sys_print(args);
+        sys_print("\n");
+        return;
+    };
+
+    const image = pe.Pe.parse(data) catch |err| {
+        sys_print("Parse error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+
+    sys_print("=== Win32 Stub Generation (CDD): ");
+    sys_print(args);
+    sys_print(" ===\n");
+
+    // Диспетчер: режим int3 (вызов заглушки = лог имени + #BP → panic trace)
+    kdisp = win32.Dispatcher.init(&kstub_entries, &kstub_code, .int3);
+    kdisp.log_fn = win32LogHook;
+    const generated = kdisp.generateFor(&image) catch |err| {
+        sys_print("Stub generation error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    // Активируем глобально: стаб-код (movabs rdi,id; call stubCommon) зовёт
+    // синглтон диспетчера — при запуске PE-процесса логи пойдут сюда
+    win32.setDispatcher(&kdisp);
+
+    sys_print("Generated stubs: ");
+    printDec(generated);
+    sys_print(" / ");
+    printDec(image.countImports().functions);
+    sys_print(" imports\n");
+    sys_print("Stub code size: ");
+    printDec(generated * win32.STUB_CODE_SIZE);
+    sys_print(" bytes (buffer: ");
+    printDec(kstub_code.len);
+    sys_print(")\n");
+
+    // Примеры стабов — ровно те имена, которые появятся в логе при первом
+    // падении (CDD: «запуск → лог → реализуй эту функцию»)
+    sys_print("Sample entries (stub -> dll!function):\n");
+    var shown: usize = 0;
+    for (kstub_entries[0..kdisp.count]) |*e| {
+        if (shown >= 10) {
+            sys_print("  ... (+");
+            printDec(kdisp.count - shown);
+            sys_print(" more)\n");
+            break;
+        }
+        var buf: [128]u8 = undefined;
+        sys_print("  #");
+        printDec(shown);
+        sys_print(" 0x");
+        putHex(e.stub_addr);
+        sys_print(" -> ");
+        sys_print(win32.fmtEntryName(e, &buf));
+        sys_print("\n");
+        shown += 1;
+    }
+    sys_print("Stub call behavior: log dll!function + int3 (#BP panic trace)\n");
 }
 
 fn cmd_disk() void {
