@@ -1,6 +1,6 @@
 # POLER-OS
 
-**Универсальная операционная система нового поколения. x86_64, монолитное ядро, Zig 0.13.0.**
+**Универсальная операционная система нового поколения. x86_64, монолитное ядро, Zig 0.14.0.**
 
 POLER-OS — это не дистрибутив Linux и не надстройка над ним. Это независимая операционная система, спроектированная с нуля для решения фундаментальной проблемы: insecurity by design. Linux уязвим архитектурно — ядро открыто для модификации после загрузки, root-процесс является богом системы, а защита строится как надстройка поверх ОС. POLER-OS меняет парадигму: безопасность не добавляется — она является архитектурным свойством ядра.
 
@@ -44,7 +44,7 @@ Linux-программы работают нативно — POLER-OS реали
 
 ---
 
-## Текущая версия: v0.7.0
+## Текущая версия: v0.7.1
 
 | Подсистема | Статус | Описание |
 |---|---|---|
@@ -58,6 +58,7 @@ Linux-программы работают нативно — POLER-OS реали
 | Keyboard | Готово | PS/2 Set 2 → Set 1 translation через i8042 controller (bit 6) |
 | Serial | Готово | COM1 (115200 baud, 8N1) |
 | Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
+| PUF | Готово | Привязка аппаратной энтропии: TSC-джиттер → сид PRNG ядра + identity; анти-клон enrollment (спека POST_QUANTUM_HARDWARE_ENTROPY) |
 | Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen |
 | SMP | Планируется | Многоядерность |
 | Networking | Планируется | virtio-net |
@@ -71,7 +72,7 @@ Linux-программы работают нативно — POLER-OS реали
 
 ### Зависимости
 
-- **Zig 0.13.0** — компилятор
+- **Zig 0.14.0** — компилятор
 - **QEMU** — для тестирования
 - **GRUB** (`grub-pc-bin`, `grub-mkrescue`) — загрузчик
 - **xorriso** — создание ISO
@@ -207,6 +208,20 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.7.1 — PUF Hardware Entropy Binding
+- Модуль `src64/puf.zig`: экстрактор аппаратной энтропии (SipHash-губка
+  с доменным разделением: сид / identity / live-пул)
+- Boot-привязка: сбор TSC-джиттера (128 замеров IA32_TSC) → сид PRNG
+  ядра + печать 256-бит device identity (спека
+  `docs/POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md`)
+- Анти-клон: `enroll()`/`bindEnrolled()` — мажоритарный консенсус +
+  стабильная маска; чужой кремний/VM → `NotThisDevice`
+- Health-check (sparse-aware) + LivePool для подмешивания живой
+  энтропии в рантайме
+- 11 юнит-тестов PUF (нативно, `zig build test`)
+- Docs: версия тулчейна выровнена с реальностью — Zig 0.14
+  (миграция Allocator `std.mem.Alignment` — коммит cd6e7b37)
 
 ### v0.7.0 — Ring 3 User Mode
 - ELF64 loader, per-process CR3, TSS IST1

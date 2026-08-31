@@ -1,2 +1,6 @@
 skills/
 node_modules/
+zig-kernel/zig-out/
+zig-kernel/.zig-cache/
+*.iso
+disk.img

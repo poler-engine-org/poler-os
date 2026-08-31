@@ -172,10 +172,19 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
-    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP)");
+    // 64-bit PUF tests (hardware entropy binding: extractor, enrollment,
+    // anti-clone, live pool — см. docs/POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md)
+    const puf64_tests = b.addTest(.{
+        .root_source_file = b.path("src64/puf.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
+    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF)");
     test_step.dependOn(&poler_core32_tests.step);
     test_step.dependOn(&poler_core64_tests.step);
     test_step.dependOn(&rsa_oaep64_tests.step);
+    test_step.dependOn(&puf64_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{

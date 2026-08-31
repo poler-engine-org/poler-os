@@ -7,12 +7,15 @@
 //   v0.5.0: 64-bit boot, HAL (GDT/IDT/PIC/APIC), ACPI, interrupts
 //   v0.5.1: VirtualBox compatibility, 64-bit Long Mode fix
 //   v0.7.0: VirtIO-BLK + FAT32 + PCI, Ring 3, ELF loader, scheduler, crypto
+//   v0.7.1: PUF — привязка аппаратной энтропии (TSC-джиттер → сид/identity,
+//           анти-клон enrollment; спека: POST_QUANTUM_HARDWARE_ENTROPY_SPEC)
 // ============================================================================
 
 const hal = @import("hal.zig");
 const std = @import("std");
 const acpi = @import("acpi.zig");
 const poler = @import("poler_core.zig");
+const puf = @import("puf.zig");
 const pmm = @import("pmm64.zig");
 const vmm = @import("vmm64.zig");
 const heap = @import("heap64.zig");
@@ -27,6 +30,16 @@ const fat32 = @import("fat32.zig");
 
 
 var use_fb: bool = false;
+
+// PUF: PRNG ядра, высеянный из аппаратной энтропии при загрузке (puf.zig).
+var kernel_rng: poler.PolerPrng = undefined;
+var kernel_rng_ready: bool = false;
+
+/// Случайное u32 для ядра (планировщик/крипто/соль). До привязки PUF — 0.
+fn krand() u32 {
+    if (kernel_rng_ready) return kernel_rng.next();
+    return 0;
+}
 
 const VGA_COLORS = [16][3]u8{
     .{ 0, 0, 0 },         // 0: Black
@@ -388,6 +401,69 @@ fn testPolerCore() void {
 }
 
 // ============================================================================
+// PUF — привязка аппаратной энтропии при загрузке (puf.zig)
+// ============================================================================
+
+/// Сбор живого TSC-джиттера: 128 замеров IA32_TSC; между замерами
+/// io-чтение LSR COM1 (гипервизор/устройство вносит вариативность).
+/// Возвращает TSC-базу (nonce привязки — каждая загрузка новый материал).
+fn harvestTscJitter(out: *[1024]u8) u64 {
+    var base: u64 = 0;
+    var i: usize = 0;
+    while (i < 128) : (i += 1) {
+        const t = hal.readMsr(0x10); // IA32_TSC
+        if (i == 0) base = t;
+        _ = hal.inb(0x3F8 + 5); // LSR: io-задержка между замерами
+        const delta = t -% base;
+        const mixed = delta ^ (t >> 17) ^ (@as(u64, i) << 48);
+        std.mem.writeInt(u64, out[i * 8 ..][0..8], mixed, .little);
+    }
+    return base;
+}
+
+/// Привязка PUF: собрать джиттер → health-check → сид PRNG ядра +
+/// печать identity (256 бит) и качества источника. Анти-клон-гейт
+/// (bindEnrolled против записанной регистрации) — v0.8 (нужен носитель
+/// для хранения Enrollment; спека §4).
+fn pufBootInit() void {
+    puts("[PUF] Hardware entropy binding...\n");
+    var raw: [1024]u8 = undefined;
+    const base = harvestTscJitter(&raw);
+    const binding = puf.bindRaw(&raw, base) catch |err| {
+        puts("  health-check FAILED (");
+        puts(@errorName(err));
+        puts(") — RNG на постоянном сидe (fallback)\n");
+        kernel_rng = poler.PolerPrng.init(0xC0FFEE, 0x11, 0x9E3779B9);
+        kernel_rng_ready = true;
+        return;
+    };
+    kernel_rng = binding.prng();
+    kernel_rng_ready = true;
+    puts("  quality: ");
+    puts(@tagName(binding.quality));
+    puts(" (events=");
+    putDecimal(binding.health.events);
+    puts(", words=");
+    putDecimal(binding.health.distinct_words);
+    puts(")\n");
+    puts("  device identity: ");
+    var w: usize = 0;
+    while (w < 4) : (w += 1) {
+        var v: u64 = 0;
+        var k: usize = 0;
+        while (k < 8) : (k += 1) {
+            v = (v << 8) | binding.identity[w * 8 + k];
+        }
+        putHex(v);
+        if (w < 3) puts(" ");
+    }
+    puts("\n");
+    puts("  first PRNG sample: ");
+    putHex(krand());
+    puts("\n");
+}
+
+// ============================================================================
 // Main Kernel Entry Point
 // Вызывается из boot64.S после перехода в 64-bit mode
 // ============================================================================
@@ -449,6 +525,10 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
 
     // 8. Test POLER Core
     testPolerCore();
+
+    // 8.7. PUF: привязка аппаратной энтропии (спека
+    //      docs/POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md)
+    pufBootInit();
 
     // 8.5. Initialize VMM (MUST be before virtio-blk so that any future
     //      code that needs VMM mapping can use it; DMA slots now use
