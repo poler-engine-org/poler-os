@@ -208,6 +208,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
+    // 64-bit Win32/CRT semantic core tests (v0.11.0, CDD №2): block-heap
+    // (malloc/calloc/realloc), GetProcAddress-резолв, QPF/QPC, консольные
+    // структуры, ленивые argc/argv/iob — всё через Ops-инъекцию
+    const win32_crt_tests = b.addTest(.{
+        .root_source_file = b.path("src64/win32_crt.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
     const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
@@ -216,8 +225,9 @@ pub fn build(b: *std.Build) void {
     const run_pe64_tests = b.addRunArtifact(pe64_tests);
     const run_win32_stubs_tests = b.addRunArtifact(win32_stubs_tests);
     const run_pe_loader_tests = b.addRunArtifact(pe_loader_tests);
+    const run_win32_crt_tests = b.addRunArtifact(win32_crt_tests);
 
-    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader)");
+    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader + Win32/CRT core)");
     test_step.dependOn(&run_poler_core32_tests.step);
     test_step.dependOn(&run_poler_core64_tests.step);
     test_step.dependOn(&run_rsa_oaep64_tests.step);
@@ -225,6 +235,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_pe64_tests.step);
     test_step.dependOn(&run_win32_stubs_tests.step);
     test_step.dependOn(&run_pe_loader_tests.step);
+    test_step.dependOn(&run_win32_crt_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{

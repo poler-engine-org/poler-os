@@ -46,7 +46,10 @@ pub const Pe = pe.Pe;
 // ─── Реестр заглушек ────────────────────────────────────────────────────────
 
 pub const MAX_STUB_ENTRIES: usize = 1024;
-pub const STUB_CODE_SIZE: usize = 31; // байт на стаб (все варианты ≤ 26)
+// v0.11.0: 31 → 48 — memmove-стаб вырос до 41Б (lea-предустановка указателей
+// на конец региона для обратного копирования: rep movsb с DF=1 идёт ВНИЗ от
+// ТЕКУЩИХ rsi/rdi, а не от конца региона — урок, пойманный исполнением).
+pub const STUB_CODE_SIZE: usize = 48;
 
 /// Номер syscall'а «win32_call» (hal.zig: case 6).
 pub const WIN32_SYSCALL: u64 = 6;
@@ -55,6 +58,19 @@ pub const StubKind = enum {
     trap, // не реализовано: xor rax,rax; int3; ret (kernel)
     impl, // реализовано: syscall-трамплин (kernel)
     record, // нативный тест: call stubCommon
+    native, // v0.11.0: чистый Ring-3 код (memset/memcpy/memmove/strlen)
+};
+
+/// Вид native-стаба — какие Win64-аргументы обрабатывает сгенерированный код.
+pub const NativeKind = enum {
+    /// memset(dst=RCX, val=EDX, count=R8) → rep stosb, ретурн dst
+    memset,
+    /// memcpy(dst=RCX, src=RDX, count=R8) → rep movsb, ретурн dst
+    memcpy,
+    /// memmove(dst=RCX, src=RDX, count=R8) → направление по cmp dst/src
+    memmove,
+    /// strlen(s=RCX) → скан до NUL, ретурн длина
+    strlen,
 };
 
 pub const StubEntry = struct {
@@ -165,8 +181,13 @@ pub const Dispatcher = struct {
         out[2] = 0x48;
         out[3] = 0x89;
         out[4] = 0xCE;
-        // 4C 89 C2      mov r10, r8    — Win64 arg3 → syscall arg4
-        out[5] = 0x4C;
+        // 4D 89 C2      mov r10, r8    — Win64 arg3 → syscall arg4
+        // ⚠ v0.10.0-ЛАТЕНТНЫЙ БАГ (пойман GCC-эталоном в v0.11): байты были
+        // 4C 89 C2 = mov rdx, r8 — ЗАТИРАЛ Win64-arg2 (RDX) третьим аргументом
+        // и оставлял r10 мусором → все impl-функции с ≥2 аргументами получали
+        // перепутанные аргументы (calloc/VirtualAlloc). 1-аргументные
+        // (GetStdHandle/malloc) не страдали — потому E2E-цикл №1 это не поймал.
+        out[5] = 0x4D;
         out[6] = 0x89;
         out[7] = 0xC2;
         // 48 BF <id>    movabs rdi, entry_id — syscall arg1
@@ -192,6 +213,147 @@ pub const Dispatcher = struct {
         out[29] = 0xC3;
         // r9 (Win64 arg4) не трогаем — syscall-обработчик читает его сам;
         // rcx/r11 затирает сама инструкция syscall — они volatile в Win64 ✓
+    }
+
+    // ─── v0.11.0: native-стабы (чистый Ring-3 код, без syscall) ───
+
+    /// memset/memcpy/memmove/strlen исполняются НАПРЯМУЮ в Ring 3 — CRT зовёт
+    /// их на каждом шагу, syscall-оверхед недопустим. Код соблюдает Win64 ABI:
+    /// трогаются только volatile-регистры (+ callee-saved push/pop), DF=0
+    /// на выходе, ретурн-значение в RAX.
+    ///
+    /// ⚠ memset: 20Б / memcpy: 20Б / strlen: 14Б / memmove: 41Б — паддинг нулями;
+    ///   слот STUB_CODE_SIZE=48Б (максимум — memmove с lea-хвостами).
+    fn writeNativeStub(out: []u8, kind: NativeKind) void {
+        @memset(out, 0);
+        switch (kind) {
+            // memset(dst=RCX, val=EDX, count=R8):
+            //   push rdi; mov r9,rcx; mov rdi,rcx; movzx eax,dl;
+            //   mov rcx,r8; rep stosb; mov rax,r9; pop rdi; ret
+            // ⚠ rep stosb хранит AL (не DL!) — val обязан попасть в AL;
+            //   dst для ретурна сохраняется в r9 (volatile 4-й слот — memset
+            //   принимает только 3 аргумента, r9 свободен).
+            .memset => {
+                out[0] = 0x57; // push rdi (callee-saved)
+                out[1] = 0x49; // mov r9, rcx — спрятать dst для ретурна
+                out[2] = 0x89;
+                out[3] = 0xC9;
+                out[4] = 0x48; // mov rdi, rcx — rdi = dst
+                out[5] = 0x89;
+                out[6] = 0xCF;
+                out[7] = 0x0F; // movzx eax, dl — val (мл. байт int) → AL
+                out[8] = 0xB6;
+                out[9] = 0xC2;
+                out[10] = 0x4C; // mov rcx, r8 — счётчик
+                out[11] = 0x89;
+                out[12] = 0xC1;
+                out[13] = 0xF3; // rep stosb — заполняет байтом из AL
+                out[14] = 0xAA;
+                out[15] = 0x4C; // mov rax, r9 — ретурн dst
+                out[16] = 0x89;
+                out[17] = 0xC8;
+                out[18] = 0x5F; // pop rdi
+                out[19] = 0xC3; // ret
+            },
+            // memcpy(dst=RCX, src=RDX, count=R8):
+            //   push rsi; push rdi; mov rax,rcx; mov rdi,rcx; mov rsi,rdx;
+            //   mov rcx,r8; cld; rep movsb; pop rdi; pop rsi; ret
+            .memcpy => {
+                out[0] = 0x56; // push rsi
+                out[1] = 0x57; // push rdi
+                out[2] = 0x48; // mov rax, rcx — return value = dst
+                out[3] = 0x89;
+                out[4] = 0xC8;
+                out[5] = 0x48; // mov rdi, rcx
+                out[6] = 0x89;
+                out[7] = 0xCF;
+                out[8] = 0x48; // mov rsi, rdx
+                out[9] = 0x89;
+                out[10] = 0xD6;
+                out[11] = 0x4C; // mov rcx, r8
+                out[12] = 0x89;
+                out[13] = 0xC1;
+                out[14] = 0xFC; // cld (DF=0 — ABI-гард)
+                out[15] = 0xF3; // rep movsb
+                out[16] = 0xA4;
+                out[17] = 0x5F; // pop rdi
+                out[18] = 0x5E; // pop rsi
+                out[19] = 0xC3; // ret
+            },
+            // memmove(dst=RCX, src=RDX, count=R8) — overlap-safe:
+            //   dst <= src → forward (cld + rep movsb);
+            //   dst >  src → backward: lea ставит rsi/rdi на КОНЕЦ региона
+            //   (src/dst + count - 1), std, rep movsb идёт вниз, cld.
+            // ⚠ v0.11-урок: rep movsb с DF=1 копирует от ТЕКУЩИХ rsi/rdi ВНИЗ —
+            //   без lea-подстройки читает ПАМЯТЬ НИЖЕ буферов (мусор/стек).
+            //   push rsi; push rdi; mov rax,rcx; mov rdi,rcx; mov rsi,rdx;
+            //   mov rcx,r8; cmp rdi,rsi; jbe .fwd;
+            //   lea rsi,[rsi+rcx-1]; lea rdi,[rdi+rcx-1]; std; rep movsb; cld;
+            //   jmp .done; .fwd: cld; rep movsb;
+            //   .done: pop rdi; pop rsi; ret
+            .memmove => {
+                out[0] = 0x56; // push rsi
+                out[1] = 0x57; // push rdi
+                out[2] = 0x48; // mov rax, rcx — return value = dst
+                out[3] = 0x89;
+                out[4] = 0xC8;
+                out[5] = 0x48; // mov rdi, rcx — dst
+                out[6] = 0x89;
+                out[7] = 0xCF;
+                out[8] = 0x48; // mov rsi, rdx — src
+                out[9] = 0x89;
+                out[10] = 0xD6;
+                out[11] = 0x4C; // mov rcx, r8 — count
+                out[12] = 0x89;
+                out[13] = 0xC1;
+                out[14] = 0x48; // cmp rdi, rsi
+                out[15] = 0x39;
+                out[16] = 0xF7;
+                out[17] = 0x76; // jbe .fwd (+16 → 35)
+                out[18] = 0x10;
+                out[19] = 0x48; // lea rsi, [rsi + rcx - 1] — хвост src
+                out[20] = 0x8D;
+                out[21] = 0x74;
+                out[22] = 0x0E;
+                out[23] = 0xFF;
+                out[24] = 0x48; // lea rdi, [rdi + rcx - 1] — хвост dst
+                out[25] = 0x8D;
+                out[26] = 0x7C;
+                out[27] = 0x0F;
+                out[28] = 0xFF;
+                out[29] = 0xFD; // std — обратное копирование
+                out[30] = 0xF3; // rep movsb (вниз от хвостов)
+                out[31] = 0xA4;
+                out[32] = 0xFC; // cld — восстановить DF=0
+                out[33] = 0xEB; // jmp .done (+3 → 38)
+                out[34] = 0x03;
+                out[35] = 0xFC; // .fwd: cld (гард против нарушенного ABI)
+                out[36] = 0xF3; // rep movsb — прямое копирование
+                out[37] = 0xA4;
+                out[38] = 0x5F; // .done: pop rdi
+                out[39] = 0x5E; // pop rsi
+                out[40] = 0xC3; // ret — 41Б (слот 48Б)
+            },
+            // strlen(s=RCX) → RAX:
+            //   xor eax,eax; .loop: cmp byte [rcx+rax],0; je .done;
+            //   inc rax; jmp .loop; .done: ret
+            .strlen => {
+                out[0] = 0x31; // xor eax, eax
+                out[1] = 0xC0;
+                out[2] = 0x80; // cmp byte [rcx + rax], 0
+                out[3] = 0x3C;
+                out[4] = 0x01;
+                out[5] = 0x00;
+                out[6] = 0x74; // je .done (+5 → 13)
+                out[7] = 0x05;
+                out[8] = 0x48; // inc rax
+                out[9] = 0xFF;
+                out[10] = 0xC0;
+                out[11] = 0xEB; // jmp .loop (-11 → 2)
+                out[12] = 0xF5;
+                out[13] = 0xC3; // .done: ret
+            },
+        }
     }
 
     // ─── Генерация стабов под все импорты образа ───
@@ -221,6 +383,7 @@ pub const Dispatcher = struct {
                     .trap => writeTrapStub(out),
                     .record => writeRecordStub(out, idx, @intFromPtr(&stubCommon)),
                     .impl => unreachable,
+                    .native => unreachable, // только через implementNative
                 }
 
                 self.entries[idx] = .{
@@ -259,6 +422,40 @@ pub const Dispatcher = struct {
             }
         }
         return false;
+    }
+
+    /// v0.11.0: перегенерировать стаб dll!func в NATIVE Ring-3 код (без
+    /// syscall-оверхеда — CRT зовёт memset/memcpy постоянно). Возврат —
+    /// нашли ли запись.
+    pub fn implementNative(self: *Dispatcher, dll_needle: []const u8, func_needle: []const u8, kind: NativeKind) bool {
+        if (self.code == null) return false;
+        const code_buf = self.code.?;
+        for (self.entries[0..self.count]) |*e| {
+            if (!std.ascii.eqlIgnoreCase(e.dll, dll_needle)) continue;
+            switch (e.func) {
+                .by_name => |n| if (std.mem.eql(u8, n, func_needle)) {
+                    const off = e.code_off;
+                    if (off + STUB_CODE_SIZE > code_buf.len) return false;
+                    writeNativeStub(code_buf[off..][0..STUB_CODE_SIZE], kind);
+                    e.kind = .native;
+                    return true;
+                },
+                .by_ordinal => {},
+            }
+        }
+        return false;
+    }
+
+    /// v0.11.0 (GetProcAddress): поиск записи ПО ИМЕНИ по ВСЕМ DLL реестра
+    /// (case-insensitive). Первое совпадение — dynaresolv вернёт его stub_addr.
+    pub fn findByNameAnyDll(self: *Dispatcher, func_needle: []const u8) ?*StubEntry {
+        for (self.entries[0..self.count]) |*e| {
+            switch (e.func) {
+                .by_name => |n| if (std.ascii.eqlIgnoreCase(n, func_needle)) return e,
+                .by_ordinal => {},
+            }
+        }
+        return null;
     }
 
     /// Патчит IAT скопированного образа: каждый слот получает адрес стаба.
@@ -575,7 +772,7 @@ test "impl-стаб: syscall-трамплин Win64→SysV и findByRip" {
     try testing.expectEqual(@as(u8, 0x48), code_buf[off + 2]);
     try testing.expectEqual(@as(u8, 0x89), code_buf[off + 3]);
     try testing.expectEqual(@as(u8, 0xCE), code_buf[off + 4]); // mov rsi,rcx
-    try testing.expectEqual(@as(u8, 0x4C), code_buf[off + 5]);
+    try testing.expectEqual(@as(u8, 0x4D), code_buf[off + 5]); // 4D (v0.11: 4C был mov rdx,r8 — латентный баг)
     try testing.expectEqual(@as(u8, 0x89), code_buf[off + 6]);
     try testing.expectEqual(@as(u8, 0xC2), code_buf[off + 7]); // mov r10,r8
     try testing.expectEqual(@as(u8, 0x48), code_buf[off + 8]);
@@ -617,4 +814,142 @@ test "fmtEntryName: имя для CDD-лога" {
     };
     const name = fmtEntryName(&e, &buf);
     try testing.expectEqualStrings("user32.dll!CreateWindowExW", name);
+}
+
+// ─── v0.11.0: native-стабы — РЕАЛЬНОЕ ИСПОЛНЕНИЕ сгенерированного кода ─────
+
+/// Вызов стаба с Win64-размещением аргументов (RCX/RDX/R8) — так же, как
+/// его вызовет PE-приложение из Ring 3. Тестовый драйвер (нативный x86_64):
+/// аргументы кладём в регистры сами, адрес — в r11, call *r11.
+fn win64Call3(fn_addr: u64, a1: u64, a2: u64, a3: u64) u64 {
+    return asm volatile ("call *%[f]"
+        : [ret] "={rax}" (-> u64),
+        : [f] "{r11}" (fn_addr),
+          [a1] "{rcx}" (a1),
+          [a2] "{rdx}" (a2),
+          [a3] "{r8}" (a3),
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "rax", "rsi", "rdi", "memory"
+    );
+}
+
+fn win64Call1(fn_addr: u64, a1: u64) u64 {
+    return asm volatile ("call *%[f]"
+        : [ret] "={rax}" (-> u64),
+        : [f] "{r11}" (fn_addr),
+          [a1] "{rcx}" (a1),
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "rax", "rsi", "rdi", "memory"
+    );
+}
+
+test "native-стабы: memset/memcpy/memmove/strlen на реальном curl.exe-реестре" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try Pe.parse(data);
+    const counts = image.countImports();
+
+    const entries = try testing.allocator.alloc(StubEntry, counts.functions);
+    defer testing.allocator.free(entries);
+    const code_len = counts.functions * STUB_CODE_SIZE;
+    // RWX: и запись кода, и исполнение (нативный тест; ядро пишет по identity)
+    const code_mem = try std.posix.mmap(
+        null,
+        code_len + 4096,
+        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(code_mem);
+
+    var disp = Dispatcher.init(entries, code_mem[0..code_len], .int3);
+    const generated = try disp.generateFor(&image);
+    try testing.expectEqual(counts.functions, generated);
+
+    // Реальные DLL-раскладки curl.exe (проверено парсером PE):
+    //   memset/strlen → api-ms-win-crt-string; memcpy/memmove → api-ms-win-crt-private
+    const ok1 = disp.implementNative("api-ms-win-crt-string-l1-1-0.dll", "memset", .memset);
+    const ok2 = disp.implementNative("api-ms-win-crt-private-l1-1-0.dll", "memcpy", .memcpy);
+    const ok3 = disp.implementNative("api-ms-win-crt-private-l1-1-0.dll", "memmove", .memmove);
+    const ok4 = disp.implementNative("api-ms-win-crt-string-l1-1-0.dll", "strlen", .strlen);
+    try testing.expect(ok1 and ok2 and ok3 and ok4);
+
+    const memset_addr = (disp.findByNameAnyDll("memset") orelse return error.NoMemset).stub_addr;
+    const memcpy_addr = (disp.findByNameAnyDll("memcpy") orelse return error.NoMemcpy).stub_addr;
+    const memmove_addr = (disp.findByNameAnyDll("memmove") orelse return error.NoMemmove).stub_addr;
+    const strlen_addr = (disp.findByNameAnyDll("strlen") orelse return error.NoStrlen).stub_addr;
+
+    // kind установлен
+    try testing.expectEqual(StubKind.native, (disp.findByNameAnyDll("memset").?).kind);
+
+    // ── memset: заполнение + ретурн dst ──
+    var mbuf: [64]u8 = undefined;
+    @memset(&mbuf, 0xAA);
+    const ret = win64Call3(memset_addr, @intFromPtr(&mbuf), 0x5A, 32);
+    try testing.expectEqual(@intFromPtr(&mbuf), ret); // memset возвращает dst
+    for (mbuf[0..32]) |b| try testing.expectEqual(@as(u8, 0x5A), b);
+    for (mbuf[32..]) |b| try testing.expectEqual(@as(u8, 0xAA), b); // хвост не тронут
+
+    // memset с val > 0xFF: используется только мл. байт
+    _ = win64Call3(memset_addr, @intFromPtr(&mbuf), 0x1234_5678, 8);
+    for (mbuf[0..8]) |b| try testing.expectEqual(@as(u8, 0x78), b);
+
+    // memset(0): count=0 → ничего
+    @memset(&mbuf, 0x11);
+    _ = win64Call3(memset_addr, @intFromPtr(&mbuf), 0x22, 0);
+    try testing.expectEqual(@as(u8, 0x11), mbuf[0]);
+
+    // ── memcpy: копирование + ретурн dst ──
+    const src = "POLER-OS native memcpy stub!";
+    var dbuf: [64]u8 = undefined;
+    @memset(&dbuf, 0);
+    const src_ptr: [*]const u8 = src.ptr;
+    const cret = win64Call3(memcpy_addr, @intFromPtr(&dbuf), @intFromPtr(src_ptr), src.len);
+    try testing.expectEqual(@intFromPtr(&dbuf), cret);
+    try testing.expectEqualStrings(src, dbuf[0..src.len]);
+
+    // ── memmove: overlap dst > src (backward) и dst < src (forward) ──
+    // dst > src: сдвиг вправо на 2 — ветка обратного копирования (std)
+    var obuf: [32]u8 = undefined;
+    @memcpy(&obuf, "abcdefghijklmnopqrstuvwxyz012345");
+    _ = win64Call3(memmove_addr, @intFromPtr(&obuf[2]), @intFromPtr(&obuf[0]), 26);
+    try testing.expectEqualStrings("ab" ++ "abcdefghijklmnopqrstuvwx", obuf[0..26]);
+
+    // dst < src: сдвиг влево на 2 — ветка прямого копирования
+    @memcpy(&obuf, "abcdefghijklmnopqrstuvwxyz012345");
+    _ = win64Call3(memmove_addr, @intFromPtr(&obuf[0]), @intFromPtr(&obuf[2]), 26);
+    try testing.expectEqualStrings("cdefghijklmnopqrstuvwxyz01", obuf[0..26]);
+
+    // ── strlen ──
+    const s1 = "Hello, POLER-OS!";
+    var zbuf: [64]u8 = undefined;
+    @memcpy(zbuf[0..s1.len], s1);
+    zbuf[s1.len] = 0;
+    try testing.expectEqual(@as(u64, s1.len), win64Call1(strlen_addr, @intFromPtr(&zbuf)));
+    try testing.expectEqual(@as(u64, 0), win64Call1(strlen_addr, @intFromPtr(&zbuf[s1.len])));
+
+    // memmove-стаб: ret на смещении 40 (41Б код в слоте 48)
+    const moff = (disp.findByNameAnyDll("memmove").?).code_off;
+    try testing.expectEqual(@as(u8, 0xC3), code_mem[moff + 40]);
+}
+
+test "findByNameAnyDll: case-insensitive, все DLL" {
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try Pe.parse(data);
+    const counts = image.countImports();
+    const entries = try testing.allocator.alloc(StubEntry, counts.functions);
+    defer testing.allocator.free(entries);
+    const code_buf = try testing.allocator.alloc(u8, counts.functions * STUB_CODE_SIZE);
+    defer testing.allocator.free(code_buf);
+
+    var disp = Dispatcher.init(entries, code_buf, .int3);
+    _ = try disp.generateFor(&image);
+
+    // Имя в верхнем регистре, DLL-агностик
+    const e = disp.findByNameAnyDll("WSASTARTUP") orelse return error.NotFound;
+    try testing.expectEqualStrings("WS2_32.dll", e.dll);
+    // несуществующее
+    try testing.expect(disp.findByNameAnyDll("NoSuchFuncHere") == null);
 }

@@ -298,3 +298,37 @@ pub fn mapPageInPML4(target_pml4_phys: u64, virt: u64, phys: u64, flags: u64) !v
 
     // No invlpg needed — this PML4 is not the active CR3 yet
 }
+
+// ─── v0.11.0 (CDD-цикл №2): валидация user-указателей из ядра ──────────────
+
+/// Identity-чтение 64-бит из физ. адреса (0-4ГБ — диапазон identity-маппинга
+/// из boot64.S; ОЗУ QEMU -m 256M целиком ниже). null = вне identity.
+inline fn physReadQ(pa: u64) ?u64 {
+    if (pa >= 0x100000000 or pa % 8 != 0) return null;
+    const p: *const volatile u64 = @ptrFromInt(pa);
+    return p.*;
+}
+
+/// Leaf-флаги PTE для va в таблицах УКАЗАННОГО PML4 (walk 4 уровней через
+/// identity, поддержка 4K/2M/1G-листьев). Возвращает листовую запись
+/// (PTE/PDE/PDPTE) с её битами — caller проверяет PRESENT/USER/WRITABLE.
+/// null = путь не present.
+///
+/// Назначение (win32_api): ядро ВАЛИДИРУЕТ user-указатель ДО разыменования —
+/// мусорный аргумент из Ring 3 не должен вызывать #PF в ядре (паника всего
+/// ядра), а указатель на kernel-VA (leaf без USER-бита) — пробиваться в
+/// supervisor-память через syscall (security: Ring 3 обязан мочь получить к
+/// странице доступ сам, иначе это не его память).
+pub fn userLeafFlags(target_pml4: u64, va: u64) ?u64 {
+    const pml4e = physReadQ(target_pml4 + 8 * ((va >> 39) & 0x1FF)) orelse return null;
+    if (pml4e & PTE_PRESENT == 0) return null;
+    const pdpte = physReadQ((pml4e & 0x000FFFFFFFFFF000) + 8 * ((va >> 30) & 0x1FF)) orelse return null;
+    if (pdpte & PTE_PRESENT == 0) return null;
+    if (pdpte & PTE_HUGE != 0) return pdpte; // 1GB-лист
+    const pde = physReadQ((pdpte & 0x000FFFFFFFFFF000) + 8 * ((va >> 21) & 0x1FF)) orelse return null;
+    if (pde & PTE_PRESENT == 0) return null;
+    if (pde & PTE_HUGE != 0) return pde; // 2MB-лист
+    const pte = physReadQ((pde & 0x000FFFFFFFFFF000) + 8 * ((va >> 12) & 0x1FF)) orelse return null;
+    if (pte & PTE_PRESENT == 0) return null;
+    return pte; // 4KB-лист
+}

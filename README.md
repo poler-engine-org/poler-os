@@ -44,7 +44,7 @@ Linux-программы работают нативно — POLER-OS реали
 
 ---
 
-## Текущая версия: v0.7.1
+## Текущая версия: v0.11.0
 
 | Подсистема | Статус | Описание |
 |---|---|---|
@@ -59,11 +59,11 @@ Linux-программы работают нативно — POLER-OS реали
 | Serial | Готово | COM1 (115200 baud, 8N1) |
 | Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
 | PUF | Готово | Привязка аппаратной энтропии: TSC-джиттер → сид PRNG ядра + identity; анти-клон enrollment (спека POST_QUANTUM_HARDWARE_ENTROPY) |
-| Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen |
+| Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen, win32_call (#6) |
+| **Win32 PE Runtime** | **CDD-циклы 1–2** | **Запуск реальных PE32+-приложений в Ring 3: curl.exe — CRT-init → main() → текст в консоли ОС**. 45 имплементаций + 4 native-стаба, block-heap (malloc/realloc), GetProcAddress, QPF/QPC (TSC) |
 | SMP | Планируется | Многоядерность |
 | Networking | Планируется | virtio-net |
 | VFS | Планируется | Виртуальная файловая система |
-| Win32 compat | Планируется | Нативная обработка Win32/64 syscalls |
 | Package verifier | Планируется | Криптографическая верификация пакетов на уровне ядра |
 
 ---
@@ -201,10 +201,11 @@ zig-kernel/
 - [x] PE/COFF (PE32+) парсер заголовков (DOS, File, Optional64, Sections, DataDirectories)
 - [x] Парсинг Import Directory Table (IAT / OriginalFirstThunk / FirstThunk)
 - [x] Генератор динамических Win32-заглушек (Stub Dispatcher) с int3 контролируемым остановом (Crash-Driven Development)
-- [x] Команды интерактивного шелла `peinfo` и `pestubs` для анализа бинарников на лету
-- [x] VMM-маппинг секций PE64 в виртуальное адресное пространство задачи (ImageBase / RVA, посекционные права P/RW/NX, BSS)
-- [x] Базовый CRT startup kit и Win32 API (GetStdHandle, GetCommandLineA/W, VirtualAlloc, malloc, free, initterm, exit)
-- [ ] Расширение Win32 API по логу CDD-цепочки (GetProcAddress, memset, QueryPerformanceFrequency, WSAStartup)
+- [x] Интерактивные команды шелла `peinfo`, `pestubs` и `peload` (загрузка + запуск)
+- [x] VMM-маппинг секций PE64 в Ring 3 по ImageBase с посекционными правами (RW/NX/USER)
+- [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → текст приложения в консоли ОС (v0.10–v0.11, CDD-циклы 1–2)
+- [x] Реализация базовых API kernel32/UCRT «по мере запросов» (CDD): 45 syscall-трамплинов + 4 native-стаба (memset/memcpy/memmove/strlen), GetProcAddress-резолв, block-heap (malloc/calloc/realloc), QPF/QPC (TSC)
+- [ ] Следующие CDD-циклы: VerifyVersionInfoW, InitOnceExecuteOnce, SSPI (Secur32), GetEnvironmentVariableA — по логу цепочки v0.11.0
 - [ ] Подмножество Linux system call interface
 - [ ] POSIX compatibility layer
 
@@ -217,6 +218,20 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.11.0 — CDD-цикл №2: вторая волна Win32/CRT API + углубление в main()
+- **МОМЕНТ ИСТИНЫ №2**: curl.exe печатает свой текст (`curl: error initializing curl library`) через наш fputs/fputc в консоль ОС — приложение дошло до WSAStartup → realloc → GetConsoleScreenBufferInfo → вывод → штатный exit(2).
+- Модуль `src64/win32_crt.zig` (новый, ~1300 строк): ЧИСТАЯ семантика Win32/CRT с Ops-инъекцией (прецедент LoaderOps) — нативно тестируется вся семантика: block-heap, GetProcAddress, QPF/QPC, консольные структуры, ленивые argc/argv/iob.
+- **Native-стабы** (`win32_stubs.zig`): memset/memcpy/memmove/strlen — чистый Ring-3 машинный код (rep stosb/movsb, 20/20/41/14 байт) без syscall-оверхеда; тесты РЕАЛЬНО исполняют сгенерированный код с Win64-раскладкой регистров.
+- **Block-heap с заголовками** (16Б: magic+size): malloc/calloc/realloc/free — realloc читает СТАРЫЙ размер из заголовка (то, чего не хватало v0.10); heap-регион разделён на vheap (VirtualAlloc) и bheap (CRT).
+- **GetProcAddress**: динамический резолв по реестру стабов — возврат user-VA трамплина; чужое имя → NULL + CDD-лог (видимость динамических запросов).
+- **QPF/QPC**: калибровка TSC по тикам APIC-таймера (PIT-калиброванного, 100 Гц) при peload; QPC — hal.readMsr(0x10).
+- Ленивые CRT-структуры (syscall-контекст): стабильный iob-массив 3×80Б, argc/argv с токенизацией cmdline НА МЕСТЕ, РАЗДЕЛЬНЫЕ `__p__fmode`/`__p__commode`/`_errno` (v0.10-баг: каждая пара получала один блок).
+- **Валидация user-указателей из ядра** (vmm.userLeafFlags): walk PML4 процесса через identity — мусорный аргумент → отказ, а не #PF-паника ядра; kernel-VA (без USER-бита) → отказ (security).
+- **Латентный баг v0.10.0 пойман и исправлен** (GCC-эталон + исполнение): байты `4C 89 C2` в syscall-трамплине были `mov rdx, r8` вместо `mov r10, r8` — все impl-функции с ≥2 аргументами получали перепутанные аргументы (1-аргументные — потому и работали).
+- Два собственных бага native-стабов пойманы исполнением: `rep stosb` пишет AL (не DL), `rep movsb` с DF=1 идёт вниз от ТЕКУЩИХ rsi/rdi (нужна lea-предустановка на конец региона).
+- Вейв-2 по логу цепочки v0.10.0: 16 трамплинов + 4 native = 20 функций (GetProcAddress, QPF/QPC, GetConsoleMode/ScreenBufferInfo, SRWLock, GetCurrentThreadId, SetUnhandledExceptionFilter, setvbuf, fputs/fputc/fflush, realloc, WSAStartup/WSACleanup…).
+- Тесты: 196/196 (27 win32_crt-тестов; STUB_CODE_SIZE 31→48). E2E: pe-run2 13/13 PASS + pe-run (v1) + kbd 9/9 + peinfo/pestubs — все зелёные.
 
 ### v0.10.0 — Ring-3 PE64 Execution & CDD Cycle #1
 - Модуль `src64/pe_loader.zig`: посекционный маппинг PE64 в виртуальную память (ImageBase `0x140000000`), инициализация структуры процесса, командной строки, TEB/PEB и выделение стека Ring 3.

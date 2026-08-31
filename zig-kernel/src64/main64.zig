@@ -30,6 +30,7 @@ const pe = @import("pe.zig");
 const win32 = @import("win32_stubs.zig");
 const pe_loader = @import("pe_loader.zig");
 const win32_api = @import("win32_api.zig");
+const win32_crt = @import("win32_crt.zig");
 
 
 
@@ -866,6 +867,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // syscall #6 (win32_call). Разрыв круга hal↔win32 через указатели.
     hal.int3Callback = &cddInt3Handler;
     hal.win32SyscallCallback = &win32_api.syscallDispatch;
+    // 8.57 (v0.11.0, CDD №2): платформенные примитивы win32_crt — walk PML4,
+    // PMM+VMM-маппинг, TSC, Serial-консоль, завершение процесса.
+    win32_api.installOps();
 
     // 8.6. Initialize Scheduler & Preemptive Multitasking
     scheduler.init();
@@ -1442,6 +1446,27 @@ fn kernelLoaderOps() pe_loader.LoaderOps {
     };
 }
 
+/// v0.11.0 (CDD №2): калибровка TSC для QueryPerformanceFrequency —
+/// замер дельты TSC (hal.readMsr(0x10) = IA32_TSC) между тиками APIC-таймера
+/// (периодический, 10мс — калиброван по PIT в hal.initApicTimer).
+/// 5 тиков = 50мс → freq = delta × 20. Гард на мусор TCG — clamp в
+/// [1 МГц, 10 ГГц]; при провале — HPET-класс 10 МГц (Windows-fallback).
+fn calibrateTsc() u64 {
+    const t0 = hal.readMsr(0x10);
+    const ticks0 = hal.tick_count;
+    var spin: u64 = 0;
+    while (hal.tick_count < ticks0 + 5) {
+        asm volatile ("pause");
+        spin += 1;
+        if (spin > 4_000_000_000) break; // страховка от зависшего таймера
+    }
+    const t1 = hal.readMsr(0x10);
+    if (t1 <= t0 or hal.tick_count < ticks0 + 5) return 10_000_000;
+    const freq = (t1 - t0) * 20; // 5 тиков = 1/20 с
+    if (freq < 1_000_000 or freq > 10_000_000_000) return 10_000_000;
+    return freq;
+}
+
 /// CDD-трап: int3 из стаба импорта. int3 — TRAP-исключение: CPU сохраняет
 /// RIP уже ПОСЛЕ int3 (на ret) — НЕ продвигаем! Логируем имя (первый hit),
 /// rax=0 (xor уже исполнен) — приложение продолжает работу.
@@ -1483,7 +1508,7 @@ fn cmd_peload(args: []const u8) void {
         return;
     };
 
-    sys_print("=== PE Load & Run (CDD cycle 1): ");
+    sys_print("=== PE Load & Run (CDD cycle 2): ");
     sys_print(args);
     sys_print(" ===\n");
 
@@ -1570,9 +1595,34 @@ fn cmd_peload(args: []const u8) void {
     printDec(generated * win32.STUB_CODE_SIZE);
     sys_print(" bytes)\n");
 
-    // 6. Топ-функции CDD-цикла №1 + CRT-startup-kit: реализованы syscall-трамплинами.
-    // Спека: GetStdHandle / GetCommandLineA/W / VirtualAlloc (+ ExitProcess),
-    // плюс «выживание mingw-UCRT»: __p__* указатели, malloc/calloc, initterm…
+    // 6a. (v0.11.0, CDD №2) NATIVE-стабы: memset/memcpy/memmove/strlen —
+    // чистый Ring-3 машинный код (rep stosb/movsb), БЕЗ syscall-оверхеда —
+    // CRT зовёт их на каждом шагу. Раскладка реальных импортов curl.exe
+    // (проверено парсером): memset/strlen ← api-ms-win-crt-string,
+    // memcpy/memmove ← api-ms-win-crt-private.
+    const native_specs = [_]struct { dll: []const u8, func: []const u8, kind: win32.NativeKind }{
+        .{ .dll = "api-ms-win-crt-string-l1-1-0.dll", .func = "memset", .kind = .memset },
+        .{ .dll = "api-ms-win-crt-string-l1-1-0.dll", .func = "strlen", .kind = .strlen },
+        .{ .dll = "api-ms-win-crt-private-l1-1-0.dll", .func = "memcpy", .kind = .memcpy },
+        .{ .dll = "api-ms-win-crt-private-l1-1-0.dll", .func = "memmove", .kind = .memmove },
+    };
+    var natives: usize = 0;
+    for (native_specs) |spec| {
+        if (kdisp.implementNative(spec.dll, spec.func, spec.kind)) natives += 1;
+    }
+    sys_print("[PE] Native stubs: ");
+    printDec(natives);
+    sys_print(" / ");
+    printDec(native_specs.len);
+    sys_print(" (memset/memcpy/memmove/strlen — Ring 3, rep stosb/movsb)\n");
+
+    // 6b. Топ-функции CDD-циклов №1+№2 + CRT-startup-kit: syscall-трамплины.
+    // Спека №1: GetStdHandle / GetCommandLineA/W / VirtualAlloc (+ ExitProcess),
+    // «выживание mingw-UCRT»: __p__* указатели, malloc/calloc, initterm…
+    // Волна №2 (по логу цепочки v0.10.0, 17 функций): GetProcAddress,
+    // QueryPerformanceFrequency/Counter, GetConsoleMode/ScreenBufferInfo,
+    // SRWLock, GetCurrentThreadId, setvbuf/fputs/fputc/fflush, realloc,
+    // WSAStartup/WSACleanup, SetUnhandledExceptionFilter.
     // Честный подсчёт: активируются только НАЙДЕННЫЕ в импортах имена.
     const impl_specs = [_][2][]const u8{
         .{ "KERNEL32.dll", "GetStdHandle" },
@@ -1583,9 +1633,22 @@ fn cmd_peload(args: []const u8) void {
         .{ "KERNEL32.dll", "GetModuleHandleA" },
         .{ "KERNEL32.dll", "GetModuleHandleW" },
         .{ "KERNEL32.dll", "Sleep" },
+        .{ "KERNEL32.dll", "GetProcAddress" },
+        .{ "KERNEL32.dll", "QueryPerformanceFrequency" },
+        .{ "KERNEL32.dll", "QueryPerformanceCounter" },
+        .{ "KERNEL32.dll", "GetConsoleMode" },
+        .{ "KERNEL32.dll", "GetConsoleScreenBufferInfo" },
+        .{ "KERNEL32.dll", "GetCurrentThreadId" },
+        .{ "KERNEL32.dll", "AcquireSRWLockExclusive" },
+        .{ "KERNEL32.dll", "ReleaseSRWLockExclusive" },
+        .{ "KERNEL32.dll", "SetUnhandledExceptionFilter" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "__p__fmode" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "__p__commode" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "setvbuf" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fputs" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fputc" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fflush" },
         .{ "api-ms-win-crt-runtime-l1-1-0.dll", "exit" },
         .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_exit" },
         .{ "api-ms-win-crt-runtime-l1-1-0.dll", "abort" },
@@ -1605,11 +1668,14 @@ fn cmd_peload(args: []const u8) void {
         .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_seh_filter_exe" },
         .{ "api-ms-win-crt-heap-l1-1-0.dll", "malloc" },
         .{ "api-ms-win-crt-heap-l1-1-0.dll", "calloc" },
+        .{ "api-ms-win-crt-heap-l1-1-0.dll", "realloc" },
         .{ "api-ms-win-crt-heap-l1-1-0.dll", "free" },
         .{ "api-ms-win-crt-heap-l1-1-0.dll", "_set_new_mode" },
         .{ "api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale" },
         .{ "api-ms-win-crt-environment-l1-1-0.dll", "__p__environ" },
         .{ "api-ms-win-crt-environment-l1-1-0.dll", "getenv" },
+        .{ "WS2_32.dll", "WSAStartup" },
+        .{ "WS2_32.dll", "WSACleanup" },
     };
     var impls: usize = 0;
     for (impl_specs) |spec| {
@@ -1619,7 +1685,7 @@ fn cmd_peload(args: []const u8) void {
     printDec(impls);
     sys_print(" / ");
     printDec(impl_specs.len);
-    sys_print(" — spec top-3 + CRT-startup-kit (найденные в импортах)\n");
+    sys_print(" — cycles 1+2 (chain-log wave: 17 fn) + CRT-startup-kit\n");
 
     // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
     kdisp.applyToImage(img.backing);
@@ -1644,17 +1710,40 @@ fn cmd_peload(args: []const u8) void {
     putHex(uctx.heap_base);
     sys_print("\n");
 
-    // 9. Контекст Win32-API (VirtualAlloc/GetCommandLine/GetModuleHandle) для syscall #6
-    win32_api.ctx = .{
+    // 9. Контекст Win32/CRT (win32_crt) для syscall #6. Heap-регион делится:
+    //    vheap [base, +512МБ) — VirtualAlloc (сырые страницы), bheap
+    //    [+512МБ, limit) — CRT block-heap (заголовки 16Б). VA-бюджет бесплатен
+    //    (страницы выделяются PMM по требованию).
+    //    TSC-частота для QPF калибруется по тикам APIC-таймера (100 Гц —
+    //    10мс/тик, калибровка PIT в hal): 5 тиков = 50мс.
+    const tsc_freq = calibrateTsc();
+    win32_crt.ctx = .{
         .pml4 = user_pml4,
         .image_base = img.base_va,
         .cmdline_a = uctx.cmdline_a_va,
         .cmdline_w = uctx.cmdline_w_va,
-        .heap_base = uctx.heap_base,
-        .heap_limit = uctx.heap_limit,
-        .heap_cursor = uctx.heap_base,
-        .allocs = 0,
+        .vheap_base = uctx.heap_base,
+        .vheap_limit = uctx.heap_base + 0x2000_0000,
+        .vheap_cursor = uctx.heap_base,
+        .vallocs = 0,
+        .bheap_base = uctx.heap_base + 0x2000_0000,
+        .bheap_limit = uctx.heap_limit,
+        .bheap_cursor = uctx.heap_base + 0x2000_0000,
+        .bheap_mapped = uctx.heap_base + 0x2000_0000,
+        .iob_array = 0,
+        .argc_ptr = 0,
+        .argv_slot = 0,
+        .environ_slot = 0,
+        .fmode_ptr = 0,
+        .commode_ptr = 0,
+        .errno_ptr = 0,
+        .tsc_freq = tsc_freq,
+        .tid = 0,
+        .implemented_calls = 0,
     };
+    sys_print("[PE] TSC calibrated: ");
+    printDec(tsc_freq);
+    sys_print(" Hz (QPF/QPC source, 5 APIC ticks)\n");
 
     // 10. GS-base → TEB (Ring 3 читает NtCurrentTeb через [gs:0x30]).
     //     Ядро GS не использует (нет swapgs) — держим TEB постоянно.
