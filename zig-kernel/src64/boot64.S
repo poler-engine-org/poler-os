@@ -171,15 +171,23 @@ _start:
     movl $4096, %ecx          // 4 pages * 1024 = 4096 dwords = 16KB
     rep stosl
 
-    // PML4[0] → PDPT (present + writable + user)
+    // PML4[0] → PDPT (present + writable)
+    // v0.10.0 SECURITY FIX: USER-бит снят со всей identity-цепочки
+    // (PML4[0], PDPT[0..3], листовые 2МБ). CPL=0 игнорирует U/S — ядро
+    // работает как раньше; Ring 3 больше не видит 0–4ГБ через ОБЩИЕ
+    // таблицы: пользовательский PML4 (копия из createUserPML4) получает
+    // USER только на своём экземпляре PML4[0] (getOrCreateTable при
+    // маппинге user-VA ≥4ГБ), но PDPT[0..3] ниже остаются supervisor —
+    // traversal из Ring 3 блокируется на PDPT. Без этого фикса маппинг
+    // user-страниц в PML4[0] открывал Ring 3 ВСЁ ядро.
     movl $pdpt_addr, %eax
-    orl $0x07, %eax           // Present + Writable + User
+    orl $0x03, %eax           // Present + Writable (NO User)
     movl %eax, pml4_addr
 
     // PDPT: 4 entries pointing to 4 PD pages
     // Each PD page maps 1GB (512 entries × 2MB)
     movl $pd_addr, %eax
-    orl $0x07, %eax
+    orl $0x03, %eax           // Present + Writable (NO User)
     movl %eax, pdpt_addr           // PDPT[0] → PD0 (0-1GB)
     addl $0x1000, %eax
     movl %eax, pdpt_addr + 8       // PDPT[1] → PD1 (1-2GB)
@@ -190,8 +198,9 @@ _start:
 
     // PD: заполняем ALL 2048 entries (4 pages × 512) с 2MB huge pages
     // Это маппит 0-4GB identity-mapped
+    // v0.10.0: 0x83 = Present + Writable + PageSize (2MB), БЕЗ User (см. фикс выше)
     movl $pd_addr, %edi
-    movl $0x87, %eax          // Present + Writable + User + PageSize(2MB), start at 0
+    movl $0x83, %eax          // Present + Writable + PageSize(2MB), start at 0
     movl $2048, %ecx          // 2048 entries = 4GB (2048 * 2MB)
 .fill_pd_loop:
     movl %eax, (%edi)

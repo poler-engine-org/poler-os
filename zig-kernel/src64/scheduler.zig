@@ -4,11 +4,11 @@
 //
 // v0.7.0: Ring 3 (user mode) support
 //   - Per-process CR3 (page tables)
-//   - User code/data segments (CS=0x1B, SS=0x23)
+//   - User code/data segments (CS=0x23, SS=0x1B — v0.10.0 SYSRET-совместимо)
 //   - TSS IST1 for double-fault handling
 //   - IRETQ privilege switch
 //   - CR3 switching on context switch
-//   - sysretq convention: CS=0x1B (User Code entry 3), SS=0x13 (Data entry 2)
+//   - sysretq convention: CS = STAR[63:48]+16|RPL3 = 0x23, SS = STAR[63:48]+8|RPL3 = 0x1B
 //
 // v0.6.1-fix: Tasks run in Ring 0 (kernel mode) for stability.
 // Ring 3 user-mode tasks will be added in v0.7.0 with proper:
@@ -185,10 +185,11 @@ pub fn createTask(entry_point: u64) !usize {
 ///   user_cr3:     Physical address of the user's PML4 (from vmm.createUserPML4)
 ///   user_stack:   Virtual address of the top of user stack (e.g., 0x100081000)
 ///
-/// The task runs with:
-///   CS = 0x1B (User Code, GDT entry 3, DPL=3, RPL=3)
-///   SS = 0x23 (User Data, GDT entry 4, DPL=3, RPL=3)
-///   RFLAGS = 0x202 (IF=1, IOPL=0)
+/// v0.10.0 FIX — селекторы под новую GDT-раскладку (SYSRET-совместимую):
+///   CS = 0x23 (User Code: GDT entry 4 = 0x20 | RPL3)
+///   SS = 0x1B (User Data: GDT entry 3 = 0x18 | RPL3)
+/// SYSRET возвращает ровно эти значения (CS = STAR[63:48]+16, SS = +8) —
+/// теперь syscall-трамплины и IRETQ-кадры живут в ОДНОЙ конвенции.
 ///
 /// When an interrupt fires in Ring 3, the CPU automatically:
 ///   1. Switches to TSS.rsp0 (kernel stack)
@@ -196,7 +197,7 @@ pub fn createTask(entry_point: u64) !usize {
 ///   3. Enters the ISR in Ring 0
 ///
 /// IRETQ restores CS with RPL=3 → switches back to Ring 3.
-/// sysretq returns with CS = STAR+16|RPL3 = 0x1B, SS = STAR+8|RPL3 = 0x13.
+/// sysretq returns with CS = STAR[63:48]+16 | RPL3 = 0x23, SS = STAR[63:48]+8 | RPL3 = 0x1B.
 pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
     if (task_count >= MAX_TASKS) return error.OutOfTasks;
 
@@ -222,16 +223,16 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
     @memset(@as([*]volatile u8, @ptrCast(frame_ptr))[0..176], 0);
 
     // Set up segment registers and execution context for Ring 3
-    // GDT layout (matches sysretq convention with STAR[32:47]=0x08):
+    // GDT layout (v0.10.0, SYSRET-совместимая — см. hal.zig):
     //   Entry 1 (0x08): Kernel Code — syscall CS
-    //   Entry 2 (0x10): Data DPL=3 — syscall SS / sysretq SS = 0x13
-    //   Entry 3 (0x18): User Code DPL=3 — sysretq CS = 0x1B
-    //   Entry 4 (0x20): User Data DPL=3 — IRETQ SS = 0x23
+    //   Entry 2 (0x10): Kernel Data — syscall SS
+    //   Entry 3 (0x18): User Data  — sysretq SS / IRETQ SS = 0x1B
+    //   Entry 4 (0x20): User Code  — sysretq CS / IRETQ CS = 0x23
     frame_ptr.rip = entry_point;
-    frame_ptr.cs = 0x1B; // User code segment (0x18 | RPL3) — entry 3 = User Code
+    frame_ptr.cs = 0x23; // User code segment (0x20 | RPL3) — entry 4 = User Code
     frame_ptr.rflags = 0x202; // IF set, IOPL=0 (no I/O port access from Ring 3)
     frame_ptr.rsp = user_stack; // User stack top (grows downward)
-    frame_ptr.ss = 0x23; // User data segment (0x20 | RPL3) — entry 4 = User Data
+    frame_ptr.ss = 0x1B; // User data segment (0x18 | RPL3) — entry 3 = User Data
     frame_ptr.vector = 48; // APIC timer vector
     frame_ptr.error_code = 0;
 

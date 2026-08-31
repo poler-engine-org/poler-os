@@ -210,18 +210,22 @@ pub const GDT = struct {
         entries[1] = 0x00209A0000000000;
 
         // Entry 2: 64-bit Kernel Data (ring 0) — matches GRUB's DS=0x10
-        // sysretq bypasses DPL checks, so SS=0x13 (0x10|RPL3) works even with DPL=0.
+        // SYSCALL loads SS = STAR[47:32]+8 = 0x08+8 = 0x10 ✓
         entries[2] = 0x0000920000000000;
 
-        // Entry 3: 64-bit User Code (ring 3)
-        // sysretq CS = STAR[32:47]+16 | RPL3 = 0x18 | 3 = 0x1B
-        // CRITICAL: Entry 3 MUST be User Code (not User Data) because
-        // sysretq computes CS.selector = STAR[32:47]+16, which points here.
-        entries[3] = 0x0020FA0000000000;
+        // v0.10.0 CRITICAL FIX — классическая раскладка для SYSRET:
+        // SYSRET: CS = STAR[63:48]+16, SS = STAR[63:48]+8 (ОБЕ от STAR[63:48]!).
+        // STAR[63:48]=0x10 → sysret CS=0x20, SS=0x18. Значит:
+        //   entry 3 (0x18) ОБЯЗАН быть User DATA,
+        //   entry 4 (0x20) ОБЯЗАН быть User CODE.
+        // (До фикса было наоборот → sysret грузил CS=0x23=DATA и SS=0x1B=CODE;
+        //  первый же iretq из Ring-3 int3 ловил #GP(0x20) — селектор данных в CS.)
 
-        // Entry 4: 64-bit User Data (ring 3)
-        // Used by IRETQ for SS = 0x20 | 3 = 0x23
-        entries[4] = 0x0000F20000000000;
+        // Entry 3: 64-bit User Data (ring 3) — sysretq SS = 0x18|3 = 0x1B
+        entries[3] = 0x0000F20000000000;
+
+        // Entry 4: 64-bit User Code (ring 3) — sysretq CS = 0x20|3 = 0x23
+        entries[4] = 0x0020FA0000000000;
 
         // Entries 5-6: TSS (filled by setTSS)
         entries[5] = 0;
@@ -437,6 +441,16 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
 }
 
 fn handleException(frame: *InterruptFrame) void {
+    // v0.10.0 (CDD №1): int3 из стаба импорта — обрабатываем ПЕРВЫМ.
+    // Стаб: xor rax,rax; int3; ret — RIP после int3 указывает внутрь стаба;
+    // колбэк находит entry по RIP, логирует dll!func, RIP+=1 (skip int3),
+    // задача продолжает с rax=0 (дефолт-«не реализовано»).
+    if (frame.vector == 3) {
+        if (int3Callback) |cb| {
+            if (cb(frame)) return;
+        }
+    }
+
     // v0.7.0: Differentiate user-mode vs kernel-mode exceptions
     const from_user = (frame.cs & 0x3) != 0;
 
@@ -445,10 +459,29 @@ fn handleException(frame: *InterruptFrame) void {
     Serial.putHex(frame.vector);
     Serial.puts("\nError Code: ");
     Serial.putHex(frame.error_code);
+    // v0.10.0: CR2 — адрес #PF (что именно читали/писали; RIP ≠ CR2 для #PF!)
+    if (frame.vector == 14) {
+        const cr2: u64 = asm volatile ("movq %%cr2, %[v]"
+            : [v] "=r" (-> u64),
+        );
+        Serial.puts("\nCR2 (fault addr): ");
+        Serial.putHex(cr2);
+    }
     Serial.puts("\nRIP: ");
     Serial.putHex(frame.rip);
     Serial.puts("\nCS: ");
     Serial.putHex(frame.cs);
+    // v0.10.0-debug: регистры из кадра — разбор #PF в user-коде
+    Serial.puts("\nRSI: ");
+    Serial.putHex(frame.rsi);
+    Serial.puts(" RDX: ");
+    Serial.putHex(frame.rdx);
+    Serial.puts(" RCX: ");
+    Serial.putHex(frame.rcx);
+    Serial.puts(" RBX: ");
+    Serial.putHex(frame.rbx);
+    Serial.puts(" RAX: ");
+    Serial.putHex(frame.rax);
     Serial.puts("\nRFLAGS: ");
     Serial.putHex(frame.rflags);
     Serial.puts("\nRSP: ");
@@ -1064,9 +1097,8 @@ pub fn initSyscalls(handler_addr: u64) void {
     Serial.puts("[HAL] Syscall mechanism initialized\n");
 }
 
-pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64) callconv(.C) u64 {
-    _ = arg3;
-    _ = arg4;
+pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
+    // arg3/arg4/arg5 — позиционные rdx/rcx/r9: для syscall №6 это Win64-аргументы
 
     // Re-enable interrupts — syscall clears IF via SFMASK, but we need
     // timer interrupts to fire for preemptive scheduling. IF will be
@@ -1127,6 +1159,21 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
             // In the future, this could trigger an immediate reschedule.
             return 0;
         },
+        6 => {
+            // Syscall 6: win32_call — CDD-цикл №1 (v0.10.0)
+            // Вызывается syscall-трамплином стаба (win32_stubs.zig, .impl):
+            //   rdi (arg1)      = entry_id в реестре стабов
+            //   rsi (arg2)      = Win64-arg1 (RCX)
+            //   rdx (arg3)      = Win64-arg2 (RDX)
+            //   r10→rcx (arg4)  = Win64-arg3 (R8)
+            //   r9  (arg5, 6-й параметр — читается прямо из регистра) = Win64-arg4
+            // Возврат — в RAX приложения (sysretq).
+            if (win32SyscallCallback) |cb| {
+                return cb(arg1, arg2, arg3, arg4, arg5);
+            }
+            Serial.puts("[SYSCALL] win32_call: нет win32SyscallCallback\n");
+            return 0;
+        },
         else => {
             Serial.puts("[SYSCALL] Unknown syscall: ");
             Serial.putDecimal(syscall_num);
@@ -1138,6 +1185,17 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
 
 // Exit callback — registered by scheduler at init to break circular dependency
 pub var exitCallback: ?*const fn () callconv(.C) void = null;
+
+// Win32 syscall dispatch — registered by main64 (hal ↔ win32_api circular-dep breaker).
+// arg-порядок = syscall-конвенция трамплина: (entry_id, w64arg1, w64arg2, w64arg3, w64arg4).
+pub var win32SyscallCallback: ?*const fn (entry_id: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 = null;
+
+// int3 CDD callback — registered by main64. Вызывается из handleException
+// для вектора 3 (#BP) ПЕРВЫМ: если адрес принадлежит стабу win32_stubs,
+// обработчик сам логирует имя (первый hit), продвигает RIP (skip int3)
+// и возвращает true — задача продолжает работу с rax=0. Возврат false →
+// обычный путь (user-kill / kernel-panic).
+pub var int3Callback: ?*const fn (frame: *InterruptFrame) bool = null;
 
 // ============================================================================
 // HAL Initialization

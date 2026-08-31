@@ -207,6 +207,35 @@ pub fn freeContiguousPages(addr: u64, count: u64) void {
     }
 }
 
+/// v0.10.0: Зарезервировать физ. диапазон [start, end) — пометить страницы
+/// занятыми, чтобы PMM не раздал их под ядро/user-образы. Используется для
+/// initrd (PVH: QEMU кладёт его высоко в RAM — вне fallback-окна 2..128МБ,
+/// но при -m 128M или иных конфигурациях диапазон может пересечься).
+pub fn reserveRange(start: u64, end: u64) void {
+    var addr = start & ~(PAGE_SIZE - 1);
+    while (addr + PAGE_SIZE <= end) : (addr += PAGE_SIZE) {
+        if (addr < MAX_MEM_SUPPORTED) {
+            if ((bitmap[addr / PAGE_SIZE / 8] & (@as(u8, 1) << @as(u3, @intCast(addr / PAGE_SIZE % 8)))) == 0) {
+                setPageInternal(addr);
+                usable_pages -= 1;
+            }
+        }
+    }
+}
+
+/// v0.10.0: Выделить N физически последовательных страниц и ОБНУЛИТЬ их
+/// (allocContiguousPages не гарантирует нулей — а PE-образы и TEB/PEB
+/// обязаны стартовать с чистых страниц).
+pub fn allocContiguousZeroed(count: u64) ?u64 {
+    const base = allocContiguousPages(count) orelse return null;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const page: [*]volatile u8 = @ptrFromInt(base + i * PAGE_SIZE);
+        @memset(page[0..PAGE_SIZE], 0);
+    }
+    return base;
+}
+
 pub fn getStats() struct { total_kb: u64, usable_pages: u64, allocated_pages: u64 } {
     return .{
         .total_kb = total_ram_bytes / 1024,

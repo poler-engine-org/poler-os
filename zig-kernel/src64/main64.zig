@@ -28,6 +28,8 @@ const virtio_blk = @import("virtio_blk.zig");
 const fat32 = @import("fat32.zig");
 const pe = @import("pe.zig");
 const win32 = @import("win32_stubs.zig");
+const pe_loader = @import("pe_loader.zig");
+const win32_api = @import("win32_api.zig");
 
 
 
@@ -698,6 +700,19 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // иначе mb2-парсер начнёт читать мусор и не найдёт ни одной страницы
     printMemoryInfo(if (have_mb2) multiboot_info else 0);
 
+    // 7.5 (v0.10.0): после pmm.init — зарезервировать физ. диапазон initrd,
+    // чтобы PMM не выдал эти страницы под kernel/user-аллокации. При
+    // QEMU -m 256M initrd лежит ~252МБ (выше fallback-окна 2..128МБ), но
+    // при -m 128M или ином размещении пересечение станет фатальным.
+    if (initrd_archive) |arch| {
+        pmm.reserveRange(@intFromPtr(arch.ptr), @intFromPtr(arch.ptr) + arch.len);
+        puts("[PMM] initrd reserved: 0x");
+        putHex(@intFromPtr(arch.ptr));
+        puts("..0x");
+        putHex(@intFromPtr(arch.ptr) + arch.len);
+        puts("\n");
+    }
+
     // 8. Test POLER Core
     testPolerCore();
 
@@ -847,6 +862,11 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     hal.clear_screen_fn = &clear_screen;
     hal.initSyscalls(@intFromPtr(&syscall_entry));
 
+    // 8.56 (v0.10.0, CDD №1): колбэки Win32-слоя — int3-трапы стабов и
+    // syscall #6 (win32_call). Разрыв круга hal↔win32 через указатели.
+    hal.int3Callback = &cddInt3Handler;
+    hal.win32SyscallCallback = &win32_api.syscallDispatch;
+
     // 8.6. Initialize Scheduler & Preemptive Multitasking
     scheduler.init();
 
@@ -952,6 +972,7 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  entropy   - Show all hardware entropy pools status (PUF, Bus, IRQ, Bio)\n");
         sys_print("  peinfo <f> - Analyze PE/COFF executable from initrd (headers, sections, imports)\n");
         sys_print("  pestubs <f> - Generate Win32 stub table for PE executable (CDD: log+int3)\n");
+        sys_print("  peload <f> - Load PE64 into Ring 3 and JUMP to EntryPoint (CDD cycle 1)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.7.2 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF Multi-Pool Active).\n");
@@ -971,6 +992,12 @@ fn execute_command(cmd: []const u8) void {
         cmd_pestubs(cmd[8..]);
     } else if (eq(cmd, "pestubs")) {
         cmd_pestubs("");
+    } else if (startsWith(cmd, "peload ")) {
+        cmd_peload(cmd[7..]);
+    } else if (eq(cmd, "peload")) {
+        cmd_peload("");
+    } else if (eq(cmd, "run")) {
+        cmd_peload("curl.exe");
     } else if (eq(cmd, "ls")) {
         cmd_ls("");
     } else if (startsWith(cmd, "ls ")) {
@@ -1384,6 +1411,266 @@ fn cmd_pestubs(args: []const u8) void {
         shown += 1;
     }
     sys_print("Stub call behavior: log dll!function + int3 (#BP panic trace)\n");
+}
+
+// ============================================================================
+// PE Load & Run — CDD-цикл №1 (v0.10.0)
+//   peload <file> — загрузка PE64 в Ring 3 и прыжок на AddressOfEntryPoint.
+// Пайплайн: user-PML4 → посекционный маппинг по ImageBase → генерация стабов
+// (int3-трапы) → реализация топ-функций (syscall-трамплины) → патч IAT →
+// TEB/PEB/стек → GS-base → createUserTask. Первый вызов импорта →
+// «[CDD] DLL!Func — не реализовано» → rax=0 → цепочка падений в логе.
+// ============================================================================
+
+/// LoaderOps-проводка kernel: PMM (обнулённые contiguous) + VMM user-маппинг +
+/// identity-указатели на физ. страницы (kernel VA == phys).
+fn pmmAllocContig(count: u64) ?u64 {
+    return pmm.allocContiguousZeroed(count);
+}
+fn vmmMapUser(pml4: u64, va: u64, pa: u64, flags: u64) bool {
+    vmm.mapPageInPML4(pml4, va, pa, flags) catch return false;
+    return true;
+}
+fn identityPagePtr(pa: u64) [*]u8 {
+    return @ptrFromInt(pa);
+}
+fn kernelLoaderOps() pe_loader.LoaderOps {
+    return .{
+        .alloc_contig = pmmAllocContig,
+        .map_user = vmmMapUser,
+        .page_ptr = identityPagePtr,
+    };
+}
+
+/// CDD-трап: int3 из стаба импорта. int3 — TRAP-исключение: CPU сохраняет
+/// RIP уже ПОСЛЕ int3 (на ret) — НЕ продвигаем! Логируем имя (первый hit),
+/// rax=0 (xor уже исполнен) — приложение продолжает работу.
+/// false → обычный user-kill путь (не наш стаб / livelock).
+fn cddInt3Handler(frame: *hal.InterruptFrame) bool {
+    const disp = win32.activeDispatcher() orelse return false;
+    const e = disp.findByRip(frame.rip) orelse return false;
+
+    e.hits += 1;
+    if (e.hits == 1) {
+        var buf: [128]u8 = undefined;
+        sys_print("[CDD] ");
+        sys_print(win32.fmtEntryName(e, &buf));
+        sys_print(" — не реализовано, ret=0\n");
+    }
+
+    // Livelock-страховка: приложение может крутиться в retry-цикле на
+    // нулевых возвратах — после 100k вызовов отдаем задачу обычному kill-пути
+    if (disp.totalHits() > 100_000) {
+        sys_print("[CDD] >100000 вызовов стабов — убиваю задачу (livelock)\n");
+        return false;
+    }
+
+    // ⚠ НЕ трогаем frame.rip: int3 — trap, RIP уже указывает на ret (base+4).
+    // (баг v0.10.0-dev: rip+=1 перескакивал ret → исполнение нулей → #PF)
+    frame.rax = 0; // дефолт «не реализовано» (xor уже исполнен — дубль для гарантии)
+    return true;
+}
+
+fn cmd_peload(args: []const u8) void {
+    if (args.len == 0) {
+        sys_print("Usage: peload <file-in-initrd>   (e.g. peload curl.exe)\n");
+        return;
+    }
+    const data = initrdFindFile(args) orelse {
+        sys_print("File not found in initrd: ");
+        sys_print(args);
+        sys_print("\n");
+        return;
+    };
+
+    sys_print("=== PE Load & Run (CDD cycle 1): ");
+    sys_print(args);
+    sys_print(" ===\n");
+
+    const image = pe.Pe.parse(data) catch |err| {
+        sys_print("Parse error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+
+    // 1. User-PML4 (kernel-маппинги копируются БЕЗ User-бита)
+    const user_pml4 = vmm.createUserPML4() catch |err| {
+        sys_print("createUserPML4 error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+
+    // 2. Планировка + ImageBase: маппим по ПРЕДПОЧТЁННОМУ базису (без .reloc).
+    //    Любой другой базис требует обработки .reloc — цикл №2.
+    var layout = pe_loader.UserLayout{};
+    const preferred = image.imageBase();
+    if (pe_loader.validateImageBase(preferred, image.sizeOfImage())) {
+        layout.image_base = preferred;
+    } else {
+        sys_print("[PE] ImageBase ");
+        putHex(preferred);
+        sys_print(" непригоден (identity 0-4ГБ / не выровнен / вне canonical user),\n");
+        sys_print("[PE] а релокация .reloc не поддержана в v0.10.0 — отказ\n");
+        return;
+    }
+
+    const ops = kernelLoaderOps();
+
+    // 3. Посекционный маппинг образа (PTE по характеристикам секций)
+    const img = pe_loader.loadImage(ops, user_pml4, &image, layout.image_base) catch |err| {
+        sys_print("loadImage error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    sys_print("[PE] Image mapped: base=");
+    putHex(img.base_va);
+    sys_print(" size=");
+    putHex(img.size_of_image);
+    sys_print(" pages=");
+    printDec(img.pages);
+    sys_print(" entry=");
+    putHex(img.entry_va);
+    sys_print("\n");
+
+    // 4. Код стабов: физ. страницы, RX для Ring 3, logical = user-VA
+    const counts = image.countImports();
+    const stub_bytes: u64 = counts.functions * win32.STUB_CODE_SIZE;
+    const stub_region = pe_loader.mapRegion(
+        ops,
+        user_pml4,
+        layout.stubs_va,
+        stub_bytes,
+        pe_loader.PTE_USER, // RX: исполняемый, без записи, без NX
+    ) catch |err| {
+        sys_print("stub mapRegion error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+
+    // 5. Генерация стабов (int3-трапы) + активация глобального диспетчера
+    kdisp = win32.Dispatcher.init(&kstub_entries, stub_region.backing[0..@intCast(stub_region.size)], .int3);
+    kdisp.logical_base = layout.stubs_va;
+    kdisp.log_fn = win32LogHook;
+    const generated = kdisp.generateFor(&image) catch |err| {
+        sys_print("Stub generation error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    win32.setDispatcher(&kdisp);
+    sys_print("[PE] Stubs: ");
+    printDec(generated);
+    sys_print(" (code ");
+    putHex(layout.stubs_va);
+    sys_print("..+");
+    printDec(generated * win32.STUB_CODE_SIZE);
+    sys_print(" bytes)\n");
+
+    // 6. Топ-функции CDD-цикла №1 + CRT-startup-kit: реализованы syscall-трамплинами.
+    // Спека: GetStdHandle / GetCommandLineA/W / VirtualAlloc (+ ExitProcess),
+    // плюс «выживание mingw-UCRT»: __p__* указатели, malloc/calloc, initterm…
+    // Честный подсчёт: активируются только НАЙДЕННЫЕ в импортах имена.
+    const impl_specs = [_][2][]const u8{
+        .{ "KERNEL32.dll", "GetStdHandle" },
+        .{ "KERNEL32.dll", "GetCommandLineA" },
+        .{ "KERNEL32.dll", "GetCommandLineW" },
+        .{ "KERNEL32.dll", "VirtualAlloc" },
+        .{ "KERNEL32.dll", "ExitProcess" },
+        .{ "KERNEL32.dll", "GetModuleHandleA" },
+        .{ "KERNEL32.dll", "GetModuleHandleW" },
+        .{ "KERNEL32.dll", "Sleep" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "__p__fmode" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "__p__commode" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "exit" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_exit" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "abort" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argc" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argv" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_errno" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_set_app_type" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_set_invalid_parameter_handler" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_onexit_table" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_register_onexit_function" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_configure_narrow_argv" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_narrow_environment" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm_e" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_cexit" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_seh_filter_exe" },
+        .{ "api-ms-win-crt-heap-l1-1-0.dll", "malloc" },
+        .{ "api-ms-win-crt-heap-l1-1-0.dll", "calloc" },
+        .{ "api-ms-win-crt-heap-l1-1-0.dll", "free" },
+        .{ "api-ms-win-crt-heap-l1-1-0.dll", "_set_new_mode" },
+        .{ "api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale" },
+        .{ "api-ms-win-crt-environment-l1-1-0.dll", "__p__environ" },
+        .{ "api-ms-win-crt-environment-l1-1-0.dll", "getenv" },
+    };
+    var impls: usize = 0;
+    for (impl_specs) |spec| {
+        if (kdisp.implementBy(spec[0], spec[1])) impls += 1;
+    }
+    sys_print("[PE] Implemented Win32 (top CDD): ");
+    printDec(impls);
+    sys_print(" / ");
+    printDec(impl_specs.len);
+    sys_print(" — spec top-3 + CRT-startup-kit (найденные в импортах)\n");
+
+    // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
+    kdisp.applyToImage(img.backing);
+    sys_print("[PE] IAT patched: ");
+    printDec(generated);
+    sys_print(" slots\n");
+
+    // 8. User-контекст Win64: стек, TEB, PEB, params+cmdline, TLS
+    const uctx = pe_loader.buildUserContext(ops, user_pml4, layout, img.base_va, args) catch |err| {
+        sys_print("buildUserContext error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    sys_print("[PE] User ctx: TEB=");
+    putHex(uctx.teb_va);
+    sys_print(" PEB=");
+    putHex(uctx.peb_va);
+    sys_print(" RSP=");
+    putHex(uctx.stack_rsp);
+    sys_print(" heap=");
+    putHex(uctx.heap_base);
+    sys_print("\n");
+
+    // 9. Контекст Win32-API (VirtualAlloc/GetCommandLine/GetModuleHandle) для syscall #6
+    win32_api.ctx = .{
+        .pml4 = user_pml4,
+        .image_base = img.base_va,
+        .cmdline_a = uctx.cmdline_a_va,
+        .cmdline_w = uctx.cmdline_w_va,
+        .heap_base = uctx.heap_base,
+        .heap_limit = uctx.heap_limit,
+        .heap_cursor = uctx.heap_base,
+        .allocs = 0,
+    };
+
+    // 10. GS-base → TEB (Ring 3 читает NtCurrentTeb через [gs:0x30]).
+    //     Ядро GS не использует (нет swapgs) — держим TEB постоянно.
+    hal.writeMsr(hal.MSR.GS_BASE, uctx.teb_va);
+
+    // 11. Ring-3 задача: IRETQ-кадр с CS=0x1B/SS=0x23, диспетчеризация тикером
+    const task_id = scheduler.createUserTask(img.entry_va, user_pml4, uctx.stack_rsp) catch |err| {
+        sys_print("createUserTask error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    sys_print("[PE] Ring 3 task #");
+    printDec(task_id);
+    sys_print(" created — waiting for first CDD int3 log\n");
+    sys_print("[CDD] chain: lines [CDD]/[WIN32] below = next functions to implement\n");
 }
 
 fn cmd_disk() void {

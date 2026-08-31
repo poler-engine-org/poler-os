@@ -200,6 +200,14 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
+    // 64-bit PE loader tests (v0.10.0, CDD №1): посекционный Ring-3 маппинг
+    // curl.exe на фейковом физ-аллокаторе (LoaderOps-инъекция) + TEB/PEB
+    const pe_loader_tests = b.addTest(.{
+        .root_source_file = b.path("src64/pe_loader.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
     const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
@@ -207,14 +215,16 @@ pub fn build(b: *std.Build) void {
     const run_puf64_tests = b.addRunArtifact(puf64_tests);
     const run_pe64_tests = b.addRunArtifact(pe64_tests);
     const run_win32_stubs_tests = b.addRunArtifact(win32_stubs_tests);
+    const run_pe_loader_tests = b.addRunArtifact(pe_loader_tests);
 
-    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs)");
+    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader)");
     test_step.dependOn(&run_poler_core32_tests.step);
     test_step.dependOn(&run_poler_core64_tests.step);
     test_step.dependOn(&run_rsa_oaep64_tests.step);
     test_step.dependOn(&run_puf64_tests.step);
     test_step.dependOn(&run_pe64_tests.step);
     test_step.dependOn(&run_win32_stubs_tests.step);
+    test_step.dependOn(&run_pe_loader_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{

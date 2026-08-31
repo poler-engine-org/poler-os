@@ -1,0 +1,28 @@
+# POLER-OS .gitattributes
+# v0.10.0: честная статистика языка на GitHub.
+#
+# Ядро POLER-OS — zig-kernel/ (92% Zig 0.14 + 8% ассемблер, 0% C).
+# Сторонние C-исходники (xorriso в upload/, PE/COFF-референсы в docs/,
+# GRUB/QEMU-артефакты) не должны засорять language stats репозитория.
+# linguist-vendored — исключить из подсчёта; -linguist-detectable — не
+# показывать в breakdown. linguist-language — форс для генерируемого кода.
+
+# ─── Загруженные сторонние исходники (не наш код) ───
+upload/** linguist-vendored -linguist-detectable
+grub-local/** linguist-vendored -linguist-detectable
+qemu-portable/** linguist-vendored -linguist-detectable
+linux-arch-experiment/** linguist-vendored -linguist-detectable
+
+# ─── Референсы документации (winnt.h, ReactOS/Wine PE-лоадер) ───
+docs/pe-reference/** linguist-documentation -linguist-detectable
+
+# ─── Двоичные артефакты ───
+*.iso binary
+*.img binary
+*.bin binary
+*.exe binary linguist-vendored -linguist-detectable
+*.o linguist-generated
+*.a linguist-generated
+
+# ─── Zig: V vendored-директория кэша (не в git, но страховка) ───
+zig-kernel/.zig-cache/** linguist-generated -linguist-detectable
