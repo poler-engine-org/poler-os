@@ -170,33 +170,41 @@ zig-kernel/
 ## Дорожная карта
 
 ### Этап 1 — Ядро (текущий)
-- [x] Загрузка в 64-bit long mode через Multiboot2/GRUB
+- [x] Загрузка в 64-bit long mode через Multiboot2/GRUB и Xen/QEMU PVH (`.note.gnu.pvh`)
 - [x] HAL: GDT, IDT, PIC, APIC, IO-APIC, TSS
 - [x] Управление памятью: PMM + VMM + kernel heap
 - [x] Preemptive multitasking: round-robin scheduler
 - [x] Ring 3: user mode, ELF64 loader, per-process CR3
 - [x] Криптография: PND v8, RSA-OAEP, POLER-CTR AEAD
 - [x] Framebuffer, PS/2 клавиатура, serial console
+- [x] Мульти-пуловый хаб аппаратной энтропии: PUF/TSC + Bus + IRQ + Bio
 - [ ] SMP — многоядерность
 
 ### Этап 2 — Файловая система и драйверы
+- [x] VirtIO-BLK драйвер диска (split virtqueues, DMA identity-map)
+- [x] FAT32 файловая система (чтение, запись, создание, удаление файлов и папок)
+- [x] CPIO Initrd парсер для загрузки образов и утилит
 - [ ] VFS (виртуальная файловая система)
-- [ ] Файловая система (ext2 или собственная)
 - [ ] Драйвер AHCI/SATA
 - [ ] Драйвер сети (virtio-net / e1000)
 - [ ] USB stack
 
 ### Этап 3 — Безопасность
+- [x] Аппаратная привязка энтропии кремния (PUF Anti-Clone)
 - [ ] Криптографическая блокировка ядра после загрузки
 - [ ] Верификация целостности системных файлов (FIM)
 - [ ] Сигнатурный сканер (userspace + kernel hooks)
 - [ ] Поведенческий мониторинг на уровне ядра
 - [ ] Верификатор пакетов (kernel gatekeeper)
 
-### Этап 4 — Совместимость
+### Этап 4 — Совместимость (Win64 / PE32+ & Linux)
+- [x] PE/COFF (PE32+) парсер заголовков (DOS, File, Optional64, Sections, DataDirectories)
+- [x] Парсинг Import Directory Table (IAT / OriginalFirstThunk / FirstThunk)
+- [x] Генератор динамических Win32-заглушек (Stub Dispatcher) с int3 контролируемым остановом (Crash-Driven Development)
+- [x] Команды интерактивного шелла `peinfo` и `pestubs` для анализа бинарников на лету
+- [ ] VMM-маппинг секций PE64 в виртуальное адресное пространство задачи
+- [ ] Реализация базовых API ntdll.dll и kernel32.dll по мере запросов бинарников
 - [ ] Подмножество Linux system call interface
-- [ ] PE/COFF loader (Windows executables)
-- [ ] Подмножество Win32/64 system calls
 - [ ] POSIX compatibility layer
 
 ### Этап 5 — Графическая среда
@@ -208,6 +216,24 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.9.0 — PE/COFF (PE32+) Loader & Win32 Stub Dispatcher
+- Модуль `src64/pe.zig`: полноценный парсер исполняемых файлов Win64 (PE32+). Поддержка DOS Header, COFF Header, Optional Header 64, Section Table, Data Directories, Data Directory IAT (Import Address Table).
+- Харденинг выравнивания `align(1)`: безопасный разбор невыровненных бинарных образов из CPIO Initrd без паник `@alignCast`.
+- Модуль `src64/win32_stubs.zig`: динамический генератор Win64-стабов (31 байт на функцию с выравниванием стека `sub/add rsp, 8` для предотвращения `#GP`).
+- Режимы работы стабов: `.int3` (контролируемый брейкпоинт в ядре) и `.record` (лог вызовов для нативных тестов).
+- Интерактивные команды ядра: `peinfo <file>` и `pestubs <file>`.
+- Тестовая верификация: 152/152 нативных юнит-тестов (запуск через `addRunArtifact`), успешный парсинг `curl.exe` (22 DLL, 274 функции).
+
+### v0.8.0 — PVH Boot Protocol & Direct QEMU 11 Support
+- Встроена секция `.note.gnu.pvh` в `boot64.S` для прямой загрузки ядра через `qemu-system-x86_64 -kernel` в современных версиях QEMU (≥11).
+- Поддержка структур `hvm_start_info` и `HvmModListEntry` для обнаружения Initrd модулей при PVH-старте.
+- Устранена уязвимость зацикливания парсера Multiboot2 при невалидном `multiboot_info`.
+
+### v0.7.3 — Input Pipeline & Scheduler Hardening
+- Исправлена критическая ошибка захвата сканкодов в Bio-пуле (устранено чтение порта 0x60 до обработчика клавиатуры).
+- Корректная таблица PS/2 Scancode Set 1, маскирование PIC IRQ1 для устранения дублирования прерываний.
+- Подключение `timerTickCallback` в планировщике, выравнивание стека задач по SysV ABI.
 
 ### v0.7.2 — Multi-Pool Hardware Entropy Hub
 - Полная реализация всех 4 пулов физической энтропии по спецификации `POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md`:
