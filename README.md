@@ -202,8 +202,9 @@ zig-kernel/
 - [x] Парсинг Import Directory Table (IAT / OriginalFirstThunk / FirstThunk)
 - [x] Генератор динамических Win32-заглушек (Stub Dispatcher) с int3 контролируемым остановом (Crash-Driven Development)
 - [x] Команды интерактивного шелла `peinfo` и `pestubs` для анализа бинарников на лету
-- [ ] VMM-маппинг секций PE64 в виртуальное адресное пространство задачи
-- [ ] Реализация базовых API ntdll.dll и kernel32.dll по мере запросов бинарников
+- [x] VMM-маппинг секций PE64 в виртуальное адресное пространство задачи (ImageBase / RVA, посекционные права P/RW/NX, BSS)
+- [x] Базовый CRT startup kit и Win32 API (GetStdHandle, GetCommandLineA/W, VirtualAlloc, malloc, free, initterm, exit)
+- [ ] Расширение Win32 API по логу CDD-цепочки (GetProcAddress, memset, QueryPerformanceFrequency, WSAStartup)
 - [ ] Подмножество Linux system call interface
 - [ ] POSIX compatibility layer
 
@@ -216,6 +217,17 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.10.0 — Ring-3 PE64 Execution & CDD Cycle #1
+- Модуль `src64/pe_loader.zig`: посекционный маппинг PE64 в виртуальную память (ImageBase `0x140000000`), инициализация структуры процесса, командной строки, TEB/PEB и выделение стека Ring 3.
+- Модуль `src64/win32_api.zig`: диспетчер системных вызовов (syscall #6) с поддержкой базовых CRT и Win32 функций (`GetStdHandle`, `VirtualAlloc` с реальным PMM+VMM, `malloc`, `exit`).
+- Поддержка команды `peload <file>` в шелле ядра: загрузка, IAT-патчинг стабами и запуск `curl.exe` в Ring 3 с передачей управления на `AddressOfEntryPoint`.
+- Исправление критических ошибок архитектуры:
+  - Коррекция GDT-селекторов под инструкцию `SYSRET` (устранен `#GP(0x20)`).
+  - Сохранение callee-saved регистров `RSI`/`RDI` в syscall-трамплинах Win64 ABI.
+  - Удален флаг `USER` с листовых страниц ядра 0–4 ГБ в `boot64.S` (аппаратная изоляция Ring 3).
+- Добавлен `.gitattributes` (`linguist-vendored` для `upload/` и `docs/`) — статистика GitHub показывает честные 95%+ Zig.
+- Тесты: 167/167 нативных юнит-тестов, 16/16 E2E тестов в QEMU.
 
 ### v0.9.0 — PE/COFF (PE32+) Loader & Win32 Stub Dispatcher
 - Модуль `src64/pe.zig`: полноценный парсер исполняемых файлов Win64 (PE32+). Поддержка DOS Header, COFF Header, Optional Header 64, Section Table, Data Directories, Data Directory IAT (Import Address Table).
