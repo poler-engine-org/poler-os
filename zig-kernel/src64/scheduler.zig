@@ -52,6 +52,14 @@ pub var scheduler_ticks: u64 = 0;
 pub export var user_rsp: u64 = 0;
 pub export var current_kernel_stack: u64 = 0;
 
+/// v0.12.0 (CDD №3): снапшот syscall-кадра активной задачи. isr64.S (путь
+/// syscall_entry) копирует сюда 8 слов СПУЩЕННОГО кадра при IF=0 — ДО sti()
+/// обработчика: прерывания не могут затереть данные в .bss, в отличие от
+/// стека ядра. Читает win32_api.kLaunchCallback (мост InitOnce-колбэка).
+/// Раскладка (порядок push'ей): [0]=r15 [1]=r14 [2]=r13 [3]=r12
+/// [4]=rbp [5]=rbx [6]=r11(user RFLAGS) [7]=rcx(user RIP после syscall).
+pub export var syscall_frame: [8]u64 = .{0} ** 8;
+
 // v0.7.0: CR3 tracking for per-process address spaces
 var kernel_cr3: u64 = 0; // Boot/kernel PML4 physical address
 var current_cr3: u64 = 0; // Currently loaded CR3
@@ -250,6 +258,68 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
     hal.Serial.puts("\n");
 
     return id;
+}
+
+/// v0.12.0 (CDD №3, event-волна): НАСТОЯЩИЙ Win64-тред приложения.
+/// CreateThread(curl): планировщик уже мульти-задачный и PML4 у процесса
+/// свой — тред = ещё одна задача на ТОМ ЖЕ CR3 (общее адресное пространство,
+/// как в Windows: один процесс, несколько потоков). Отличия от createUserTask:
+///   • RCX = param (Win64: ThreadProc(LPVOID) — единственный аргумент)
+///   • RSP указывает на фейковый return-адрес (exit-трамплин ExitThread):
+///     возврат из ThreadProc = штатное завершение потока (как CRT-тханк).
+/// Вызывается ИЗ syscall-контекста процесса (CR3 = process PML4) — запись
+/// exit-адреса в user-стек выполняет вызывающий (win32_api), здесь только
+/// кадр задачи.
+pub fn createUserThreadTask(entry_point: u64, user_cr3: u64, thread_rsp: u64, param_rcx: u64) !usize {
+    if (task_count >= MAX_TASKS) return error.OutOfTasks;
+
+    const id = task_count;
+    task_count += 1;
+
+    const task = &tasks[id];
+    task.id = id;
+    task.state = .Ready;
+    task.privilege = .User;
+    task.cr3 = user_cr3;
+    task.user_stack_top = thread_rsp;
+
+    const kstack_top = @intFromPtr(&task.kernel_stack) + task.kernel_stack.len;
+    const frame_ptr: *hal.InterruptFrame = @ptrFromInt(kstack_top - 176);
+    @memset(@as([*]volatile u8, @ptrCast(frame_ptr))[0..176], 0);
+
+    frame_ptr.rip = entry_point;
+    frame_ptr.cs = 0x23;
+    frame_ptr.rflags = 0x202; // IF=1: треду доступны прерывания/вытеснение
+    frame_ptr.rsp = thread_rsp;
+    frame_ptr.ss = 0x1B;
+    frame_ptr.vector = 48;
+    frame_ptr.error_code = 0;
+    frame_ptr.rcx = param_rcx; // ThreadProc(LPVOID) — Win64 RCX
+
+    task.rsp = @intFromPtr(frame_ptr);
+
+    hal.Serial.puts("[SCHED] Created user THREAD ");
+    hal.Serial.putDecimal(id);
+    hal.Serial.puts(" at entry ");
+    hal.Serial.putHex(entry_point);
+    hal.Serial.puts(" param=");
+    hal.Serial.putHex(param_rcx);
+    hal.Serial.puts(" (shared CR3 with process)\n");
+
+    return id;
+}
+
+/// v0.12.0: тред по хэндлу мёртв? (WaitForSingleObject на thread-handle).
+/// Хэндл = THREAD_HANDLE_BASE + task_id (см. win32_api.kCreateThreadOp).
+/// База 0x1000 — выше пулов сокетов (0x100+) и WSA-событий (0x200+),
+/// чтобы threadHandleDead не принял событие за тред.
+pub const THREAD_HANDLE_BASE: u64 = 0x1000;
+
+pub fn threadHandleDead(handle: u64) bool {
+    if (handle < THREAD_HANDLE_BASE) return false;
+    const id = handle - THREAD_HANDLE_BASE;
+    if (id == 0 or id >= task_count) return true; // вне диапазона = мёртв
+    return tasks[id].state == .Killed;
 }
 
 pub fn schedule(current_rsp: u64) callconv(.C) u64 {

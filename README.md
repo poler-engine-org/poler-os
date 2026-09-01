@@ -44,7 +44,7 @@ Linux-программы работают нативно — POLER-OS реали
 
 ---
 
-## Текущая версия: v0.11.0
+## Текущая версия: v0.12.0
 
 | Подсистема | Статус | Описание |
 |---|---|---|
@@ -60,7 +60,7 @@ Linux-программы работают нативно — POLER-OS реали
 | Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
 | PUF | Готово | Привязка аппаратной энтропии: TSC-джиттер → сид PRNG ядра + identity; анти-клон enrollment (спека POST_QUANTUM_HARDWARE_ENTROPY) |
 | Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen, win32_call (#6) |
-| **Win32 PE Runtime** | **CDD-циклы 1–2** | **Запуск реальных PE32+-приложений в Ring 3: curl.exe — CRT-init → main() → текст в консоли ОС**. 45 имплементаций + 4 native-стаба, block-heap (malloc/realloc), GetProcAddress, QPF/QPC (TSC) |
+| **Win32 PE Runtime** | **CDD-циклы 1–3** | **curl.exe в Ring 3 до connect()**: CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → getaddrinfo → socket() → **connect(192.0.2.1:80)**. 118 имплементаций + 6 native-стабов (strcmp/strncmp/bsearch — Ring-3-код), НАСТОЯЩИЕ Win64-треды (задачи планировщика на общем CR3), мост колбэка InitOnce (sysretq→launcher→trampoline→syscall #7), Enrollment-Gate (bindEnrolled — кремниевый отпечаток при буте), VerSetConditionMask/VerifyVersionInfoW (нативная «Win10»-семантика) |
 | SMP | Планируется | Многоядерность |
 | Networking | Планируется | virtio-net |
 | VFS | Планируется | Виртуальная файловая система |
@@ -203,9 +203,9 @@ zig-kernel/
 - [x] Генератор динамических Win32-заглушек (Stub Dispatcher) с int3 контролируемым остановом (Crash-Driven Development)
 - [x] Интерактивные команды шелла `peinfo`, `pestubs` и `peload` (загрузка + запуск)
 - [x] VMM-маппинг секций PE64 в Ring 3 по ImageBase с посекционными правами (RW/NX/USER)
-- [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → текст приложения в консоли ОС (v0.10–v0.11, CDD-циклы 1–2)
-- [x] Реализация базовых API kernel32/UCRT «по мере запросов» (CDD): 45 syscall-трамплинов + 4 native-стаба (memset/memcpy/memmove/strlen), GetProcAddress-резолв, block-heap (malloc/calloc/realloc), QPF/QPC (TSC)
-- [ ] Следующие CDD-циклы: VerifyVersionInfoW, InitOnceExecuteOnce, SSPI (Secur32), GetEnvironmentVariableA — по логу цепочки v0.11.0
+- [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → socket() → connect() (v0.10–v0.12, CDD-циклы 1–3)
+- [x] Реализация базовых API kernel32/UCRT/WS2_32 «по мере запросов» (CDD): 118 syscall-трамплинов + 6 native-стабов (memset/memcpy/memmove/strlen/strcmp/strncmp + native-bsearch), block-heap, GetProcAddress, QPF/QPC (TSC), НАСТОЯЩИЕ Win64-треды, Enrollment-Gate
+- [ ] Следующие CDD-циклы: setsockopt/getsockopt/getsockname/select (сокетные опции и мультиплексирование — путь к send()), TLS-стек (SChannel), .reloc для DYNAMIC_BASE — по логу цепочки v0.12.0
 - [ ] Подмножество Linux system call interface
 - [ ] POSIX compatibility layer
 
@@ -218,6 +218,17 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.12.0 — CDD-цикл №3: нативная версия/SSPI/окружение, МОСТ КОЛБЭКА, Win64-треды, connect()
+- **МОМЕНТ ИСТИНЫ №3c**: `curl.exe` (реальный PE32+, 3.8МБ) в Ring 3 проходит ПОЛНЫЙ путь сетевой инициализации: CRT-init → main() → парсинг URL (`--url` через native-bsearch) → конфиг/CA-поиск → WSAStartup → InitSecurityInterfaceA (SSPI-таблица 25/25) → **два Dns-треда** (Happy Eyeballs) → getaddrinfo (синтез TEST-NET) → socket(AF_INET) → ioctlsocket(FIONBIO) → **connect(192.0.2.1:80) — ЦЕЛЬ ЦИКЛА ДОСТИГНУТА**.
+- **НАСТОЯЩИЕ Win64-треды**: `CreateThread` → задача планировщика на ТОЙ ЖЕ PML4 (общее адресное пространство, как процесс Windows): RCX=param, [rsp]=exit-трамплин (динамическая extra-запись `ExitThread`), стек 64КБ из vheap; возврат из ThreadProc = syscall #6 → kill задачи. WaitFor-семья видит мёртвый тред-хэндл (WAIT_OBJECT_0) — резолвер будит цикл curl.
+- **Мост Win64-колбэка** (`InitOnceExecuteOnce`): вызов user-кода из syscall-обработчика без разрушения ядра — sysretq → launcher (Ring 3) → callback → trampoline → syscall #7 (cb_done) → восстановление сохранённого syscall-кадра; вложенность (глубина 2), стек транзакций.
+- **Enrollment-Gate** (спека §4): `enroll_gate.zig` — TSC-кремниевый отпечаток (CPUID-детерминизм, sponge-фолдинг), bindEnrolled() при буте — сверка с запечённым эталоном; `[ENROLL] PASSED`.
+- **Нативная версия/окружение** (не эмуляция — контракт): VerSetConditionMask (покомпонентные маски), VerifyVersionInfoW с ТЮПЛЬ-семантикой (major/minor) — «да, эта машина Win10-совместима»; GetEnvironmentVariableA/W с LastError-контрактом (ERROR_ENVVAR_NOT_FOUND); FormatMessageA/W со стек-аргументами; строки: strcmp/strncmp — native Ring-3-код (машинные байты сверены с GNU-as), _strdup/strchr/strrchr/strstr/memcmp/strcspn/_stricmp/atoi/strtol/…; strerror/setlocale/mbstowcs_s/_time64.
+- **WSA-event-каркас**: WSACreateEvent (пул 0x200+; ранее trap-NULL → «curl: (27) Out of memory»), WSAEventSelect/EnumNetworkEvents/WaitForMultipleEvents, __WSAFDIsSet с РЕАЛЬНОЙ семантикой fd_set (массив с смещения 8!), WSAIoctl, CreateEventA, WaitFor-семья, CS/CV-функции.
+- **Native-bsearch**: 142Б Ring-3-кода (3 слота) — вызывает КОМПАРАТОР ПРИЛОЖЕНИЯ (не наш код!) из Ring 3; собран через GNU `as` (после двух ошибок ручного кодирования — volаtile-регистр RDX убил p-указатель; регрессионный тест с RDX-затирающим компаратором).
+- Исправления на пути: ucl_pending не сбрасывался после редиректа (бесконечный цикл моста — isr64.S), размер OSVERSIONINFOW = 284 (szCSDVersion = 128 WCHAR!), стек-аргументы Win64: arg5 = [rsp+0x28] у callee (32Б shadow).
+- Тесты: 266/266 (+52 к v0.11: мост, SSPI, ws2, версия, окружение, строки, события, треды). E2E: pe-run3 ALL PASS (моменты №3a/№3b/№3c) + pe-run v1 (цикло-агностичен) + kbd 9/9 + pe-e2e PASS.
 
 ### v0.11.0 — CDD-цикл №2: вторая волна Win32/CRT API + углубление в main()
 - **МОМЕНТ ИСТИНЫ №2**: curl.exe печатает свой текст (`curl: error initializing curl library`) через наш fputs/fputc в консоль ОС — приложение дошло до WSAStartup → realloc → GetConsoleScreenBufferInfo → вывод → штатный exit(2).

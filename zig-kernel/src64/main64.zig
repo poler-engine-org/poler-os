@@ -16,6 +16,7 @@ const std = @import("std");
 const acpi = @import("acpi.zig");
 const poler = @import("poler_core.zig");
 const puf = @import("puf.zig");
+const enroll_gate = @import("enroll_gate.zig");
 const pmm = @import("pmm64.zig");
 const vmm = @import("vmm64.zig");
 const heap = @import("heap64.zig");
@@ -573,6 +574,92 @@ fn onBioEntropy(sample: u64) void {
     }
 }
 
+/// v0.12.0 (CDD №3, спека §4): Эталонный Enrollment-профиль — свёртка
+/// CPUID-блока канонического окружения (QEMU 11 TCG, default CPU, PVH):
+/// 38564015 D7724537 709317B2 16547885 770B1433 1D341FDA AFE29884 0919357B.
+/// Бейк: консольная команда 'enroll' печатает live-identity своей машины —
+/// заменить значение ниже (чужой кремний/VM → WARN + требование аттестации).
+var enroll_reference: ?enroll_gate.Identity = enroll_gate.Identity{
+    0x15, 0x40, 0x56, 0x38, 0x37, 0x45, 0x72, 0xD7,
+    0xB2, 0x17, 0x93, 0x70, 0x85, 0x78, 0x54, 0x16,
+    0x33, 0x14, 0x0B, 0x77, 0xDA, 0x1F, 0x34, 0x1D,
+    0x84, 0x98, 0xE2, 0xAF, 0x7B, 0x35, 0x19, 0x09,
+};
+
+/// Результат последней проверки Enrollment-Gate (cmd 'enroll', диагностика).
+var enroll_last_verdict: enroll_gate.Verdict = .first_boot;
+
+/// Аппаратный Enrollment-Gate (спека §4: Anti-Cloning & Cloud Immunity).
+/// Собираем кремниевый отпечаток (CPUID-блок + TSC-свидетель), сворачиваем
+/// его в identity и сравниваем с эталоном. Мисматч = чужой процессор /
+/// неавторизованная VM → диагностическое ПРЕДУПРЕЖДЕНИЕ + требование
+/// аттестации (крипто-русьла помечаются — halt-политика вне CDD-цикла).
+fn enrollmentGate() void {
+    puts("[ENROLL] Hardware Enrollment-Gate (спека §4, v0.12.0)\n");
+    var raw: [enroll_gate.RAW_LEN]u8 = undefined;
+    enroll_gate.captureFingerprint(&raw);
+    const identity = enroll_gate.identityOf(&raw);
+
+    puts("  silicon identity: ");
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        putHex(std.mem.readInt(u32, identity[i * 4 ..][0..4], .little));
+        if (i < 7) puts(" ");
+    }
+    puts("\n");
+
+    const verdict = enroll_gate.bindEnrolled(&raw, enroll_reference);
+    enroll_last_verdict = verdict;
+    switch (verdict) {
+        .verified => puts("  bindEnrolled: PASSED — тот же кремний/VM-конфиг (ε совпала)\n"),
+        .first_boot => {
+            puts("  bindEnrolled: FIRST BOOT — профиль ЗАРЕГИСТРИРОВАН этой загрузкой\n");
+            puts("    (bake: enroll_reference в main64.zig; hex выше — 'enroll' повторит)\n");
+            enroll_reference = identity;
+        },
+        .mismatch => {
+            vga_setcolor(0x0E);
+            puts("  *** bindEnrolled: ОТКАЗ — чужой процессор/неавторизованная VM! ***\n");
+            puts("  *** Требуется аттестация устройства (cmd 'enroll').      ***\n");
+            vga_setcolor(0x07);
+        },
+    }
+}
+
+/// Команда шелла 'enroll' (v0.12.0): live-состояние Enrollment-Gate.
+/// 'enroll test' — демо анти-клона: подделанный отпечаток → MISMATCH.
+fn cmd_enroll(args: []const u8) void {
+    if (eq(args, "test")) {
+        var raw: [enroll_gate.RAW_LEN]u8 = undefined;
+        enroll_gate.captureFingerprint(&raw);
+        const ref = enroll_reference orelse enroll_gate.identityOf(&raw);
+        // «Клон диска на чужом кремнии»: сигнатура CPU затёрта
+        std.mem.writeInt(u64, raw[2 * 8 ..][0..8], 0, .little);
+        puts("[ENROLL] forge-тест: подделка CPUID-блока → ");
+        switch (enroll_gate.bindEnrolled(&raw, ref)) {
+            .mismatch => puts("MISMATCH (анти-клон работает: клон отклонён)\n"),
+            else => puts("ОШИБКА: подделка пропущена!\n"),
+        }
+        return;
+    }
+    puts("Enrollment-Gate: ");
+    switch (enroll_last_verdict) {
+        .verified => puts("VERIFIED (кремний совпал с эталоном)\n"),
+        .first_boot => puts("FIRST BOOT (эталон не забейкан)\n"),
+        .mismatch => puts("*** MISMATCH: чужой кремний/VM — аттестация нужна ***\n"),
+    }
+    var raw: [enroll_gate.RAW_LEN]u8 = undefined;
+    enroll_gate.captureFingerprint(&raw);
+    const identity = enroll_gate.identityOf(&raw);
+    puts("  live identity: ");
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        putHex(std.mem.readInt(u32, identity[i * 4 ..][0..4], .little));
+        if (i < 7) puts(" ");
+    }
+    puts("\n");
+}
+
 /// Привязка PUF и запуск всех 4 пулов аппаратной энтропии:
 /// Phase (PUF/TSC) + Bus (VirtIO/PCIe) + IRQ (APIC/HPET) + Bio (клавиатура).
 fn pufBootInit() void {
@@ -721,6 +808,11 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     //      docs/POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md)
     pufBootInit();
 
+    // 8.75 (v0.12.0, CDD №3): Аппаратный Enrollment-Gate — проверка
+    //      bindEnrolled() при старте ядра (спека §4: анти-клон/анти-облако):
+    //      кремниевый отпечаток против эталонного Enrollment-профиля.
+    enrollmentGate();
+
     // 8.5. Initialize VMM (MUST be before virtio-blk so that any future
     //      code that needs VMM mapping can use it; DMA slots now use
     //      identity mapping so this order is not strictly required, but
@@ -850,8 +942,8 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 9. Ready!
     vga_setcolor(0x0B);
     puts("\n╔══════════════════════════════════════════════════════╗\n");
-    puts("║         POLER-OS v0.7.0 — BOOT COMPLETE             ║\n");
-    puts("║     HAL + ACPI + POLER Core — all systems GO        ║\n");
+    puts("║         POLER-OS v0.12.0 — BOOT COMPLETE             ║\n");
+    puts("║  HAL+PUF+Enrollment-Gate+PE Runtime — all systems GO║\n");
     puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
 
@@ -870,6 +962,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 8.57 (v0.11.0, CDD №2): платформенные примитивы win32_crt — walk PML4,
     // PMM+VMM-маппинг, TSC, Serial-консоль, завершение процесса.
     win32_api.installOps();
+    // 8.58 (v0.12.0, CDD №3): syscall #7 — trampoline Win64-колбэка
+    // (InitOnceExecuteOnce) отчитывается о завершении.
+    hal.win32CbDoneCallback = &win32_api.callbackDone;
 
     // 8.6. Initialize Scheduler & Preemptive Multitasking
     scheduler.init();
@@ -907,7 +1002,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.7.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.12.0 Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
@@ -974,12 +1069,14 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  rm <f>    - Delete a file\n");
         sys_print("  disk      - Show disk info\n");
         sys_print("  entropy   - Show all hardware entropy pools status (PUF, Bus, IRQ, Bio)\n");
+        sys_print("  enroll    - Enrollment-Gate status: silicon identity + bindEnrolled verdict\n");
+        sys_print("  enroll test - Forge-test: анти-клон (подделка отпечатка → MISMATCH)\n");
         sys_print("  peinfo <f> - Analyze PE/COFF executable from initrd (headers, sections, imports)\n");
         sys_print("  pestubs <f> - Generate Win32 stub table for PE executable (CDD: log+int3)\n");
-        sys_print("  peload <f> - Load PE64 into Ring 3 and JUMP to EntryPoint (CDD cycle 1)\n");
+        sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (CDD cycle 3)\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.7.2 (x86_64 Long Mode)\n");
-        sys_print("Cognitive Semantic Runtime Environment (PUF Multi-Pool Active).\n");
+        sys_print("POLER-OS v0.12.0 (x86_64 Long Mode)\n");
+        sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
     } else if (eq(cmd, "clear")) {
         sys_clear_screen();
     } else if (eq(cmd, "poler")) {
@@ -988,6 +1085,10 @@ fn execute_command(cmd: []const u8) void {
         sys_print("pndMixAlt(42, 17, 1) = 0x000002CD\n");
     } else if (eq(cmd, "entropy")) {
         cmd_entropy();
+    } else if (eq(cmd, "enroll")) {
+        cmd_enroll("");
+    } else if (eq(cmd, "enroll test")) {
+        cmd_enroll("test");
     } else if (startsWith(cmd, "peinfo ")) {
         cmd_peinfo(cmd[7..]);
     } else if (eq(cmd, "peinfo")) {
@@ -1498,18 +1599,27 @@ fn cddInt3Handler(frame: *hal.InterruptFrame) bool {
 
 fn cmd_peload(args: []const u8) void {
     if (args.len == 0) {
-        sys_print("Usage: peload <file-in-initrd>   (e.g. peload curl.exe)\n");
+        sys_print("Usage: peload <file-in-initrd> [process-args]  (e.g. peload curl.exe http://example.com)\n");
         return;
     }
-    const data = initrdFindFile(args) orelse {
+    // v0.12.0: файл — первый токен, ОСТАЛЬНОЕ — аргументы процесса (URL…):
+    // полная строка попадает в GetCommandLineA/params-страницу → argv.
+    var file_end = std.mem.indexOfScalar(u8, args, ' ') orelse args.len;
+    if (file_end == 0) file_end = args.len;
+    const file = args[0..file_end];
+    const data = initrdFindFile(file) orelse {
         sys_print("File not found in initrd: ");
-        sys_print(args);
+        sys_print(file);
         sys_print("\n");
         return;
     };
 
-    sys_print("=== PE Load & Run (CDD cycle 2): ");
-    sys_print(args);
+    sys_print("=== PE Load & Run (CDD cycle 3): ");
+    sys_print(file);
+    if (args.len > file_end) {
+        sys_print(" — cmdline: ");
+        sys_print(args);
+    }
     sys_print(" ===\n");
 
     const image = pe.Pe.parse(data) catch |err| {
@@ -1560,9 +1670,19 @@ fn cmd_peload(args: []const u8) void {
     putHex(img.entry_va);
     sys_print("\n");
 
-    // 4. Код стабов: физ. страницы, RX для Ring 3, logical = user-VA
+    // 4. Код стабов: физ. страницы, RX для Ring 3, logical = user-VA.
+    //    v0.12.0: запас под EXTRA-записи (SSPI-таблица Secur32 — функции,
+    //    которые curl получает ЧЕРЕЗ ТАБЛИЦУ, а не через IAT) + 3 слота
+    //    моста колбэка (launcher/trampoline/mailbox) + 3 слота native-bsearch
+    //    (127Б: вызов компаратора приложения из Ring 3 — легален и безопасен)
+    //    + 1 слот ExitThread (динамическая extra-запись при первом
+    //    CreateThread: return-трамплин ThreadProc).
     const counts = image.countImports();
-    const stub_bytes: u64 = counts.functions * win32.STUB_CODE_SIZE;
+    const SSPI_EXTRA: u64 = 25; // SecurityFunctionTable-имена (см. ниже)
+    const BRIDGE_SLOTS: u64 = 3;
+    const NATIVE2_SLOTS: u64 = 3; // bsearch (alias-таблица опций curl)
+    const EXITTHREAD_SLOTS: u64 = 1;
+    const stub_bytes: u64 = (counts.functions + SSPI_EXTRA + BRIDGE_SLOTS + NATIVE2_SLOTS + EXITTHREAD_SLOTS) * win32.STUB_CODE_SIZE;
     const stub_region = pe_loader.mapRegion(
         ops,
         user_pml4,
@@ -1603,6 +1723,8 @@ fn cmd_peload(args: []const u8) void {
     const native_specs = [_]struct { dll: []const u8, func: []const u8, kind: win32.NativeKind }{
         .{ .dll = "api-ms-win-crt-string-l1-1-0.dll", .func = "memset", .kind = .memset },
         .{ .dll = "api-ms-win-crt-string-l1-1-0.dll", .func = "strlen", .kind = .strlen },
+        .{ .dll = "api-ms-win-crt-string-l1-1-0.dll", .func = "strcmp", .kind = .strcmp },
+        .{ .dll = "api-ms-win-crt-string-l1-1-0.dll", .func = "strncmp", .kind = .strncmp },
         .{ .dll = "api-ms-win-crt-private-l1-1-0.dll", .func = "memcpy", .kind = .memcpy },
         .{ .dll = "api-ms-win-crt-private-l1-1-0.dll", .func = "memmove", .kind = .memmove },
     };
@@ -1614,7 +1736,65 @@ fn cmd_peload(args: []const u8) void {
     printDec(natives);
     sys_print(" / ");
     printDec(native_specs.len);
-    sys_print(" (memset/memcpy/memmove/strlen — Ring 3, rep stosb/movsb)\n");
+    sys_print(" (memset/memcpy/memmove/strlen/strcmp/strncmp — Ring 3)\n");
+
+    // 6a2. (v0.12.0, CDD №3) EXTRA-записи реестра — SSPI-таблица Secur32.
+    //      curl получает SecurityFunctionTableA от InitSecurityInterfaceA и
+    //      зовёт функции ЧЕРЕЗ ТАБЛИЦУ (не через IAT!) — каждому имени нужен
+    //      свой вызываемый user-VA. .impl → syscall-трамплин → win32_crt
+    //      отвечает SEC_E_UNSUPPORTED (SEC_E_OK = 0 затирал бы out-параметры).
+    const sspi_extra_specs = [_][]const u8{
+        "EnumerateSecurityPackagesA",     "EnumerateSecurityPackagesW",
+        "QuerySecurityPackageInfoA",      "QuerySecurityPackageInfoW",
+        "FreeContextBuffer",             "ImportSecurityContextA",
+        "ImportSecurityContextW",        "AcceptSecurityContext",
+        "ImpersonateSecurityContext",    "RevertSecurityContext",
+        "QuerySecurityContextToken",     "DeleteSecurityContext",
+        "ApplyControlToken",             "QueryContextAttributesA",
+        "QueryContextAttributesW",       "QueryCredentialsAttributesA",
+        "QueryCredentialsAttributesW",   "FreeCredentialsHandle",
+        "AcquireCredentialsHandleA",     "AcquireCredentialsHandleW",
+        "AddCredentialsA",               "AddCredentialsW",
+        "CompleteAuthToken",             "InitializeSecurityContextA",
+        "InitializeSecurityContextW",
+    };
+    var extras: usize = 0;
+    for (sspi_extra_specs) |fname| {
+        if (kdisp.addExtraStub("Secur32.dll", fname, .impl) != null) extras += 1;
+    }
+    sys_print("[PE] Extra SSPI stubs: ");
+    printDec(extras);
+    sys_print(" / ");
+    printDec(sspi_extra_specs.len);
+    sys_print(" (SecurityFunctionTable — вызовы ЧЕРЕЗ таблицу)\n");
+
+    // 6a3. (v0.12.0, CDD №3) МОСТ КОЛБЭКА (InitOnceExecuteOnce): launcher/
+    //      trampoline/mailbox в хвосте стаб-региона. Кернель-путь: колбэк
+    //      возвращает на СОБСТВЕННЫЙ trampoline → syscall #7 (done_target=null).
+    win32_api.bridge = kdisp.buildCallbackBridge(null, win32.CB_SYSCALL_DONE, win32.CALLBACK_COOKIE);
+    if (win32_api.bridge) |br| {
+        sys_print("[PE] Callback bridge: launcher=");
+        putHex(br.launcher_va);
+        sys_print(" trampoline=");
+        putHex(br.trampoline_va);
+        sys_print(" mailbox=");
+        putHex(br.mailbox_va);
+        sys_print(" (InitOnce → Ring 3 → syscall #7)\n");
+    } else {
+        sys_print("[PE] Callback bridge: НЕ СОБРАН (InitOnce уйдёт в no-launch)\n");
+    }
+
+    // 6a4. (v0.12-fix) NATIVE bsearch: alias-таблица опций curl. Каждый голый
+    //      URL curl 8.x подаёт в getparameter как опцию «--url» — поиск имени
+    //      в таблице идёт bsearch'ом; trap-стаб возвращал NULL = «не найдено»
+    //      → «curl: option http://…: is unknown». Компаратор — код
+    //      ПРИЛОЖЕНИЯ, вызывать его можно только из Ring 3 → binary-search
+    //      исполняется НАТИВНО в кольце 3 (Win64-контракт: shadow+align).
+    if (kdisp.implementNativeBsearch("api-ms-win-crt-utility-l1-1-0.dll", "bsearch")) {
+        sys_print("[PE] Native bsearch: OK (Ring 3, компаратор приложения; код после mailbox)\n");
+    } else {
+        sys_print("[PE] Native bsearch: НЕ НАЙДЕН в импортах (пропускаем)\n");
+    }
 
     // 6b. Топ-функции CDD-циклов №1+№2 + CRT-startup-kit: syscall-трамплины.
     // Спека №1: GetStdHandle / GetCommandLineA/W / VirtualAlloc (+ ExitProcess),
@@ -1648,6 +1828,7 @@ fn cmd_peload(args: []const u8) void {
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "setvbuf" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fputs" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fputc" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fwrite" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fflush" },
         .{ "api-ms-win-crt-runtime-l1-1-0.dll", "exit" },
         .{ "api-ms-win-crt-runtime-l1-1-0.dll", "_exit" },
@@ -1676,6 +1857,99 @@ fn cmd_peload(args: []const u8) void {
         .{ "api-ms-win-crt-environment-l1-1-0.dll", "getenv" },
         .{ "WS2_32.dll", "WSAStartup" },
         .{ "WS2_32.dll", "WSACleanup" },
+        // Волна №3 (CDD №3, по логу цепочки v0.11.0): версионирование
+        // (VerSetConditionMask/VerifyVersionInfoW — curl проверяет Win7+),
+        // окружение (GetEnvironmentVariable → пустое), ошибки (GetLastError/
+        // SetLastError/FormatMessage), синхронизация (InitOnce → мост),
+        // SSPI (InitSecurityInterfaceA — таблица), сокеты (socket/connect/
+        // closesocket/ioctlsocket/getaddrinfo/send/recv…).
+        .{ "KERNEL32.dll", "VerSetConditionMask" },
+        .{ "KERNEL32.dll", "VerifyVersionInfoW" },
+        .{ "KERNEL32.dll", "InitOnceExecuteOnce" },
+        .{ "KERNEL32.dll", "GetEnvironmentVariableA" },
+        .{ "KERNEL32.dll", "GetEnvironmentVariableW" },
+        .{ "KERNEL32.dll", "FormatMessageA" },
+        .{ "KERNEL32.dll", "FormatMessageW" },
+        .{ "KERNEL32.dll", "GetLastError" },
+        .{ "KERNEL32.dll", "SetLastError" },
+        .{ "Secur32.dll", "InitSecurityInterfaceA" },
+        .{ "Secur32.dll", "InitSecurityInterfaceW" },
+        .{ "WS2_32.dll", "socket" },
+        .{ "WS2_32.dll", "connect" },
+        .{ "WS2_32.dll", "closesocket" },
+        .{ "WS2_32.dll", "ioctlsocket" },
+        .{ "WS2_32.dll", "send" },
+        .{ "WS2_32.dll", "recv" },
+        .{ "WS2_32.dll", "htons" },
+        .{ "WS2_32.dll", "htonl" },
+        .{ "WS2_32.dll", "ntohs" },
+        .{ "WS2_32.dll", "ntohl" },
+        .{ "WS2_32.dll", "WSAGetLastError" },
+        .{ "WS2_32.dll", "getaddrinfo" },
+        .{ "WS2_32.dll", "freeaddrinfo" },
+        // Module-walk (проявился с URL-аргументами: curl инспектирует DLL)
+        .{ "KERNEL32.dll", "CreateToolhelp32Snapshot" },
+        .{ "KERNEL32.dll", "Module32First" },
+        .{ "KERNEL32.dll", "Module32Next" },
+        .{ "KERNEL32.dll", "CloseHandle" },
+        // Critical sections: Initialize/Enter/Leave — void-функции, no-op
+        // для однопоточного CDD-процесса (semantически корректный ноль).
+        .{ "KERNEL32.dll", "InitializeCriticalSection" },
+        .{ "KERNEL32.dll", "EnterCriticalSection" },
+        .{ "KERNEL32.dll", "LeaveCriticalSection" },
+        .{ "KERNEL32.dll", "GetModuleFileNameA" },
+        // fix-волна №3 (по логу v0.12-run4): «curl: option …: out of memory» —
+        // _strdup(trap)→NULL; strrchr(NULL) ломал конфиг-путь. Строковое
+        // семейство закрывается целиком (bsearch-компараторы уже native).
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "_strdup" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "_stricmp" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "_strnicmp" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "tolower" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "isspace" },
+        .{ "api-ms-win-crt-private-l1-1-0.dll", "memcmp" },
+        .{ "api-ms-win-crt-private-l1-1-0.dll", "strchr" },
+        .{ "api-ms-win-crt-private-l1-1-0.dll", "strrchr" },
+        .{ "api-ms-win-crt-private-l1-1-0.dll", "strstr" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "strerror" },
+        .{ "api-ms-win-crt-locale-l1-1-0.dll", "setlocale" },
+        .{ "api-ms-win-crt-convert-l1-1-0.dll", "atoi" },
+        .{ "api-ms-win-crt-convert-l1-1-0.dll", "strtol" },
+        .{ "api-ms-win-crt-convert-l1-1-0.dll", "strtoul" },
+        // event-волна (по логу v0.12-run5): «curl: (27) Out of memory» —
+        // WSACreateEvent(trap)→NULL. Событийный каркас сетевой модели:
+        // WSAEventSelect/Wait/Enum + KERNEL32 WaitFor-семья + stdio-тройка.
+        .{ "WS2_32.dll", "WSACreateEvent" },
+        .{ "WS2_32.dll", "WSACloseEvent" },
+        .{ "WS2_32.dll", "WSAResetEvent" },
+        .{ "WS2_32.dll", "WSAEventSelect" },
+        .{ "WS2_32.dll", "WSAEnumNetworkEvents" },
+        .{ "WS2_32.dll", "WSAWaitForMultipleEvents" },
+        .{ "WS2_32.dll", "WSAIoctl" },
+        .{ "WS2_32.dll", "WSASetLastError" },
+        .{ "WS2_32.dll", "__WSAFDIsSet" },
+        .{ "KERNEL32.dll", "CreateEventA" },
+        .{ "KERNEL32.dll", "WaitForSingleObject" },
+        .{ "KERNEL32.dll", "WaitForSingleObjectEx" },
+        .{ "KERNEL32.dll", "WaitForMultipleObjects" },
+        .{ "KERNEL32.dll", "InitializeCriticalSectionEx" },
+        .{ "KERNEL32.dll", "DeleteCriticalSection" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_fileno" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_isatty" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_setmode" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_fsopen" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "strcspn" },
+        .{ "api-ms-win-crt-convert-l1-1-0.dll", "mbstowcs_s" },
+        // threading-волна (по логу v0.12-run6): CreateThread(trap)→NULL →
+        // curl вечно ждёт резолвер. Теперь тред — задача планировщика на
+        // той же PML4; время/CV/memchr — поддержка цикла резолвера.
+        .{ "KERNEL32.dll", "CreateThread" },
+        .{ "KERNEL32.dll", "GetSystemTimeAsFileTime" },
+        .{ "KERNEL32.dll", "GetTickCount64" },
+        .{ "KERNEL32.dll", "InitializeConditionVariable" },
+        .{ "KERNEL32.dll", "WakeConditionVariable" },
+        .{ "KERNEL32.dll", "SleepConditionVariableCS" },
+        .{ "api-ms-win-crt-private-l1-1-0.dll", "memchr" },
+        .{ "api-ms-win-crt-time-l1-1-0.dll", "_time64" },
     };
     var impls: usize = 0;
     for (impl_specs) |spec| {
@@ -1685,7 +1959,7 @@ fn cmd_peload(args: []const u8) void {
     printDec(impls);
     sys_print(" / ");
     printDec(impl_specs.len);
-    sys_print(" — cycles 1+2 (chain-log wave: 17 fn) + CRT-startup-kit\n");
+    sys_print(" — cycles 1+2+3 (waves: 17+20 fn) + CRT-startup-kit\n");
 
     // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
     kdisp.applyToImage(img.backing);
@@ -1740,6 +2014,12 @@ fn cmd_peload(args: []const u8) void {
         .tsc_freq = tsc_freq,
         .tid = 0,
         .implemented_calls = 0,
+        .last_error = 0,
+        .next_socket_fd = 0x100,
+        .sockets_opened = 0,
+        .sspi_table = 0,
+        .locale_str = 0,
+        .next_event_handle = 0x200,
     };
     sys_print("[PE] TSC calibrated: ");
     printDec(tsc_freq);

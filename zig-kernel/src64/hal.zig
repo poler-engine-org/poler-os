@@ -536,10 +536,14 @@ fn handleKeyboard(frame: *InterruptFrame) void {
 
     const scan = inb(0x60);
 
-    // Debug: show raw scancode on serial (helps diagnose translation issues)
-    Serial.puts("[KBD] scan=0x");
-    Serial.putHex(scan);
-    Serial.puts("\n");
+    // Debug: raw scancode на serial — ТОЛЬКО нажатия (bit7=release):
+    // release-коды (0x9C от sendkey ret) печатались ВНУТРИ строк шелла
+    // (гонка [KBD]-лога с печатью «cmdline: …») и ломали E2E-парсинг.
+    if (scan != 0xE0 and (scan & 0x80) == 0) {
+        Serial.puts("[KBD] scan=0x");
+        Serial.putHex(scan);
+        Serial.puts("\n");
+    }
 
     // Extended key prefix
     if (scan == 0xE0) {
@@ -1174,6 +1178,19 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
             Serial.puts("[SYSCALL] win32_call: нет win32SyscallCallback\n");
             return 0;
         },
+        7 => {
+            // Syscall 7: win32_cb_done — v0.12.0 (CDD №3): trampoline
+            // Win64-колбэка (InitOnceExecuteOnce) отчитался о завершении:
+            //   rdi (arg1) = cookie моста, rsi (arg2) = результат колбэка (RAX).
+            // Ядро восстанавливает СОХРАНЁННЫЙ syscall-кадр (win32_api.
+            // callbackDone) → asm-попы → sysretq → возврат в точку ПОСЛЕ
+            // исходного syscall'а InitOnce с RAX=TRUE/FALSE.
+            if (win32CbDoneCallback) |cb| {
+                return cb(arg1, arg2);
+            }
+            Serial.puts("[SYSCALL] win32_cb_done: нет win32CbDoneCallback\n");
+            return 0;
+        },
         else => {
             Serial.puts("[SYSCALL] Unknown syscall: ");
             Serial.putDecimal(syscall_num);
@@ -1189,6 +1206,10 @@ pub var exitCallback: ?*const fn () callconv(.C) void = null;
 // Win32 syscall dispatch — registered by main64 (hal ↔ win32_api circular-dep breaker).
 // arg-порядок = syscall-конвенция трамплина: (entry_id, w64arg1, w64arg2, w64arg3, w64arg4).
 pub var win32SyscallCallback: ?*const fn (entry_id: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 = null;
+
+// v0.12.0 (CDD №3): syscall #7 — trampoline Win64-колбэка (InitOnce) отчитался:
+// (cookie, результат). Возврат попадает в RAX восстановленного исходного syscall'а.
+pub var win32CbDoneCallback: ?*const fn (cookie: u64, result: u64) u64 = null;
 
 // int3 CDD callback — registered by main64. Вызывается из handleException
 // для вектора 3 (#BP) ПЕРВЫМ: если адрес принадлежит стабу win32_stubs,

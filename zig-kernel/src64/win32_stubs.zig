@@ -71,6 +71,10 @@ pub const NativeKind = enum {
     memmove,
     /// strlen(s=RCX) → скан до NUL, ретурн длина
     strlen,
+    /// strcmp(s1=RCX, s2=RDX) → лексикографическая разница (int)
+    strcmp,
+    /// strncmp(s1=RCX, s2=RDX, n=R8) → разница до n байт (int)
+    strncmp,
 };
 
 pub const StubEntry = struct {
@@ -89,6 +93,11 @@ pub const TrapMode = enum {
     int3, // ядро: генерировать trap-стабы (#BP → CDD-лог)
     record, // тесты: генерировать record-стабы (фиксация вызова)
 };
+
+/// Номер syscall'а завершения Win64-колбэка (hal.zig: case 7).
+pub const CB_SYSCALL_DONE: u64 = 7;
+/// Cookie моста колбэка (запекается в trampoline, проверяется callbackDone).
+pub const CALLBACK_COOKIE: u64 = 0x504F_4C45_4342_3121; // "POLECB1!"
 
 pub const Dispatcher = struct {
     entries: []StubEntry = &[_]StubEntry{},
@@ -353,6 +362,111 @@ pub const Dispatcher = struct {
                 out[12] = 0xF5;
                 out[13] = 0xC3; // .done: ret
             },
+            // strcmp(s1=RCX, s2=RDX) → EAX = (int)(s1[i] - s2[i]) на первом
+            // различии (или 0 при равенстве). ⚠ v0.12-урок: trap-стаб отвечал
+            // rax=0 = «строки РАВНЫ» — ЛОЖЬ заворачивала curl в дикую ветку
+            // (module-walk → exit(1)). strcmp обязан говорить ПРАВДУ.
+            //   xor eax,eax
+            //   .loop: movzx r8d,[rcx+rax]; movzx r9d,[rdx+rax];
+            //           cmp r8d,r9d; jne .done; test r8d,r8d; je .done;
+            //           inc rax; jmp .loop
+            //   .done:  mov eax,r8d; sub eax,r9d; ret
+            .strcmp => {
+                out[0] = 0x31; // xor eax, eax
+                out[1] = 0xC0;
+                out[2] = 0x44; // movzx r8d, byte [rcx + rax]
+                out[3] = 0x0F;
+                out[4] = 0xB6;
+                out[5] = 0x04;
+                out[6] = 0x01;
+                out[7] = 0x44; // movzx r9d, byte [rdx + rax]
+                out[8] = 0x0F;
+                out[9] = 0xB6;
+                out[10] = 0x0C; // ⚠ modrm reg=001 (+REX.R) → r9d! (04 = r8d — v0.12-уловка objdump)
+                out[11] = 0x02;
+                out[12] = 0x45; // cmp r8d, r9d
+                out[13] = 0x39;
+                out[14] = 0xC8;
+                out[15] = 0x75; // jne .done (+10 → 27)
+                out[16] = 0x0A;
+                out[17] = 0x45; // test r8d, r8d
+                out[18] = 0x85;
+                out[19] = 0xC0;
+                out[20] = 0x74; // je .done (+5 → 27)
+                out[21] = 0x05;
+                out[22] = 0x48; // inc rax
+                out[23] = 0xFF;
+                out[24] = 0xC0;
+                out[25] = 0xEB; // jmp .loop (-25 → 2)
+                out[26] = 0xE7;
+                out[27] = 0x44; // .done: mov eax, r8d
+                out[28] = 0x89;
+                out[29] = 0xC0;
+                out[30] = 0x44; // sub eax, r9d
+                out[31] = 0x29;
+                out[32] = 0xC8;
+                out[33] = 0xC3; // ret — 34Б (слот 48Б)
+            },
+            // strncmp(s1=RCX, s2=RDX, n=R8) → EAX — семантика C99:
+            //   while(n && *s1 && *s1==*s2) {s1++;s2++;n--;}
+            //   return n ? (int)((uchar)*s1 - (uchar)*s2) : 0;
+            // ⚠ v0.12-урок №2 (как strcmp): trap-стаб отвечал rax=0 =
+            // «строки РАВНЫ» → curl'овский `!strncmp("-", url, 1)` считал
+            // ЛЮБОЙ аргумент опцией («option http://…: is unknown»).
+            // strncmp обязан говорить ПРАВДУ.
+            //   xor eax,eax; test r8,r8; jz .ret0;
+            //   .loop: movzx r9d,[rcx+rax]; movzx r10d,[rdx+rax];
+            //           cmp r9d,r10d; jne .diff; test r9d,r9d; je .diff;
+            //           inc rax; dec r8; jnz .loop;
+            //   .ret0: xor eax,eax; ret;        ; ⚠ rax = ИНДЕКС → ОБНУЛИТЬ
+            //   .diff: mov eax,r9d; sub eax,r10d; ret
+            .strncmp => {
+                out[0] = 0x31; // xor eax, eax
+                out[1] = 0xC0;
+                out[2] = 0x4D; // test r8, r8 — REX.R+B (r8 в reg и rm)
+                out[3] = 0x85;
+                out[4] = 0xC0;
+                out[5] = 0x74; // jz .ret0 (+28 → 35)
+                out[6] = 0x1C;
+                out[7] = 0x44; // movzx r9d, byte [rcx + rax]
+                out[8] = 0x0F;
+                out[9] = 0xB6;
+                out[10] = 0x0C;
+                out[11] = 0x01;
+                out[12] = 0x44; // movzx r10d, byte [rdx + rax]
+                out[13] = 0x0F;
+                out[14] = 0xB6;
+                out[15] = 0x14;
+                out[16] = 0x02;
+                out[17] = 0x4D; // cmp r9d, r10d — REX.R+B
+                out[18] = 0x39;
+                out[19] = 0xCA;
+                out[20] = 0x75; // jne .diff (+16 → 38)
+                out[21] = 0x10;
+                out[22] = 0x45; // test r9d, r9d — REX.R+B
+                out[23] = 0x85;
+                out[24] = 0xC9;
+                out[25] = 0x74; // je .diff (+11 → 38) — s1 кончился
+                out[26] = 0x0B;
+                out[27] = 0x48; // inc rax
+                out[28] = 0xFF;
+                out[29] = 0xC0;
+                out[30] = 0x49; // dec r8 — REX.W+B
+                out[31] = 0xFF;
+                out[32] = 0xC8;
+                out[33] = 0x75; // jnz .loop (-28 → 7)
+                out[34] = 0xE4;
+                out[35] = 0x31; // .ret0: xor eax, eax — rax был ИНДЕКСОМ!
+                out[36] = 0xC0;
+                out[37] = 0xC3; // ret (eax=0)
+                out[38] = 0x44; // .diff: mov eax, r9d
+                out[39] = 0x89;
+                out[40] = 0xC8;
+                out[41] = 0x44; // sub eax, r10d
+                out[42] = 0x29;
+                out[43] = 0xD0;
+                out[44] = 0xC3; // ret — 45Б (слот 48Б)
+            },
         }
     }
 
@@ -456,6 +570,253 @@ pub const Dispatcher = struct {
             }
         }
         return null;
+    }
+
+    /// v0.12.0: добавить запись ВНЕ PE-импортов образа (функции, которые
+    /// приложение получает НЕ через IAT, а через возвращённые нами таблицы —
+    /// SSPI SecurityFunctionTable от InitSecurityInterfaceA). Код пишется в
+    /// слоте [count], entry_id = count, счётчик растёт. kind=.impl →
+    /// syscall-трамплин (диспетчеризуется ядром); kind=.trap → int3-CDD-лог.
+    /// Буфер кода должен быть зарезервирован с запасом (main64).
+    pub fn addExtraStub(self: *Dispatcher, dll: []const u8, func_name: []const u8, kind: StubKind) ?*StubEntry {
+        if (self.code == null) return null;
+        const code_buf = self.code.?;
+        if (self.count >= self.entries.len) return null;
+        const idx = self.count;
+        const code_off = idx * STUB_CODE_SIZE;
+        if (code_off + STUB_CODE_SIZE > code_buf.len) return null;
+
+        const out = code_buf[code_off..][0..STUB_CODE_SIZE];
+        switch (kind) {
+            .trap => writeTrapStub(out),
+            .impl => writeImplStub(out, idx),
+            .record => writeRecordStub(out, idx, @intFromPtr(&stubCommon)),
+            .native => return null, // native-стабы задаются kind-машиной генерации
+        }
+        self.entries[idx] = .{
+            .dll = dll,
+            .func = .{ .by_name = func_name },
+            .kind = kind,
+            .stub_addr = self.stubAddr(code_off),
+            .iat_rva = 0, // не привязан к IAT
+            .slot_index = 0,
+            .code_off = code_off,
+        };
+        self.count += 1;
+        return &self.entries[idx];
+    }
+
+    // ─── v0.12.0: мост запуска Win64-колбэка (InitOnceExecuteOnce) ──────────
+    //
+    // Проблема: InitOnceExecuteOnce(InitOnce, InitFn, Parameter, Context)
+    // требует ИСПОЛНИТЬ InitFn — код Ring 3 c Win64-ABI (RCX/RDX/R8). Из
+    // syscall-обработчика (CPL=0) прямой call возможен, но колбэк, вызвав
+    // любой импорт-трамплин, сделает syscall ИЗ CPL=0 → SYSRET всегда
+    // возвращает Ring 3 → ядро-код на CPL=3 → #PF-катастрофа.
+    //
+    // Решение — мост из трёх артефактов в user-VA (слоты после всех стабов):
+    //   mailbox (32Б): {init_once, parameter, context, target} — ядро пишет
+    //                  перед запуском (identity-указатель), launcher читает.
+    //   launcher:      вход через sysretq (RCX=launcher, RSP=16-aligned):
+    //                  mov rcx,[mailbox+0]; mov rdx,[mailbox+8]; mov r8,
+    //                  [mailbox+16]; push trampoline; jmp [mailbox+24]
+    //                  → колбэк получает Win64-аргументы, его ret уходит на
+    //                  trampoline (выравнивание стека — как настоящий call).
+    //   trampoline:    mov rsi,rax (результат); movabs rdi,cookie;
+    //                  movabs rax,SYSCALL_CB_DONE; syscall — ядро по cookie
+    //                  восстанавливает СОХРАНЁННЫЙ syscall-кадр (см.
+    //                  win32_api.CallbackState) и возвращает управление в
+    //                  точку ПОСЛЕ исходного syscall'а с RAX=TRUE. Если ядро
+    //                  не смогло — trampoline крутится в jmp $ (не падает).
+    //
+    // done_target: адрес, пушимый launcher'ом как return-адрес колбэка.
+    // null → собственный trampoline (путь ядра). Нативные тесты подменяют
+    // его своим стабом, чтобы исполнить весь мост без реального syscall'а.
+
+    pub const CallbackBridge = struct {
+        launcher_va: u64, // user-VA (sysretq RCX)
+        trampoline_va: u64, // user-VA (адрес возврата колбэка)
+        mailbox_va: u64, // user-VA (32Б: ядро пишет, launcher читает)
+        mailbox_off: usize, // смещение в Dispatcher.code (identity-запись)
+    };
+
+    /// Сгенерировать мост в слотах [count..count+3). ВАЖНО: вызывать ПОСЛЕ
+    /// всех addExtraStub (слоты должны остаться последними в регионе).
+    pub fn buildCallbackBridge(self: *Dispatcher, done_target: ?u64, syscall_num: u64, cookie: u64) ?CallbackBridge {
+        if (self.code == null) return null;
+        const code_buf = self.code.?;
+        if (self.count + 3 > self.entries.len) return null;
+        const base_off = self.count * STUB_CODE_SIZE;
+        if (base_off + 3 * STUB_CODE_SIZE > code_buf.len) return null;
+
+        const launcher_off = base_off;
+        const trampoline_off = base_off + STUB_CODE_SIZE;
+        const mailbox_off = base_off + 2 * STUB_CODE_SIZE;
+
+        // mailbox: нули (ядро заполнит перед каждым запуском)
+        @memset(code_buf[mailbox_off..][0..STUB_CODE_SIZE], 0);
+
+        const launcher_va = self.stubAddr(launcher_off);
+        const trampoline_va = self.stubAddr(trampoline_off);
+        const mailbox_va = self.stubAddr(mailbox_off);
+        // Кому колбэк вернётся: свой trampoline (ядро) или тест-стаб.
+        const ret_target = done_target orelse trampoline_va;
+
+        // ── launcher (42Б в слоте 48) ──
+        //   48 8B 0D <rel32>   mov rcx, [rip+d]   ; init_once
+        //   48 8B 15 <rel32>   mov rdx, [rip+d]   ; parameter
+        //   4C 8B 05 <rel32>   mov r8,  [rip+d]   ; context
+        //   48 B8 <imm64>      movabs rax, ret_target
+        //   50                 push rax            ; return-адрес колбэка
+        //   4C 8B 1D <rel32>   mov r11, [rip+d]   ; target (InitFn)
+        //   41 FF E3           jmp r11             ; хвостовой уход в колбэк
+        // Вход через sysretq: RSP 16-aligned → push → RSP%16==8 на входе
+        // колбэка — в точности Win64-контракт настоящего call.
+        const L = code_buf[launcher_off..][0..STUB_CODE_SIZE];
+        @memset(L, 0);
+        L[0] = 0x48;
+        L[1] = 0x8B;
+        L[2] = 0x0D;
+        writeRel32(L[3..7], mailbox_off, launcher_off + 7); // rcx ← [mb+0]
+        L[7] = 0x48;
+        L[8] = 0x8B;
+        L[9] = 0x15;
+        writeRel32(L[10..14], mailbox_off + 8, launcher_off + 14); // rdx ← [mb+8]
+        L[14] = 0x4C;
+        L[15] = 0x8B;
+        L[16] = 0x05;
+        writeRel32(L[17..21], mailbox_off + 16, launcher_off + 21); // r8 ← [mb+16]
+        L[21] = 0x48;
+        L[22] = 0xB8; // movabs rax, ret_target
+        std.mem.writeInt(u64, L[23..31], ret_target, .little);
+        L[31] = 0x50; // push rax
+        L[32] = 0x4C;
+        L[33] = 0x8B;
+        L[34] = 0x1D;
+        writeRel32(L[35..39], mailbox_off + 24, launcher_off + 39); // r11 ← [mb+24]
+        L[39] = 0x41;
+        L[40] = 0xFF;
+        L[41] = 0xE3; // jmp r11
+
+        // ── trampoline (27Б) ──
+        //   48 89 C6            mov rsi, rax       ; SysV arg2 = результат
+        //   48 BF <cookie>      movabs rdi, cookie ; SysV arg1
+        //   48 B8 <num>         movabs rax, syscall_num
+        //   0F 05               syscall
+        //   EB FE               jmp $ (ядро не вернулось — не падаем)
+        const T = code_buf[trampoline_off..][0..STUB_CODE_SIZE];
+        @memset(T, 0);
+        T[0] = 0x48;
+        T[1] = 0x89;
+        T[2] = 0xC6; // mov rsi, rax
+        T[3] = 0x48;
+        T[4] = 0xBF; // movabs rdi, cookie
+        std.mem.writeInt(u64, T[5..13], cookie, .little);
+        T[13] = 0x48;
+        T[14] = 0xB8; // movabs rax, num
+        std.mem.writeInt(u64, T[15..23], syscall_num, .little);
+        T[23] = 0x0F;
+        T[24] = 0x05; // syscall
+        T[25] = 0xEB;
+        T[26] = 0xFE; // jmp $
+
+        return .{
+            .launcher_va = launcher_va,
+            .trampoline_va = trampoline_va,
+            .mailbox_va = mailbox_va,
+            .mailbox_off = mailbox_off,
+        };
+    }
+
+    /// rel32 для rip-адресации: значение по адресу target_off читается
+    /// инструкцией, ЗАКАНЧИВАЮЩЕЙСЯ на end_off.
+    fn writeRel32(out: []u8, target_off: usize, end_off: usize) void {
+        const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(end_off)));
+        std.mem.writeInt(i32, out[0..4], rel, .little);
+    }
+
+    // ─── v0.12.0 (CDD №3, fix-волна): native bsearch (127Б, 3 слота) ────
+
+    /// bsearch(key=RCX, base=RDX, nmemb=R8, size=R9, compar=[rsp+8]):
+    /// классический бинарный поиск, вызов компаратора ПО Win64-контракту
+    /// (32Б shadow + выравнивание 16 на call). РАБОТАЕТ В RING 3 — компаратор
+    /// (код приложения, напр. alias-compare curl) вызывается с привилегиями
+    /// ПРИЛОЖЕНИЯ: любые стабы внутри него (strcmp-native, syscall-трамплины)
+    /// полностью легальны. ⚠ trap-стаб возвращал NULL = «не найдено» →
+    /// getparameter не находил ДАЖЕ «--url» (каждый голый URL — это опция
+    /// --url!) → «curl: option http://…: is unknown». БД машинного кода ниже
+    /// проверена objdump-дизассемблированием.
+    ///
+    /// Код:
+    ///   push r12; push r13; push r14; push r15; push rbx; push rbp;
+    ///   sub rsp,0x28                     ; shadow 32 + выравнивание
+    ///   rbx=key, rbp=base, r12=two(nmemb), r13=size, r14=[rsp+0x60]=compar
+    ///   test r12,r12; jz .nf
+    /// .loop:
+    ///   rax=r12; shr rax,1; r15=half; rcx=half; imul rcx,r13;
+    ///   lea rdx,[rbp+rcx]  ; p
+    ///   mov rcx,rbx; call r14            ; c=compar(key,p)
+    ///   test eax,eax; jz .found; js .lower
+    ///   ; c>0: base=p+size; two-=half+1; jz .nf; jmp .loop
+    /// .lower: r12=half; jmp .loop
+    /// .found: rax=rdx → epilogue
+    /// .nf:    rax=0     → epilogue
+    fn writeNativeBsearch(out: []u8) void {
+        @memset(out, 0);
+        // Сгенерировано GNU as, проверено objdump (142Б в 3 слотах 144Б).
+        // ⚠ v0.12-урок №3 (ГЛАВНЫЙ): p НЕ ХРАНИТЬ В VOLATILE-РЕГИСТРЕ!
+        //   Ранняя версия держала p в RDX: после `call r14` компаратор/strcmp
+        //   ЗАТРАПЛИВАЛИ RDX (Win64 ABI: RDX volatile) → путь c>0 писал в
+        //   base МУСОР (mov rbp,rdx), .found возвращал МУСОР. Теперь p
+        //   ПЕРЕСЧИТЫВАЕТСЯ из callee-saved: base(rbp) + half(r15)*size(r13).
+        // ⚠ v0.12-урок №3b: test two/two КАЖДУЮ итерацию (while-семантика
+        //   glibc): .lower (two=half) может обнулить two при half=0.
+        // ⚠ конвенция Win64: arg5 у callee — [entry_rsp+0x28] (ПОСЛЕ 32Б
+        //   shadow; подтверждено дизассемблированием вызова MultiByteToWideChar
+        //   в curl: arg5 кладётся в 0x20(%rsp) у CALLER'а) → [rsp+0x80].
+        const code = [142]u8{
+            0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+            0x53, 0x55, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x89,
+            0xCB, 0x48, 0x89, 0xD5, 0x4D, 0x89, 0xC4, 0x4D,
+            0x89, 0xCD, 0x4C, 0x8B, 0xB4, 0x24, 0x80, 0x00,
+            0x00, 0x00, 0x4D, 0x85, 0xE4, 0x74, 0x56, 0x4C,
+            0x89, 0xE0, 0x48, 0xD1, 0xE8, 0x49, 0x89, 0xC7,
+            0x48, 0x89, 0xC1, 0x49, 0x0F, 0xAF, 0xCD, 0x48,
+            0x8D, 0x54, 0x0D, 0x00, 0x48, 0x89, 0xD9, 0x41,
+            0xFF, 0xD6, 0x85, 0xC0, 0x74, 0x1C, 0x78, 0x15,
+            0x49, 0x8D, 0x47, 0x01, 0x49, 0x0F, 0xAF, 0xC5,
+            0x48, 0x01, 0xC5, 0x4D, 0x29, 0xFC, 0x49, 0xFF,
+            0xCC, 0x74, 0x22, 0xEB, 0xC5, 0x4D, 0x89, 0xFC,
+            0xEB, 0xC0, 0x4C, 0x89, 0xF8, 0x49, 0x0F, 0xAF,
+            0xC5, 0x48, 0x8D, 0x44, 0x05, 0x00, 0x48, 0x83,
+            0xC4, 0x28, 0x5D, 0x5B, 0x41, 0x5F, 0x41, 0x5E,
+            0x41, 0x5D, 0x41, 0x5C, 0xC3, 0x31, 0xC0, 0x48,
+            0x83, 0xC4, 0x28, 0x5D, 0x5B, 0x41, 0x5F, 0x41,
+            0x5E, 0x41, 0x5D, 0x41, 0x5C, 0xC3,
+        };
+        @memcpy(out[0..code.len], &code);
+    }
+
+    /// Пометить dll!func как native-В bsearch (код в слотах [count+3..count+6),
+    /// ПОСЛЕ моста). Возврат — нашли ли запись.
+    pub fn implementNativeBsearch(self: *Dispatcher, dll_needle: []const u8, func_needle: []const u8) bool {
+        if (self.code == null) return false;
+        const code_buf = self.code.?;
+        const off = (self.count + 3) * STUB_CODE_SIZE; // после launcher/tramp/mailbox
+        if (off + 3 * STUB_CODE_SIZE > code_buf.len) return false;
+        for (self.entries[0..self.count]) |*e| {
+            if (!std.ascii.eqlIgnoreCase(e.dll, dll_needle)) continue;
+            switch (e.func) {
+                .by_name => |n| if (std.mem.eql(u8, n, func_needle)) {
+                    writeNativeBsearch(code_buf[off..][0..3 * STUB_CODE_SIZE]);
+                    e.kind = .native;
+                    e.stub_addr = self.stubAddr(off);
+                    return true;
+                },
+                .by_ordinal => {},
+            }
+        }
+        return false;
     }
 
     /// Патчит IAT скопированного образа: каждый слот получает адрес стаба.
@@ -841,6 +1202,31 @@ fn win64Call1(fn_addr: u64, a1: u64) u64 {
     );
 }
 
+/// Вызов Win64-функции с 5 АРГУМЕНТАМИ: arg5 — на стеке вызываемого
+/// ([rsp+0x20] у caller'а → [entry_rsp+0x28] у callee, ПОСЛЕ 32Б shadow —
+/// конвенция Microsoft x64, подтверждена дизассемблированием curl).
+/// Динамическое выравнивание RSP до 16 (and $-16) — как у настоящего ABI.
+fn win64Call5(fn_addr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) u64 {
+    return asm volatile (
+        \\push %%rbp
+        \\mov  %%rsp, %%rbp
+        \\and  $-16, %%rsp
+        \\sub  $0x28, %%rsp
+        \\movq %[a5], 0x20(%%rsp)
+        \\callq *%[f]
+        \\mov  %%rbp, %%rsp
+        \\pop  %%rbp
+        : [ret] "={rax}" (-> u64),
+        : [f] "{r11}" (fn_addr),
+          [a1] "{rcx}" (a1),
+          [a2] "{rdx}" (a2),
+          [a3] "{r8}" (a3),
+          [a4] "{r9}" (a4),
+          [a5] "r" (a5),
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "rax", "rsi", "rdi", "memory"
+    );
+}
+
 test "native-стабы: memset/memcpy/memmove/strlen на реальном curl.exe-реестре" {
     if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
 
@@ -868,12 +1254,14 @@ test "native-стабы: memset/memcpy/memmove/strlen на реальном curl
     try testing.expectEqual(counts.functions, generated);
 
     // Реальные DLL-раскладки curl.exe (проверено парсером PE):
-    //   memset/strlen → api-ms-win-crt-string; memcpy/memmove → api-ms-win-crt-private
+    //   memset/strlen/strcmp → api-ms-win-crt-string; memcpy/memmove → api-ms-win-crt-private
     const ok1 = disp.implementNative("api-ms-win-crt-string-l1-1-0.dll", "memset", .memset);
     const ok2 = disp.implementNative("api-ms-win-crt-private-l1-1-0.dll", "memcpy", .memcpy);
     const ok3 = disp.implementNative("api-ms-win-crt-private-l1-1-0.dll", "memmove", .memmove);
     const ok4 = disp.implementNative("api-ms-win-crt-string-l1-1-0.dll", "strlen", .strlen);
-    try testing.expect(ok1 and ok2 and ok3 and ok4);
+    const ok5 = disp.implementNative("api-ms-win-crt-string-l1-1-0.dll", "strcmp", .strcmp);
+    const ok6 = disp.implementNative("api-ms-win-crt-string-l1-1-0.dll", "strncmp", .strncmp);
+    try testing.expect(ok1 and ok2 and ok3 and ok4 and ok5 and ok6);
 
     const memset_addr = (disp.findByNameAnyDll("memset") orelse return error.NoMemset).stub_addr;
     const memcpy_addr = (disp.findByNameAnyDll("memcpy") orelse return error.NoMemcpy).stub_addr;
@@ -929,9 +1317,212 @@ test "native-стабы: memset/memcpy/memmove/strlen на реальном curl
     try testing.expectEqual(@as(u64, s1.len), win64Call1(strlen_addr, @intFromPtr(&zbuf)));
     try testing.expectEqual(@as(u64, 0), win64Call1(strlen_addr, @intFromPtr(&zbuf[s1.len])));
 
+    // ── strcmp (v0.12.0): ПРАВДА вместо trap-нуля («равны») ──
+    const strcmp_addr = (disp.findByNameAnyDll("strcmp") orelse return error.NoStrcmp).stub_addr;
+    // equal → 0
+    var sbuf1: [32]u8 = undefined;
+    var sbuf2: [32]u8 = undefined;
+    @memcpy(sbuf1[0..8], "curl.exe");
+    @memcpy(sbuf2[0..8], "curl.exe");
+    sbuf1[8] = 0;
+    sbuf2[8] = 0;
+    try testing.expectEqual(@as(u64, 0), win64Call3(strcmp_addr, @intFromPtr(&sbuf1), @intFromPtr(&sbuf2), 0));
+    // s1 < s2 → отрицательный (мл. слово; 'a'-'b' = -1)
+    @memcpy(sbuf1[0..3], "abc");
+    @memcpy(sbuf2[0..3], "abd");
+    sbuf1[3] = 0;
+    sbuf2[3] = 0;
+    // strcmp возвращает int (EAX, знак в 32 битах): 'c'-'d' = -1
+    const lt = win64Call3(strcmp_addr, @intFromPtr(&sbuf1), @intFromPtr(&sbuf2), 0);
+    try testing.expectEqual(@as(i32, -1), @as(i32, @bitCast(@as(u32, @truncate(lt)))));
+    // s1 > s2 → положительный ('d'-'c' = 1)
+    const gt = win64Call3(strcmp_addr, @intFromPtr(&sbuf2), @intFromPtr(&sbuf1), 0);
+    try testing.expectEqual(@as(i32, 1), @as(i32, @bitCast(@as(u32, @truncate(gt)))));
+    // префикс длиннее: "ab" vs "abc" → NUL-'c' < 0
+    @memcpy(sbuf1[0..2], "ab");
+    sbuf1[2] = 0;
+    const lt2 = win64Call3(strcmp_addr, @intFromPtr(&sbuf1), @intFromPtr(&sbuf2), 0);
+    try testing.expect(@as(i32, @bitCast(@as(u32, @truncate(lt2)))) < 0);
+
+    // ── strncmp (v0.12-fix №2): РАЗЛИЧИЕ НА ПЕРВОМ БАЙТЕ — а не «равны» ──
+    // Драйвер бага: !strncmp("-", "http://example.com", 1) в trap-мире
+    // было TRUE → URL классифицирован как ОПЦИЯ. Ядровая ПРАВДА: '-' vs 'h'.
+    const strncmp_addr = (disp.findByNameAnyDll("strncmp") orelse return error.NoStrncmp).stub_addr;
+    var dash: [2]u8 = .{ '-', 0 };
+    var url: [32]u8 = undefined;
+    const istr = "http://example.com";
+    @memcpy(url[0..istr.len], istr);
+    url[istr.len] = 0;
+    // n=1: '-'(0x2D) vs 'h'(0x68) → отрицательная разница ≠ 0
+    const dash_vs_url = win64Call3(strncmp_addr, @intFromPtr(&dash), @intFromPtr(&url), 1);
+    const dvu: i32 = @bitCast(@as(u32, @truncate(dash_vs_url)));
+    try testing.expect(dvu != 0 and dvu < 0); // '-' < 'h'
+    // n=0 → 0 (ничего не сравнивалось)
+    try testing.expectEqual(@as(u64, 0), win64Call3(strncmp_addr, @intFromPtr(&dash), @intFromPtr(&url), 0));
+    // равные префиксы до n → 0
+    try testing.expectEqual(@as(u64, 0), win64Call3(strncmp_addr, @intFromPtr(&url), @intFromPtr(&url), istr.len));
+    // n за пределами равенства: "http" vs "htts" → 'p'-'s' < 0
+    var url2: [32]u8 = undefined;
+    @memcpy(url2[0..istr.len], istr);
+    url2[3] = 's'; // https…
+    url2[istr.len] = 0;
+    const h_vs_s = win64Call3(strncmp_addr, @intFromPtr(&url), @intFromPtr(&url2), istr.len);
+    const hvs: i32 = @bitCast(@as(u32, @truncate(h_vs_s)));
+    try testing.expect(hvs != 0 and hvs < 0); // 'p' < 's'
+    // s1 короче внутри n: "http" vs "httpx" в n=10 → NUL-'x' < 0
+    var short: [8]u8 = undefined;
+    @memcpy(short[0..4], "http");
+    short[4] = 0;
+    var longr: [8]u8 = undefined;
+    @memcpy(longr[0..5], "httpx");
+    longr[5] = 0;
+    const sh = win64Call3(strncmp_addr, @intFromPtr(&short), @intFromPtr(&longr), 10);
+    try testing.expect(@as(i32, @bitCast(@as(u32, @truncate(sh)))) < 0);
+    // strncmp-стаб: ret на смещениях 37 и 44 (45Б код в слоте 48)
+    const noff = (disp.findByNameAnyDll("strncmp").?).code_off;
+    try testing.expectEqual(@as(u8, 0xC3), code_mem[noff + 37]);
+    try testing.expectEqual(@as(u8, 0xC3), code_mem[noff + 44]);
+
     // memmove-стаб: ret на смещении 40 (41Б код в слоте 48)
     const moff = (disp.findByNameAnyDll("memmove").?).code_off;
     try testing.expectEqual(@as(u8, 0xC3), code_mem[moff + 40]);
+}
+
+test "native-bsearch: бинарный поиск с КОМПАРАТОРОМ приложения (Ring 3)" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+    // Драйвер бага v0.12: curl 8.x подаёт каждый голый URL как опцию «--url»;
+    // поиск имени в alias-таблице — bsearch'ом; trap-стаб отвечал NULL =
+    // «не найдено» → «curl: option http://…: is unknown». Native-стаб
+    // вызывает КОД ПРИЛОЖЕНИЯ (компаратор) с привилегиями Ring 3.
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try Pe.parse(data);
+    const counts = image.countImports();
+    // запас: мост 3 + bsearch 3 + компаратор 1 + 1
+    const entries = try testing.allocator.alloc(StubEntry, counts.functions);
+    defer testing.allocator.free(entries);
+    // RWX-mmap под код (как в остальных native-тестах; allocator-хип = NX):
+    // стабы + мост 3 + bsearch 3 + компаратор 1 + выравнивание страницы
+    const code_len = (counts.functions + 10) * STUB_CODE_SIZE + 4096;
+    const code_buf = try std.posix.mmap(
+        null,
+        code_len,
+        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(code_buf);
+
+    var disp = Dispatcher.init(entries, code_buf[0..code_len], .int3);
+    // logical_base НЕ ставим: stub_addr = физ. адрес в RWX-mmap (исполняемый
+    // в тест-процессе).
+    _ = try disp.generateFor(&image);
+
+    try testing.expect(disp.implementNativeBsearch("api-ms-win-crt-utility-l1-1-0.dll", "bsearch"));
+    const bs = disp.findByNameAnyDll("bsearch") orelse return error.NoBsearch;
+    try testing.expectEqual(StubKind.native, bs.kind);
+
+    // компаратор: int cmp(const void* a, const void* b) → *(u32*)a - *(u32*)b
+    //   8B 01    mov eax, [rcx]
+    //   2B 02    sub eax, [rdx]
+    //   C3       ret
+    const cmp_off = (disp.count + 6) * STUB_CODE_SIZE;
+    const cmp_code = [_]u8{ 0x8B, 0x01, 0x2B, 0x02, 0xC3 };
+    @memcpy(code_buf[cmp_off..][0..cmp_code.len], &cmp_code);
+    const cmp_va = disp.stubAddr(cmp_off);
+
+    // таблица 6×8Б (ключ u32@0), сортирована
+    var table = [_]u64{ 10, 20, 30, 40, 50, 60 };
+    const tbase: u64 = @intFromPtr(&table);
+
+    var key: u32 = 30;
+    const r30 = win64Call5(bs.stub_addr, @intFromPtr(&key), tbase, 6, 8, cmp_va);
+    try testing.expectEqual(tbase + 2 * 8, r30); // найден элемент №2
+
+    key = 10;
+    try testing.expectEqual(tbase, win64Call5(bs.stub_addr, @intFromPtr(&key), tbase, 6, 8, cmp_va)); // первый
+    key = 60;
+    try testing.expectEqual(tbase + 5 * 8, win64Call5(bs.stub_addr, @intFromPtr(&key), tbase, 6, 8, cmp_va)); // последний
+    key = 35;
+    try testing.expectEqual(@as(u64, 0), win64Call5(bs.stub_addr, @intFromPtr(&key), tbase, 6, 8, cmp_va)); // между — NULL
+    key = 5;
+    try testing.expectEqual(@as(u64, 0), win64Call5(bs.stub_addr, @intFromPtr(&key), tbase, 6, 8, cmp_va)); // ниже — NULL
+    key = 70;
+    try testing.expectEqual(@as(u64, 0), win64Call5(bs.stub_addr, @intFromPtr(&key), tbase, 6, 8, cmp_va)); // выше — NULL
+    // пустая таблица → NULL
+    key = 30;
+    try testing.expectEqual(@as(u64, 0), win64Call5(bs.stub_addr, @intFromPtr(&key), tbase, 0, 8, cmp_va));
+    // 1 элемент: попадание и промах
+    var one = [_]u64{42};
+    key = 42;
+    try testing.expectEqual(@intFromPtr(&one), win64Call5(bs.stub_addr, @intFromPtr(&key), @intFromPtr(&one), 1, 8, cmp_va));
+    key = 41;
+    try testing.expectEqual(@as(u64, 0), win64Call5(bs.stub_addr, @intFromPtr(&key), @intFromPtr(&one), 1, 8, cmp_va));
+
+    // рет-байты стаба: ret на смещениях 0x7C и 0x8D (142Б код в 3 слотах)
+    // ⚠ bs.code_off — слот ТРАП-стаба (IAT-позиция); native-код живёт
+    // в (count+3)*STUB_CODE_SIZE — читаем его через смещение от буфера.
+    const native_off = (disp.count + 3) * STUB_CODE_SIZE;
+    try testing.expectEqual(@as(u8, 0xC3), code_buf[native_off + 0x7C]);
+    try testing.expectEqual(@as(u8, 0xC3), code_buf[native_off + 0x8D]);
+    try testing.expectEqual(bs.stub_addr, @intFromPtr(code_buf.ptr) + native_off);
+
+    // ── РЕГРЕССИЯ v0.12 «p в VOLATILE»: компаратор curl-стиля ЗАТРАПЛИВАЕТ
+    // RDX (mov rdx,[rdx]; jmp strcmp) — старый стаб держал p в RDX → путь
+    // c>0 (mov rbp,rdx) и .found возвращали МУСОР. Таблица {char* name},
+    // строки NUL-терминированы — как alias-таблица curl.
+    {
+        // strcmp-копия (байты стаба слота 78) в слот [count+7]
+        const sc_off = (disp.count + 7) * STUB_CODE_SIZE;
+        const sc_code = [_]u8{
+            0x31, 0xC0, 0x44, 0x0F, 0xB6, 0x04, 0x01, 0x44, 0x0F, 0xB6, 0x0C, 0x02,
+            0x45, 0x39, 0xC8, 0x75, 0x0A, 0x45, 0x85, 0xC0, 0x74, 0x05,
+            0x48, 0xFF, 0xC0, 0xEB, 0xE7,
+            0x44, 0x89, 0xC0, 0x44, 0x29, 0xC8, 0xC3,
+        };
+        @memcpy(code_buf[sc_off..][0..sc_code.len], &sc_code);
+        const sc_va = disp.stubAddr(sc_off);
+
+        // компаратор: mov rcx,[rcx]; mov rdx,[rdx]; movabs r11,sc_va; jmp r11
+        const cc_off = (disp.count + 8) * STUB_CODE_SIZE;
+        var ci: usize = 0;
+        const CC = code_buf[cc_off..];
+        CC[ci] = 0x48; CC[ci+1] = 0x8B; CC[ci+2] = 0x09; ci += 3; // mov rcx,[rcx]
+        CC[ci] = 0x48; CC[ci+1] = 0x8B; CC[ci+2] = 0x12; ci += 3; // mov rdx,[rdx]
+        CC[ci] = 0x49; CC[ci+1] = 0xBB;                            // movabs r11, sc_va
+        std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(CC.ptr + ci + 2)), sc_va, .little); ci += 10;
+        CC[ci] = 0x41; CC[ci+1] = 0xFF; CC[ci+2] = 0xE3;           // jmp r11
+        const cc_va = disp.stubAddr(cc_off);
+
+        // строки + таблица {char*}×8 — алфавитные, NUL в конце
+        var names: [8][16]u8 = undefined;
+        const strs = [_][]const u8{ "alpn", "anyauth", "append", "ssl", "url", "user", "verbose", "xattr" };
+        var tbl: [8][2]u64 = undefined;
+        for (strs, 0..) |s, k| {
+            @memcpy(names[k][0..s.len], s);
+            names[k][s.len] = 0;
+            tbl[k][0] = @intFromPtr(&names[k]);
+            tbl[k][1] = 0x1000 + k;
+        }
+        // ключ "ssl" (elem[3]): 3 итерации (url→lower, append→c>0, ssl→found)
+        var keybuf: [8]u8 = undefined;
+        @memcpy(keybuf[0..3], "ssl");
+        keybuf[3] = 0;
+        var key2: [1]u64 = .{@intFromPtr(&keybuf)};
+        const found = win64Call5(bs.stub_addr, @intFromPtr(&key2), @intFromPtr(&tbl), 8, 16, cc_va);
+        try testing.expectEqual(@intFromPtr(&tbl[3]), found);
+
+        // ключ "zzz": все c>0 → .nf → NULL
+        @memcpy(keybuf[0..3], "zzz");
+        keybuf[3] = 0;
+        try testing.expectEqual(@as(u64, 0), win64Call5(bs.stub_addr, @intFromPtr(&key2), @intFromPtr(&tbl), 8, 16, cc_va));
+
+        // ключ "alpn" (elem[0]): .lower-путь
+        @memcpy(keybuf[0..4], "alpn");
+        keybuf[4] = 0;
+        try testing.expectEqual(@intFromPtr(&tbl[0]), win64Call5(bs.stub_addr, @intFromPtr(&key2), @intFromPtr(&tbl), 8, 16, cc_va));
+    }
 }
 
 test "findByNameAnyDll: case-insensitive, все DLL" {
@@ -952,4 +1543,168 @@ test "findByNameAnyDll: case-insensitive, все DLL" {
     try testing.expectEqualStrings("WS2_32.dll", e.dll);
     // несуществующее
     try testing.expect(disp.findByNameAnyDll("NoSuchFuncHere") == null);
+}
+
+// ─── v0.12.0: extra-записи + мост колбэка ───────────────────────────────────
+
+test "addExtraStub: записи вне PE-импортов (SSPI-таблица) — impl/trap" {
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try Pe.parse(data);
+    const counts = image.countImports();
+    const total = counts.functions + 8;
+    const entries = try testing.allocator.alloc(StubEntry, total);
+    defer testing.allocator.free(entries);
+    const code_buf = try testing.allocator.alloc(u8, total * STUB_CODE_SIZE);
+    defer testing.allocator.free(code_buf);
+
+    var disp = Dispatcher.init(entries, code_buf, .int3);
+    disp.logical_base = 0x200000000;
+    _ = try disp.generateFor(&image);
+    const imports = disp.count;
+    try testing.expectEqual(counts.functions, imports);
+
+    // extra-запись .impl: слот [imports], entry_id = imports, код-трамплин
+    const e1 = disp.addExtraStub("Secur32.dll", "QuerySecurityPackageInfoA", .impl) orelse return error.ExtraFailed;
+    try testing.expectEqual(imports + 1, disp.count);
+    try testing.expectEqual(imports * STUB_CODE_SIZE, e1.code_off);
+    try testing.expectEqual(@as(u64, 0x200000000 + imports * STUB_CODE_SIZE), e1.stub_addr);
+    try testing.expectEqual(StubKind.impl, e1.kind);
+    // байты трамплина (entry_id в movabs rdi)
+    try testing.expectEqual(@as(u8, 0x56), code_buf[e1.code_off + 0]);
+    const id = std.mem.readInt(u64, code_buf[e1.code_off + 10 ..][0..8], .little);
+    try testing.expectEqual(@as(u64, imports), id);
+    // findByNameAnyDll находит extra-запись (GetProcAddress-резолв)
+    try testing.expectEqual(e1, disp.findByNameAnyDll("QUERYSECURITYPACKAGEINFOA").?);
+    // findByRip тоже знает extra-слоты (int3-путь)
+    try testing.expect(disp.findByRip(e1.stub_addr + 4) != null);
+
+    // extra-запись .trap: int3-CDD-лог
+    const e2 = disp.addExtraStub("Secur32.dll", "AcquireCredentialsHandleA", .trap) orelse return error.ExtraFailed2;
+    try testing.expectEqual(StubKind.trap, e2.kind);
+    try testing.expectEqual(@as(u8, 0xCC), code_buf[e2.code_off + 3]);
+
+    // переполнение entries → null (не паника)
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        _ = disp.addExtraStub("X.dll", "f", .trap);
+    }
+    try testing.expect(disp.addExtraStub("X.dll", "overflow", .trap) == null);
+}
+
+test "callback-мост: launcher/trampoline/mailbox — байты + РЕАЛЬНОЕ ИСПОЛНЕНИЕ" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    // RWX-регион под код (запись из Zig + исполнение), 16 слотов + запас
+    const n_slots: usize = 16;
+    const code_len = n_slots * STUB_CODE_SIZE;
+    const code_mem = try std.posix.mmap(
+        null,
+        code_len,
+        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(code_mem);
+
+    var entries: [n_slots]StubEntry = undefined;
+    var disp = Dispatcher.init(&entries, code_mem[0..code_len], .int3);
+    // logical_base = null → stub_addr = физический адрес (нативный тест)
+    _ = disp.addExtraStub("Secur32.dll", "QuerySecurityPackageInfoA", .impl) orelse return error.ExtraFailed;
+    _ = disp.addExtraStub("Secur32.dll", "AcquireCredentialsHandleA", .impl) orelse return error.ExtraFailed2;
+
+    // ── тестовые артефакты (В RWX-РЕГИОНЕ — стек не исполняется, NX!) ──
+    // callback (Win64-конвенция!): складывает RCX/RDX/R8 по адресам из
+    // mailbox (mailbox несёт УКАЗАТЕЛИ на b-блоки), возвращает 77 в RAX:
+    //   mov [rcx], rcx ; mov [rdx], rdx ; mov [r8], r8 ; mov rax, 77 ; ret
+    // done-стаб (замена trampoline): [rcx+8] ← rax ; ret
+    var b: [3][16]u8 align(8) = undefined; // блоки: [0]=&RCX, [1]=&RDX, [2]=&R8
+    for (&b) |*blk| @memset(blk, 0);
+
+    const cb_off = 5 * STUB_CODE_SIZE; // слот 5: callback
+    const done_off = 6 * STUB_CODE_SIZE; // слот 6: done-стаб
+    const C = code_mem[cb_off..][0..STUB_CODE_SIZE];
+    @memset(C, 0);
+    C[0] = 0x48;
+    C[1] = 0x89;
+    C[2] = 0x09; // mov [rcx], rcx
+    C[3] = 0x48;
+    C[4] = 0x89;
+    C[5] = 0x12; // mov [rdx], rdx
+    // ⚠ REX-дисциплина (урок v0.12): B-бит расширяет R/M! 4C 89 00 =
+    // mov [RAX], r8 (B=0 → rm=000=RAX — затирал done-стаб!), а нужно
+    // mov [r8], r8 → REX.W+R+B = 4D (reg=r8 по R, rm=r8 по B).
+    C[6] = 0x4D;
+    C[7] = 0x89;
+    C[8] = 0x00; // mov [r8], r8
+    C[9] = 0x48;
+    C[10] = 0xC7;
+    C[11] = 0xC0; // mov rax, imm32
+    C[12] = 77;
+    C[16] = 0xC3; // ret
+    const D = code_mem[done_off..][0..STUB_CODE_SIZE];
+    @memset(D, 0);
+    D[0] = 0x48;
+    D[1] = 0x89;
+    D[2] = 0x41;
+    D[3] = 0x08; // mov [rcx+8], rax
+    D[4] = 0xC3; // ret
+
+    const br = disp.buildCallbackBridge(
+        @intFromPtr(code_mem[done_off..].ptr),
+        CB_SYSCALL_DONE,
+        CALLBACK_COOKIE,
+    ) orelse return error.BridgeFailed;
+    // слоты моста — после 2 extra-записей
+    try testing.expectEqual(4 * STUB_CODE_SIZE, br.mailbox_off); // 2 extra + 2 слота моста до mailbox
+
+    // mailbox = {init_once=&b[0], parameter=&b[1], context=&b[2], target=callback}
+    const mb: *[4]u64 = @ptrCast(@alignCast(code_mem[br.mailbox_off..][0..32]));
+    mb[0] = @intFromPtr(&b[0]);
+    mb[1] = @intFromPtr(&b[1]);
+    mb[2] = @intFromPtr(&b[2]);
+    mb[3] = @intFromPtr(code_mem[cb_off..].ptr);
+
+    // ── ИСПОЛНЕНИЕ моста: вызываем launcher как обычную функцию ──
+    // (launcher игнорирует входные регистры — всё берёт из mailbox; для
+    // кернеля вход через sysretq, для теста — call; RSP-семантика общая)
+    const Launcher = *const fn () callconv(.C) void;
+    const launcher: Launcher = @ptrFromInt(br.launcher_va);
+    launcher();
+
+    // колбэк получил Win64-аргументы RCX/RDX/R8 (записал через указатели)
+    try testing.expectEqual(@intFromPtr(&b[0]), @as(*align(1) u64, @ptrFromInt(@intFromPtr(&b[0]))).*);
+    try testing.expectEqual(@intFromPtr(&b[1]), @as(*align(1) u64, @ptrFromInt(@intFromPtr(&b[1]))).*);
+    try testing.expectEqual(@intFromPtr(&b[2]), @as(*align(1) u64, @ptrFromInt(@intFromPtr(&b[2]))).*);
+    // результат колбэка (RAX=77) дошёл до done-стаба: [rcx+8] = 77
+    try testing.expectEqual(@as(u64, 77), @as(*align(1) u64, @ptrFromInt(@intFromPtr(&b[0]) + 8)).*);
+
+    // ── байтовая верификация trampoline (ядро: done_target = свой) ──
+    var entries2: [n_slots]StubEntry = undefined;
+    const code2_mem = try std.posix.mmap(
+        null,
+        code_len,
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(code2_mem);
+    var disp2 = Dispatcher.init(&entries2, code2_mem[0..code_len], .int3);
+    const br2 = disp2.buildCallbackBridge(null, CB_SYSCALL_DONE, CALLBACK_COOKIE) orelse return error.BridgeFailed2;
+    // launcher пушит СОБСТВЕННЫЙ trampoline
+    const push_target = std.mem.readInt(u64, code2_mem[0 + 23 ..][0..8], .little);
+    try testing.expectEqual(br2.trampoline_va, push_target);
+    // trampoline: mov rsi,rax; movabs rdi,cookie; movabs rax,7; syscall; jmp $
+    const T = br2.mailbox_off - STUB_CODE_SIZE; // trampoline стоит перед mailbox
+    try testing.expectEqual(@as(u8, 0x48), code2_mem[T + 0]);
+    try testing.expectEqual(@as(u8, 0x89), code2_mem[T + 1]);
+    try testing.expectEqual(@as(u8, 0xC6), code2_mem[T + 2]); // mov rsi, rax
+    try testing.expectEqual(CALLBACK_COOKIE, std.mem.readInt(u64, code2_mem[T + 5 ..][0..8], .little));
+    try testing.expectEqual(@as(u64, CB_SYSCALL_DONE), std.mem.readInt(u64, code2_mem[T + 15 ..][0..8], .little));
+    try testing.expectEqual(@as(u8, 0x0F), code2_mem[T + 23]);
+    try testing.expectEqual(@as(u8, 0x05), code2_mem[T + 24]); // syscall
+    try testing.expectEqual(@as(u8, 0xEB), code2_mem[T + 25]);
+    try testing.expectEqual(@as(u8, 0xFE), code2_mem[T + 26]); // jmp $ — не падаем
 }

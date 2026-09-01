@@ -411,7 +411,12 @@ isr_stub_table:
 
 .extern user_rsp
 .extern current_kernel_stack
+.extern syscall_frame          // v0.12.0: снапшот кадра (8 слов, .bss)
 .extern zig_syscall_handler
+.extern ucl_pending            // v0.12.0: мост Win64-колбэка (win32_api)
+.extern ucl_rsp
+.extern ucl_rip
+.extern ucl_rflags
 
 .global syscall_entry
 syscall_entry:
@@ -441,8 +446,37 @@ syscall_entry:
     // 5th arg is RAX (syscall number), which we move to R8.
     movq %rax, %r8
 
+    // v0.12.0 (CDD №3): снапшот спущенного кадра в .bss — 8 слов.
+    // IF=0 (SYSCALL маскирует IF через EFER_SFMASK) — атомарно против
+    // прерываний: стек ядра под кадром может быть затёрт таймером ПОСЛЕ
+    // sti() в обработчике, а syscall_frame — нет. Читает его
+    // win32_api.kLaunchCallback (мост InitOnce-колбэка).
+    // rax/r11 — scratch (значения уже сохранены push'ами выше).
+    leaq syscall_frame(%rip), %r11
+    movq 0(%rsp),  %rax
+    movq %rax, 0(%r11)         // r15
+    movq 8(%rsp),  %rax
+    movq %rax, 8(%r11)         // r14
+    movq 16(%rsp), %rax
+    movq %rax, 16(%r11)        // r13
+    movq 24(%rsp), %rax
+    movq %rax, 24(%r11)        // r12
+    movq 32(%rsp), %rax
+    movq %rax, 32(%r11)        // rbp
+    movq 40(%rsp), %rax
+    movq %rax, 40(%r11)        // rbx
+    movq 48(%rsp), %rax
+    movq %rax, 48(%r11)        // r11 (user RFLAGS)
+    movq 56(%rsp), %rax
+    movq %rax, 56(%r11)        // rcx (user RIP после syscall)
+
     // Call Zig syscall handler
     call zig_syscall_handler
+
+    // v0.12.0 (CDD №3): запуск Win64-колбэка? (InitOnceExecuteOnce:
+    // обработчик сохранил кадр в CallbackState и заполнил ucl_*)
+    cmpq $0, ucl_pending(%rip)
+    jne .ucl_launch
 
     // Restore general purpose registers
     popq %r15
@@ -460,5 +494,23 @@ syscall_entry:
     movq user_rsp(%rip), %rsp
 
     // Return to Ring 3
+    sysretq
+
+.ucl_launch:
+    // Кадр НЕ поднимаем (pop'ы пропущены): он уже скопирован в
+    // CallbackState (win32_api). Уходим в Ring 3 на LAUNCHER моста:
+    //   RCX → RIP (sysretq), R11 → RFLAGS (user), RSP → dedicated-стек.
+    // sysretq здесь оставляет SS/CS из STAR — тот же путь, что обычный
+    // возврат (проверен E2E v0.10+).
+    // ⚠ v0.12.0-fix: редирект ОДНОРАЗОВЫЙ — сбрасываем флаг ЗДЕСЬ.
+    // Раньше ucl_pending чистился только в callbackDone (syscall #7),
+    // но колбэк ДО добирания до trampoline зовёт syscall #6 (calloc/…)
+    // и КАЖДЫЙ возврат из него снова уводил в launcher — бесконечный
+    // перезапуск колбэка (E2E: 60 запусков, 0 завершений).
+    movq ucl_rsp(%rip), %rsp
+    movq ucl_rip(%rip), %rcx
+    movq ucl_rflags(%rip), %r11
+    movq $0, ucl_pending(%rip)
+    xorl %eax, %eax
     sysretq
 

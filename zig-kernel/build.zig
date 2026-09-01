@@ -217,6 +217,14 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
+    // 64-bit Enrollment-Gate tests (v0.12.0, CDD №3): CPUID-отпечаток,
+    // identity-свёртка (puf.extractIdentity), вердикты anti-clone (спека §4)
+    const enroll_gate_tests = b.addTest(.{
+        .root_source_file = b.path("src64/enroll_gate.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
     const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
@@ -226,8 +234,9 @@ pub fn build(b: *std.Build) void {
     const run_win32_stubs_tests = b.addRunArtifact(win32_stubs_tests);
     const run_pe_loader_tests = b.addRunArtifact(pe_loader_tests);
     const run_win32_crt_tests = b.addRunArtifact(win32_crt_tests);
+    const run_enroll_gate_tests = b.addRunArtifact(enroll_gate_tests);
 
-    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader + Win32/CRT core)");
+    const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader + Win32/CRT core + Enrollment-Gate)");
     test_step.dependOn(&run_poler_core32_tests.step);
     test_step.dependOn(&run_poler_core64_tests.step);
     test_step.dependOn(&run_rsa_oaep64_tests.step);
@@ -236,6 +245,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_win32_stubs_tests.step);
     test_step.dependOn(&run_pe_loader_tests.step);
     test_step.dependOn(&run_win32_crt_tests.step);
+    test_step.dependOn(&run_enroll_gate_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{

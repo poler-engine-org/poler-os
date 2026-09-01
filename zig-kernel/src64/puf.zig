@@ -518,6 +518,24 @@ pub fn bindEnrolled(raw: []const u8, enr: *const Enrollment) PufError!Binding {
     return .{ .seed = seed, .identity = identity, .quality = health.quality, .health = health };
 }
 
+/// v0.12.0 (Enrollment-Gate, CDD №3): экстрактор identity из ПЕРВЫХ
+/// stable_words слов сырого материала (хвост — живой свидетель, в identity
+/// НЕ входит). Отдельный domain отделяет gate-identity от PUF-identity
+/// (русла seed/identity не пересекаются — та же дисциплина, что в bindRaw).
+/// Это «свертка кремниевого отпечатка» для проверки при старте ядра.
+pub fn extractIdentity(raw: []const u8, stable_words: usize, domain: u64) [IDENTITY_LEN]u8 {
+    var sponge = Sponge.init(domain, 0);
+    const n = @min(stable_words, raw.len / 8);
+    var i: usize = 0;
+    while (i < n) : (i += 1) sponge.absorbWord(readWord(raw, i * 8));
+    const words = sponge.squeeze();
+    var identity: [IDENTITY_LEN]u8 = undefined;
+    for (words, 0..) |w, k| {
+        std.mem.writeInt(u32, identity[k * 4 ..][0..4], w, .little);
+    }
+    return identity;
+}
+
 // ── Вспомогательное ───────────────────────────────────────────────────────
 
 /// Чтение слова u64 по смещению off (LE, за пределами буфера — нули).
@@ -785,4 +803,40 @@ test "bindEnrolled: сид воспроизводим на том же крем�
     const s2 = try bindEnrolled(&base, &enr);
     // ключ выведен из стабильной проекции → совпадает
     try testing.expectEqualSlices(u32, &s1.seed, &s2.seed);
+}
+
+// ─── v0.12.0: extractIdentity (Enrollment-Gate) ────────────────────────────
+
+test "extractIdentity: детерминизм, граница стабильных слов, домены" {
+    // 128 слов: 24 «стабильных» (CPUID-подобных) + 104 «свидетеля»
+    var raw: [1024]u8 = undefined;
+    var w: usize = 0;
+    while (w < 128) : (w += 1) {
+        const val: u64 = if (w < 24) 0x1000_0000 + w * 0x0101 else w * 0xDEAD_BEEF;
+        std.mem.writeInt(u64, raw[w * 8 ..][0..8], val, .little);
+    }
+    const DOM_A: u64 = 0x4547_4154_4531_2132;
+
+    // детерминизм
+    try testing.expectEqualSlices(u8, &extractIdentity(&raw, 24, DOM_A), &extractIdentity(&raw, 24, DOM_A));
+
+    // свидетель (слова ≥ 24) НЕ входит в identity: мутации хвоста невидимы
+    var raw2 = raw;
+    std.mem.writeInt(u64, raw2[100 * 8 ..][0..8], 0x4242_4242_4242_4242, .little);
+    try testing.expectEqualSlices(u8, &extractIdentity(&raw, 24, DOM_A), &extractIdentity(&raw2, 24, DOM_A));
+
+    // мутация СТАБИЛЬНОГО слова меняет identity
+    var raw3 = raw;
+    std.mem.writeInt(u64, raw3[5 * 8 ..][0..8], 0x9999_9999_9999_9999, .little);
+    try testing.expect(!std.mem.eql(u8, &extractIdentity(&raw, 24, DOM_A), &extractIdentity(&raw3, 24, DOM_A)));
+
+    // домен разделяет русла
+    const DOM_B: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+    try testing.expect(!std.mem.eql(u8, &extractIdentity(&raw, 24, DOM_A), &extractIdentity(&raw, 24, DOM_B)));
+
+    // усечение: 24 стабильных ≠ 12 стабильных
+    try testing.expect(!std.mem.eql(u8, &extractIdentity(&raw, 24, DOM_A), &extractIdentity(&raw, 12, DOM_A)));
+
+    // пустой буфер — валидный (нулевой) identity, не паника
+    _ = extractIdentity(&[_]u8{}, 24, DOM_A);
 }
