@@ -161,6 +161,42 @@ fn krand() u32 {
     return 0;
 }
 
+/// v0.16.0 (CDD №7): крипто-заполнение для Ring-3 (ops.entropy_fill ←
+/// BCryptGenRandom): поток PolerPrng на PUF-сиде (пере-сид каждые 64 IRQ
+/// фолдами хаба) + живой XOR-микс TSC/тиков. ГЛАВНОЕ СВОЙСТВО: каждый вызов
+/// даёт НОВЫЙ материал — статический сид 0x7E5CA01B (v0.14–v0.15) сидировал
+/// DRBG-экземпляры OpenSSL (главный + резолвер) ИДЕНТИЧНО → декапсуляция
+/// X25519MLKEM768 (bad decrypt) при дефолтном гибриде. Лечится здесь.
+pub fn pufCryptoFill(buf: [*]u8, len: usize) void {
+    if (len == 0) return;
+    // Слой 1: поток PRNG ядра (PUF-binding + live-пере-сид от хаба)
+    var i: usize = 0;
+    while (i + 4 <= len) : (i += 4) {
+        const w = krand();
+        buf[i] = @truncate(w);
+        buf[i + 1] = @truncate(w >> 8);
+        buf[i + 2] = @truncate(w >> 16);
+        buf[i + 3] = @truncate(w >> 24);
+    }
+    if (i < len) {
+        const w = krand();
+        var j: usize = 0;
+        while (i + j < len) : (j += 1) {
+            buf[i + j] = @truncate(w >> @intCast(j * 8));
+        }
+    }
+    // Слой 2: живой материал (TSC-джиттер + тики) — даже при fallback-сиде
+    // PUF-биндинга (постоянный сид) байты двух вызовов будут РАЗНЫМИ
+    var st: u64 = hal.readMsr(0x10) ^ (hal.tick_count << 32) ^ 0x9E37_79B9_7F4A_7C15;
+    var k: usize = 0;
+    while (k < len) : (k += 1) {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        buf[k] ^= @truncate(st >> 32);
+    }
+}
+
 const VGA_COLORS = [16][3]u8{
     .{ 0, 0, 0 },         // 0: Black
     .{ 0, 0, 170 },       // 1: Blue
@@ -809,6 +845,24 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     //      docs/POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md)
     pufBootInit();
 
+    // 8.7b (v0.16.0, CDD №7): крипто-мост PUF → Ring 3 — BCryptGenRandom
+    //      (curl-OpenSSL) получает живой материал хаба, а не статический сид.
+    win32_api.entropy_fill_fn = pufCryptoFill;
+
+    // 8.7c (v0.16.0, CDD №7): CMOS RTC — живой wall-clock (Unix-секунды).
+    //      Требование X509-verify: notBefore/notAfter сверяются с time(NULL);
+    //      статика 2026-01-01 проваливала свежие сертификаты example.com.
+    {
+        const unix = hal.rtcUnixTime();
+        if (unix != 0) {
+            puts("[RTC] Wall-clock: ");
+            printDec(unix);
+            puts(" Unix-сек (верификация notBefore/notAfter — CDD №7)\n");
+        } else {
+            puts("[RTC] CMOS не читается — время статично (fallback)\n");
+        }
+    }
+
     // 8.75 (v0.12.0, CDD №3): Аппаратный Enrollment-Gate — проверка
     //      bindEnrolled() при старте ядра (спека §4: анти-клон/анти-облако):
     //      кремниевый отпечаток против эталонного Enrollment-профиля.
@@ -920,6 +974,13 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     };
     if (virtio_net.isInitialized()) {
         puts("[VNET] virtio-net готов: реальный TCP/DNS для Ring 3 (SLIRP)\n");
+        // v0.16.0 (CDD №7): IRQ Network Worker — pollRx + TCP-таймеры
+        // (ретрансмиты/keep-alive) дышат на КАЖДОМ тике APIC-таймера даже
+        // когда Ring 3 молчит (чистое крипто-вычисление OpenSSL без
+        // сисколов): ACKи уходят, окно не зависает, сервер не ретранзмитит.
+        // pollRx самонебезопасен (in_poll-гард) и быстр (≤8 фреймов).
+        hal.net_irq_sink = virtio_net.pollRx;
+        puts("[VNET] IRQ Network Worker: pollRx+TCP-таймеры на каждом тике (CDD №7)\n");
     } else {
         puts("[VNET] No virtio-net device (expected without -netdev)\n");
     }
@@ -950,6 +1011,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     }
     if (initrd_archive) |arch| {
         parseInitrdCpio(arch, if (have_mb2) "multiboot2 module" else "PVH hvm_start_info module");
+        // v0.16.0 (CDD №7): VFS-мост Ring 3 — файлы initrd (curl.exe, 
+        // cacert.pem) доступны PE-процессу через CreateFileA/fopen (RO-VFS)
+        win32_api.initrd_archive = arch;
     } else {
         puts("[INITRD] No initrd modules loaded by bootloader.\n");
     }
@@ -1017,7 +1081,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.15.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.16.0 Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
@@ -1553,6 +1617,18 @@ fn cmd_pestubs(args: []const u8) void {
 // «[CDD] DLL!Func — не реализовано» → rax=0 → цепочка падений в логе.
 // ============================================================================
 
+/// v0.16.0 (CDD №7): окружение PE-процесса (GetEnvironmentVariableA/getenv).
+/// CURL_CA_BUNDLE — путь к CA-бандлу в initrd-VFS: curl-OpenSSL поднимает
+/// верификацию цепочки БЕЗ флага -k (сертификат example.com → корень бандла).
+const pe_env = [_]win32_crt.EnvEntry{
+    .{ .name = "CURL_CA_BUNDLE", .value = "cacert.pem" },
+    .{ .name = "SSL_CERT_FILE", .value = "cacert.pem" },
+    .{ .name = "HOME", .value = "/" },
+    .{ .name = "CURL_HOME", .value = "/" },
+    .{ .name = "USERPROFILE", .value = "C:\\" },
+    .{ .name = "PATH", .value = "C:\\" },
+};
+
 /// LoaderOps-проводка kernel: PMM (обнулённые contiguous) + VMM user-маппинг +
 /// identity-указатели на физ. страницы (kernel VA == phys).
 fn pmmAllocContig(count: u64) ?u64 {
@@ -1640,7 +1716,7 @@ fn cmd_peload(args: []const u8) void {
         return;
     };
 
-    sys_print("=== PE Load & Run (CDD cycle 6): ");
+    sys_print("=== PE Load & Run (CDD cycle 7): ");
     sys_print(file);
     if (args.len > file_end) {
         sys_print(" — cmdline: ");
@@ -2031,6 +2107,37 @@ fn cmd_peload(args: []const u8) void {
         .{ "api-ms-win-crt-utility-l1-1-0.dll", "_byteswap_ulong" },
         .{ "api-ms-win-crt-utility-l1-1-0.dll", "_byteswap_ushort" },
         .{ "api-ms-win-crt-utility-l1-1-0.dll", "_byteswap_uint64" },
+        // Волна CDD №7 (v0.16.0): файловая волна VFS — верификация SSL без
+        // -k требует от curl-OpenSSL РЕАЛЬНЫХ файлов: CA-бандл открывается
+        // fopen/fread (BIO), конфиг — _fsopen; Win32 File API — каркас
+        // (CreateFileA/ReadFile/CloseHandle/атрибуты/типы); lowio — мост.
+        .{ "KERNEL32.dll", "CreateFileA" },
+        .{ "KERNEL32.dll", "ReadFile" },
+        .{ "KERNEL32.dll", "WriteFile" },
+        .{ "KERNEL32.dll", "GetFileAttributesA" },
+        .{ "KERNEL32.dll", "GetFileType" },
+        .{ "KERNEL32.dll", "SetConsoleCtrlHandler" },
+        .{ "KERNEL32.dll", "SetHandleInformation" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fopen" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fread" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fseek" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_fseeki64" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "ftell" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fclose" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "feof" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "ferror" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "rewind" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "fgets" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "getc" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "ungetc" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "puts" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "putchar" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_read" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_write" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_close" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_lseeki64" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_sopen_s" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_chsize_s" },
     };
     var impls: usize = 0;
     for (impl_specs) |spec| {
@@ -2040,7 +2147,7 @@ fn cmd_peload(args: []const u8) void {
     printDec(impls);
     sys_print(" / ");
     printDec(impl_specs.len);
-    sys_print(" — cycles 1+…+6 (волны 17+20 fn + Wave-A + CRT-kit + CDD6: strerror_s/_wcserror_s)\n");
+    sys_print(" — cycles 1+…+7 (волны 17+20 fn + Wave-A + CRT-kit + CDD6 strerror_s + CDD7: FILE/VFS/PUF-энтропия)\n");
 
     // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
     kdisp.applyToImage(img.backing);
@@ -2110,9 +2217,18 @@ fn cmd_peload(args: []const u8) void {
         // гигантский стековый темп (8КБ-переполнение cmd_peload затирало
         // tasks[1] нулями — kernel-panic каскад; см. scheduler.zig).
         .sockets = undefined,
+        // v0.16.0 (CDD №7): файловая волна VFS (хэндлы 0x800+, слоты)
+        .next_file_handle = win32_crt.FILE_HANDLE_BASE,
+        .files = undefined,
     };
     for (&win32_crt.ctx.?.sockets) |*sk| sk.* = .{};
     for (&win32_crt.ctx.?.tls_sessions) |*ts| ts.* = .{};
+    for (&win32_crt.ctx.?.files) |*fl| fl.* = .{};
+    // v0.16.0 (CDD №7): окружение PE-процесса — ядро отвечает за него, как
+    // и за «версию Windows» (OS_ACTUAL). CURL_CA_BUNDLE/SSL_CERT_FILE — путь
+    // к CA-бандлу в initrd-VFS: верификация сертификата БЕЗ флага -k.
+    win32_crt.env_table = &pe_env;
+    sys_print("[PE] env: CURL_CA_BUNDLE=cacert.pem (VFS) — верификация SSL без -k\n");
     sys_print("[PE] TSC calibrated: ");
     printDec(tsc_freq);
     sys_print(" Hz (QPF/QPC source, 5 APIC ticks)\n");

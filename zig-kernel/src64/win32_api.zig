@@ -39,6 +39,8 @@ const win32 = @import("win32_stubs.zig");
 const crt = @import("win32_crt.zig");
 const scheduler = @import("scheduler.zig");
 const virtio_net = @import("virtio_net.zig");
+const cpio = @import("cpio.zig");
+const fat32 = @import("fat32.zig");
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -72,7 +74,79 @@ pub fn installOps() void {
         .net_tcp_poll = kNetTcpPoll,
         .net_tcp_close = kNetTcpClose,
         .sleep_task = kSleepTask,
+        // v0.16.0 (CDD №7): PUF-энтропия для Ring-3 крипты (BCryptGenRandom)
+        // + VFS (CPIO initrd + FAT32) для файловой волны (CA-бандл без -k)
+        // + живой wall-clock (CMOS RTC) — X509-верификация notBefore/notAfter
+        .entropy_fill = kEntropyFill,
+        .vfs_file_size = kVfsFileSize,
+        .vfs_file_read = kVfsFileRead,
+        .wall_time = kWallTime,
     };
+}
+
+/// Wall-clock Unix-секунды из CMOS RTC (QEMU = время хоста).
+fn kWallTime() u64 {
+    return hal.rtcUnixTime();
+}
+
+// ─── v0.16.0 (CDD №7): PUF-энтропия + VFS (initrd CPIO + FAT32) ──────────
+
+/// Крипто-заполнение ядра (main64.pufCryptoFill: PolerPrng на PUF-сиде +
+/// live-фолды хаба + TSC-микс). Ставится main64.pufBootInit — разрыв цикла
+/// импортов main64 ↔ win32_api (как hal.timerTickCallback).
+pub var entropy_fill_fn: ?*const fn (buf: [*]u8, len: usize) void = null;
+
+/// CPIO-initrd: main64 заполняет после разбора загрузочных модулей
+/// (PVH modlist / mb2-модуль). Только для чтения — RO-VFS.
+pub var initrd_archive: ?[]const u8 = null;
+
+fn kEntropyFill(buf: [*]u8, len: usize) void {
+    if (entropy_fill_fn) |f| f(buf, len);
+}
+
+/// Поиск в CPIO-initrd по имени (case-insensitive — Windows-семантика путей).
+fn vfsFindCpio(name: []const u8) ?[]const u8 {
+    const arch = initrd_archive orelse return null;
+    var parser = cpio.CpioParser.init(arch);
+    while (parser.next()) |file| {
+        if (std.ascii.eqlIgnoreCase(file.name, name)) return file.data;
+    }
+    return null;
+}
+
+/// VFS: размер файла по нормализованному имени (CPIO initrd → FAT32).
+fn kVfsFileSize(name: [*]const u8, name_len: usize) u64 {
+    if (name_len == 0 or name_len > 260) return crt.VFS_NOT_FOUND;
+    const n = name[0..name_len];
+    if (vfsFindCpio(n)) |data| return data.len;
+    if (fat32.getFs()) |fs| {
+        if (fs.openFile(n)) |f| return f.file_size;
+    }
+    return crt.VFS_NOT_FOUND;
+}
+
+/// VFS: чтение [offset..offset+len) → out (USER-VA; валидация уже прошла
+/// в win32_crt ДО вызова). CPIO — memcpy слайса; FAT32 — open+seek+read.
+fn kVfsFileRead(name: [*]const u8, name_len: usize, offset: u64, out: [*]u8, len: usize) u64 {
+    if (name_len == 0 or name_len > 260) return 0;
+    const n = name[0..name_len];
+    if (vfsFindCpio(n)) |data| {
+        if (offset >= data.len) return 0;
+        const avail = data.len - @as(usize, @intCast(offset));
+        const take = @min(avail, len);
+        @memcpy(out[0..take], data[@intCast(offset)..][0..take]);
+        return take;
+    }
+    if (fat32.getFs()) |fs| {
+        var file = fs.openFile(n) orelse return 0;
+        if (offset >= file.file_size) return 0;
+        file.position = @intCast(offset);
+        const avail = file.file_size - file.position;
+        const want: u32 = @intCast(@min(@as(u64, len), @as(u64, avail)));
+        if (want == 0) return 0;
+        return fs.readFile(&file, out[0..want], want);
+    }
+    return 0;
 }
 
 // ─── v0.14.0 (CDD №5): virtio-net мост (syscall-контекст, CR3=user — CPL=0
@@ -159,6 +233,15 @@ fn kSleepTask(ms: u64) void {
     // Наш user_rsp (записан НАШИМ syscall_entry; флаг с этого момента был
     // поднят — чужие syscall его затереть не могли)
     const my_rsp = scheduler.user_rsp;
+
+    // v0.16.0-fix (CDD №7): РЕ-СИНК cks ПЕРЕД парковкой — инвариант
+    // «current_kernel_stack == kstack_top ТЕКУЩЕЙ задачи»: хвост нашего
+    // syscall-кадра (asm-exit pops / callbackDone [top-64..top)) обязан
+    // лежать на НАШЕМ kstack, а кадры парковки — не на чужом.
+    if (scheduler.current_task_id != 0 and scheduler.current_task_id < scheduler.task_count) {
+        const t = &scheduler.tasks[scheduler.current_task_id];
+        scheduler.current_kernel_stack = @intFromPtr(&t.kernel_stack) + t.kernel_stack.len;
+    }
 
     // Будильник планировщику: слайс паркованной не давать
     scheduler.setTaskSleep(capped);

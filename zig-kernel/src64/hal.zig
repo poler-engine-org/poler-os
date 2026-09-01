@@ -10,6 +10,10 @@ pub var timerTickCallback: ?*const fn (u64) callconv(.C) u64 = null;
 // Multi-pool hardware entropy callbacks (Spec §1-2)
 pub var irq_entropy_sink: ?*const fn (u64) void = null; // IRQ pool (APIC timer / hardware interrupt intervals)
 pub var bio_entropy_sink: ?*const fn (u64) void = null; // Bio pool (keystroke interval bio-dynamics)
+/// v0.16.0 (CDD №7): IRQ Network Worker — pollRx() + TCP-таймеры из тика
+/// APIC-таймера (retрансмиты/keep-alive/ACKи при молчащем Ring 3).
+/// Обнуляется до NULL; main64 вешает virtio_net.pollRx после init драйвера.
+pub var net_irq_sink: ?*const fn () void = null;
 
 // Simple spinlock for protecting shared resources (e.g. serial output)
 pub var serial_lock: u32 = 0;
@@ -53,6 +57,84 @@ pub fn outl(port: u16, val: u32) void {
         : [val] "{eax}" (val),
           [port] "{dx}" (port),
     );
+}
+
+// ─── v0.16.0 (CDD №7): CMOS RTC — реальное wall-clock время ───────────────
+
+/// Чтение регистра MC146818 (index-порт 0x70, data-порт 0x71).
+fn rtcReg(reg: u8) u8 {
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+fn bcdToBin(v: u8) u8 {
+    return (v & 0x0F) + (v >> 4) * 10;
+}
+
+/// Дней от Unix-эпохи до даты (алгоритм Howard Hinnant days_from_civil).
+fn daysFromCivil(y: i64, m: u32, d: u32) i64 {
+    const yy: i64 = if (m <= 2) y - 1 else y;
+    const era: i64 = @divFloor(yy, 400);
+    const yoe: i64 = yy - era * 400; // [0, 399]
+    const mp: i64 = @mod(@as(i64, m) + 9, 12); // [0, 11]
+    const doy: i64 = @divFloor(153 * mp + 2, 5) + @as(i64, d) - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Wall-clock время (Unix-секунды UTC) из CMOS RTC. QEMU подаёт время
+/// хоста — TLS-верификация (notBefore/notAfter сертификатов) требует
+/// живую дату: фиксированный 2026-01-01 из v0.12 давал «not yet valid (9)»
+/// на свежевыпущенных сертификатах example.com. Фолбэк при битом RTC — 0
+/// (вызывающие деградируют на прежнюю статику).
+pub fn rtcUnixTime() u64 {
+    // 1) дождаться конца update-in-progress (бит 7 регистра A)
+    var guard: u32 = 0;
+    while (guard < 200_000) : (guard += 1) {
+        outb(0x70, 0x0A);
+        if (inb(0x71) & 0x80 == 0) break;
+    }
+    // 2) стабильное чтение: два прохода обязаны совпасть (тикающая секунда)
+    var tries: u32 = 0;
+    while (tries < 4) : (tries += 1) {
+        const sec = rtcReg(0x00);
+        const min = rtcReg(0x02);
+        const hour = rtcReg(0x04);
+        const day = rtcReg(0x07);
+        const mon = rtcReg(0x08);
+        const year = rtcReg(0x09);
+        const cent = rtcReg(0x32);
+        const stb = rtcReg(0x0B);
+        if (rtcReg(0x00) != sec) continue; // секунда тикнула — перечитаем
+
+        const binary = stb & 0x04 != 0;
+        const bcd = struct {
+            fn f(v: u8, bin: bool) u32 {
+                return if (bin) v else bcdToBin(v);
+            }
+        }.f;
+        var h: u32 = bcd(hour & 0x7F, binary);
+        if (stb & 0x02 == 0) { // 12-часовой режим: бит 0x80 = PM
+            if (hour & 0x80 != 0) {
+                h = if (h == 12) 12 else h + 12;
+            } else if (h == 12) {
+                h = 0;
+            }
+        }
+        const s: u32 = bcd(sec, binary);
+        const mi: u32 = bcd(min, binary);
+        const d: u32 = bcd(day, binary);
+        const mo: u32 = bcd(mon, binary);
+        const yr: u32 = bcd(year, binary);
+        const cy: u32 = bcd(cent, binary);
+        const full_year: i64 = @as(i64, cy) * 100 + @as(i64, yr);
+        if (mo < 1 or mo > 12 or d < 1 or d > 31 or s > 59 or mi > 59 or h > 23) continue;
+        if (full_year < 2000 or full_year > 2100) continue; // битый century
+        const days = daysFromCivil(full_year, mo, d);
+        const unix: i64 = days * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + @as(i64, s);
+        return @intCast(@max(unix, 0));
+    }
+    return 0; // RTC не читается — вызывающие деградируют на статику
 }
 
 pub fn inb(port: u16) u8 {
@@ -431,7 +513,15 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                 // tasks[].rsp=0/мусор, kernel-panic @ptrFromInt (лаг v0.12).
                 // cli(): вложенный тик ждёт; IRETQ восстановит IF из кадра.
                 // Дополнительно: кадр обязан быть ненулевым и 8-выровнен.
+                // v0.16.0-fix (CDD №7): IRQ Network Worker — ВНУТРИ атомарной
+                // секции (до cb), но НЕ на каждом тике: сервис 10 Гц (каждый
+                // 10-й тик) — RTX-бэкофф 200мс/KA 1с дыхают с запасом, а
+                // 100-Гц pollRx под TCG отъедал CPU у Ring-3 крипты (сервер
+                // успевал FIN до нашего Finished — bad decrypt-подобный обрыв).
                 cli();
+                if (net_irq_sink) |nsink| {
+                    if (tick_count % 10 == 0) nsink();
+                }
                 const next_rsp = cb(@intFromPtr(frame));
                 if (next_rsp != 0 and next_rsp & 7 == 0) {
                     next_frame = @ptrFromInt(next_rsp);

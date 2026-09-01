@@ -64,6 +64,11 @@ pub var tasks: [MAX_TASKS]Task = undefined;
 pub var current_task_id: usize = 0;
 pub var task_count: usize = 0;
 pub var scheduler_ticks: u64 = 0;
+// v0.16.0-fix (CDD №7): дедупликация WARN «вне собственного стека» (раз на задачу)
+var warned_tasks: [MAX_TASKS]usize = .{0} ** MAX_TASKS;
+var warned_n: usize = 0;
+// v0.16.0-fix (CDD №7, SELF-HEAL): теневые валидные rsp (см. schedule)
+pub var shadow_rsp: [MAX_TASKS]u64 = .{0} ** MAX_TASKS;
 
 // Exported variables for assembly syscall_entry
 pub export var user_rsp: u64 = 0;
@@ -399,7 +404,19 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     // v0.13.0-fix: syscall-транзакция активна — НЕ трогаем контекст задачи
     // (user_rsp/current_kernel_stack глобальны — свитч между Ring-3
     // задачами внутри syscall = порча; ждем sysretq, потом свободный тик).
-    if (in_win32_syscall != 0) return current_rsp;
+    // v0.16.0-fix (CDD №7, ЗАСТРЯВШИЕ CV-ТРЕДЫ): РЕ-СИНХРОНИЗАЦИЯ cks —
+    // sysretq-выход не восстанавливает current_kernel_stack, и латентная
+    // гонка могла оставить ЧУЖОЕ значение: следующий syscall задачи
+    // читает чужой kstack (кадры вне собственного стека → WARN → вечная
+    // парковка треда → deadlocks curl). Инвариант: cks == kstack_top
+    // ТЕКУЩЕЙ задачи — восстанавливаем его на каждом тике транзакции.
+    if (in_win32_syscall != 0) {
+        if (current_task_id != 0 and current_task_id < task_count) {
+            const ktop: u64 = @intFromPtr(&tasks[current_task_id].kernel_stack) + tasks[current_task_id].kernel_stack.len;
+            if (current_kernel_stack != ktop) current_kernel_stack = ktop;
+        }
+        return current_rsp;
+    }
     scheduler_ticks += 1;
 
 
@@ -427,6 +444,15 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
         hal.Serial.puts("\n");
     }
     tasks[current_task_id].rsp = current_rsp;
+    // v0.16.0-fix (CDD №7, SELF-HEAL): теневой слепок валидного rsp — кадр
+    // на СОБСТВЕННОМ kstack. Латентная гонка (sysretq не восстанавливает
+    // cks) изредка сохраняет КАДР-НА-ЧУЖОМ-СТЕКЕ (WARN «вне собственного
+    // стека» → тред застревает навечно → deadlock curl). САМ КАДР на своём
+    // стеке НЕ тронут (гонка портит только УКАЗАТЕЛЬ) — восстановление
+    // теневой копии полностью реанимирует тред.
+    if (current_task_id != 0 and taskRspValid(current_task_id, current_rsp)) {
+        shadow_rsp[current_task_id] = current_rsp;
+    }
     if (tasks[current_task_id].state == .Running) {
         tasks[current_task_id].state = .Ready;
     }
@@ -461,12 +487,50 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
         }
     }
     if (bad_rsp != 0) {
-        // CDD-трейс: ПОРЧА кадров — не роняем ядро, пропускаем задачу
-        hal.Serial.puts("[SCHED] WARN: task ");
-        hal.Serial.putDecimal(bad_id);
-        hal.Serial.puts(" rsp=0x");
-        hal.Serial.putHex(bad_rsp);
-        hal.Serial.puts(" вне собственного стека — skip\n");
+        // v0.16.0-fix (CDD №7, SELF-HEAL): гонка сохраняла кадр-на-чужом-
+        // стеке как rsp задачи — тред застревал навечно. Валидный кадр на
+        // СВОЁМ стеке цел (порча только указателя): восстанавливаем теневую
+        // копию — тред реанимирован на следующем же тике.
+        if (bad_id != 0 and shadow_rsp[bad_id] != 0 and taskRspValid(bad_id, shadow_rsp[bad_id])) {
+            tasks[bad_id].rsp = shadow_rsp[bad_id];
+            hal.Serial.puts("[SCHED] SELF-HEAL: task ");
+            hal.Serial.putDecimal(bad_id);
+            hal.Serial.puts(" rsp восстановлен из тени (0x");
+            hal.Serial.putHex(shadow_rsp[bad_id]);
+            hal.Serial.puts(")\n");
+            bad_rsp = 0; // реанимирован — не считаем падением
+        }
+    }
+    if (bad_rsp != 0) {
+        // CDD-трейс: ПОРЧА кадров — не роняем ядро, пропускаем задачу.
+        // v0.16.0-fix (CDD №7): печатаем ОДИН РАЗ на задачу — иначе 100Гц-тик
+        // × серийный порт = тысячи строк/с (замедление тика и шум лога).
+        var print_warn = true;
+        for (warned_tasks) |w| {
+            if (w == bad_id) print_warn = false;
+        }
+        if (print_warn and warned_n < warned_tasks.len) {
+            warned_tasks[warned_n] = bad_id;
+            warned_n += 1;
+            hal.Serial.puts("[SCHED] WARN: task ");
+            hal.Serial.putDecimal(bad_id);
+            hal.Serial.puts(" rsp=0x");
+            hal.Serial.putHex(bad_rsp);
+            hal.Serial.puts(" вне [0x");
+            const bbase: u64 = @intFromPtr(&tasks[bad_id].kernel_stack);
+            hal.Serial.putHex(bbase);
+            hal.Serial.puts(",0x");
+            hal.Serial.putHex(bbase + tasks[bad_id].kernel_stack.len);
+            hal.Serial.puts("] cks=0x");
+            hal.Serial.putHex(current_kernel_stack);
+            hal.Serial.puts(" cur=");
+            hal.Serial.putDecimal(current_task_id);
+            hal.Serial.puts(" state=");
+            hal.Serial.putDecimal(@intFromEnum(tasks[bad_id].state));
+            hal.Serial.puts(" wake=");
+            hal.Serial.putDecimal(tasks[bad_id].wake_tick);
+            hal.Serial.puts("\n");
+        }
     }
     if (!found) {
         // Никто не готов С валидным кадром — не переключаемся вообще:

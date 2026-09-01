@@ -481,14 +481,19 @@ syscall_entry:
     // Call Zig syscall handler
     call zig_syscall_handler
 
-    // Транзакция завершена: сброс ДО pop'ов (IF всё ещё 0 — атомарно;
-    // после sysretq тик волен переключать).
-    movq $0, in_win32_syscall(%rip)
-
-    // v0.12.0 (CDD №3): запуск Win64-колбэка? (InitOnceExecuteOnce:
-    // обработчик сохранил кадр в CallbackState и заполнил ucl_*)
+    // v0.16.0-fix (CDD №7, застрявшие CV-треды): сброс флага транзакции
+    // ПЕРЕНЕСЁН за pop'ы — раньше окно «flag=0 до sysretq» (~12 инструкций,
+    // IF=1 после sti() обработчика) позволяло тику ПЕРЕКЛЮЧИТЬ задачу
+    // посреди выхода: кадр сохранялся, задача замораживалась в середине
+    // pop-последовательности, а ГЛОБАЛЬНЫЕ (cks) оставались от владельца
+    // последнего свитча → следующий syscall читал ЧУЖОЙ kstack (WARN
+    // «вне собственного стека» → вечная парковка треда → deadlock curl).
+    // Теперь pop'ы идут под flag=1 (тик честно ждёт в guard-пути и
+    // возвращается в ту же точку), окно сужено до mov+sysretq (~2 такта).
+    // Проверка колбэка осталась под flag=1: .ucl_launch уводит в Ring 3
+    // (мост сам управляет транзакцией).
     cmpq $0, ucl_pending(%rip)
-    jne .ucl_launch
+    jne .ucl_launch_flagged
 
     // Restore general purpose registers
     popq %r15
@@ -502,11 +507,25 @@ syscall_entry:
     popq %r11
     popq %rcx
 
-    // Switch back to user RSP
-    movq user_rsp(%rip), %rsp
+    // Транзакция завершена. v0.16.0-fix: user_rsp снимается в РЕГИСТР
+    // под flag=1 (чужой syscall не перезапишет глобал, пока мы владельцы),
+    // хвост атомарен cli-ом (тик не встанет кадром на user-стеке);
+    // sysretq восстановит IF из R11 (user-RFLAGS, IF=1).
+    movq user_rsp(%rip), %r10
+    cli
+    movq $0, in_win32_syscall(%rip)
+    movq %r10, %rsp
 
     // Return to Ring 3
     sysretq
+
+.ucl_launch_flagged:
+    // Флаг поднят — сбрасываем ПЕРЕД уходом в колбэк (Ring 3): колбэк
+    // превентивен (тики диспетчируют резолвер/TLS-тред), его собственные
+    // syscall'ы поднимут флег заново на входе. Окно до sysretq — 3 команды,
+    // user_rsp здесь не читается (используется dedicated cb-стек).
+    movq $0, in_win32_syscall(%rip)
+    jmp .ucl_launch
 
 .ucl_launch:
     // Кадр НЕ поднимаем (pop'ы пропущены): он уже скопирован в

@@ -144,6 +144,24 @@ pub const Ops = struct {
     /// v0.15.0 (CDD №6): сон ТЕКУЩЕЙ задачи — планировщик не даёт слайс до
     /// истечения ms (парковка воркер-тредов; ядро — scheduler.setTaskSleep).
     sleep_task: *const fn (ms: u64) void,
+    /// v0.16.0 (CDD №7): КРИПТО-заполнение буфера энтропией ядра — PUF-хаб
+    /// (джиттер кремния + тайминги шины + IRQ). Ядро: main64.pufCryptoFill
+    /// (PolerPrng на сиде PUF-binding + live-фолды хаба); тест: advancing
+    /// xorshift — ГЛАВНОЕ СВОЙСТВО: два вызова дают РАЗНЫЕ байты (статический
+    /// сид 0x7E5C_A01B был rot-козлом ML-KEM-декапсуляции в v0.15.0).
+    entropy_fill: *const fn (buf: [*]u8, len: usize) void,
+    /// v0.16.0 (CDD №7): VFS — размер файла по имени (CPIO initrd + FAT32
+    /// через virtio-blk). Возврат 0xFFFF_FFFF_FFFF_FFFF = не найден.
+    /// Имя — НОРМАЛИЗОВАННОЕ ядром (без диска/слэшей, case-insensitive).
+    vfs_file_size: *const fn (name: [*]const u8, name_len: usize) u64,
+    /// v0.16.0 (CDD №7): чтение [offset..offset+len) файла → out (USER-VA,
+    /// валидация НА ВЫЗЫВАЮЩЕМ до вызова). Возврат = прочитано байт.
+    vfs_file_read: *const fn (name: [*]const u8, name_len: usize, offset: u64, out: [*]u8, len: usize) u64,
+    /// v0.16.0 (CDD №7): РЕАЛЬНОЕ wall-clock время (Unix-секунды, CMOS RTC
+    /// — QEMU подаёт время хоста). null по умолчанию → статика v0.12-эпохи
+    /// (нативные тесты не зависят от живой даты). Потребители: _time64
+    /// (X509-verify OpenSSL: notBefore/notAfter), GetSystemTimeAsFileTime.
+    wall_time: ?*const fn () u64 = null,
 };
 
 fn denyAll(_: u64, _: u64) bool {
@@ -188,6 +206,13 @@ fn noPoll(_: i64) i64 {
 }
 fn noClose(_: i64) void {}
 fn noSleep(_: u64) void {} // фейк: без парковки (нативные тесты)
+fn noEntropy(_: [*]u8, _: usize) void {} // фейк: без энтропии (заполнять НЕЛЬЗЯ — см. kBCryptGenRandom)
+fn noVfsSize(_: [*]const u8, _: usize) u64 {
+    return 0xFFFF_FFFF_FFFF_FFFF; // VFS недоступен → «файл не найден»
+}
+fn noVfsRead(_: [*]const u8, _: usize, _: u64, _: [*]u8, _: usize) u64 {
+    return 0;
+}
 
 /// Дефолт: параноик. win32_api.installOps() ставит настоящие примитивы.
 pub var ops: Ops = .{
@@ -212,6 +237,9 @@ pub var ops: Ops = .{
     .net_tcp_poll = noPoll,
     .net_tcp_close = noClose,
     .sleep_task = noSleep,
+    .entropy_fill = noEntropy,
+    .vfs_file_size = noVfsSize,
+    .vfs_file_read = noVfsRead,
 };
 
 fn emptyWriter(_: []const u8) void {}
@@ -268,9 +296,666 @@ pub const Ctx = struct {
 
     // v0.13.0 (CDD №4)
     sockets: [MAX_SOCKS]Sock, // состояния сокетов (fd = 0x100 + индекс)
+
+    // v0.16.0 (CDD №7)
+    next_file_handle: u64, // CreateFileA/W: пул 0x800+ (файлы VFS)
+    files: [MAX_FILES]FileState, // дескрипторы открытых файлов (RO-VFS)
 };
 
 pub var ctx: ?Ctx = null;
+
+// ─── v0.16.0 (CDD №7): VFS-файлы (CPIO initrd + FAT32) + окружение ──────────
+
+/// MAX_FILES — файловые дескрипторы CreateFileA/W (curl: cacert.pem +
+/// .curlrc + вывод — пары дескрипторов достаточно; 16 = запас).
+pub const MAX_FILES: usize = 16;
+pub const MAX_PATH_LEN: usize = 260;
+
+/// Хэндлы файлов: 0x800 + индекс (не пересекается: сокеты 0x100+,
+/// события 0x200+, мьютексы 0x400+).
+pub const FILE_HANDLE_BASE: u64 = 0x800;
+pub const INVALID_HANDLE_VALUE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+pub const VFS_NOT_FOUND: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Состояние открытого файла (RO-VFS): имя + позиция. Чтение — по имени
+/// через ops.vfs_file_read (ядерный CPIO/FAT32 — бекенд-агностично).
+pub const FileState = struct {
+    in_use: bool = false,
+    name: [MAX_PATH_LEN]u8 = [_]u8{0} ** MAX_PATH_LEN,
+    name_len: usize = 0,
+    pos: u64 = 0,
+    size: u64 = 0,
+    eof: bool = false, // CRT-семантика: флаг ставится при ЧТЕНИИ ЗА концом
+};
+
+/// Запись окружения процесса (ядро-предоставленные переменные; тест — свои).
+/// v0.16.0 (CDD №7): CURL_CA_BUNDLE=cacert.pem — верификация SSL без -k.
+pub const EnvEntry = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Таблица окружения: ядро устанавливает перед стартом PE-процесса
+/// (main64), тесты — свои значения. ПУСТАЯ по умолчанию (как v0.12–v0.15).
+pub var env_table: []const EnvEntry = &.{};
+
+/// Поиск в env-таблице (case-insensitive — Windows-семантика).
+fn envLookup(name: []const u8) ?[]const u8 {
+    for (env_table) |e| {
+        if (std.ascii.eqlIgnoreCase(e.name, name)) return e.value;
+    }
+    return null;
+}
+
+/// Нормализация пути Win32 → имя VFS: срез диска «X:», ведущие '/'/'\\',
+/// префикс «./», '\\'-разделители → '/' (CPIO-имена плоские; FAT32 — путь).
+/// Возвращает срез ОТОБРАЖАЕМОГО имени (в буфере вызывающего) или null
+/// (пусто/мусор).
+fn vfsNormalizePath(src: []const u8, out: *[MAX_PATH_LEN]u8) ?[]const u8 {
+    var s = src;
+    // «X:/path» или «X:\\path» — диск
+    if (s.len >= 2 and s[1] == ':' and std.ascii.isAlphabetic(s[0])) s = s[2..];
+    while (s.len > 0 and (s[0] == '/' or s[0] == '\\')) s = s[1..];
+    if (s.len >= 2 and s[0] == '.' and (s[1] == '/' or s[1] == '\\')) s = s[2..];
+    while (s.len > 0 and (s[0] == '/' or s[0] == '\\')) s = s[1..];
+    if (s.len == 0 or s.len > MAX_PATH_LEN - 1) return null;
+    var n: usize = 0;
+    for (s) |ch| {
+        // FAT32/VFS не понимают UNC-префиксы и «..»-навигацию выше корня —
+        // но «dir/file» — валидный путь. Проверки не режем — честный VFS.
+        out[n] = if (ch == '\\') '/' else ch;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+// ─── v0.16.0 (CDD №7): Win32 File API поверх VFS ──────────────────────────
+
+// LastError-коды файловой волны (Win32)
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_INVALID_HANDLE_FILE: u32 = 6;
+const ERROR_HANDLE_EOF: u32 = 38;
+const ERROR_FILE_EXISTS: u32 = 80;
+
+/// CreateFile-диспозиции (dwCreationDisposition)
+const CREATE_NEW: u64 = 1;
+const CREATE_ALWAYS: u64 = 2;
+const OPEN_EXISTING: u64 = 3;
+const OPEN_ALWAYS: u64 = 4;
+const TRUNCATE_EXISTING: u64 = 5;
+
+/// dwDesiredAccess: запись в RO-VFS запрещена (честная граница)
+const GENERIC_WRITE: u64 = 0x4000_0000;
+
+/// GetFileAttributes / GetFileType
+const FILE_ATTRIBUTE_NORMAL: u64 = 0x80;
+const INVALID_FILE_ATTRIBUTES: u64 = 0xFFFF_FFFF;
+const FILE_TYPE_DISK: u64 = 1;
+const FILE_TYPE_CHAR: u64 = 2;
+
+/// SetFilePointer-методы
+const FILE_BEGIN: u64 = 0;
+const FILE_CURRENT: u64 = 1;
+const FILE_END: u64 = 2;
+
+/// FILE*-блок CRT-stdio (80Б = UCRT-размер): заголовок-пропуск наш —
+/// [0..4) magic, [4..8) индекс FileState. std-потоки (iob-массив) magic
+/// НЕ имеют → автоматически отличаем «наш файл» от stdout/stderr.
+const CRT_FILE_MAGIC: u32 = 0x454C_4946; // "FILE"
+const CRT_FILE_SIZE: u64 = 80;
+
+/// Хэндл → FileState (пул 0x800+; хэндл валиден пока слот жив).
+fn fileByHandle(h: u64) ?*FileState {
+    if (h < FILE_HANDLE_BASE or h >= FILE_HANDLE_BASE + MAX_FILES) return null;
+    const c = &(ctx orelse return null);
+    const f = &c.files[@as(usize, @intCast(h - FILE_HANDLE_BASE))];
+    if (!f.in_use) return null;
+    return f;
+}
+
+/// FILE* (CRT-stdio) → индекс FileState. null = не наш файл (std-поток).
+fn crtFileIdx(stream: u64) ?usize {
+    if (stream == 0) return null;
+    if (!ops.validate_read(stream, 8)) return null;
+    const base = userPtr(stream);
+    if (std.mem.readInt(u32, base[0..4], .little) != CRT_FILE_MAGIC) return null;
+    const idx: usize = std.mem.readInt(u32, base[4..8], .little);
+    if (idx >= MAX_FILES) return null;
+    const c = &(ctx orelse return null);
+    if (!c.files[idx].in_use) return null;
+    return idx;
+}
+
+/// Открытие FileState по нормализованному имени: слот + кэш размера.
+fn fileSlotAlloc(norm: []const u8, size: u64) ?usize {
+    const c = &(ctx orelse return null);
+    for (&c.files, 0..) |*f, i| {
+        if (!f.in_use) {
+            f.* = .{};
+            f.in_use = true;
+            @memcpy(f.name[0..norm.len], norm);
+            f.name_len = norm.len;
+            f.size = size;
+            c.next_file_handle += 1; // статистика открытых файлов
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Поиск файла по user-пути: нормализация + ops.vfs_file_size.
+/// Возврат: .{ norm, size } или null (не найден / мусорный путь).
+const VfsFound = struct { norm: []const u8, size: u64 };
+fn vfsOpenByName(path_va: u64, wide: bool) ?VfsFound {
+    const len = if (wide) userStrLenW(path_va) orelse return null else userStrLen(path_va) orelse return null;
+    if (len == 0 or len > MAX_PATH_LEN - 2) return null;
+    var raw: [MAX_PATH_LEN]u8 = undefined;
+    if (wide) {
+        // UTF-16LE → байты (BMP-символы >0x7F — честно «?»; пути у нас ASCII)
+        var i: u64 = 0;
+        while (i < len) : (i += 1) {
+            const ch = userW(path_va + i * 2).*;
+            raw[@intCast(i)] = if (ch < 128) @intCast(ch) else '?';
+        }
+    } else {
+        @memcpy(raw[0..@intCast(len)], userPtr(path_va)[0..@intCast(len)]);
+    }
+    // Скретч нормализации — статическая страница модуля (один PE-процесс:
+    // конкуренции за буфер нет; имя копируется в FileState до возврата).
+    const norm_buf: *[MAX_PATH_LEN]u8 = &vfs_norm_scratch;
+    const norm = vfsNormalizePath(raw[0..@intCast(len)], norm_buf) orelse return null;
+    const size = ops.vfs_file_size(norm.ptr, norm.len);
+    if (size == VFS_NOT_FOUND) return null;
+    return .{ .norm = norm, .size = size };
+}
+
+/// Статический скретч нормализации (один PE-процесс — конкуренции нет).
+var vfs_norm_scratch: [MAX_PATH_LEN]u8 = undefined;
+
+/// CreateFileA/W (7 аргументов; диспозиция — arg5/стек[0], доступ — arg2):
+/// OPEN_EXISTING + read → хэндл 0x800+; запись/создание в RO-VFS → отказ.
+fn createFileCommon(lp_file_name: u64, desired_access: u64, creation: u64, wide: bool) u64 {
+    const found = vfsOpenByName(lp_file_name, wide) orelse {
+        setLastError(ERROR_FILE_NOT_FOUND);
+        logf("[WIN32] CreateFile{c}(?) -> INVALID (VFS: не найден, 2)\n", .{if (wide) @as(u8, 'W') else @as(u8, 'A')});
+        return INVALID_HANDLE_VALUE;
+    };
+    if (creation == CREATE_NEW or creation == CREATE_ALWAYS or creation == TRUNCATE_EXISTING) {
+        setLastError(if (creation == CREATE_NEW) ERROR_FILE_EXISTS else ERROR_ACCESS_DENIED);
+        logf("[WIN32] CreateFile{c}(\"{s}\") -> INVALID (RO-VFS: создание запрещено)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), found.norm });
+        return INVALID_HANDLE_VALUE;
+    }
+    if (desired_access & GENERIC_WRITE != 0) {
+        setLastError(ERROR_ACCESS_DENIED);
+        logf("[WIN32] CreateFile{c}(\"{s}\") -> INVALID (RO-VFS: GENERIC_WRITE)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), found.norm });
+        return INVALID_HANDLE_VALUE;
+    }
+    const idx = fileSlotAlloc(found.norm, found.size) orelse {
+        setLastError(ERROR_FILE_NOT_FOUND); // таблица полна — как «нет файла»
+        return INVALID_HANDLE_VALUE;
+    };
+    setLastError(0);
+    logf("[WIN32] CreateFile{c}(\"{s}\") -> 0x{x} (VFS, {d}Б)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), found.norm, FILE_HANDLE_BASE + idx, found.size });
+    return FILE_HANDLE_BASE + idx;
+}
+
+/// ReadFile(h, buf, n, lpRead, lpOverlapped): Win64 a1..a4 + стек[0].
+/// TRUE + *lpRead=байт; EOF → TRUE + 0. Консоль-псевдохэндлы: stdin=0Б.
+fn readFileCommon(h: u64, buf: u64, n: u64, lp_read: u64, lp_overlapped: u64) u64 {
+    if (lp_overlapped != 0) {
+        setLastError(ERROR_INVALID_PARAMETER); // async-модель не поддержана
+        return 0;
+    }
+    if (h == FAKE_STDIN) {
+        if (lp_read != 0 and ops.validate_write(lp_read, 4)) userD(lp_read).* = 0;
+        return 1; // TRUE: stdin пуст (EOF сразу)
+    }
+    const f = fileByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    var got: u64 = 0;
+    if (n > 0 and buf != 0) {
+        if (!ops.validate_write(buf, n)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const want = @min(n, f.size - f.pos);
+        if (want > 0) {
+            got = ops.vfs_file_read(f.name[0..f.name_len].ptr, f.name_len, f.pos, userPtr(buf), @intCast(want));
+            f.pos += got;
+        }
+    }
+    if (lp_read != 0 and ops.validate_write(lp_read, 4)) userD(lp_read).* = @truncate(got);
+    if (f.pos >= f.size) f.eof = true;
+    return 1; // TRUE
+}
+
+/// WriteFile(h, buf, n, lpWritten, lpOverlapped): Win64 a1..a4 + стек[0].
+/// stdout/stderr → консоль ОС; файл RO-VFS → ACCESS_DENIED (честно).
+fn writeFileCommon(h: u64, buf: u64, n: u64, lp_written: u64, lp_overlapped: u64) u64 {
+    if (lp_overlapped != 0) {
+        setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (h == FAKE_STDOUT or h == FAKE_STDERR) {
+        if (n > 0) {
+            if (!ops.validate_read(buf, n)) {
+                setLastError(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            ops.write_console(userPtr(buf)[0..@intCast(n)]);
+        }
+        if (lp_written != 0 and ops.validate_write(lp_written, 4)) userD(lp_written).* = @truncate(n);
+        return 1;
+    }
+    if (fileByHandle(h) != null) {
+        setLastError(ERROR_ACCESS_DENIED); // RO-VFS
+        logf("[WIN32] WriteFile(файл VFS) -> FALSE (RO-VFS, 5)\n", .{});
+        return 0;
+    }
+    setLastError(ERROR_INVALID_HANDLE_FILE);
+    return 0;
+}
+
+/// GetFileSize(h, lpHigh): младший 32-бит размера; старший — по указателю.
+fn getFileSizeCommon(h: u64, lp_high: u64) u64 {
+    const f = fileByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0xFFFF_FFFF; // INVALID_FILE_SIZE
+    };
+    if (lp_high != 0 and ops.validate_write(lp_high, 4)) {
+        userD(lp_high).* = @truncate(f.size >> 32);
+    }
+    return @truncate(f.size);
+}
+
+/// GetFileSizeEx(h, lpFileSize): u64-размер по указателю → TRUE.
+fn getFileSizeExCommon(h: u64, lp_size: u64) u64 {
+    const f = fileByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    if (lp_size == 0 or !ops.validate_write(lp_size, 8)) {
+        setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    userQ(lp_size).* = f.size;
+    return 1;
+}
+
+/// SetFilePointer(h, dist(±), lpHigh, method): навигация RO-VFS.
+/// Возврат — младшие 32 позиции; не-файл → 0xFFFFFFFF + 6.
+fn setFilePointerCommon(h: u64, dist: u64, lp_high: u64, method: u64) u64 {
+    const f = fileByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0xFFFF_FFFF;
+    };
+    var off: i64 = @bitCast(dist);
+    if (lp_high != 0 and ops.validate_read(lp_high, 4)) {
+        const hi: u32 = userD(lp_high).*;
+        off = @bitCast(dist | (@as(u64, hi) << 32));
+    }
+    const base: i64 = switch (method) {
+        FILE_BEGIN => 0,
+        FILE_CURRENT => @bitCast(f.pos),
+        FILE_END => @bitCast(f.size),
+        else => {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0xFFFF_FFFF;
+        },
+    };
+    var new_pos: i64 = base +% off;
+    if (new_pos < 0) new_pos = 0; // RO-VFS не расширяется — клэмп
+    if (new_pos > @as(i64, @bitCast(f.size))) new_pos = @bitCast(f.size);
+    f.pos = @bitCast(new_pos);
+    f.eof = false;
+    setLastError(0);
+    return @truncate(f.pos);
+}
+
+/// SetFilePointerEx(h, liDistance(±i64), lpNew, method) → TRUE.
+fn setFilePointerExCommon(h: u64, dist: u64, lp_new: u64, method: u64) u64 {
+    const f = fileByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    const off: i64 = @bitCast(dist);
+    const base: i64 = switch (method) {
+        FILE_BEGIN => 0,
+        FILE_CURRENT => @bitCast(f.pos),
+        FILE_END => @bitCast(f.size),
+        else => {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        },
+    };
+    var np: i64 = base +% off;
+    if (np < 0) np = 0;
+    if (np > @as(i64, @bitCast(f.size))) np = @bitCast(f.size);
+    f.pos = @bitCast(np);
+    f.eof = false;
+    setLastError(0);
+    if (lp_new != 0 and ops.validate_write(lp_new, 8)) userQ(lp_new).* = f.pos;
+    return 1;
+}
+
+/// GetFileAttributesA(name): файл VFS → FILE_ATTRIBUTE_NORMAL (0x80).
+fn getFileAttributesCommonA(lp_file_name: u64) u64 {
+    const found = vfsOpenByName(lp_file_name, false) orelse {
+        setLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    };
+    _ = found.size;
+    logf("[WIN32] GetFileAttributesA(\"{s}\") -> 0x80 (NORMAL, VFS)\n", .{found.norm});
+    return FILE_ATTRIBUTE_NORMAL;
+}
+
+/// GetFileType(h): std-псевдохэндлы → CHAR(консоль), файл VFS → DISK.
+fn getFileTypeCommon(h: u64) u64 {
+    if (h == FAKE_STDIN or h == FAKE_STDOUT or h == FAKE_STDERR) return FILE_TYPE_CHAR;
+    if (fileByHandle(h) != null) return FILE_TYPE_DISK;
+    return 0; // FILE_TYPE_UNKNOWN
+}
+
+// ─── v0.16.0 (CDD №7): CRT-stdio FILE* поверх VFS ─────────────────────
+
+/// fopen/_fsopen(path, mode[, share]): mode «r*» → FILE* (блок 80Б с
+/// заголовком-пропуском); «w*»/«a*» → NULL + errno EACCES (RO-VFS);
+/// не найден → NULL + errno ENOENT.
+fn kfopenCommon(path_va: u64, mode_va: u64, caller: []const u8) u64 {
+    const c = &(ctx orelse return 0);
+    var mode: u8 = '?';
+    if (mode_va != 0 and ops.validate_read(mode_va, 1)) {
+        mode = userPtr(mode_va)[0];
+    }
+    const found = vfsOpenByName(path_va, false) orelse {
+        if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
+            @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 2; // ENOENT
+        }
+        // Лог-контракт v0.11+ (тест _fsopen): имя даже при мусорном пути
+        var name_buf: [48]u8 = undefined;
+        var name_len: u64 = 0;
+        if (path_va != 0) {
+            if (userStrLen(path_va)) |l| {
+                name_len = @min(l, 47);
+                if (name_len > 0 and ops.validate_read(path_va, name_len)) {
+                    @memcpy(name_buf[0..@intCast(name_len)], userPtr(path_va)[0..@intCast(name_len)]);
+                    name_buf[@intCast(name_len)] = 0;
+                }
+            }
+        }
+        logf("[CRT] {s}(\"{s}\", mode='{c}') -> NULL (VFS: не найден, ENOENT)\n", .{ caller, name_buf[0..@intCast(name_len)], mode });
+        return 0;
+    };
+    if (mode != 'r') {
+        if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
+            @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 13; // EACCES
+        }
+        logf("[CRT] {s}(\"{s}\", mode='{c}') -> NULL (RO-VFS: только чтение)\n", .{ caller, found.norm, mode });
+        return 0;
+    }
+    const idx = fileSlotAlloc(found.norm, found.size) orelse {
+        if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
+            @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 24; // EMFILE
+        }
+        return 0;
+    };
+    const blk_va = kmalloc(CRT_FILE_SIZE);
+    if (blk_va == 0) {
+        c.files[idx].in_use = false;
+        return 0;
+    }
+    @memset(userPtr(blk_va)[0..CRT_FILE_SIZE], 0);
+    std.mem.writeInt(u32, userPtr(blk_va)[0..4], CRT_FILE_MAGIC, .little);
+    std.mem.writeInt(u32, userPtr(blk_va)[4..8], @intCast(idx), .little);
+    logf("[CRT] {s}(\"{s}\") -> FILE* 0x{x} (VFS, {d}Б)\n", .{ caller, found.norm, blk_va, found.size });
+    return blk_va;
+}
+
+/// fread(ptr, size, nmemb, stream): Win64 a1..a4. Полные элементы;
+/// eof-флаг — при чтении ЗА концом (CRT-контракт).
+fn kfread(ptr: u64, size: u64, nmemb: u64, stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return 0;
+    const c = &(ctx orelse return 0);
+    const f = &c.files[idx];
+    if (size == 0 or nmemb == 0) return 0;
+    if (size * nmemb > 16 * 1024 * 1024) return 0; // защитный лимит
+    const total = size * nmemb;
+    if (!ops.validate_write(ptr, total)) return 0;
+    const want: u64 = @min(total, f.size - f.pos);
+    var got: u64 = 0;
+    if (want > 0) {
+        got = ops.vfs_file_read(f.name[0..f.name_len].ptr, f.name_len, f.pos, userPtr(ptr), @intCast(want));
+        f.pos += got;
+    }
+    if (got < total) f.eof = true; // меньше ЗАПРОШЕННОГО → след. чтение за концом
+    return got / size; // полные элементы
+}
+
+/// fseek(stream, offset(±i32), whence) / _fseeki64(±i64): 0 = успех.
+fn kfseekCommon(stream: u64, offset: u64, whence: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return @bitCast(@as(i64, -1));
+    const c = &(ctx orelse return @bitCast(@as(i64, -1)));
+    const f = &c.files[idx];
+    const off: i64 = @bitCast(offset);
+    const base: i64 = switch (whence) {
+        0 => 0, // SEEK_SET
+        1 => @bitCast(f.pos), // SEEK_CUR
+        2 => @bitCast(f.size), // SEEK_END
+        else => return @bitCast(@as(i64, -1)),
+    };
+    var np: i64 = base +% off;
+    if (np < 0) np = 0;
+    if (np > @as(i64, @bitCast(f.size))) np = @bitCast(f.size);
+    f.pos = @bitCast(np);
+    f.eof = false;
+    return 0;
+}
+
+/// ftell(stream): текущая позиция (файлы VFS < 2^31 в нашей модели).
+fn kftell(stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return @bitCast(@as(i64, -1));
+    return ctx.?.files[idx].pos;
+}
+
+/// feof(stream): 1 только после чтения ЗА концом (EOF-флаг).
+fn kfeof(stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return 0;
+    return if (ctx.?.files[idx].eof) 1 else 0;
+}
+
+/// ferror(stream): RO-VFS читает без ошибок → 0.
+fn kferror(stream: u64) u64 {
+    _ = stream;
+    return 0;
+}
+
+/// fclose(stream): слот + заголовок блока → 0 (контракт CRT).
+fn kfclose(stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return 0; // чужой/NULL — уже «закрыт»
+    const c = &(ctx orelse return 0);
+    c.files[idx].in_use = false;
+    if (ops.validate_write(stream, 8)) {
+        @memset(userPtr(stream)[0..8], 0); // magic гасим — повторное закрытие безопасно
+    }
+    logf("[CRT] fclose(FILE* 0x{x}) -> 0\n", .{stream});
+    return 0;
+}
+
+/// rewind(stream): позиция 0, EOF-флаг снят.
+fn krewind(stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return 0;
+    const f = &ctx.?.files[idx];
+    f.pos = 0;
+    f.eof = false;
+    return 0;
+}
+
+/// fgets(buf, size, stream): до size-1Б, '\n' включительно, NUL-хвост.
+fn kfgets(buf: u64, size: u64, stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return 0;
+    const c = &(ctx orelse return 0);
+    const f = &c.files[idx];
+    if (size <= 1 or !ops.validate_write(buf, size)) return 0;
+    const limit: u64 = size - 1;
+    var out_i: u64 = 0;
+    var chunk: [128]u8 = undefined;
+    var done = false;
+    while (out_i < limit and !done) {
+        const want: usize = @intCast(@min(@as(u64, chunk.len), limit - out_i));
+        const got = ops.vfs_file_read(f.name[0..f.name_len].ptr, f.name_len, f.pos, &chunk, want);
+        if (got == 0) break; // EOF
+        // ищем '\n' в прочитанном
+        var nl: ?usize = null;
+        var j: usize = 0;
+        while (j < got) : (j += 1) {
+            if (chunk[j] == '\n') {
+                nl = j;
+                break;
+            }
+        }
+        const take: usize = if (nl) |k| k + 1 else @intCast(got);
+        @memcpy(userPtr(buf + out_i)[0..take], chunk[0..take]);
+        out_i += take;
+        f.pos += take;
+        if (nl != null) done = true;
+        if (got < want) break; // конец файла внутри чанка
+    }
+    if (out_i == 0) {
+        f.eof = true;
+        return 0; // NULL: ни одного байта
+    }
+    userPtr(buf)[@intCast(out_i)] = 0;
+    if (f.pos >= f.size) f.eof = true;
+    return buf;
+}
+
+/// getc(stream): 1 байт или -1 (EOF).
+fn kgetc(stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return @bitCast(@as(i64, -1));
+    const f = &ctx.?.files[idx];
+    var b: [1]u8 = undefined;
+    const got = ops.vfs_file_read(f.name[0..f.name_len].ptr, f.name_len, f.pos, &b, 1);
+    if (got == 0) {
+        f.eof = true;
+        return @bitCast(@as(i64, -1));
+    }
+    f.pos += 1;
+    return b[0];
+}
+
+/// ungetc(c, stream): откат позиции на 1 (парсеры PEM читают «посмотрел — вернул»).
+fn kungetc(ch: u64, stream: u64) u64 {
+    const idx = crtFileIdx(stream) orelse return @bitCast(@as(i64, -1));
+    const f = &ctx.?.files[idx];
+    if (ch > 0xFF) return @bitCast(@as(i64, -1));
+    if (f.pos == 0) return @bitCast(@as(i64, -1));
+    f.pos -= 1;
+    f.eof = false;
+    return ch;
+}
+
+// ─── v0.16.0 (CDD №7): lowio (_read/_write/_close/_lseeki64/_sopen_s) ───
+
+/// fd = 3 + индекс (0/1/2 заняты stdio). Слот FileState по fd lowio.
+fn fileIdxByFd(fd: u64) ?usize {
+    if (fd < 3 or fd >= 3 + MAX_FILES) return null;
+    const idx: usize = @intCast(fd - 3);
+    if (!ctx.?.files[idx].in_use) return null;
+    return idx;
+}
+
+/// _read(fd, buf, count): байты или 0 (EOF); не-файловый fd → -1.
+fn kread(fd: u64, buf: u64, count: u64) u64 {
+    const idx = fileIdxByFd(fd) orelse return @bitCast(@as(i64, -1));
+    const f = &ctx.?.files[idx];
+    if (count == 0) return 0;
+    if (!ops.validate_write(buf, count)) return @bitCast(@as(i64, -1));
+    const want = @min(count, f.size - f.pos);
+    var got: u64 = 0;
+    if (want > 0) {
+        got = ops.vfs_file_read(f.name[0..f.name_len].ptr, f.name_len, f.pos, userPtr(buf), @intCast(want));
+        f.pos += got;
+    }
+    if (got < count) f.eof = true;
+    return got;
+}
+
+/// _write(fd, buf, count): 1/2 → консоль; файл RO-VFS → -1 (EACCES).
+fn kwrite(fd: u64, buf: u64, count: u64) u64 {
+    if (fd == 1 or fd == 2) {
+        if (count > 0) {
+            if (!ops.validate_read(buf, count)) return @bitCast(@as(i64, -1));
+            ops.write_console(userPtr(buf)[0..@intCast(count)]);
+        }
+        return count;
+    }
+    return @bitCast(@as(i64, -1)); // fd 0 / файл RO-VFS
+}
+
+/// _close(fd): слот освобождён → 0.
+fn kclose(fd: u64) u64 {
+    const idx = fileIdxByFd(fd) orelse return 0;
+    ctx.?.files[idx].in_use = false;
+    return 0;
+}
+
+/// _lseeki64(fd, offset(±i64), whence): новая позиция или -1.
+fn klseeki64(fd: u64, offset: u64, whence: u64) u64 {
+    const idx = fileIdxByFd(fd) orelse return @bitCast(@as(i64, -1));
+    const f = &ctx.?.files[idx];
+    const off: i64 = @bitCast(offset);
+    const base: i64 = switch (whence) {
+        0 => 0,
+        1 => @bitCast(f.pos),
+        2 => @bitCast(f.size),
+        else => return @bitCast(@as(i64, -1)),
+    };
+    var np: i64 = base +% off;
+    if (np < 0) np = 0;
+    if (np > @as(i64, @bitCast(f.size))) np = @bitCast(f.size);
+    f.pos = @bitCast(np);
+    f.eof = false;
+    return f.pos;
+}
+
+/// _sopen_s(pfd, path, oflag, shflag, pmode): *pfd = 3+idx; RO-VFS.
+fn ksopenS(fd_va: u64, path_va: u64, oflag: u64) u64 {
+    if (fd_va == 0 or !ops.validate_write(fd_va, 4)) return 22; // EINVAL
+    userD(fd_va).* = 0xFFFF_FFFF; // -1 по умолчанию
+    const write_flag = oflag & 0x3; // _O_RDONLY=0, _O_WRONLY=1, _O_RDWR=2
+    const found = vfsOpenByName(path_va, false) orelse return 2; // ENOENT
+    if (write_flag != 0) return 13; // EACCES: RO-VFS
+    const idx = fileSlotAlloc(found.norm, found.size) orelse return 24; // EMFILE
+    userD(fd_va).* = @intCast(3 + idx);
+    logf("[CRT] _sopen_s(\"{s}\") -> fd={d} (VFS)\n", .{ found.norm, 3 + idx });
+    return 0;
+}
+
+/// _chsize_s(fd, size): RO-VFS — EACCES (13).
+fn kchsizeS(fd: u64, size: u64) u64 {
+    _ = fd;
+    _ = size;
+    return 13; // EACCES
+}
+
+/// puts(s): строка + '\n' в консоль → неотрицательный код.
+fn kputs(s_va: u64) u64 {
+    const len = userStrLen(s_va) orelse return @bitCast(@as(i64, -1));
+    if (len > 0) ops.write_console(userPtr(s_va)[0..@intCast(len)]);
+    ops.write_console("\n");
+    return 1;
+}
+
+/// putchar(c): байт в консоль → сам байт (контракт int).
+fn kputchar(ch: u64) u64 {
+    if (ch > 0xFF) return @bitCast(@as(i64, -1));
+    var b: [1]u8 = .{@truncate(ch)};
+    ops.write_console(&b);
+    return ch;
+}
 
 // ─── Block-heap (malloc/calloc/realloc/free) ────────────────────────────────
 
@@ -569,7 +1254,9 @@ fn fputc(c: u64, stream: u64) u64 {
 /// ошибки — helpf() пишет его через fwrite). Байты идут в виртуальную
 /// консоль; аргумент 4-й (stream) в Win64 — R9, диспетчер передаёт a4.
 fn fwrite(ptr: u64, size: u64, nmemb: u64, stream: u64) u64 {
-    _ = stream; // stdout/stderr — в serial одинаково (CDD-упрощение)
+    // v0.16.0 (CDD №7): FILE* VFS — RO-VFS → 0 элементов (отказ записи);
+    // stdout/stderr (iob-блоки без magic) — прежний консольный путь.
+    if (crtFileIdx(stream) != null) return 0;
     if (size == 0 or nmemb == 0) return 0;
     const total = size * nmemb;
     if (total > 16 * 1024 * 1024) return 0; // защитный лимит
@@ -784,12 +1471,11 @@ pub fn userStrLenW(va: u64) ?u64 {
     return null;
 }
 
-/// GetEnvironmentVariableA/W: окружение процесса в v0.12 ПУСТО → переменная
-/// не найдена: возврат 0 + LastError=ERROR_ENVVAR_NOT_FOUND (контракт curl:
-/// «нет переменной» → дефолтное поведение, не ошибка). Буфер не трогаем.
+/// GetEnvironmentVariableA(name, buf, size): v0.16.0 (CDD №7) — env-таблица
+/// процесса (ядро ставит CURL_CA_BUNDLE=cacert.pem и др.; тесты — свои).
+/// Контракт Win32: найдено → len (без NUL) + копия; буфер мал → требуемый
+/// размер (len+1) + ERROR_INSUFFICIENT_BUFFER; нет → 0 + 203.
 fn getEnvironmentVariableA(name_va: u64, buf: u64, size: u64) u64 {
-    _ = buf;
-    _ = size;
     const len = userStrLen(name_va) orelse {
         setLastError(ERROR_INVALID_PARAMETER);
         return 0;
@@ -799,14 +1485,29 @@ fn getEnvironmentVariableA(name_va: u64, buf: u64, size: u64) u64 {
         return 0;
     }
     const name = userPtr(name_va)[0..@intCast(len)];
-    logf("[WIN32] GetEnvironmentVariableA(\"{s}\") -> 0 (окружение пусто)\n", .{name});
+    if (envLookup(name)) |val| {
+        if (size == 0 or val.len + 1 > size) {
+            setLastError(ERROR_INSUFFICIENT_BUFFER);
+            logf("[WIN32] GetEnvironmentVariableA(\"{s}\") -> нужно {d}Б (122)\n", .{ name, val.len + 1 });
+            return val.len + 1;
+        }
+        if (!ops.validate_write(buf, val.len + 1)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        @memcpy(userPtr(buf)[0..val.len], val);
+        userPtr(buf)[val.len] = 0;
+        setLastError(0);
+        logf("[WIN32] GetEnvironmentVariableA(\"{s}\") -> \"{s}\"\n", .{ name, val });
+        return val.len;
+    }
+    logf("[WIN32] GetEnvironmentVariableA(\"{s}\") -> 0 (нет переменной)\n", .{name});
     setLastError(ERROR_ENVVAR_NOT_FOUND);
     return 0;
 }
 
+/// GetEnvironmentVariableW: env-таблица → UTF-16LE-значение.
 fn getEnvironmentVariableW(name_va: u64, buf: u64, size: u64) u64 {
-    _ = buf;
-    _ = size;
     const len = userStrLenW(name_va) orelse {
         setLastError(ERROR_INVALID_PARAMETER);
         return 0;
@@ -815,9 +1516,52 @@ fn getEnvironmentVariableW(name_va: u64, buf: u64, size: u64) u64 {
         setLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    logf("[WIN32] GetEnvironmentVariableW(L\"{d} wchars\") -> 0 (окружение пусто)\n", .{len});
+    // имя UTF-16 → ASCII-байты для поиска (переменные окружения у нас ASCII)
+    var name_buf: [64]u8 = undefined;
+    const n: usize = @intCast(@min(len, 63));
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        name_buf[i] = @truncate(userW(name_va + i * 2).*);
+    }
+    if (envLookup(name_buf[0..n])) |val| {
+        if (size == 0 or val.len + 1 > size) {
+            setLastError(ERROR_INSUFFICIENT_BUFFER);
+            return val.len + 1;
+        }
+        if (!ops.validate_write(buf, (val.len + 1) * 2)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        var j: usize = 0;
+        while (j < val.len) : (j += 1) {
+            userW(buf + j * 2).* = val[j];
+        }
+        userW(buf + val.len * 2).* = 0;
+        setLastError(0);
+        logf("[WIN32] GetEnvironmentVariableW(L\"{s}\") -> {d} wchars\n", .{ name_buf[0..n], val.len });
+        return val.len;
+    }
+    logf("[WIN32] GetEnvironmentVariableW(L\"{s}\") -> 0 (нет переменной)\n", .{name_buf[0..n]});
     setLastError(ERROR_ENVVAR_NOT_FOUND);
     return 0;
+}
+
+/// getenv (CRT): env-таблица → стабильный heap-блок с NUL (контракт:
+/// результат НЕ освобождается приложением; утечка в bump-heap — CDD-граница).
+fn kgetenv(name_va: u64) u64 {
+    const len = userStrLen(name_va) orelse return 0;
+    if (len == 0) return 0;
+    const name = userPtr(name_va)[0..@intCast(len)];
+    const val = envLookup(name) orelse {
+        logf("[CRT] getenv(\"{s}\") -> NULL (нет переменной)\n", .{name});
+        return 0;
+    };
+    const p = kmalloc(val.len + 1);
+    if (p == 0) return 0;
+    @memcpy(userPtr(p)[0..val.len], val);
+    userPtr(p)[val.len] = 0;
+    logf("[CRT] getenv(\"{s}\") -> \"{s}\"\n", .{ name, val });
+    return p;
 }
 
 /// Тексты частых ошибок Win32/Winsock (FormatMessageA; curl печатает их в
@@ -1736,13 +2480,18 @@ fn kReleaseMutex(h: u64) u64 {
 }
 
 /// bcrypt.dll!BCryptGenRandom(hAlgorithm, pbBuffer, cbBuffer, dwFlags):
-/// 0 (STATUS_SUCCESS), буфер — TSC-микс xorshift (SYNTHETIC-энтропия:
-/// честно для CDD — настоящий CSPRNG в ядре появится с энтропийным хабом).
+/// 0 (STATUS_SUCCESS), буфер — КРИПТО-энтропия PUF-хаба ядра.
+/// v0.16.0 (CDD №7): статический сид 0x7E5C_A01B (v0.14) заменён на
+/// ops.entropy_fill — живой материал UnifiedEntropyHub (джиттер кремния +
+/// тайминги шины + IRQ). Статический сид был причиной bad-decrypt при
+/// дефолтном гибриде X25519MLKEM768 (декапсуляция ML-KEM): каждый вызов
+/// давал ИДЕНТИЧНЫЕ байты → DRBG-экземпляры OpenSSL (главный + резолвер)
+/// сидировались одним материалом. Теперь: каждый вызов — новый поток PRNG.
 fn kBCryptGenRandom(pb: u64, cb: u64) u64 {
     if (cb == 0) return 0;
     if (cb > 4096) return 0xC000_0009; // STATUS_INVALID_PARAMETER
     if (pb == 0 or !ops.validate_write(pb, cb)) return 0xC000_000D; // STATUS_INVALID_HANDLE? min win
-    tlsEntropy(userPtr(pb)[0..@intCast(cb)], 0x7E5C_A01B);
+    ops.entropy_fill(userPtr(pb), @intCast(cb));
     return 0; // STATUS_SUCCESS
 }
 
@@ -2866,7 +3615,11 @@ pub fn kmemchr(s: u64, c: u64, n: u64) u64 {
 /// 1767225600): не «сейчас», но детерминированно и далеко от 0 (curl
 /// использует время для кэша/Retry-After, не для криптографии).
 fn kTime64(t: u64) u64 {
-    const now: u64 = 1767225600;
+    // v0.16.0 (CDD №7): живое время из CMOS RTC (ядро) — X509-verify
+    // OpenSSL сверяет notBefore/notAfter с time(NULL); статика 2026-01-01
+    // проваливала свежие сертификаты («not yet valid (9)»). Фолбэк — прежняя
+    // константа (тесты без wall_time видят старое поведение).
+    const now: u64 = if (ops.wall_time) |f| f() else 1767225600;
     if (t != 0 and ops.validate_write(t, 8)) {
         std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(userPtr(t))), now, .little);
     }
@@ -2877,7 +3630,11 @@ fn kTime64(t: u64) u64 {
 /// (100нс-интервалы с 1601-01-01). 2026-01-01 = 133951872000000000.
 fn kGetSystemTimeAsFileTime(lp: u64) u64 {
     if (lp == 0 or !ops.validate_write(lp, 8)) return 0;
-    std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(userPtr(lp))), 133_951_872_000_000_000, .little);
+    // v0.16.0 (CDD №7): FILETIME = (Unix + 11644473600) × 10⁷ — живой RTC
+    // (или статика v0.12-эпохи, если wall_time не установлен — тесты).
+    const unix: u64 = if (ops.wall_time) |f| f() else 13395187200;
+    const ft: u64 = (unix + 11644473600) * 10_000_000;
+    std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(userPtr(lp))), ft, .little);
     return 0;
 }
 
@@ -2903,11 +3660,12 @@ fn kSleepConditionVariableCS(cv: u64, cs: u64, ms: u64) u64 {
 
 // ─── v0.12.0 (CDD №3, event-волна): stdio-интроспекция + конверсия ─────────
 
-/// _fileno(FILE*): stdin/stdout/stdstderr → 0/1/2 (по позиции в iob-массиве),
-/// чужой FILE* → -1 (errno EINVAL). Статическая FILE-модель CRT.
+/// _fileno(FILE*): stdin/stdout/stderr → 0/1/2 (по позиции в iob-массиве),
+/// наш VFS-FILE* → 3+idx (lowio-fd); чужой FILE* → -1. Статическая модель CRT.
 fn kfileno(file: u64) u64 {
     const c = &(ctx orelse return @bitCast(@as(i64, -1)));
     if (file == 0) return @bitCast(@as(i64, -1));
+    if (crtFileIdx(file)) |idx| return 3 + idx; // v0.16.0: VFS-файл
     if (c.iob_array != 0 and file >= c.iob_array and file < c.iob_array + 3 * 80) {
         const idx = (file - c.iob_array) / 80;
         return idx;
@@ -2922,15 +3680,18 @@ fn kisatty(fd: u64) u64 {
 }
 
 /// _get_osfhandle(fd): int fd → Win32 HANDLE (mingw-UCRT печатает тело
-/// ответа fwrite'ом через osfhandle-путь; 0/1/2 → stdio-псевдохэндлы).
-/// v0.13.0 (CDD №4, финальный шаг цикла).
+/// ответа fwrite'ом через osfhandle-путь; 0/1/2 → stdio-псевдохэндлы;
+/// v0.16.0: fd ≥3 → файловый хэндл 0x800+idx VFS).
 fn kGetOsfHandle(fd: u64) u64 {
-    const h: u64 = switch (fd) {
-        0 => FAKE_STDIN,
-        1 => FAKE_STDOUT,
-        2 => FAKE_STDERR,
-        else => 0xFFFFFFFF_FFFF_FFFF, // -1: не-stdio fd
-    };
+    const h: u64 = if (fd >= 3 and fd < 3 + MAX_FILES)
+        FILE_HANDLE_BASE + (fd - 3) // VFS-файл
+    else
+        switch (fd) {
+            0 => FAKE_STDIN,
+            1 => FAKE_STDOUT,
+            2 => FAKE_STDERR,
+            else => 0xFFFFFFFF_FFFF_FFFF, // -1: не-stdio fd
+        };
     logf("[WIN32] _get_osfhandle({d}) -> 0x{x}\n", .{ fd, h });
     return h;
 }
@@ -3065,35 +3826,12 @@ fn kmbstowcsS(ret_va: u64, wcstr: u64, size_in: u64, mbstr: u64, count: u64) u64
     return 0;
 }
 
-/// _fsopen(path, mode, share): файловой системы нет → NULL + errno ENOENT
-/// («файл не найден» — честная граница; конфиг .curlrc у нас и не должен
-/// существовать). Режим тоже валидируем по первой букве (r/w/a).
+/// _fsopen(path, mode, share) — v0.16.0 (CDD №7): VFS (CPIO initrd +
+/// FAT32 через ядро). Читаемые режимы → FILE*-блок с FileState-слотом;
+/// файл не найден → NULL + ENOENT; запись → NULL + EACCES (RO-VFS).
 fn kfsopen(path_va: u64, mode_va: u64, share: u64) u64 {
-    var name_buf: [48]u8 = undefined;
-    var name_len: u64 = 0;
-    if (path_va != 0) {
-        if (userStrLen(path_va)) |l| {
-            name_len = @min(l, 47);
-            if (name_len > 0 and ops.validate_read(path_va, name_len)) {
-                @memcpy(name_buf[0..@intCast(name_len)], userPtr(path_va)[0..@intCast(name_len)]);
-                name_buf[@intCast(name_len)] = 0;
-            }
-        }
-    }
-    if (ctx) |*cc| {
-        if (cc.errno_ptr != 0) {
-            if (ops.validate_write(cc.errno_ptr, 4)) {
-                @as(*align(1) u32, @ptrFromInt(cc.errno_ptr)).* = 2; // ENOENT
-            }
-        }
-    }
-    var mode: u8 = '?';
-    if (mode_va != 0 and ops.validate_read(mode_va, 1)) {
-        mode = userPtr(mode_va)[0];
-    }
-    logf("[CRT] _fsopen(\"{s}\", mode='{c}') -> NULL (нет ФС, ENOENT)\n", .{ name_buf[0..@intCast(name_len)], mode });
-    _ = share;
-    return 0;
+    _ = share; // share-mode не влияет на RO-чтение
+    return kfopenCommon(path_va, mode_va, "_fsopen");
 }
 
 // ─── v0.12.0 (CDD №3): module-walk KERNEL32 (цепочка с URL-аргументами) ────
@@ -3126,6 +3864,17 @@ fn module32Next(h: u64, lp_me: u64) u64 {
 
 /// CloseHandle(hObject): TRUE (закрываем что угодно — псевдо-объекты).
 fn closeHandle(h: u64) u64 {
+    // v0.16.0 (CDD №7): файловые хэндлы освобождают слот VFS
+    if (h >= FILE_HANDLE_BASE and h < FILE_HANDLE_BASE + MAX_FILES) {
+        if (ctx) |*c| {
+            const idx: usize = @intCast(h - FILE_HANDLE_BASE);
+            if (c.files[idx].in_use) {
+                c.files[idx].in_use = false;
+                logf("[WIN32] CloseHandle(0x{x}) -> TRUE (VFS-файл закрыт)\n", .{h});
+                return 1;
+            }
+        }
+    }
     logf("[WIN32] CloseHandle(0x{x}) -> TRUE\n", .{h});
     return 1;
 }
@@ -3340,6 +4089,33 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = module32Next(a1, a2);
         } else if (std.mem.eql(u8, name, "CloseHandle")) {
             ret = closeHandle(a1);
+        } else if (std.mem.eql(u8, name, "CreateFileA")) {
+            // v0.16.0 (CDD №7): файловая волна VFS. Win64: RCX=name, RDX=access,
+            // R8=share, R9=secattrs; стек[0]=creation, стек[1]=flags, стек[2]=tmpl
+            ret = createFileCommon(a1, a2, ops.stack_arg(0), false);
+        } else if (std.mem.eql(u8, name, "CreateFileW")) {
+            ret = createFileCommon(a1, a2, ops.stack_arg(0), true);
+        } else if (std.mem.eql(u8, name, "ReadFile")) {
+            // RCX=h, RDX=buf, R8=n, R9=lpRead; стек[0]=lpOverlapped
+            ret = readFileCommon(a1, a2, a3, a4, ops.stack_arg(0));
+        } else if (std.mem.eql(u8, name, "WriteFile")) {
+            ret = writeFileCommon(a1, a2, a3, a4, ops.stack_arg(0));
+        } else if (std.mem.eql(u8, name, "GetFileSize")) {
+            ret = getFileSizeCommon(a1, a2);
+        } else if (std.mem.eql(u8, name, "GetFileSizeEx")) {
+            ret = getFileSizeExCommon(a1, a2);
+        } else if (std.mem.eql(u8, name, "SetFilePointer")) {
+            ret = setFilePointerCommon(a1, a2, a3, a4);
+        } else if (std.mem.eql(u8, name, "SetFilePointerEx")) {
+            ret = setFilePointerExCommon(a1, a2, a3, a4);
+        } else if (std.mem.eql(u8, name, "GetFileAttributesA")) {
+            ret = getFileAttributesCommonA(a1);
+        } else if (std.mem.eql(u8, name, "GetFileType")) {
+            ret = getFileTypeCommon(a1);
+        } else if (std.mem.eql(u8, name, "SetHandleInformation") or
+            std.mem.eql(u8, name, "SetConsoleCtrlHandler"))
+        {
+            ret = 1; // TRUE: наследование/CTRL-обработчики — beyond-model
         } else if (std.mem.eql(u8, name, "InitializeCriticalSection") or
             std.mem.eql(u8, name, "EnterCriticalSection") or
             std.mem.eql(u8, name, "LeaveCriticalSection") or
@@ -3430,6 +4206,48 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = ksetmode(a1, a2);
         } else if (std.mem.eql(u8, name, "_fsopen")) {
             ret = kfsopen(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "fopen")) {
+            // v0.16.0 (CDD №7): fopen(path, mode) — VFS-файл → FILE*
+            ret = kfopenCommon(a1, a2, "fopen");
+        } else if (std.mem.eql(u8, name, "fread")) {
+            // fread(ptr, size, nmemb, stream): Win64 RCX/RDX/R8/R9 → a1..a4
+            ret = kfread(a1, a2, a3, a4);
+        } else if (std.mem.eql(u8, name, "fseek")) {
+            ret = kfseekCommon(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "_fseeki64")) {
+            ret = kfseekCommon(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "ftell")) {
+            ret = kftell(a1);
+        } else if (std.mem.eql(u8, name, "fclose")) {
+            ret = kfclose(a1);
+        } else if (std.mem.eql(u8, name, "feof")) {
+            ret = kfeof(a1);
+        } else if (std.mem.eql(u8, name, "ferror")) {
+            ret = kferror(a1);
+        } else if (std.mem.eql(u8, name, "rewind")) {
+            ret = krewind(a1);
+        } else if (std.mem.eql(u8, name, "fgets")) {
+            ret = kfgets(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "getc")) {
+            ret = kgetc(a1);
+        } else if (std.mem.eql(u8, name, "ungetc")) {
+            ret = kungetc(a1, a2);
+        } else if (std.mem.eql(u8, name, "puts")) {
+            ret = kputs(a1);
+        } else if (std.mem.eql(u8, name, "putchar")) {
+            ret = kputchar(a1);
+        } else if (std.mem.eql(u8, name, "_read")) {
+            ret = kread(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "_write")) {
+            ret = kwrite(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "_close")) {
+            ret = kclose(a1);
+        } else if (std.mem.eql(u8, name, "_lseeki64")) {
+            ret = klseeki64(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "_sopen_s")) {
+            ret = ksopenS(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "_chsize_s")) {
+            ret = kchsizeS(a1, a2);
         } else {
             handled = false;
         }
@@ -3587,7 +4405,8 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
         if (std.mem.eql(u8, name, "__p__environ")) {
             ret = lazyEnvironSlot();
         } else if (std.mem.eql(u8, name, "getenv")) {
-            ret = 0; // переменная не найдена (безопасный NULL)
+            // v0.16.0 (CDD №7): env-таблица (CURL_CA_BUNDLE для SSL без -k)
+            ret = kgetenv(a1);
         } else {
             handled = false;
         }
@@ -4176,6 +4995,11 @@ fn tReset() void {
     t_thread_exit_va = 0;
     t_exit_task_calls = 0;
     t_signaled_handle = 0;
+    // v0.16.0 (CDD №7): VFS/энтропия/окружение — чистый старт каждого теста
+    t_vfs_n = 0;
+    t_entropy_seed = 0x1234_5678_9ABC_DEF0;
+    t_entropy_calls = 0;
+    env_table = &.{};
 }
 
 fn tValidateTrue(va: u64, len: u64) bool {
@@ -4247,8 +5071,67 @@ fn tOps() Ops {
         .net_tcp_recv = noRecv,
         .net_tcp_poll = noPoll,
         .net_tcp_close = noClose,
-    .sleep_task = noSleep,
+        .sleep_task = noSleep,
+        // v0.16.0 (CDD №7): PUF-энтропия (каждый вызов — ДРУГИЕ байты)
+        .entropy_fill = tEntropyFill,
+        // v0.16.0 (CDD №7): VFS-фейк — t_vfs[0..t_vfs_n] (как мини-initrd)
+        .vfs_file_size = tVfsSize,
+        .vfs_file_read = tVfsRead,
     };
+}
+
+// v0.16.0 (CDD №7): тестовые фейки энтропии и VFS ─────────────────
+var t_entropy_seed: u64 = 0x1234_5678_9ABC_DEF0;
+var t_entropy_calls: usize = 0;
+
+/// Энтропия-фейк: xorshift с СЕДОМ, меняющимся на каждый вызов —
+/// ГЛАВНОЕ СВОЙСТВО (развал ML-KEM в v0.15): два вызова ≠ байты.
+fn tEntropyFill(buf: [*]u8, len: usize) void {
+    t_entropy_calls += 1;
+    var st: u64 = t_entropy_seed;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        buf[i] = @truncate(st >> 32);
+    }
+    t_entropy_seed +%= 0x9E37_79B9_7F4A_7C15; // следующий вызов = НОВЫЙ материал
+}
+
+const TVfsFile = struct { name: []const u8, data: []const u8 };
+var t_vfs: [4]TVfsFile = .{
+    .{ .name = "", .data = "" }, .{ .name = "", .data = "" },
+    .{ .name = "", .data = "" }, .{ .name = "", .data = "" },
+};
+var t_vfs_n: usize = 0;
+
+fn tVfsAdd(name: []const u8, data: []const u8) void {
+    if (t_vfs_n >= t_vfs.len) return;
+    t_vfs[t_vfs_n] = .{ .name = name, .data = data };
+    t_vfs_n += 1;
+}
+
+fn tVfsSize(name: [*]const u8, name_len: usize) u64 {
+    const n = name[0..name_len];
+    for (t_vfs[0..t_vfs_n]) |f| {
+        if (std.mem.eql(u8, f.name, n)) return f.data.len;
+    }
+    return VFS_NOT_FOUND;
+}
+
+fn tVfsRead(name: [*]const u8, name_len: usize, offset: u64, out: [*]u8, len: usize) u64 {
+    const n = name[0..name_len];
+    for (t_vfs[0..t_vfs_n]) |f| {
+        if (std.mem.eql(u8, f.name, n)) {
+            if (offset >= f.data.len) return 0;
+            const avail = f.data.len - @as(usize, @intCast(offset));
+            const take = @min(avail, len);
+            @memcpy(out[0..take], f.data[@intCast(offset)..][0..take]);
+            return take;
+        }
+    }
+    return 0;
 }
 
 // v0.12.0 threading-фейки: параметры CreateThread записываются в глобалы,
@@ -4350,6 +5233,9 @@ fn tCtx(cmdline: []const u8) void {
         .tls_sessions = [_]TlsSession{.{}} ** MAX_TLS,
         .tls_last_fd = 0,
         .sockets = [_]Sock{.{}} ** MAX_SOCKS,
+        // v0.16.0 (CDD №7)
+        .next_file_handle = FILE_HANDLE_BASE,
+        .files = [_]FileState{.{}} ** MAX_FILES,
     };
 }
 
@@ -4831,7 +5717,10 @@ test "dispatch: дефолтные ops-параноики — отказ без 
         .net_tcp_recv = noRecv,
         .net_tcp_poll = noPoll,
         .net_tcp_close = noClose,
-    .sleep_task = noSleep,
+        .sleep_task = noSleep,
+        .entropy_fill = noEntropy,
+        .vfs_file_size = noVfsSize,
+        .vfs_file_read = noVfsRead,
     };
     ctx = null;
     var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
@@ -6105,9 +6994,12 @@ test "crt: memchr/_time64/GetSystemTimeAsFileTime/GetTickCount64" {
     try testing.expectEqual(@as(u64, 1767225600), reg.call(id_tm, mb + 0x300, 0, 0, 0));
     try testing.expectEqual(@as(u64, 1767225600), userQ(mb + 0x300).*);
 
-    // GetSystemTimeAsFileTime: 64-бит FILETIME
+    // GetSystemTimeAsFileTime: 64-бит FILETIME. v0.16.0-фикс (CDD №7):
+    // корректная формула (Unix + 11644473600) × 10⁷ (1601-эпоха Windows) —
+    // прежний литерал забывал offset 1601 (латент v0.12). Фолбэк-статика
+    // 2024-06-13 (13395187200с) → 250396608000000000.
     _ = reg.call(id_ft, mb + 0x380, 0, 0, 0);
-    try testing.expectEqual(@as(u64, 133_951_872_000_000_000), userQ(mb + 0x380).*);
+    try testing.expectEqual(@as(u64, (13_395_187_200 + 11_644_473_600) * 10_000_000), userQ(mb + 0x380).*);
 
     // GetTickCount64: TSC 3ГГц → мс
     t_tsc = 3_000_000_000; // 1 секунда
@@ -6386,4 +7278,290 @@ test "waveA5: CreateMutexA/WaitFor/Release + BCryptGenRandom + ctype + byteswap"
 
     // byteswap: 0x12000000 → 0x12 (ntohl-семантика curl)
     try testing.expectEqual(@as(u64, 0x12), reg.call(id_bswap, 0x12000000, 0, 0, 0));
+}
+
+// ─── Тесты: v0.16.0 (CDD №7) — PUF-энтропия + VFS/FILE-API + окружение ──────
+
+test "cdd7-entropy: BCryptGenRandom — ДВА вызова дают РАЗНЫЕ байты (ML-KEM-фикс)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_bc = reg.add("bcrypt.dll", "BCryptGenRandom", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memset(&g_mem, 0xEE);
+
+    // вызов 1: 32Б в g_mem[0x100..0x120]
+    try testing.expectEqual(@as(u64, 0), reg.call(id_bc, 0, mb + 0x100, 32, 0));
+    // вызов 2: 32Б в g_mem[0x200..0x220]
+    try testing.expectEqual(@as(u64, 0), reg.call(id_bc, 0, mb + 0x200, 32, 0));
+    // ГЛАВНОЕ СВОЙСТВО (rot-козёл v0.15: статический сид 0x7E5CA01B):
+    // два вызова НЕ равны — DRBG-экземпляры сидируются разным материалом
+    var same = true;
+    for (g_mem[0x100..0x120], g_mem[0x200..0x220]) |a, b| {
+        if (a != b) {
+            same = false;
+            break;
+        }
+    }
+    try testing.expect(!same);
+    // энтропия реально запрашивалась (ops.entropy_fill, не tlsEntropy!)
+    try testing.expectEqual(@as(usize, 2), t_entropy_calls);
+    // оба буфера заполнены (не 0xEE)
+    var filled1 = false;
+    var filled2 = false;
+    for (g_mem[0x100..0x120]) |b| {
+        if (b != 0xEE) filled1 = true;
+    }
+    for (g_mem[0x200..0x220]) |b| {
+        if (b != 0xEE) filled2 = true;
+    }
+    try testing.expect(filled1 and filled2);
+    // cb=0 → SUCCESS без вызова энтропии; мусорный буфер → STATUS_INVALID_HANDLE
+    const calls_before = t_entropy_calls;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_bc, 0, 0, 0, 0));
+    try testing.expectEqual(calls_before, t_entropy_calls);
+    try testing.expectEqual(@as(u64, 0xC000_000D), reg.call(id_bc, 0, 0x9990, 16, 0));
+}
+
+test "cdd7-file: CreateFileA/ReadFile/GetFileSize/SetFilePointer/CloseHandle — VFS" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    tVfsAdd("hello.txt", "Hello from POLER VFS!\n");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_cf = reg.add("KERNEL32.dll", "CreateFileA", 0);
+    const id_rf = reg.add("KERNEL32.dll", "ReadFile", 0);
+    const id_gs = reg.add("KERNEL32.dll", "GetFileSize", 0);
+    const id_gx = reg.add("KERNEL32.dll", "GetFileSizeEx", 0);
+    const id_sp = reg.add("KERNEL32.dll", "SetFilePointer", 0);
+    const id_ch = reg.add("KERNEL32.dll", "CloseHandle", 0);
+    const id_ga = reg.add("KERNEL32.dll", "GetFileAttributesA", 0);
+    const id_gt = reg.add("KERNEL32.dll", "GetFileType", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+
+    // путь в user-памяти; CreateFileA: arg5(creation)=OPEN_EXISTING(3) — стек
+    @memcpy(g_mem[0x100..0x109], "hello.txt");
+    g_mem[0x109] = 0;
+    t_stack_args[0] = 3; // OPEN_EXISTING
+    const h = reg.call(id_cf, mb + 0x100, 0x8000_0000, 0, 0);
+    try testing.expectEqual(@as(u64, FILE_HANDLE_BASE), h);
+    try testing.expect(logHas("CreateFileA(\"hello.txt\")"));
+
+    // GetFileSize → 22; GetFileSizeEx → u64 в буфере
+    try testing.expectEqual(@as(u64, 22), reg.call(id_gs, h, 0, 0, 0));
+    @memset(g_mem[0x400..0x410], 0xEE);
+    try testing.expectEqual(@as(u64, 1), reg.call(id_gx, h, mb + 0x400, 0, 0));
+    try testing.expectEqual(@as(u64, 22), std.mem.readInt(u64, g_mem[0x400..0x408], .little));
+
+    // ReadFile: 8Б (lpRead — a4; lpOverlapped=стек[0]=NULL)
+    t_stack_args[0] = 0;
+    @memset(g_mem[0x500..0x600], 0xEE);
+    try testing.expectEqual(@as(u64, 1), reg.call(id_rf, h, mb + 0x500, 8, mb + 0x410));
+    try testing.expectEqualStrings("Hello fr", g_mem[0x500..0x508]);
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, g_mem[0x410..0x414], .little));
+    // остаток (14Б), затем EOF → TRUE + 0
+    try testing.expectEqual(@as(u64, 1), reg.call(id_rf, h, mb + 0x500, 100, mb + 0x410));
+    try testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, g_mem[0x410..0x414], .little));
+    try testing.expectEqual(@as(u64, 1), reg.call(id_rf, h, mb + 0x500, 10, mb + 0x410));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, g_mem[0x410..0x414], .little));
+
+    // SetFilePointer: BEGIN→6 (чтение 5Б «from »), END→22
+    try testing.expectEqual(@as(u64, 6), reg.call(id_sp, h, 6, 0, 0));
+    try testing.expectEqual(@as(u64, 1), reg.call(id_rf, h, mb + 0x500, 5, mb + 0x410));
+    try testing.expectEqualStrings("from ", g_mem[0x500..0x505]);
+    try testing.expectEqual(@as(u64, 22), reg.call(id_sp, h, 0, 0, 2));
+
+    // не-файловый хэндл → FALSE + LastError 6
+    ctx.?.last_error = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_rf, 0x9999, mb + 0x500, 5, mb + 0x410));
+    try testing.expectEqual(@as(u32, 6), ctx.?.last_error);
+
+    // CloseHandle → TRUE (слот освобождён); файл не найден → INVALID + 2
+    try testing.expectEqual(@as(u64, 1), reg.call(id_ch, h, 0, 0, 0));
+    @memcpy(g_mem[0x120..0x128], "nope.txt");
+    g_mem[0x128] = 0;
+    t_stack_args[0] = 3;
+    try testing.expectEqual(INVALID_HANDLE_VALUE, reg.call(id_cf, mb + 0x120, 0x8000_0000, 0, 0));
+    try testing.expectEqual(@as(u32, 2), ctx.?.last_error);
+
+    // GetFileAttributesA: найден → 0x80; нет → 0xFFFFFFFF + 2
+    try testing.expectEqual(@as(u64, 0x80), reg.call(id_ga, mb + 0x100, 0, 0, 0));
+    ctx.?.last_error = 0;
+    try testing.expectEqual(@as(u64, 0xFFFFFFFF), reg.call(id_ga, mb + 0x120, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 2), ctx.?.last_error);
+    // GetFileType: файл → DISK(1); stdout-псевдохэндл → CHAR(2)
+    const id_gsh = reg.add("KERNEL32.dll", "GetStdHandle", 0);
+    const stdout_h = reg.call(id_gsh, @bitCast(@as(u64, 0xFFFF_FFF6)), 0, 0, 0);
+    try testing.expectEqual(@as(u64, 2), reg.call(id_gt, stdout_h, 0, 0, 0));
+}
+
+test "cdd7-stdio: fopen/fread/fseek/ftell/feof/fgets/getc/ungetc/fclose — VFS" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    tVfsAdd("cacert.pem", "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_fo = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "fopen", 0);
+    const id_rd = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "fread", 0);
+    const id_sk = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "fseek", 0);
+    const id_tl = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "ftell", 0);
+    const id_fe = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "feof", 0);
+    const id_er = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "ferror", 0);
+    const id_fc = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "fclose", 0);
+    const id_fg = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "fgets", 0);
+    const id_gc = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "getc", 0);
+    const id_ug = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "ungetc", 0);
+    const id_rw = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "rewind", 0);
+    const id_fn = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "_fileno", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memcpy(g_mem[0x100..0x10A], "cacert.pem");
+    g_mem[0x10A] = 0;
+    @memcpy(g_mem[0x120..0x122], "rb");
+    g_mem[0x122] = 0;
+
+    // fopen("cacert.pem", "rb") → FILE* (блок 80Б из block-heap)
+    const fp = reg.call(id_fo, mb + 0x100, mb + 0x120, 0, 0);
+    try testing.expect(fp != 0);
+    try testing.expect(logHas("fopen(\"cacert.pem\")"));
+    // _fileno(FILE*) → 3 (первый VFS-fd после stdio 0/1/2)
+    try testing.expectEqual(@as(u64, 3), reg.call(id_fn, fp, 0, 0, 0));
+
+    // ftell=0, feof=0; fread 28Б (первая строка+перевод строки)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_tl, fp, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_fe, fp, 0, 0, 0));
+    @memset(g_mem[0x500..0x600], 0xEE);
+    try testing.expectEqual(@as(u64, 28), reg.call(id_rd, mb + 0x500, 1, 28, fp));
+    try testing.expectEqualStrings("-----BEGIN CERTIFICATE-----\n", g_mem[0x500..0x51C]);
+    try testing.expectEqual(@as(u64, 28), reg.call(id_tl, fp, 0, 0, 0));
+    // fread хвост (31Б из 59): 31 < want → eof-флаг поднят; ferror=0
+    try testing.expectEqual(@as(u64, 31), reg.call(id_rd, mb + 0x500, 1, 100, fp));
+    try testing.expectEqual(@as(u64, 1), reg.call(id_fe, fp, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_er, fp, 0, 0, 0));
+    // fread ЗА концом: 0 элементов, eof держится
+    try testing.expectEqual(@as(u64, 0), reg.call(id_rd, mb + 0x500, 1, 28, fp));
+
+    // fseek(SEEK_SET 0) снимает eof; fgets читает строку до '\n' включительно
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sk, fp, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_fe, fp, 0, 0, 0));
+    const fg = reg.call(id_fg, mb + 0x600, 100, fp, 0);
+    try testing.expectEqual(mb + 0x600, fg);
+    try testing.expectEqualStrings("-----BEGIN CERTIFICATE-----\n", g_mem[0x600..0x61C]);
+    // getc: 'M'; ungetc('M') → снова 'M'
+    try testing.expectEqual(@as(u64, 'M'), reg.call(id_gc, fp, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 'M'), reg.call(id_ug, 'M', fp, 0, 0));
+    try testing.expectEqual(@as(u64, 'M'), reg.call(id_gc, fp, 0, 0, 0));
+    // rewind → позиция 0
+    try testing.expectEqual(@as(u64, 0), reg.call(id_rw, fp, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_tl, fp, 0, 0, 0));
+
+    // fclose → 0; после закрытия fread → 0
+    try testing.expectEqual(@as(u64, 0), reg.call(id_fc, fp, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_rd, mb + 0x500, 1, 10, fp));
+
+    // fopen несуществующего → NULL; режим 'w' → NULL (RO-VFS)
+    @memcpy(g_mem[0x140..0x147], "nope.pm");
+    g_mem[0x147] = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_fo, mb + 0x140, mb + 0x120, 0, 0));
+    @memcpy(g_mem[0x128..0x12A], "wb");
+    g_mem[0x12A] = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_fo, mb + 0x100, mb + 0x128, 0, 0));
+}
+
+test "cdd7-lowio: _sopen_s/_read/_lseeki64/_write/_close — lowio через VFS" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    tVfsAdd("data.bin", "0123456789");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_so = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "_sopen_s", 0);
+    const id_rd = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "_read", 0);
+    const id_lk = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "_lseeki64", 0);
+    const id_wr = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "_write", 0);
+    const id_cl = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "_close", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memcpy(g_mem[0x100..0x108], "data.bin");
+    g_mem[0x108] = 0;
+
+    // _sopen_s(&fd, "data.bin", _O_RDONLY) → 0, fd=3
+    try testing.expectEqual(@as(u64, 0), reg.call(id_so, mb + 0x200, mb + 0x100, 0, 0));
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, g_mem[0x200..0x204], .little));
+    // _read: 4Б
+    @memset(g_mem[0x300..0x310], 0xEE);
+    try testing.expectEqual(@as(u64, 4), reg.call(id_rd, 3, mb + 0x300, 4, 0));
+    try testing.expectEqualStrings("0123", g_mem[0x300..0x304]);
+    // _lseeki64(SEEK_SET 2) → 2; _read → «234»
+    try testing.expectEqual(@as(u64, 2), reg.call(id_lk, 3, 2, 0, 0));
+    try testing.expectEqual(@as(u64, 3), reg.call(id_rd, 3, mb + 0x300, 3, 0));
+    try testing.expectEqualStrings("234", g_mem[0x300..0x303]);
+    // _write в файл → -1 (RO-VFS); _write(1) → консоль
+    try testing.expectEqual(@as(u64, @bitCast(@as(i64, -1))), reg.call(id_wr, 3, mb + 0x300, 3, 0));
+    @memcpy(g_mem[0x400..0x403], "AB\n");
+    try testing.expectEqual(@as(u64, 3), reg.call(id_wr, 1, mb + 0x400, 3, 0));
+    try testing.expect(consoleHas("AB"));
+    // _close → 0; чтение после закрытия → -1
+    try testing.expectEqual(@as(u64, 0), reg.call(id_cl, 3, 0, 0, 0));
+    try testing.expectEqual(@as(u64, @bitCast(@as(i64, -1))), reg.call(id_rd, 3, mb + 0x300, 3, 0));
+}
+
+test "cdd7-env: GetEnvironmentVariableA/W + getenv — env-таблица (CURL_CA_BUNDLE)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_a = reg.add("KERNEL32.dll", "GetEnvironmentVariableA", 0);
+    const id_w = reg.add("KERNEL32.dll", "GetEnvironmentVariableW", 0);
+    const id_g = reg.add("api-ms-win-crt-environment-l1-1-0.dll", "getenv", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+
+    // ядро-окружение: как main64 ставит перед peload
+    var env = [_]EnvEntry{
+        .{ .name = "CURL_CA_BUNDLE", .value = "cacert.pem" },
+        .{ .name = "HOME", .value = "/" },
+    };
+    env_table = &env;
+
+    // найдено: len=10 + копия в буфер
+    @memcpy(g_mem[0x100..0x10E], "CURL_CA_BUNDLE");
+    g_mem[0x10E] = 0;
+    @memset(g_mem[0x200..0x210], 0xEE);
+    try testing.expectEqual(@as(u64, 10), reg.call(id_a, mb + 0x100, mb + 0x200, 64, 0));
+    try testing.expectEqualStrings("cacert.pem\x00", g_mem[0x200..0x20B]);
+    try testing.expectEqual(@as(u32, 0), ctx.?.last_error);
+
+    // буфер мал (5 < 11) → требуемый размер 11 + ERROR_INSUFFICIENT_BUFFER
+    try testing.expectEqual(@as(u64, 11), reg.call(id_a, mb + 0x100, mb + 0x200, 5, 0));
+    try testing.expectEqual(@as(u32, 122), ctx.?.last_error);
+
+    // нет переменной → 0 + 203
+    @memcpy(g_mem[0x120..0x126], "NOSUCH");
+    g_mem[0x126] = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_a, mb + 0x120, mb + 0x200, 64, 0));
+    try testing.expectEqual(@as(u32, 203), ctx.?.last_error);
+
+    // W-вариант: имя UTF-16, значение UTF-16LE
+    const wname = "CURL_CA_BUNDLE";
+    for (wname, 0..) |ch, i| userW(mb + 0x300 + i * 2).* = ch;
+    userW(mb + 0x300 + wname.len * 2).* = 0;
+    @memset(g_mem[0x400..0x430], 0xEE);
+    try testing.expectEqual(@as(u64, 10), reg.call(id_w, mb + 0x300, mb + 0x400, 64, 0));
+    var ok_w = true;
+    for ("cacert.pem", 0..) |ch, i| {
+        if (std.mem.readInt(u16, g_mem[0x400 + i * 2 ..][0..2], .little) != ch) ok_w = false;
+    }
+    try testing.expect(ok_w);
+
+    // getenv (CRT): heap-блок с NUL
+    const p = reg.call(id_g, mb + 0x100, 0, 0, 0);
+    try testing.expect(p != 0);
+    try testing.expectEqualStrings("cacert.pem", userPtr(p)[0..10]);
+    try testing.expectEqual(@as(u8, 0), userPtr(p)[10]);
+    // getenv отсутствующей → NULL
+    try testing.expectEqual(@as(u64, 0), reg.call(id_g, mb + 0x120, 0, 0, 0));
+    try testing.expect(logHas("getenv(\"CURL_CA_BUNDLE\")"));
 }
