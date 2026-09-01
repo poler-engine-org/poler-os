@@ -44,7 +44,7 @@ Linux-программы работают нативно — POLER-OS реали
 
 ---
 
-## Текущая версия: v0.14.0
+## Текущая версия: v0.15.0
 
 | Подсистема | Статус | Описание |
 |---|---|---|
@@ -52,16 +52,16 @@ Linux-программы работают нативно — POLER-OS реали
 | HAL | Готово | GDT, IDT, PIC remap, Local APIC timer (vector 48), IO-APIC, TSS IST1 |
 | ACPI | Готово | RSDP/RSDT/MADT/HPET parsing |
 | Memory | Готово | PMM (bitmap), VMM (4-level paging + OOM rollback), kernel heap (free-list + SipHash-2-4) |
-| Scheduler | Готово | Round-robin с APIC timer preemption (8 задач, 32КБ kernel-стеки, атомарное переключение, структурная валидация кадров) |
+| Scheduler | Готово | Round-robin с APIC timer preemption (8 задач, 32КБ kernel-стеки, атомарное переключение, структурная валидация кадров, кооперативная парковка сна — wake_tick) |
 | Ring 3 | Готово | User mode: ELF64 loader, per-process CR3, syscall/sysretq, TSS IST, транзакции syscall (in_win32_syscall — многотредовая безопасность) |
 | Framebuffer | Готово | Linear framebuffer (1024x768x32bpp) + bitmap font |
 | Keyboard | Готово | PS/2 Set 2 → Set 1 translation через i8042 controller (bit 6) |
 | Serial | Готово | COM1 (115200 baud, 8N1) |
 | Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
-| VirtIO-Net | Готово | PCI legacy-драйвер, RX/TX VirtQueue, ARP/IPv4/TCP/DNS мини-стек (SLIRP, реальный интернет) |
+| VirtIO-Net | Готово | PCI legacy-драйвер, RX/TX VirtQueue, ARP/IPv4/TCP (окно/ретрансмиты/keepalive)/ICMP/DNS мини-стек (SLIRP, реальный интернет) |
 | PUF | Готово | Привязка аппаратной энтропии: TSC-джиттер → сид PRNG ядра + identity; анти-клон enrollment (спека POST_QUANTUM_HARDWARE_ENTROPY) |
 | Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen, win32_call (#6), cb_done (#7) |
-| **Win32 PE Runtime** | **CDD-циклы 1–4** | **curl.exe в Ring 3 — ПОЛНЫЙ HTTP-ОБМЕН**: CRT-init → main() → 2 Win64-треда (Happy Eyeballs) → getaddrinfo → socket() → connect() → select → **send(«GET / HTTP/1.1…», 75Б)** → recv(HTTP/1.1 200 OK, 52Б) → **«Hello POLER!» в консоли ОС** → штатный exit(0). 128 имплементаций + 6 native-стабов, SocketState-движок (опции/события FD_*/loopback-I/O), мультиплексор select с перезаписью fd_set, мост колбэка InitOnce, Enrollment-Gate |
+| **Win32 PE Runtime** | **CDD-циклы 1–6** | **curl.exe в Ring 3 — ПОЛНЫЙ HTTPS-ОБМЕН (TLS 1.3)**: CRT-init → main() → 2 Win64-треда (Happy Eyeballs) → getaddrinfo → socket() → connect() → select → **send(«GET / HTTP/1.1…», 75Б)** → recv(HTTP/1.1 200 OK, 52Б) → **«Hello POLER!» в консоли ОС** → штатный exit(0). 128 имплементаций + 6 native-стабов, SocketState-движок (опции/события FD_*/loopback-I/O), мультиплексор select с перезаписью fd_set, мост колбэка InitOnce, Enrollment-Gate |
 | SMP | Планируется | Многоядерность |
 | Networking | Планируется | virtio-net (реальный стек вместо loopback-штора) |
 | VFS | Планируется | Виртуальная файловая система |
@@ -207,7 +207,8 @@ zig-kernel/
 - [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → socket() → connect() → select → send() → recv() → печать тела → exit(0) (v0.10–v0.13, CDD-циклы 1–4)
 - [x] Реализация базовых API kernel32/UCRT/WS2_32 «по мере запросов» (CDD): 138 syscall-трамплинов + 6 native-стабов + native-bsearch + native-qsort (175Б), block-heap, GetProcAddress, QPF/QPC (TSC), НАСТОЯЩИЕ Win64-треды, Enrollment-Gate, SocketState-движок с событиями FD_* и loopback-HTTP
 - [x] **CDD-цикл №5 (v0.14.0): РЕАЛЬНЫЙ СЕТЕВОЙ ОБМЕН** — драйвер VirtIO-Net (PCI legacy, RX/TX VirtQueue, 10Б-виртуальный-заголовок) + мини-стек ARP/IPv4/TCP (трёхстороннее рукопожатие, отложенные ACKи)/DNS (UDP→SLIRP): `curl.exe http://example.com` в Ring 3 получил НАСТОЯЩИЙ HTML из интернета и напечатал его в консоли ОС, штатный exit(0). SSPI/SChannel SYNTHETIC-TLS-движок построен (таблица + QuerySecurityPackageInfo/AcquireCredentialsHandle/InitializeSecurityContext/EncryptMessage/DecryptMessage); настоящий TLS-ClientHello (1539Б, OpenSSL внутри curl) отправлен на example.com
-- [ ] Следующие CDD-циклы: полное HTTPS-замыкание (curl-OpenSSL: анализ серверного FIN после handshake-флайта; CA-хранилище), strerror_s и прочие остатки CRT-семьи, .reloc для DYNAMIC_BASE, ICMP/ping, TCP-ретрансмиты с окном
+- [x] **CDD-цикл №6 (v0.15.0): ПОЛНОЕ ЗАМЫКАНИЕ HTTPS** — TCP-hardening (скользящее окно приёма, ретрансмиты с экспоненциальным бэкоффом, keep-alive, честный FIN-кланг fin_wait_1/2/time_wait), ICMP/ping + ifconfig/netstat в шелле, strerror_s/_wcserror_s, **кооперативная парковка сна задач** (диагноз HTTPS-разведки: CV-треды жгли CPU → крипто-треду не хватало слайсов → серверный FIN): `curl.exe -k --curves X25519 https://example.com` — TLS 1.3 handshake → зашифрованный GET → **расшифрованный HTML «Example Domain» напечатан в консоли ОС** → graceful FIN → штатный exit(0)
+- [ ] Следующие CDD-циклы: MLKEM768-расследование (bad decrypt на X25519MLKEM768-гибриде у curl-OpenSSL; чистый X25519 работает), IRQ-служба сети (таймерные тики → pollRx: ACKи/keepalive при Ring-3 паузах), .reloc для DYNAMIC_BASE, FILE-семья (initrd-VFS)
 - [ ] Подмножество Linux system call interface
 - [ ] POSIX compatibility layer
 
@@ -220,6 +221,16 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.15.0 — CDD-цикл №6: МОМЕНТ ИСТИНЫ №6 — ПОЛНОЕ ЗАМЫКАНИЕ HTTPS (TLS 1.3 в Ring 3)
+- **МОМЕНТ ИСТИНЫ №6 — ЗАШИФРОВАННЫЙ ИНТЕРНЕТ В RING 3**: `peload curl.exe -k --curves X25519 https://example.com` в QEMU SLIRP: DNS (104.20.23.154) → TCP-рукопожатие → **настоящий TLS 1.3 handshake** (ClientHello 311Б → ServerHello+Certificate flight 4846Б/16 сегментов → CCS+client Finished 6+58Б) → **зашифрованный HTTP GET (123Б)** через наш virtio-net → **расшифрованный curl-OpenSSL HTML «Example Domain» (585Б тело) напечатан в консоли ОС** → TLS close_notify (31/48/24Б) → graceful FIN → **штатный ExitProcess(0x0)**. Бэклог трапов ПУСТ. TLS-крипто (X25519 + AES-256-GCM + SHA-384, шифр 0x1303) считался самим curl — мы доставили поток бит-в-бит.
+- **РОТ-КОЗЁЛ HTTPS-провала v0.14.0 НАЙДЕН И УСТРАНЁН — гонка слайсов**: разведка (pcap + serial) показала: серверный FIN приходил через ~10с TLS-таймаута, потому что клиентский Finished опаздывал на ~40с — **воркер-треды curl крутились в SleepConditionVariableCS(10мс) с мгновенным возвратом** (255K вызовов за прогон!), in_win32_syscall≈всегда поднят → schedule() не тикает → крипто-треду достаются крохи CPU. После фикса: крипто = **1 секунда** (было 40с), CV-вызовы = 43 (было 255K).
+- **Кооперативная парковка сна задач** (`scheduler.zig` + `win32_api.zig`): Task.wake_tick (планировщик пропускает спящую до будильника); Sleep/SleepEx/SleepConditionVariableCS → ops.sleep_task → kSleepTask: внутри syscall-транзакции АТОМАРНО (cli) опускаем in_win32_syscall, уходим в hlt-цикл до дедлайна (тики переключают задачи, CPU спит), перед возвратом восстанавливаем СВОЙ user_rsp (мог быть затёрт syscall'ами задач, исполнявшихся в парковке) и флаг транзакции под cli — asm-exit делает sysretq на НАШ стек. Гонка v0.13.0 не вскрылась обратно (регрессии pe-run4/pe-run5 — ALL PASS).
+- **TCP Stack Hardening** (`virtio_net.zig`): скользящее окно приёма (реклама РЕАЛЬНОГО места RX-ринга ≤64К, drop+re-ACK при исчерпании, window-update после дренажа — 16-сегментные TLS-flights проходят без потерь); ретрансмиты данных с экспоненциальным бэкоффом (RTX-буфер 32КБ [snd_una..snd_nxt), RTO 200мс→×2→потолок 3с, ≤8 попыток, +FIN в хвосте чанка); keep-alive (1с тишины → проба seq=snd_nxt-1, ≤5 без ответа → abort); честный FIN-кланг: established → fin_wait_1 (наш FIN) → fin_wait_2 (FIN ACKed) → time_wait (финальный ACK) → closed; ACK-машина snd_una-продвижения (сброс RTO/KA-таймеров, seq-обёртки u32).
+- **ICMP + сетевая диагностика шелла**: билдеры/парсер Echo Request/Reply (RFC 1071 чексуммы), ответ на входящие ping (SLIRP probe), icmpPing с TSC-RTT-калибровкой; команды `ping <ip|host>` (DNS-резолв цели, пофробные [PING]-логи, сводка), `ifconfig` (eth0: IP/MAC/gw/DNS/link/счётчики RX-TX/ретрансмиты/KА-пробы/DNS-кэш), `netstat` (таблица TCP: пир/состояние/ринг/inflight/FIN/ABORT).
+- **strerror_s/_wcserror_s** (C11 Annex K, api-ms-win-crt-runtime): усечение с NUL без выхода за буфер, errno_t-возвраты (0/EINVAL 22), UTF-16LE для wide — TLS-ошибки curl печатаются честным текстом («bad decrypt»-диагностика стала возможна). curl импортирует strerror_s (274 fn / 22 DLL).
+- **Диагностика MLKEM (бэклог №7)**: дефолтный пост-квантовый гибрид X25519MLKEM768 (группа 0x11EC, key_share 1124Б) у этой сборки curl/OpenSSL даёт CRYPTO_internal:bad decrypt на декапсуляции (поток бит-в-бит чист — проверено pcap↔ring); чистый X25519 работает идеально — форсируем --curves X25519.
+- Тесты: 296/296 (+8 к v0.14: ICMP roundtrip/отбрасывания/echo-reply, sliding-window инварианты, RTX seq-математика обёрток u32, бэкофф-потолок, strerror_s/_wcserror_s). E2E: **pe-run6 ALL PASS** (момент №6: ICMP 4×4 + ifconfig/netstat + HTTPS HTML + exit(0), pcap 9319Б с TLS-record 0x16 0x03) + pe-run5 ALL PASS (HTTP-регрессия) + pe-run4 ALL PASS (loopback-регрессия).
 
 ### v0.14.0 — CDD-цикл №5: МОМЕНТ ИСТИНЫ №5 — РЕАЛЬНЫЙ сетевой обмен (VirtIO-Net + SLIRP)
 - **МОМЕНТ ИСТИНЫ №5 — НАСТОЯЩИЙ ИНТЕРНЕТ В RING 3**: `curl.exe http://example.com` в QEMU (`-netdev user` + `-device virtio-net-pci`): наш ARP-резолвинг шлюза SLIRP (10.0.2.2) → наш DNS-резолвер (UDP → 10.0.2.3, A-запись example.com → 172.66.147.243) → наше TCP-рукопожатие (SYN → SYN-ACK → ACK) → GET / HTTP/1.1 (75Б) через наш virtio-net TX → **РЕАЛЬНЫЙ HTML-ответ (870Б) «Example Domain» через наш RX** → напечатан curl.exe в консоли ОС (MB2WC → WriteConsoleW) → **штатный ExitProcess(0x0)**. Бэклог трапов ПУСТ. Без единой строки Windows — вся сеть наша.

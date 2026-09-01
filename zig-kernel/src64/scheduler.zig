@@ -51,6 +51,13 @@ pub const Task = struct {
     kernel_stack: [32768]u8 align(16), // Ring 0 stack (32KB)
     cr3: u64, // Per-process PML4 physical address (0 = use kernel CR3)
     user_stack_top: u64, // Top of user stack (virtual address, for reference/cleanup)
+    // v0.15.0 (CDD №6): сон задачи — планировщик пропускает до wake_tick
+    // (hal.tick_count, 10мс-джиффи). 0 = не спит. ПОЧЕМУ ТАК: CV-треды curl
+    // (SleepConditionVariableCS 10мс с мгновенным возвратом) жгли CPU
+    // сисколами — TLS-крипто главного треда получал ~1/6 слайсов → Finished
+    // опаздывал за серверный TLS-таймаут (~10с) → FIN → bad decrypt-подобные
+    // провалы. Парковка: сискол мгновенно возвращается, wake откладывается.
+    wake_tick: u64 = 0,
 };
 
 pub var tasks: [MAX_TASKS]Task = undefined;
@@ -164,6 +171,7 @@ pub fn createTask(entry_point: u64) !usize {
     task.privilege = .Kernel;
     task.cr3 = 0; // Use kernel CR3
     task.user_stack_top = 0;
+    task.wake_tick = 0; // v0.15.0: не спит при рождении
 
     // Set up the initial stack frame in the kernel stack.
     // InterruptFrame layout (176 bytes):
@@ -244,6 +252,7 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
     task.privilege = .User;
     task.cr3 = user_cr3; // Per-process page tables!
     task.user_stack_top = user_stack;
+    task.wake_tick = 0; // v0.15.0: не спит при рождении
 
     // Set up the initial stack frame in the kernel stack.
     // When IRETQ pops this frame and sees CS=0x23 (RPL=3),
@@ -432,10 +441,14 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     var found = false;
     var bad_rsp: u64 = 0;
     var bad_id: usize = 0;
+    const now = hal.tick_count; // v0.15.0: сон-парковка задач
     while (checked < task_count) : ({
         next_id = (next_id + 1) % task_count;
         checked += 1;
     }) {
+        if (tasks[next_id].wake_tick != 0 and tasks[next_id].wake_tick > now) {
+            continue; // спит (Sleep/CV) — слайс не даём
+        }
         if (tasks[next_id].state == .Ready or tasks[next_id].state == .Running) {
             if (taskRspValid(next_id, tasks[next_id].rsp)) {
                 found = true;
@@ -473,6 +486,7 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
 
     current_task_id = next_id;
     tasks[current_task_id].state = .Running;
+    tasks[current_task_id].wake_tick = 0; // v0.15.0: проснулась по будильнику
 
     // DEBUG: Log when switching to a user task
     if (tasks[current_task_id].privilege == .User) {
@@ -517,4 +531,24 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     }
 
     return next_task.rsp;
+}
+
+// ============================================================================
+// v0.15.0 (CDD №6): сон задач — парковка до wake_tick
+// ============================================================================
+
+/// Поставить будильник ТЕКУЩЕЙ задаче: ms миллисекунд (тик = 10мс,
+/// калибровка APIC-таймера в hal). Сискол (Sleep/CV) мгновенно вернётся
+/// в Ring 3, но планировщик НЕ даст задаче слайс до истечения — воркеры
+/// паркуются, крипто-тред curl получает CPU. Гард: ms=0 — сброс (не спит),
+/// потолок 60с (диагностический таймаут livelock-охоты).
+pub fn setTaskSleep(ms: u64) void {
+    if (current_task_id >= task_count) return;
+    if (ms == 0) {
+        tasks[current_task_id].wake_tick = 0;
+        return;
+    }
+    const capped: u64 = @min(ms, 60_000);
+    const ticks = (capped + 9) / 10; // округление вверх: Sleep(1) ≥ 1 тик
+    tasks[current_task_id].wake_tick = hal.tick_count + ticks;
 }

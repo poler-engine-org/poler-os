@@ -957,7 +957,7 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 9. Ready!
     vga_setcolor(0x0B);
     puts("\n╔══════════════════════════════════════════════════════╗\n");
-    puts("║         POLER-OS v0.13.0 — BOOT COMPLETE             ║\n");
+    puts("║         POLER-OS v0.15.0 — BOOT COMPLETE             ║\n");
     puts("║  HAL+PUF+Enrollment-Gate+PE Runtime — all systems GO║\n");
     puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
@@ -1017,7 +1017,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.13.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.15.0 Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
@@ -1082,15 +1082,18 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  touch <f> - Create an empty file\n");
         sys_print("  write <f> <text> - Write text to a file\n");
         sys_print("  rm <f>    - Delete a file\n");
+        sys_print("  ping <ip|host> - ICMP Echo Request/Reply (RTT, статистика) через virtio-net\n");
+        sys_print("  ifconfig - Сетевые интерфейсы: IP, MAC, шлюз, DNS, счётчики RX/TX\n");
+        sys_print("  netstat - Таблица TCP-соединений мини-стека (состояния, ринг, inflight)\n");
         sys_print("  disk      - Show disk info\n");
         sys_print("  entropy   - Show all hardware entropy pools status (PUF, Bus, IRQ, Bio)\n");
         sys_print("  enroll    - Enrollment-Gate status: silicon identity + bindEnrolled verdict\n");
         sys_print("  enroll test - Forge-test: анти-клон (подделка отпечатка → MISMATCH)\n");
         sys_print("  peinfo <f> - Analyze PE/COFF executable from initrd (headers, sections, imports)\n");
         sys_print("  pestubs <f> - Generate Win32 stub table for PE executable (CDD: log+int3)\n");
-        sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (CDD cycle 4)\n");
+        sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (e.g. peload curl.exe -k https://example.com)\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.13.0 (x86_64 Long Mode)\n");
+        sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
     } else if (eq(cmd, "clear")) {
         sys_clear_screen();
@@ -1122,6 +1125,14 @@ fn execute_command(cmd: []const u8) void {
         cmd_ls("");
     } else if (startsWith(cmd, "ls ")) {
         cmd_ls(cmd[3..]);
+    } else if (eq(cmd, "ping")) {
+        cmd_ping("");
+    } else if (startsWith(cmd, "ping ")) {
+        cmd_ping(cmd[5..]);
+    } else if (eq(cmd, "ifconfig")) {
+        cmd_ifconfig();
+    } else if (eq(cmd, "netstat")) {
+        cmd_netstat();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -1629,7 +1640,7 @@ fn cmd_peload(args: []const u8) void {
         return;
     };
 
-    sys_print("=== PE Load & Run (CDD cycle 4): ");
+    sys_print("=== PE Load & Run (CDD cycle 6): ");
     sys_print(file);
     if (args.len > file_end) {
         sys_print(" — cmdline: ");
@@ -1936,6 +1947,9 @@ fn cmd_peload(args: []const u8) void {
         .{ "api-ms-win-crt-private-l1-1-0.dll", "strrchr" },
         .{ "api-ms-win-crt-private-l1-1-0.dll", "strstr" },
         .{ "api-ms-win-crt-runtime-l1-1-0.dll", "strerror" },
+        .{ "api-ms-win-crt-runtime-l1-1-0.dll", "strerror_s" },
+        // (_wcserror_s реализован в win32_crt-dispatch + тесты; curl его не
+        // импортирует → в impl_specs не вносим — счёт честный)
         .{ "api-ms-win-crt-locale-l1-1-0.dll", "setlocale" },
         .{ "api-ms-win-crt-convert-l1-1-0.dll", "atoi" },
         .{ "api-ms-win-crt-convert-l1-1-0.dll", "strtol" },
@@ -2026,7 +2040,7 @@ fn cmd_peload(args: []const u8) void {
     printDec(impls);
     sys_print(" / ");
     printDec(impl_specs.len);
-    sys_print(" — cycles 1+2+3+4+5 (waves: 17+20 fn + Wave-A/ctype/byteswap) + CRT-startup-kit\n");
+    sys_print(" — cycles 1+…+6 (волны 17+20 fn + Wave-A + CRT-kit + CDD6: strerror_s/_wcserror_s)\n");
 
     // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
     kdisp.applyToImage(img.backing);
@@ -2118,6 +2132,172 @@ fn cmd_peload(args: []const u8) void {
     printDec(task_id);
     sys_print(" created — waiting for first CDD int3 log\n");
     sys_print("[CDD] chain: lines [CDD]/[WIN32] below = next functions to implement\n");
+}
+
+// ============================================================================
+// v0.15.0 (CDD №6): сетевая диагностика шелла — ping / ifconfig / netstat
+// ============================================================================
+
+/// «10.0.2.15» в десятичной записи.
+fn printIp(ip: [4]u8) void {
+    printDec(ip[0]);
+    sys_print(".");
+    printDec(ip[1]);
+    sys_print(".");
+    printDec(ip[2]);
+    sys_print(".");
+    printDec(ip[3]);
+}
+
+/// Два hex-символа (байт MAC-адреса без префикса).
+fn putHexByte(b: u8) void {
+    const hex = "0123456789abcdef";
+    var s: [2]u8 = undefined;
+    s[0] = hex[b >> 4];
+    s[1] = hex[b & 0xF];
+    sys_print(&s);
+}
+
+/// ping <ip|host> [count]: ICMP Echo Request/Reply через virtio-net
+/// (SLIRP-шлюз 10.0.2.2 отвечает мгновенно; внешние IP — NAT-проброс).
+/// Пофробные [PING]-строки идут в serial (virtio_net.icmpPing), сводка —
+/// в VGA-консоль.
+fn cmd_ping(args: []const u8) void {
+    if (args.len == 0) {
+        sys_print("Usage: ping <ip|host> [count]   (например: ping 10.0.2.2, ping example.com)\n");
+        return;
+    }
+    var it = std.mem.tokenizeScalar(u8, args, ' ');
+    const target = it.next() orelse {
+        sys_print("ping: пустая цель\n");
+        return;
+    };
+    var count: u8 = 4;
+    if (it.next()) |cnt_s| {
+        const v = std.fmt.parseInt(u8, cnt_s, 10) catch 4;
+        if (v > 0) count = @min(v, 16);
+    }
+    if (!virtio_net.isInitialized()) {
+        sys_print("ping: virtio-net не инициализирован (нет устройства)\n");
+        return;
+    }
+    // цель: IP-литерал или DNS-резолв
+    var ip: [4]u8 = undefined;
+    if (virtio_net.parseIpLiteral(target)) |lit| {
+        ip = lit;
+    } else {
+        sys_print("ping: резолв '");
+        sys_print(target);
+        sys_print("' через DNS (10.0.2.3)…\n");
+        ip = virtio_net.dnsResolve(target) orelse {
+            sys_print("ping: DNS не разрезолвил '");
+            sys_print(target);
+            sys_print("'\n");
+            return;
+        };
+    }
+    sys_print("PING ");
+    sys_print(target);
+    sys_print(" (");
+    printIp(ip);
+    sys_print("): 64Б данных, ");
+    printDec(count);
+    sys_print(" проб\n");
+    const res = virtio_net.icmpPing(ip, count);
+    sys_print("\n--- ");
+    sys_print(target);
+    sys_print(" — статистика пинга ---\n");
+    sys_print("передано: ");
+    printDec(res.sent);
+    sys_print(", получено: ");
+    printDec(res.received);
+    if (res.received > 0 and res.sent > 0) {
+        const pct = (@as(u64, res.received) * 100) / @as(u64, res.sent);
+        sys_print(" (");
+        printDec(pct);
+        sys_print("%), лучший RTT: ");
+        printDec(res.rtt_ms);
+        sys_print("мс\n");
+    } else {
+        sys_print(" — таймаут (хост недоступен или ICMP фильтруется)\n");
+    }
+}
+
+/// ifconfig: интерфейс eth0 (virtio-net) — IP/MAC/шлюз/DNS + счётчики.
+fn cmd_ifconfig() void {
+    if (!virtio_net.isInitialized()) {
+        sys_print("eth0: virtio-net устройство не найдено\n");
+        return;
+    }
+    const mac = virtio_net.ourMac();
+    sys_print("eth0: virtio-net (POLER SLIRP user-mode)\n");
+    sys_print("  inet 10.0.2.15  netmask 255.255.255.0\n");
+    sys_print("  gateway 10.0.2.2    dns 10.0.2.3\n");
+    sys_print("  ether ");
+    for (mac, 0..) |b, i| {
+        putHexByte(b);
+        if (i < 5) sys_print(":");
+    }
+    sys_print("\n  link: ");
+    if (virtio_net.gatewayResolved()) {
+        sys_print("UP (ARP шлюза резолвлен)\n");
+    } else {
+        sys_print("DOWN (ARP шлюза не резолвлен)\n");
+    }
+    const st = virtio_net.netStats();
+    sys_print("  RX: ");
+    printDec(st.rx_frames);
+    sys_print(" кадров / ");
+    printDec(st.rx_bytes);
+    sys_print("Б\n  TX: ");
+    printDec(st.tx_frames);
+    sys_print(" кадров / ");
+    printDec(st.tx_bytes);
+    sys_print("Б\n  ретрансмиты TCP: ");
+    printDec(st.rtx_frames);
+    sys_print(", keep-alive пробы: ");
+    printDec(st.ka_probes);
+    sys_print("\n");
+    if (virtio_net.dnsCacheGet()) |dc| {
+        sys_print("  DNS-кэш: ");
+        sys_print(dc.host);
+        sys_print(" -> ");
+        printIp(dc.ip);
+        sys_print("\n");
+    }
+}
+
+/// netstat: таблица TCP-соединений мини-стека (слот/пир/состояние/ринг).
+fn cmd_netstat() void {
+    if (!virtio_net.isInitialized()) {
+        sys_print("netstat: virtio-net не инициализирован\n");
+        return;
+    }
+    sys_print("Активные TCP-соединения (мини-стек ядра)\n");
+    sys_print("slot  пир                 состояние    ring(Б)  inflight(Б)\n");
+    var any = false;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const ci = virtio_net.connInfo(i) orelse continue;
+        any = true;
+        printDec(ci.slot);
+        sys_print("     ");
+        printIp(ci.peer_ip);
+        sys_print(":");
+        printDec(ci.peer_port);
+        if (ci.peer_port < 10) sys_print("  ");
+        if (ci.peer_port < 100) sys_print(" ");
+        sys_print("  ");
+        sys_print(@tagName(ci.state));
+        sys_print("  ");
+        printDec(ci.ring_bytes);
+        sys_print("  ");
+        printDec(ci.inflight);
+        if (ci.fin_received) sys_print("  [FIN]");
+        if (ci.aborted) sys_print("  [ABORT]");
+        sys_print("\n");
+    }
+    if (!any) sys_print("  (нет активных соединений)\n");
 }
 
 fn cmd_disk() void {

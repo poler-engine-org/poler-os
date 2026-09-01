@@ -109,11 +109,25 @@ pub const MAX_TCP_CONNS: usize = 8;
 const RX_RING_PAGES: usize = 16; // 64КБ приёма на соединение
 const RX_RING_SIZE: usize = RX_RING_PAGES * 4096;
 
+// v0.15.0 (CDD №6): ретрансмит-буфер [snd_una..snd_nxt) — 32КБ на соединение
+const RTX_PAGES: usize = 8;
+const RTX_SIZE: usize = RTX_PAGES * 4096;
+
+// v0.15.0 (CDD №6): TCP-таймеры (hal.tick_count = 10мс-джиффи)
+const RTO_INITIAL_TICKS: u32 = 20; // 200мс (SLIRP-RTT ≪ — без ложных ретратов)
+const RTO_MAX_TICKS: u32 = 300; // 3с — потолок экспоненциального бэкоффа
+const RTX_MAX_ATTEMPTS: u8 = 8; // далее — abort соединения
+const KA_IDLE_TICKS: u64 = 100; // 1с без встречного трафика → проба
+const KA_MAX_PROBES: u8 = 5; // далее — соединение мертво
+const WIN_UPDATE_THRESHOLD: u16 = 16384; // окно открылось → window-update ACK
+
 const TcpState = enum(u8) {
     unused,
     syn_sent,
     established,
-    fin_wait,
+    fin_wait_1, // наш FIN отправлен, ждём ACK (ретрансмится движком)
+    fin_wait_2, // наш FIN ACKed, ждём FIN пир
+    time_wait, // FIN пира ACKed финальным ACK — короткий отдых → closed
     closed,
 };
 
@@ -124,6 +138,7 @@ pub const TcpConn = struct {
     src_port: u16 = 0,
     iss: u32 = 0, // initial send seq
     snd_nxt: u32 = 0, // следующий seq для отправки
+    snd_una: u32 = 0, // v0.15.0: старейший неподтверждённый seq (RTX-движок)
     rcv_nxt: u32 = 0, // следующий ожидаемый seq
     irs: u32 = 0, // initial recv seq (peer)
     // RX-кольцо (identity-mapped страницы PMM)
@@ -132,8 +147,22 @@ pub const TcpConn = struct {
     ring_head: usize = 0, // позиция чтения
     ring_tail: usize = 0, // позиция записи
     fin_received: bool = false,
+    aborted: bool = false, // v0.15.0: RST / ретрансмит-таймаут (данные не валидны)
     syn_retries: u8 = 0,
     need_ack: bool = false, // отложенный ACK (анти-реентерабельность!)
+    // v0.15.0 (CDD №6): sliding window приёма — рекламим РЕАЛЬНОЕ место
+    win_advertised: u16 = 0xFFFF, // последнее заявленное окно
+    // v0.15.0 (CDD №6): ретрансмиты с экспоненциальным бэкоффом
+    rtx_phys: u64 = 0, // RTX-буфер (лениво, RTX_PAGES identity-страниц)
+    rtx_virt: u64 = 0,
+    rtx_len: usize = 0, // байт в буфере = snd_nxt - snd_una - (fin?1:0)
+    fin_unacked: bool = false, // FIN занимает +1 seq в flight
+    rto_ticks: u32 = RTO_INITIAL_TICKS,
+    rtx_attempts: u8 = 0, // ретрансмиты ПОДРЯД без нового ACK
+    last_xmit_tick: u64 = 0, // тик последей передачи (новой или ретрансмита)
+    last_ack_tick: u64 = 0, // тик последнего валидного ACK от пира
+    // v0.15.0 (CDD №6): keep-alive
+    ka_probes: u8 = 0,
 };
 
 // ─── Состояние драйвера ─────────────────────────────────────────────────────
@@ -190,6 +219,23 @@ var vn: struct {
 
     conns: [MAX_TCP_CONNS]TcpConn = undefined,
     next_src_port: u16 = 0xC350, // 50000+
+
+    // v0.15.0 (CDD №6): статистика (ifconfig/netstat) + ICMP-состояние
+    rx_frames: u64 = 0,
+    rx_bytes: u64 = 0,
+    tx_frames: u64 = 0,
+    tx_bytes: u64 = 0,
+    rtx_frames: u64 = 0, // ретрансмиты
+    ka_probes_sent: u64 = 0,
+    // ICMP echo: последняя пинг-сессия
+    icmp_id: u16 = 0,
+    icmp_seq: u16 = 0,
+    icmp_reply_seq: u16 = 0, // seq последнего Echo Reply
+    icmp_reply_seen: bool = false,
+    icmp_rx_tsc: u64 = 0, // TSC момента прихода ответа
+    icmp_req_seen: bool = false, // входящий Echo Request (для ответа)
+    tsc_per_ms: u64 = 0, // калибровка TSC (RTT пинга)
+    in_poll: bool = false, // анти-реентерабельность pollRx/service
 } = .{};
 
 // ─── I/O-регистры ───────────────────────────────────────────────────────────
@@ -311,6 +357,7 @@ pub fn buildIpv4(buf: []u8, src: [4]u8, dst: [4]u8, proto: u8, payload_len: usiz
 
 /// TCP-сегмент (20Б заголовок + опции до 40Б + данные).
 /// опции_len — дополнительные байты (SYN → MSS-опция 4Б).
+/// v0.15.0 (CDD №6): window — заявляемое окно приёма (sliding window).
 pub fn buildTcpSegment(
     buf: []u8,
     src_port: u16,
@@ -322,6 +369,7 @@ pub fn buildTcpSegment(
     payload: []const u8,
     src_ip: [4]u8,
     dst_ip: [4]u8,
+    window: u16,
 ) usize {
     const data_off: u8 = @intCast((20 + options_len) / 4);
     buf[0] = @intCast(src_port >> 8);
@@ -338,8 +386,8 @@ pub fn buildTcpSegment(
     buf[11] = @intCast(ack & 0xFF);
     buf[12] = data_off << 4; // data offset (words)
     buf[13] = @intCast(flags & 0xFF);
-    buf[14] = 0xFF; // window (шкала 2 — 64K... SLIRP ок)
-    buf[15] = 0xFF;
+    buf[14] = @intCast(window >> 8); // v0.15.0: окно приёма (было 0xFFFF)
+    buf[15] = @intCast(window & 0xFF);
     buf[16] = 0; // checksum placeholder
     buf[17] = 0;
     buf[18] = 0; // urgent ptr
@@ -472,6 +520,66 @@ fn skipDnsName(pkt: []const u8, start: usize) ?usize {
 }
 
 // ============================================================================
+// v0.15.0 (CDD №6): ICMP — ping-диагностика (Echo Request / Echo Reply)
+// ============================================================================
+
+pub const IcmpEcho = struct { id: u16, seq: u16 };
+
+/// ICMP Echo Request (8Б заголовок + 56Б payload «polerping»): type 8, code 0,
+/// checksum RFC 1071 (та же ipChecksum), id+seq.
+pub fn buildIcmpEcho(buf: []u8, id: u16, seq: u16) usize {
+    buf[0] = 8; // type = echo request
+    buf[1] = 0; // code
+    buf[2] = 0; // checksum placeholder
+    buf[3] = 0;
+    buf[4] = @intCast(id >> 8);
+    buf[5] = @intCast(id & 0xFF);
+    buf[6] = @intCast(seq >> 8);
+    buf[7] = @intCast(seq & 0xFF);
+    // payload 56Б (стандартный размер ping)
+    var i: usize = 8;
+    while (i < 64) : (i += 1) buf[i] = @truncate(0x50 + i); // «poler…»
+    const csum = ipChecksum(buf[0..64]);
+    buf[2] = @intCast(csum >> 8);
+    buf[3] = @intCast(csum & 0xFF);
+    return 64;
+}
+
+/// ICMP Echo Reply из принятого пакета: type 0 + id/seq. null — не reply /
+/// битая чексумма / не наш id.
+pub fn parseIcmpReply(pkt: []const u8, want_id: u16) ?IcmpEcho {
+    if (pkt.len < 16) return null;
+    if (pkt[0] != 0) return null; // не echo reply
+    if (pkt[1] != 0) return null;
+    // чексумма: пересчёт (поле = 0) обязан совпасть с полем пакета
+    const expect = (@as(u16, pkt[2]) << 8) | pkt[3];
+    var scratch: [64]u8 = undefined;
+    const n = @min(pkt.len, 64);
+    @memcpy(scratch[0..n], pkt[0..n]);
+    scratch[2] = 0;
+    scratch[3] = 0;
+    if (ipChecksum(scratch[0..n]) != expect) return null; // чексумма битая
+    const id = (@as(u16, pkt[4]) << 8) | pkt[5];
+    if (id != want_id) return null;
+    return .{ .id = id, .seq = (@as(u16, pkt[6]) << 8) | pkt[7] };
+}
+
+/// ICMP Echo Request, пришедший НАМ (SLIRP/host probe): type 8 → ответить.
+/// Возврат — готовый Echo Reply в buf (зеркалим payload).
+pub fn buildIcmpEchoReply(buf: []u8, req: []const u8) usize {
+    if (req.len < 8) return 0;
+    @memcpy(buf[0..req.len], req);
+    buf[0] = 0; // type = echo reply
+    buf[1] = 0;
+    buf[2] = 0;
+    buf[3] = 0;
+    const csum = ipChecksum(buf[0..req.len]);
+    buf[2] = @intCast(csum >> 8);
+    buf[3] = @intCast(csum & 0xFF);
+    return req.len;
+}
+
+// ============================================================================
 // Инициализация драйвера
 // ============================================================================
 
@@ -553,7 +661,27 @@ pub fn init() VnetError!void {
 
     wr8(VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
     vn.initialized = true;
+
+    // v0.15.0 (CDD №6): TSC-калибровка для RTT пинга (дельта TSC за 2 тика
+    // APIC-таймера = 20мс). Гард: таймер не тикает → 0 (ping в тиках).
+    calibrateTscPerMs();
+
     hal.Serial.puts("[VNET] Initialization complete (SLIRP: 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3)\n");
+}
+
+fn calibrateTscPerMs() void {
+    const t0 = hal.readMsr(0x10);
+    const tk0 = hal.tick_count;
+    var spin: u32 = 0;
+    while (hal.tick_count < tk0 + 2) {
+        asm volatile ("pause");
+        spin += 1;
+        if (spin > 8_000_000) break; // таймер не тикает — не зависать
+    }
+    const t1 = hal.readMsr(0x10);
+    if (hal.tick_count >= tk0 + 2 and t1 > t0) {
+        vn.tsc_per_ms = (t1 - t0) / 20; // 2 тика = 20мс
+    }
 }
 
 pub fn isInitialized() bool {
@@ -679,6 +807,8 @@ pub fn sendFrame(frame: []const u8) bool {
         if (used_idx != vn.tx_last_used) {
             _ = usedRingPtr(vn.tx_used)[vn.tx_last_used % QUEUE_SIZE];
             vn.tx_last_used +%= 1;
+            vn.tx_frames += 1; // v0.15.0: статистика (реальная отправка)
+            vn.tx_bytes += frame.len;
             return true;
         }
         asm volatile ("pause");
@@ -698,8 +828,19 @@ pub fn sendFrame(frame: []const u8) bool {
 /// ИЗ спина sendFrame — вложенный вызов перезаписывал TX-дескриптор, ACKи
 /// терялись, сервер ретрансмитил). Вместо этого: need_ack-флаг, а ВЫШЕ —
 /// один накопленный ACK после цикла.
+/// v0.15.0 (CDD №6): in_poll-гард (служба таймеров TCP — ретрансмиты и
+/// keep-alive — гоняется в poll-точках, не из IRQ) + статистика RX.
 pub fn pollRx() void {
     if (!vn.initialized) return;
+    if (vn.in_poll) return; // анти-реентерабельность
+    vn.in_poll = true;
+    defer vn.in_poll = false;
+
+    // v0.15.0: таймеры TCP (ретрансмиты с бэкоффом + keep-alive) — каждый
+    // poll-такт: во время активного обмена curl вызывает send/recv/select
+    // непрерывно → движок дышит на каждом системном вызове.
+    tcpTimers();
+
     var handled_any = false;
     var guard: u8 = 0;
     while (guard < 8) : (guard += 1) {
@@ -711,6 +852,8 @@ pub fn pollRx() void {
         // ⚠ legacy: elem.len = 10Б hdr + кадр — Ethernet начинается с +10
         if (k < 8 and elem.len > VNET_HDR_LEN + ETH_HDR_LEN) {
             const frame_len: usize = @intCast(elem.len - VNET_HDR_LEN);
+            vn.rx_frames += 1; // v0.15.0: статистика
+            vn.rx_bytes += frame_len;
             const buf: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(vn.rx_bufs[k])));
             handleFrame(buf[VNET_HDR_LEN .. VNET_HDR_LEN + frame_len]);
             handled_any = true;
@@ -787,13 +930,50 @@ fn handleFrame(frame: []volatile u8) void {
         const ip_end = @min(ETH_HDR_LEN + iplen, f.len);
         if (ip_end < ETH_HDR_LEN + ihl) return;
         const payload = f[ETH_HDR_LEN + ihl .. ip_end];
-        if (proto == IP_PROTO_UDP and payload.len >= 8) {
+        if (proto == IP_PROTO_ICMP and payload.len >= 8) {
+            handleIcmp(f, payload);
+        } else if (proto == IP_PROTO_UDP and payload.len >= 8) {
             handleUdp(payload);
         } else if (proto == IP_PROTO_TCP and payload.len >= 20) {
             handleTcp(payload);
         }
         return;
     }
+}
+
+/// v0.15.0 (CDD №6): ICMP-вход. Echo Request к НАМ (10.0.2.15) — зеркальный
+/// ответ (host/SLIRP probe). Echo Reply с нашим id — фиксация для icmpPing.
+fn handleIcmp(frame_full: []const u8, icmp: []const u8) void {
+    if (icmp[0] == 8) { // echo request → нам?
+        if (icmp.len > 128) return; // гард буфера ответа
+        // frame: [eth 14][ip 20]: src ip = 14+12..16, dst ip = 14+16..20
+        const dst_ip = frame_full[ETH_HDR_LEN + 16 .. ETH_HDR_LEN + 20];
+        if (dst_ip[0] == 10 and dst_ip[1] == 0 and dst_ip[2] == 2 and dst_ip[3] == 15) {
+            var reply: [ETH_HDR_LEN + 20 + 128]u8 = undefined;
+            const n = buildIcmpEchoReply(reply[ETH_HDR_LEN + 20 ..], icmp);
+            if (n > 0) {
+                const src_ip: [4]u8 = frame_full[ETH_HDR_LEN + 12 .. ETH_HDR_LEN + 16].*;
+                _ = buildEthernet(&reply, src_macFromFrame(frame_full), vn.mac, ETH_TYPE_IPV4);
+                _ = buildIpv4(reply[ETH_HDR_LEN..], .{ 10, 0, 2, 15 }, src_ip, IP_PROTO_ICMP, n);
+                _ = sendFrame(reply[0 .. ETH_HDR_LEN + 20 + n]);
+                hal.Serial.puts("[VNET] ICMP: echo request answered\n");
+            }
+            return;
+        }
+        return;
+    }
+    if (icmp[0] == 0) { // echo reply
+        const r = parseIcmpReply(icmp, vn.icmp_id) orelse return;
+        vn.icmp_reply_seq = r.seq;
+        vn.icmp_reply_seen = true;
+        vn.icmp_rx_tsc = hal.readMsr(0x10);
+    }
+}
+
+fn src_macFromFrame(f: []const u8) [6]u8 {
+    var m: [6]u8 = undefined;
+    @memcpy(&m, f[6..12]);
+    return m;
 }
 
 /// UDP: только DNS-ответы (10.0.2.3 → нас).
@@ -815,6 +995,9 @@ fn handleUdp(udp: []const u8) void {
 var vn_dns_txn: u16 = 0;
 
 /// TCP-вход: сегменты для наших соединений.
+/// v0.15.0 (CDD №6): полная ACK-машина (snd_una-продвижение → сброс RTO +
+/// KA-таймера), sliding window (окно исчерпано → сегмент НЕ принимается,
+/// re-ACK), FIN-стейт fin_wait_1/fin_wait_2/time_wait.
 fn handleTcp(seg: []const u8) void {
     const dst_port = (@as(u16, seg[2]) << 8) | seg[3];
     const src_port = (@as(u16, seg[0]) << 8) | seg[1];
@@ -823,20 +1006,52 @@ fn handleTcp(seg: []const u8) void {
     const data_off = (@as(usize, seg[12] >> 4) * 4);
     const flags = seg[13];
     const payload = if (seg.len > data_off) seg[data_off..] else seg[0..0];
+    const now = hal.tick_count;
 
     for (&vn.conns, 0..) |*c, ci| {
-        if (c.state != .syn_sent and c.state != .established and c.state != .fin_wait) continue;
+        const active = c.state == .syn_sent or c.state == .established or
+            c.state == .fin_wait_1 or c.state == .fin_wait_2 or c.state == .time_wait;
+        if (!active) continue;
         if (c.src_port != dst_port or c.peer_port != src_port) continue;
+
+        // любая активность пира = жив (keep-alive reset)
+        c.last_ack_tick = now;
+        c.ka_probes = 0;
+
         if ((flags & TCP_RST) != 0) {
             hal.Serial.puts("[VNET] TCP RST — соединение закрыто\n");
             c.state = .closed;
+            c.aborted = true;
             return;
         }
+
+        // v0.15.0: ACK-обработка — продвижение snd_una (ретрансмит-движок).
+        // adv ≤ inflight — отсекает и дубликаты (adv-обёртка), и «ACK будущего».
+        if ((flags & TCP_ACK) != 0 and c.state != .syn_sent) {
+            const inflight = c.snd_nxt -% c.snd_una;
+            const adv = ack -% c.snd_una;
+            if (adv != 0 and adv <= inflight) {
+                if (adv > c.rtx_len) c.fin_unacked = false; // ACK покрыл и FIN
+                rtxConsume(c, @intCast(adv));
+                c.snd_una +%= adv;
+                c.rto_ticks = RTO_INITIAL_TICKS; // свежий ACK → RTO reset
+                c.rtx_attempts = 0;
+                if (c.state == .fin_wait_1 and c.snd_nxt == c.snd_una) {
+                    // наш FIN подтверждён
+                    c.state = if (c.fin_received) .time_wait else .fin_wait_2;
+                    hal.Serial.puts("[VNET] TCP: наш FIN ACKed (slot ");
+                    hal.Serial.putDecimal(ci);
+                    hal.Serial.puts(")\n");
+                }
+            }
+        }
+
         if (c.state == .syn_sent and (flags & TCP_SYN) != 0 and (flags & TCP_ACK) != 0) {
             // SYN-ACK: ack = iss+1 ✓ → ESTABLISHED, шлём ACK
             c.irs = seq;
             c.rcv_nxt = seq +% 1;
             c.snd_nxt = ack; // = iss+1
+            c.snd_una = ack; // SYN подтверждён (v0.15.0)
             c.state = .established;
             hal.Serial.puts("[VNET] TCP: SYN-ACK принят — соединение установлено (slot ");
             hal.Serial.putDecimal(ci);
@@ -844,17 +1059,25 @@ fn handleTcp(seg: []const u8) void {
             sendTcpAck(c);
             return;
         }
-        if (c.state == .established or c.state == .fin_wait) {
+
+        if (c.state == .established or c.state == .fin_wait_1 or
+            c.state == .fin_wait_2 or c.state == .time_wait)
+        {
             const rel = seq -% c.rcv_nxt;
             if (rel == 0) {
                 // ожидаемые данные (или чистый ACK)
                 if (payload.len > 0) {
+                    // v0.15.0: sliding window — места в RX-ринге нет → сегмент
+                    // НЕ принимаем (пиры ретрансмитят после window-update)
+                    if (ringSpace(c) <= payload.len) {
+                        c.need_ack = true; // re-ACK с нулевым окном
+                        return;
+                    }
                     ringWrite(c, payload);
                     c.rcv_nxt = seq +% @as(u32, @intCast(payload.len));
                     if ((flags & TCP_FIN) != 0) {
                         c.rcv_nxt +%= 1;
                         c.fin_received = true;
-                        c.state = .fin_wait;
                     }
                     c.need_ack = true; // отложенный ACK (анти-реентерабельность)
                     hal.Serial.puts("[VNET] TCP: данные ");
@@ -865,8 +1088,10 @@ fn handleTcp(seg: []const u8) void {
                 } else if ((flags & TCP_FIN) != 0) {
                     c.rcv_nxt +%= 1;
                     c.fin_received = true;
-                    c.state = .fin_wait;
-                    c.need_ack = true;
+                    c.need_ack = true; // финальный ACK
+                    if (c.state == .fin_wait_2 or c.state == .time_wait) {
+                        c.state = .time_wait; // FIN в момент TIME_WAIT → re-ACK
+                    }
                     hal.Serial.puts("[VNET] TCP: FIN принят (slot ");
                     hal.Serial.putDecimal(ci);
                     hal.Serial.puts(")\n");
@@ -903,6 +1128,18 @@ pub fn ringBytes(c: *const TcpConn) usize {
         return c.ring_tail - c.ring_head;
     }
     return RX_RING_SIZE - c.ring_head + c.ring_tail;
+}
+
+/// v0.15.0 (CDD №6): свободное место RX-ринга (sliding window).
+/// Инвариант: tail НИКОГДА не догоняет head (drop при нехватке в handleTcp)
+/// → ringBytes ≤ RX_RING_SIZE-1, space ≥ 1.
+pub fn ringSpace(c: *const TcpConn) usize {
+    return RX_RING_SIZE - ringBytes(c);
+}
+
+/// v0.15.0 (CDD №6): окно приёма для рекламы (u16, без window scaling).
+fn recvWindow(c: *const TcpConn) u16 {
+    return @intCast(@min(ringSpace(c), 0xFFFF));
 }
 
 // ============================================================================
@@ -986,14 +1223,24 @@ pub fn tcpConnect(peer_ip: [4]u8, peer_port: u16) VnetError!usize {
     c.iss = @truncate(hal.readMsr(0x10)); // TSC как ISS
     if (c.iss == 0) c.iss = 0x1234;
     c.snd_nxt = c.iss +% 1;
+    c.snd_una = c.iss; // v0.15.0: SYN [iss, iss+1) в полёте
     c.rcv_nxt = 0;
     c.fin_received = false;
+    c.aborted = false;
     c.syn_retries = 0;
+    c.rtx_len = 0; // v0.15.0: ретрансмит-буфер пуст
+    c.fin_unacked = false;
+    c.rto_ticks = RTO_INITIAL_TICKS;
+    c.rtx_attempts = 0;
+    c.ka_probes = 0;
+    c.last_xmit_tick = hal.tick_count;
+    c.last_ack_tick = hal.tick_count;
+    c.win_advertised = 0xFFFF; // кольцо пусто на момент connect
     c.state = .syn_sent;
 
     // SYN с MSS-опцией
     var seg: [64]u8 = undefined;
-    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.iss, 0, TCP_SYN, 4, &.{}, .{ 10, 0, 2, 15 }, peer_ip);
+    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.iss, 0, TCP_SYN, 4, &.{}, .{ 10, 0, 2, 15 }, peer_ip, 0xFFFF);
     if (!sendIp(IP_PROTO_TCP, seg[0..n], peer_ip)) {
         c.state = .unused;
         return VnetError.Timeout;
@@ -1028,19 +1275,32 @@ pub fn tcpConnect(peer_ip: [4]u8, peer_port: u16) VnetError!usize {
     return VnetError.Timeout;
 }
 
-/// Отправка ACK текущего состояния.
+/// Отправка ACK текущего состояния (окно = реальное место ринга).
+/// v0.15.0 (CDD №6): заодно window-update — отправитель возобновляет поток.
 fn sendTcpAck(c: *TcpConn) void {
     var seg: [64]u8 = undefined;
-    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, 0, &.{}, .{ 10, 0, 2, 15 }, c.peer_ip);
+    const win = recvWindow(c);
+    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, 0, &.{}, .{ 10, 0, 2, 15 }, c.peer_ip, win);
+    c.win_advertised = win;
     _ = sendIp(IP_PROTO_TCP, seg[0..n], c.peer_ip);
 }
 
-/// Отправка данных (PSH+ACK): сегмент ≤ MSS.
+/// Отправка данных (PSH+ACK): сегмент ≤ MSS. v0.15.0: данные сохраняются
+/// в RTX-буфер [snd_una..snd_nxt) — ретрансмиты с бэкоффом (tcpTimers).
 fn sendTcpData(c: *TcpConn, data: []const u8) bool {
     var seg: [ETH_HDR_LEN + 20 + 40 + 1600]u8 = undefined;
-    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt, c.rcv_nxt, TCP_ACK | TCP_PSH, 0, data, .{ 10, 0, 2, 15 }, c.peer_ip);
+    const win = recvWindow(c);
+    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt, c.rcv_nxt, TCP_ACK | TCP_PSH, 0, data, .{ 10, 0, 2, 15 }, c.peer_ip, win);
     if (!sendIp(IP_PROTO_TCP, seg[0..n], c.peer_ip)) return false;
+    // v0.15.0-фикс: rtxStore ТОЛЬКО после успешной отправки — инвариант
+    // «буфер покрывает ровно [snd_una, snd_nxt)» не нарушается при TX-фейле
+    if (!rtxStore(c, data)) {
+        // CDD-граница: >32КБ неподержтверждённых — fire&forget (лог)
+        hal.Serial.puts("[VNET] TCP: RTX-буфер полон — сегмент без ретрансмита\n");
+    }
     c.snd_nxt +%= @intCast(data.len);
+    c.win_advertised = win;
+    c.last_xmit_tick = hal.tick_count;
     return true;
 }
 
@@ -1060,15 +1320,17 @@ pub fn tcpSend(slot: usize, data: []const u8) VnetError!usize {
 }
 
 /// tcpRecv: данные из RX-кольца (поллинг с таймаутом ~150мс; 0 = нет данных).
+/// v0.15.0 (CDD №6): после дренажа ринга — window-update ACK (открываем
+/// окно отправителю) + EOF по fin_received (FIN сервера уже принят).
 pub fn tcpRecv(slot: usize, out: []u8, wait: bool) VnetError!usize {
     if (slot >= MAX_TCP_CONNS) return VnetError.BadState;
     const c = &vn.conns[slot];
-    if (c.state == .closed) return VnetError.ConnClosed;
+    if (c.state == .closed and c.aborted) return VnetError.ConnClosed; // RST/timeout
     if (wait) {
         var spins: u32 = 0;
         while (spins < 4_000_000) : (spins += 1) {
             pollRx();
-            if (ringBytes(c) > 0 or c.state == .closed) break;
+            if (ringBytes(c) > 0 or (c.state == .closed or c.fin_received)) break;
             asm volatile ("pause");
         }
     } else {
@@ -1076,7 +1338,10 @@ pub fn tcpRecv(slot: usize, out: []u8, wait: bool) VnetError!usize {
     }
     const avail = ringBytes(c);
     if (avail == 0) {
-        if (c.state == .fin_wait and c.fin_received) return VnetError.ConnClosed;
+        // FIN уже принят (и ring пуст) → EOF; TIME_WAIT/CLOSED аналогично
+        if (c.fin_received or c.state == .closed or c.state == .time_wait) {
+            return VnetError.ConnClosed;
+        }
         return 0;
     }
     const n = @min(avail, out.len);
@@ -1085,6 +1350,13 @@ pub fn tcpRecv(slot: usize, out: []u8, wait: bool) VnetError!usize {
     while (i < n) : (i += 1) {
         out[i] = rp[c.ring_head];
         c.ring_head = (c.ring_head + 1) % RX_RING_SIZE;
+    }
+    // v0.15.0: window-update — окно открылось после дренажа
+    if (c.win_advertised < WIN_UPDATE_THRESHOLD and recvWindow(c) >= WIN_UPDATE_THRESHOLD) {
+        sendTcpAck(c);
+        hal.Serial.puts("[VNET] TCP: window-update (slot ");
+        hal.Serial.putDecimal(slot);
+        hal.Serial.puts(")\n");
     }
     return n;
 }
@@ -1095,8 +1367,9 @@ pub fn tcpPoll(slot: usize) i64 {
     if (slot >= MAX_TCP_CONNS) return 0;
     pollRx();
     const c = &vn.conns[slot];
-    if (c.state == .closed) return -1;
-    if (c.fin_received and ringBytes(c) == 0) return -1;
+    if (c.state == .closed and c.aborted) return -1; // RST — данных нет
+    if (c.fin_received and ringBytes(c) == 0) return -1; // EOF после дренажа
+    if (c.state == .time_wait and ringBytes(c) == 0) return -1;
     return @intCast(ringBytes(c));
 }
 
@@ -1110,15 +1383,166 @@ pub fn tcpRingBytes(slot: usize) usize {
     return ringBytes(&vn.conns[slot]);
 }
 
-/// Закрытие: FIN + FIN-ACK (упрощённо: FIN и сразу closed).
+/// tcpClose: v0.15.0 — честный FIN-кланг: FIN|ACK → fin_wait_1 →
+/// (ACK нашего FIN) fin_wait_2 → (FIN пира + финальный ACK) time_wait →
+/// closed. FIN ретрансмится движком до подтверждения. Данные пира в ринге
+/// доигрываются (fin_received).
 pub fn tcpClose(slot: usize) void {
     if (slot >= MAX_TCP_CONNS) return;
     const c = &vn.conns[slot];
-    if (c.state != .established and c.state != .fin_wait) return;
+    if (c.state != .established and c.state != .fin_wait_1) return;
+    if (c.fin_unacked) return; // FIN уже в полёте
     var seg: [64]u8 = undefined;
-    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, 0, &.{}, .{ 10, 0, 2, 15 }, c.peer_ip);
-    _ = sendIp(IP_PROTO_TCP, seg[0..n], c.peer_ip);
-    c.state = .closed;
+    const win = recvWindow(c);
+    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, 0, &.{}, .{ 10, 0, 2, 15 }, c.peer_ip, win);
+    if (sendIp(IP_PROTO_TCP, seg[0..n], c.peer_ip)) {
+        c.snd_nxt +%= 1; // FIN занимает один seq
+        c.fin_unacked = true;
+        c.state = .fin_wait_1;
+        c.last_xmit_tick = hal.tick_count;
+        c.win_advertised = win;
+        hal.Serial.puts("[VNET] TCP: FIN отправлен (slot ");
+        hal.Serial.putDecimal(slot);
+        hal.Serial.puts(")\n");
+    } else {
+        c.state = .closed;
+        c.aborted = true;
+    }
+}
+
+// ============================================================================
+// v0.15.0 (CDD №6): RTX-движок — ретрансмиты с экспоненциальным бэкоффом +
+// TCP keep-alive. Гоняется в poll-точках (pollRx → tcpTimers): во время
+// активного обмена curl шлёт send/recv/select непрерывно — движок дышит на
+// каждом системном вызове. Чистая Ring-3 пауза (крипто-вычисления OpenSSL
+// без сисколов) таймеры приостанавливает — CDD-граница (IRQ-служба — цикл №7).
+// ============================================================================
+
+/// RTX-буфер: ленивая аллокация 8 identity-страниц.
+fn rtxEnsure(c: *TcpConn) bool {
+    if (c.rtx_virt != 0) return true;
+    const base = pmm.allocContiguousPages(RTX_PAGES) orelse return false;
+    c.rtx_phys = base;
+    c.rtx_virt = base;
+    const zp: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(base)));
+    @memset(zp[0..RTX_SIZE], 0);
+    return true;
+}
+
+/// Сохранить данные для ретрансмита (в хвост [snd_una..snd_nxt)).
+fn rtxStore(c: *TcpConn, data: []const u8) bool {
+    if (!rtxEnsure(c)) return false;
+    if (c.rtx_len + data.len > RTX_SIZE) return false;
+    const rp: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(c.rtx_virt)));
+    var i: usize = 0;
+    while (i < data.len) : (i += 1) rp[c.rtx_len + i] = data[i];
+    c.rtx_len += data.len;
+    return true;
+}
+
+/// ACK покрыл adv байт от snd_una — сдвигаем буфер (memmove влево).
+fn rtxConsume(c: *TcpConn, adv: usize) void {
+    if (adv == 0) return;
+    const drop = @min(adv, c.rtx_len);
+    const rest = c.rtx_len - drop;
+    if (rest > 0 and drop > 0) {
+        const rp: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(c.rtx_virt)));
+        var i: usize = 0;
+        while (i < rest) : (i += 1) rp[i] = rp[drop + i];
+    }
+    c.rtx_len = rest;
+}
+
+/// Ретрансмит: MSS-чанк от snd_una (+FIN если он в хвосте).
+fn rtxTransmit(c: *TcpConn) void {
+    var seg: [ETH_HDR_LEN + 20 + 40 + 1600]u8 = undefined;
+    if (c.rtx_len > 0) {
+        const n = @min(c.rtx_len, MSS);
+        const rp: [*]const u8 = @ptrFromInt(@as(usize, @intCast(c.rtx_virt)));
+        var flags: u16 = TCP_ACK | TCP_PSH;
+        if (c.fin_unacked and n == c.rtx_len) flags |= TCP_FIN; // FIN в хвосте
+        const seglen = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_una, c.rcv_nxt, flags, 0, rp[0..n], .{ 10, 0, 2, 15 }, c.peer_ip, recvWindow(c));
+        if (sendIp(IP_PROTO_TCP, seg[0..seglen], c.peer_ip)) {
+            vn.rtx_frames += 1;
+            hal.Serial.puts("[VNET] TCP: RETRANSMIT ");
+            hal.Serial.putDecimal(n);
+            hal.Serial.puts("Б, попытка ");
+            hal.Serial.putDecimal(c.rtx_attempts + 1);
+            hal.Serial.puts("\n");
+        }
+    } else if (c.fin_unacked) {
+        // ретрансмит одинокого FIN
+        const seglen = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt -% 1, c.rcv_nxt, TCP_FIN | TCP_ACK, 0, &.{}, .{ 10, 0, 2, 15 }, c.peer_ip, recvWindow(c));
+        if (sendIp(IP_PROTO_TCP, seg[0..seglen], c.peer_ip)) {
+            vn.rtx_frames += 1;
+            hal.Serial.puts("[VNET] TCP: FIN retransmit\n");
+        }
+    }
+}
+
+/// Keep-alive проба: seq = snd_nxt-1 (пустой сегмент за границей) —
+/// пир отвечает дубль-ACKом (handleTcp сбрасывает ka-счётчик).
+fn sendKaProbe(c: *TcpConn) void {
+    var seg: [64]u8 = undefined;
+    const n = buildTcpSegment(&seg, c.src_port, c.peer_port, c.snd_nxt -% 1, c.rcv_nxt, TCP_ACK, 0, &.{}, .{ 10, 0, 2, 15 }, c.peer_ip, recvWindow(c));
+    if (sendIp(IP_PROTO_TCP, seg[0..n], c.peer_ip)) {
+        vn.ka_probes_sent += 1;
+        hal.Serial.puts("[VNET] TCP: keep-alive проба (slot)\n");
+    }
+}
+
+/// Таймеры TCP: ретрансмиты (RTO ×2 бэкофф, ≤8 попыток) + keep-alive
+/// (1с idle → проба, ≤5 без ответа → abort) + time_wait-истечение.
+fn tcpTimers() void {
+    const now = hal.tick_count;
+    for (&vn.conns, 0..) |*c, si| {
+        switch (c.state) {
+            .time_wait => {
+                if (now -% c.last_xmit_tick > 30) { // ~300мс TIME_WAIT
+                    c.state = .closed;
+                }
+                continue;
+            },
+            .syn_sent => continue, // SYN-ретрансмиты — зона tcpConnect (свой цикл): SYN не в RTX-буфере, abort-таймер не должен убить ожидание SYN-ACK
+            .established, .fin_wait_1, .fin_wait_2 => {},
+            else => continue,
+        }
+        const inflight = c.snd_nxt -% c.snd_una;
+        if (inflight > 0) {
+            // ретрансмит-таймер: без ACK за RTO → повтор с бэкоффом
+            if (now -% c.last_xmit_tick > c.rto_ticks) {
+                rtxTransmit(c);
+                c.rtx_attempts += 1;
+                c.last_xmit_tick = now;
+                c.rto_ticks = @min(c.rto_ticks * 2, RTO_MAX_TICKS); // экспоненциальный бэкофф
+                if (c.rtx_attempts >= RTX_MAX_ATTEMPTS) {
+                    hal.Serial.puts("[VNET] TCP: ретрансмит-таймаут — соединение закрыто (slot ");
+                    hal.Serial.putDecimal(si);
+                    hal.Serial.puts(")\n");
+                    c.state = .closed;
+                    c.aborted = true;
+                }
+            }
+        } else {
+            // всё подтверждено — RTO в исходное
+            c.rto_ticks = RTO_INITIAL_TICKS;
+            c.rtx_attempts = 0;
+            // keep-alive: тишина KA_IDLE → проба (сервер видит жизнь
+            // соединения даже во время долгих TLS-пауз клиента)
+            if (c.state == .established and (now -% c.last_ack_tick) > KA_IDLE_TICKS) {
+                sendKaProbe(c);
+                c.ka_probes += 1;
+                c.last_ack_tick = now; // период проб = KA_IDLE
+                if (c.ka_probes > KA_MAX_PROBES) {
+                    hal.Serial.puts("[VNET] TCP: keep-alive провален — соединение закрыто (slot ");
+                    hal.Serial.putDecimal(si);
+                    hal.Serial.puts(")\n");
+                    c.state = .closed;
+                    c.aborted = true;
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1152,6 +1576,7 @@ pub fn dnsResolve(host: []const u8) ?[4]u8 {
             while (spins < 6_000_000) : (spins += 1) {
                 pollRx();
                 if (vn.dns_have) {
+                    dnsCachePut(host, vn.dns_last_ip); // v0.15.0: кэш для netstat
                     return vn.dns_last_ip;
                 }
                 asm volatile ("pause");
@@ -1184,6 +1609,139 @@ pub fn parseIpLiteral(s: []const u8) ?[4]u8 {
     if (digits == 0 or oi != 3) return null;
     oct[3] = @intCast(val);
     return oct;
+}
+
+// ============================================================================
+// v0.15.0 (CDD №6): ICMP ping (Echo Request/Reply через шлюз SLIRP —
+// NAT-режим QEMU user-net пробрасывает ICMP) + статистика для ifconfig
+// ============================================================================
+
+pub const PingResult = struct {
+    sent: u8 = 0,
+    received: u8 = 0,
+    rtt_ms: u64 = 0, // лучший (минимальный) RTT
+};
+
+/// icmpPing: count проб по ip (блокирующий поллинг, таймаут ~1-3с на пробу).
+/// RTT — TSC-дельта (калибровка tsc_per_ms; 0 → тиковая грубость).
+/// Каждая проба логируется [PING]-строкой (serial; E2E-маяки).
+pub fn icmpPing(ip: [4]u8, count: u8) PingResult {
+    var res = PingResult{ .sent = 0, .received = 0 };
+    if (!vn.initialized) return res;
+    if (!resolveGateway()) return res;
+    vn.icmp_id = @as(u16, @truncate(hal.readMsr(0x10) >> 4)) | 1;
+    var seq: u16 = 1;
+    var probes: u8 = 0;
+    while (probes < count) : (probes += 1) {
+        var icmp: [64]u8 = undefined;
+        const n = buildIcmpEcho(&icmp, vn.icmp_id, seq);
+        vn.icmp_seq = seq;
+        vn.icmp_reply_seen = false;
+        vn.icmp_reply_seq = 0;
+        const t0 = hal.readMsr(0x10);
+        if (!sendIp(IP_PROTO_ICMP, icmp[0..n], ip)) break;
+        res.sent += 1;
+        // ждём Echo Reply (поллинг ~1-3с — реальный интернет-RTT ≪)
+        var spins: u32 = 0;
+        while (spins < 3_000_000) : (spins += 1) {
+            pollRx();
+            if (vn.icmp_reply_seen and vn.icmp_reply_seq == seq) break;
+            asm volatile ("pause");
+        }
+        if (vn.icmp_reply_seen and vn.icmp_reply_seq == seq) {
+            res.received += 1;
+            const dt = vn.icmp_rx_tsc -% t0;
+            const ms: u64 = if (vn.tsc_per_ms > 0) dt / vn.tsc_per_ms else dt;
+            if (res.rtt_ms == 0 or ms < res.rtt_ms) res.rtt_ms = ms;
+            hal.Serial.puts("[PING] seq=");
+            hal.Serial.putDecimal(seq);
+            hal.Serial.puts(": ответ от ");
+            for (ip, 0..) |b, j| {
+                hal.Serial.putDecimal(b);
+                if (j < 3) hal.Serial.puts(".");
+            }
+            hal.Serial.puts(", время ");
+            hal.Serial.putDecimal(ms);
+            hal.Serial.puts("мс\n");
+        } else {
+            hal.Serial.puts("[PING] seq=");
+            hal.Serial.putDecimal(seq);
+            hal.Serial.puts(": таймаут (нет ответа)\n");
+        }
+        seq += 1;
+    }
+    return res;
+}
+
+pub const NetStats = struct {
+    rx_frames: u64,
+    rx_bytes: u64,
+    tx_frames: u64,
+    tx_bytes: u64,
+    rtx_frames: u64,
+    ka_probes: u64,
+};
+
+pub fn netStats() NetStats {
+    return .{
+        .rx_frames = vn.rx_frames,
+        .rx_bytes = vn.rx_bytes,
+        .tx_frames = vn.tx_frames,
+        .tx_bytes = vn.tx_bytes,
+        .rtx_frames = vn.rtx_frames,
+        .ka_probes = vn.ka_probes_sent,
+    };
+}
+
+/// netstat-строка соединения (для cmd_netstat).
+pub const ConnInfo = struct {
+    slot: usize,
+    state: TcpState,
+    peer_ip: [4]u8,
+    peer_port: u16,
+    src_port: u16,
+    ring_bytes: usize,
+    inflight: u32, // snd_nxt - snd_una
+    fin_received: bool,
+    aborted: bool,
+};
+
+pub fn connInfo(slot: usize) ?ConnInfo {
+    if (slot >= MAX_TCP_CONNS) return null;
+    const c = &vn.conns[slot];
+    if (c.state == .unused) return null;
+    return .{
+        .slot = slot,
+        .state = c.state,
+        .peer_ip = c.peer_ip,
+        .peer_port = c.peer_port,
+        .src_port = c.src_port,
+        .ring_bytes = ringBytes(c),
+        .inflight = c.snd_nxt -% c.snd_una,
+        .fin_received = c.fin_received,
+        .aborted = c.aborted,
+    };
+}
+
+/// DNS-кэш (последний успешный резолв) для ifconfig/netstat.
+pub const DnsCache = struct { host: []const u8, ip: [4]u8 };
+
+var dns_cache_host: [64]u8 = undefined;
+var dns_cache_len: usize = 0;
+var dns_cache_ip: [4]u8 = .{ 0, 0, 0, 0 };
+var dns_cache_valid: bool = false;
+
+pub fn dnsCacheGet() ?DnsCache {
+    if (!dns_cache_valid or dns_cache_len == 0) return null;
+    return .{ .host = dns_cache_host[0..dns_cache_len], .ip = dns_cache_ip };
+}
+
+pub fn dnsCachePut(host: []const u8, ip: [4]u8) void {
+    const n = @min(host.len, dns_cache_host.len);
+    @memcpy(dns_cache_host[0..n], host[0..n]);
+    dns_cache_len = n;
+    dns_cache_ip = ip;
+    dns_cache_valid = true;
 }
 
 const std = @import("std");
@@ -1228,7 +1786,7 @@ test "net: buildIpv4 — чексумма валидна (пересчёт = 0)"
 
 test "net: buildTcpSegment — SYN с MSS + чексумма-стенд" {
     var seg: [64]u8 = undefined;
-    const n = buildTcpSegment(&seg, 0xC350, 0x01BB, 0x1000, 0, TCP_SYN, 4, &.{}, .{ 10, 0, 2, 15 }, .{ 93, 184, 216, 34 });
+    const n = buildTcpSegment(&seg, 0xC350, 0x01BB, 0x1000, 0, TCP_SYN, 4, &.{}, .{ 10, 0, 2, 15 }, .{ 93, 184, 216, 34 }, 0xFFFF);
     try testing.expectEqual(@as(usize, 24), n); // 20 + 4 (MSS)
     try testing.expectEqual(@as(u8, 0xC3), seg[0]);
     try testing.expectEqual(@as(u8, 0x01), seg[2]); // dst port 443 = 0x01BB
@@ -1239,15 +1797,21 @@ test "net: buildTcpSegment — SYN с MSS + чексумма-стенд" {
     try testing.expectEqual(@as(u8, MSS >> 8), seg[22]);
     // data offset = 6 слов (24/4)
     try testing.expectEqual(@as(u8, 0x60), seg[12]);
+    // v0.15.0: window поле
+    try testing.expectEqual(@as(u8, 0xFF), seg[14]);
+    try testing.expectEqual(@as(u8, 0xFF), seg[15]);
 }
 
 test "net: buildTcpSegment — заголовок корректен" {
     var seg: [64]u8 = undefined;
-    const n = buildTcpSegment(&seg, 0xC350, 0x01BB, 0x1000, 0x2000, TCP_ACK | TCP_PSH, 0, "hello", .{ 10, 0, 2, 15 }, .{ 10, 0, 2, 2 });
+    const n = buildTcpSegment(&seg, 0xC350, 0x01BB, 0x1000, 0x2000, TCP_ACK | TCP_PSH, 0, "hello", .{ 10, 0, 2, 15 }, .{ 10, 0, 2, 2 }, 0x4000);
     try testing.expectEqual(@as(usize, 25), n); // 20 + 5
     try testing.expectEqual(@as(u8, 0x50), seg[12]); // data offset 5
     try testing.expectEqual(@as(u8, TCP_ACK | TCP_PSH), seg[13]);
     try testing.expectEqualStrings("hello", seg[20..25]);
+    // v0.15.0: window = 0x4000
+    try testing.expectEqual(@as(u8, 0x40), seg[14]);
+    try testing.expectEqual(@as(u8, 0x00), seg[15]);
 }
 
 test "net: buildArpRequest — поля op/hln/plen" {
@@ -1355,4 +1919,142 @@ test "net: skipDnsName — простые и сжатые имена" {
     buf[0] = 0xC0;
     buf[1] = 0x0C;
     try testing.expectEqual(@as(?usize, 2), skipDnsName(buf[0..], 0));
+}
+
+// ─── v0.15.0 (CDD №6): ICMP + sliding window + RTX-seq-математика ──────────
+
+test "net: buildIcmpEcho → parseIcmpReply — roundtrip (id/seq/чексумма)" {
+    var pkt: [64]u8 = undefined;
+    const n = buildIcmpEcho(&pkt, 0x1234, 7);
+    try testing.expectEqual(@as(usize, 64), n);
+    try testing.expectEqual(@as(u8, 8), pkt[0]); // echo request
+    // чексумма валидна: пересчёт с нулевым полем = значение поля
+    var scratch: [64]u8 = undefined;
+    @memcpy(&scratch, &pkt);
+    scratch[2] = 0;
+    scratch[3] = 0;
+    const expect = (@as(u16, pkt[2]) << 8) | pkt[3];
+    try testing.expect(ipChecksum(&scratch) == expect);
+    // reply: type=0 → чексумму пересчитать (type входит в сумму)
+    pkt[0] = 0;
+    pkt[2] = 0;
+    pkt[3] = 0;
+    const cs = ipChecksum(pkt[0..n]);
+    pkt[2] = @intCast(cs >> 8);
+    pkt[3] = @intCast(cs & 0xFF);
+    const r = parseIcmpReply(pkt[0..n], 0x1234);
+    try testing.expect(r != null);
+    try testing.expectEqual(@as(u16, 0x1234), r.?.id);
+    try testing.expectEqual(@as(u16, 7), r.?.seq);
+}
+
+test "net: parseIcmpReply — отбрасывания (не reply / чужой id / битая csum)" {
+    var pkt: [64]u8 = undefined;
+    _ = buildIcmpEcho(&pkt, 0x1234, 1);
+    pkt[0] = 0; // reply → чексумму пересчитать
+    pkt[2] = 0;
+    pkt[3] = 0;
+    const cs = ipChecksum(pkt[0..64]);
+    pkt[2] = @intCast(cs >> 8);
+    pkt[3] = @intCast(cs & 0xFF);
+    // валидный baseline (sanity)
+    try testing.expect(parseIcmpReply(pkt[0..64], 0x1234) != null);
+    // чужой id
+    try testing.expectEqual(@as(?IcmpEcho, null), parseIcmpReply(pkt[0..], 0x4321));
+    // битая чексумма (портим payload после вычисления)
+    pkt[40] ^= 0xFF;
+    try testing.expectEqual(@as(?IcmpEcho, null), parseIcmpReply(pkt[0..], 0x1234));
+    // не echo reply (тип 3 = destination unreachable)
+    var pkt2: [64]u8 = undefined;
+    @memcpy(&pkt2, &pkt);
+    pkt2[0] = 3;
+    try testing.expectEqual(@as(?IcmpEcho, null), parseIcmpReply(pkt2[0..], 0x1234));
+    // короткий пакет
+    try testing.expectEqual(@as(?IcmpEcho, null), parseIcmpReply(pkt2[0..8], 0x1234));
+}
+
+test "net: buildIcmpEchoReply — зеркало запроса с корректной чексуммой" {
+    var req: [64]u8 = undefined;
+    _ = buildIcmpEcho(&req, 0xBEEF, 42);
+    var reply: [64]u8 = undefined;
+    const n = buildIcmpEchoReply(&reply, req[0..64]);
+    try testing.expectEqual(@as(usize, 64), n);
+    try testing.expectEqual(@as(u8, 0), reply[0]); // echo reply
+    // id/seq зеркалятся
+    try testing.expectEqual(@as(u8, 0xBE), reply[4]);
+    try testing.expectEqual(@as(u8, 0xEF), reply[5]);
+    try testing.expectEqual(@as(u8, 0), reply[6]);
+    try testing.expectEqual(@as(u8, 42), reply[7]);
+    // payload зеркалятся
+    try testing.expectEqualSlices(u8, req[8..64], reply[8..64]);
+    // и reply сам валиден для parseIcmpReply
+    const r = parseIcmpReply(reply[0..n], 0xBEEF);
+    try testing.expect(r != null);
+    try testing.expectEqual(@as(u16, 42), r.?.seq);
+}
+
+test "net: ringSpace/recvWindow — sliding window инварианты" {
+    var c = TcpConn{};
+    c.ring_head = 0;
+    c.ring_tail = 0;
+    try testing.expectEqual(RX_RING_SIZE, ringSpace(&c));
+    try testing.expectEqual(@as(u16, 0xFFFF), recvWindow(&c)); // cap u16
+    // 1000Б в ринге
+    c.ring_tail = 1000;
+    try testing.expectEqual(RX_RING_SIZE - 1000, ringSpace(&c));
+    // почти полный ринг → окно крошечное
+    c.ring_head = 1;
+    c.ring_tail = 0; // wrap: tail догнал-бы head если бы не инвариант
+    // bytes = SIZE - 1 + 0 = SIZE-1 → space = 1
+    try testing.expectEqual(@as(usize, RX_RING_SIZE - (RX_RING_SIZE - 1)), ringSpace(&c));
+    // окно 1Б (нулём не бывает: drop при исчерпании)
+    try testing.expectEqual(@as(u16, 1), recvWindow(&c));
+}
+
+test "net: TCP seq-математика RTX-движка (обёртка u32)" {
+    var c = TcpConn{};
+    // 32Б в полёте через границу 2^32
+    c.snd_una = 0xFFFFFFF0;
+    c.snd_nxt = c.snd_una +% 32;
+    const inflight = c.snd_nxt -% c.snd_una;
+    try testing.expectEqual(@as(u32, 32), inflight);
+    // валидный ACK на 16Б — adv корректен через границу
+    const ack = c.snd_una +% 16; // 0x00000000 (wrap!)
+    const adv = ack -% c.snd_una;
+    try testing.expectEqual(@as(u32, 16), adv);
+    try testing.expect(adv <= inflight);
+    // ACK «из будущего» (за snd_nxt) — отклоняется
+    const bogus = c.snd_nxt +% 100;
+    try testing.expect((bogus -% c.snd_una) > inflight);
+    // дубликат (старый ack) — обёртка-гигант — отклоняется
+    const dup = c.snd_una -% 1;
+    try testing.expect((dup -% c.snd_una) > inflight);
+    // FIN занимает +1: inflight = rtx_len + 1
+    c.rtx_len = 32;
+    c.fin_unacked = false;
+    c.snd_nxt = c.snd_una +% 32;
+    try testing.expectEqual(@as(u32, 32), c.snd_nxt -% c.snd_una);
+    c.fin_unacked = true;
+    c.snd_nxt +%= 1;
+    try testing.expectEqual(@as(u32, 33), c.snd_nxt -% c.snd_una);
+    // ACK на 33 (данные+FIN) — adv == 33 > rtx_len(32) → FIN покрыт
+    const ack2 = c.snd_una +% 33;
+    try testing.expect((ack2 -% c.snd_una) > @as(u32, @intCast(c.rtx_len)));
+}
+
+test "net: rtx-бэкофф — экспоненциальный рост с потолком" {
+    var rto: u32 = RTO_INITIAL_TICKS; // 20
+    var steps: u8 = 0;
+    while (steps < 10) : (steps += 1) {
+        rto = @min(rto * 2, RTO_MAX_TICKS);
+    }
+    try testing.expectEqual(RTO_MAX_TICKS, rto); // упёрся в потолок 300
+    try testing.expect(RTO_MAX_TICKS == 300);
+    try testing.expect(RTO_INITIAL_TICKS == 20);
+    // 20→40→80→160→320→cap: 5 шагов до потолка
+    var rto2: u32 = RTO_INITIAL_TICKS;
+    rto2 = @min(rto2 * 2, RTO_MAX_TICKS);
+    try testing.expectEqual(@as(u32, 40), rto2);
+    rto2 = @min(rto2 * 2, RTO_MAX_TICKS);
+    try testing.expectEqual(@as(u32, 80), rto2);
 }

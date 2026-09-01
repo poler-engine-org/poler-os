@@ -71,6 +71,7 @@ pub fn installOps() void {
         .net_tcp_recv = kNetTcpRecv,
         .net_tcp_poll = kNetTcpPoll,
         .net_tcp_close = kNetTcpClose,
+        .sleep_task = kSleepTask,
     };
 }
 
@@ -137,6 +138,55 @@ fn kNetTcpPoll(slot: i64) i64 {
 
 fn kNetTcpClose(slot: i64) void {
     virtio_net.tcpClose(@intCast(slot));
+}
+
+/// v0.15.0 (CDD №6): НАСТОЯЩИЙ сон задачи — кооперативная парковка.
+/// Проблема (диагноз https-разведки): CV-треды curl зовут
+/// SleepConditionVariableCS(10мс) тысячами раз/с; с мгновенным возвратом
+/// они жгут CPU, а in_win32_syscall≈всегда поднят → schedule() не тикает →
+/// TLS-крипто главного треда получает крохи слайсов → Finished опаздывает
+/// за серверный TLS-таймаут.
+/// Решение: внутри syscall-транзакции АТОМАРНО (cli) опускаем флаг и
+/// уходим в hlt-цикл до дедлайна — таймерные тики переключают задачи
+/// (паркованная пропускается по wake_tick), CPU спит. Перед возвратом
+/// восстанавливаем СВОЙ user_rsp (его мог затереть syscall чужой задачи)
+/// и флаг транзакции — asm-exit сделает sysretq на НАШ стек.
+fn kSleepTask(ms: u64) void {
+    if (ms == 0) return;
+    const capped: u64 = @min(ms, 60_000);
+    const deadline = hal.tick_count + (capped + 9) / 10;
+
+    // Наш user_rsp (записан НАШИМ syscall_entry; флаг с этого момента был
+    // поднят — чужие syscall его затереть не могли)
+    const my_rsp = scheduler.user_rsp;
+
+    // Будильник планировщику: слайс паркованной не давать
+    scheduler.setTaskSleep(capped);
+
+    // Отпускаем транзакцию — атомарно под cli (тика между cli и sti нет)
+    hal.cli();
+    scheduler.in_win32_syscall = 0;
+    hal.sti();
+
+    // Спим: hlt до прерывания; тик может переключить нас (wake_tick гардит
+    // повторную выдачу слайса до дедлайна). Возврат — когда дедлайн прошёл.
+    var guard: u64 = 0;
+    while (@as(i64, @bitCast(deadline -% hal.tick_count)) > 0) {
+        asm volatile ("hlt" ::: "memory");
+        guard += 1;
+        if (guard > 60_000) break; // 600с страховка от зависшего таймера
+    }
+
+    // Возврат в транзакцию: user_rsp мог быть перезаписан syscall'ами задач,
+    // исполнявшихся в парковке — восстанавливаем свой под cli.
+    hal.cli();
+    scheduler.user_rsp = my_rsp;
+    scheduler.in_win32_syscall = 1;
+    hal.sti();
+    // будильник снят (или снимется при следующем dispatch)
+    if (scheduler.current_task_id < scheduler.task_count) {
+        scheduler.tasks[scheduler.current_task_id].wake_tick = 0;
+    }
 }
 
 // ─── v0.12.0 (threading-волна): НАСТОЯЩИЕ Win64-треды ────────────────────────

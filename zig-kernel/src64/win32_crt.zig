@@ -141,6 +141,9 @@ pub const Ops = struct {
     net_tcp_poll: *const fn (slot: i64) i64,
     /// Закрытие соединения (FIN).
     net_tcp_close: *const fn (slot: i64) void,
+    /// v0.15.0 (CDD №6): сон ТЕКУЩЕЙ задачи — планировщик не даёт слайс до
+    /// истечения ms (парковка воркер-тредов; ядро — scheduler.setTaskSleep).
+    sleep_task: *const fn (ms: u64) void,
 };
 
 fn denyAll(_: u64, _: u64) bool {
@@ -184,6 +187,7 @@ fn noPoll(_: i64) i64 {
     return 0;
 }
 fn noClose(_: i64) void {}
+fn noSleep(_: u64) void {} // фейк: без парковки (нативные тесты)
 
 /// Дефолт: параноик. win32_api.installOps() ставит настоящие примитивы.
 pub var ops: Ops = .{
@@ -207,6 +211,7 @@ pub var ops: Ops = .{
     .net_tcp_recv = noRecv,
     .net_tcp_poll = noPoll,
     .net_tcp_close = noClose,
+    .sleep_task = noSleep,
 };
 
 fn emptyWriter(_: []const u8) void {}
@@ -2885,11 +2890,14 @@ fn kGetTickCount64() u64 {
 }
 
 /// Condition-variable семья (curl: CV+CS = синхронизация резолвера):
-/// однопоточно-совместимая семантика — Sleep-вариант сразу «просыпается»
-/// (как Windows для незанятой CV), Wake — no-op.
+/// v0.15.0 (CDD №6): НАСТОЯЩИЙ сон — парковка задачи до wake_tick
+/// (мс-таймаут честный; пробуждения по WakeConditionVariable нет —
+/// поллинговая семантика таймаута, как у Windows при занятой очереди).
+/// Возврат TRUE = «CV свободна» (пользователь воспринимает как пробуждение).
 fn kSleepConditionVariableCS(cv: u64, cs: u64, ms: u64) u64 {
-    logf("[WIN32] SleepConditionVariableCS(0x{x}, ms={d}) -> TRUE (CV свободна)\n", .{ cv, ms });
+    logf("[WIN32] SleepConditionVariableCS(0x{x}, ms={d}) — парковка\n", .{ cv, ms });
     _ = cs;
+    ops.sleep_task(ms);
     return 1;
 }
 
@@ -3286,10 +3294,15 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             // v0.12.0: реальный TID — главный тред и тред резолвера различаются
             ret = ops.current_tid();
         } else if (std.mem.eql(u8, name, "AcquireSRWLockExclusive") or
-            std.mem.eql(u8, name, "ReleaseSRWLockExclusive") or
-            std.mem.eql(u8, name, "Sleep"))
+            std.mem.eql(u8, name, "ReleaseSRWLockExclusive"))
         {
             ret = 0; // no-op: однопоточный CDD-процесс (честная граница)
+        } else if (std.mem.eql(u8, name, "Sleep")) {
+            // v0.15.0 (CDD №6): НАСТОЯЩИЙ сон — парковка задачи до wake_tick
+            // (воркеры не жгут CPU, крипто-тред получает слайсы)
+            logf("[WIN32] Sleep({d}ms) — парковка задачи\n", .{a1});
+            ops.sleep_task(a1);
+            ret = 0;
         } else if (std.mem.eql(u8, name, "SetUnhandledExceptionFilter")) {
             ret = 0; // предыдущего фильтра не было
         } else if (std.mem.eql(u8, name, "VerSetConditionMask")) {
@@ -3364,9 +3377,10 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             // CV свободна (никто не ждёт под тем же CS) — мгновенный TRUE
             ret = kSleepConditionVariableCS(a1, a2, a3);
         } else if (std.mem.eql(u8, name, "SleepEx")) {
-            // v0.13.0 (CDD №4, финальный шаг): сон «пройден» — 0 (ядро без
-            // sleep-примитива для Ring 3; curl ждёт готовности сокета)
-            logf("[WIN32] SleepEx({d}ms) -> 0 (проснулся)\n", .{a1});
+            // v0.15.0 (CDD №6): парковка задачи (alertable игнорируем —
+            // APC-очереди нет; возврат 0 = WAIT_IO_COMPLETION-нет)
+            logf("[WIN32] SleepEx({d}ms) — парковка задачи\n", .{a1});
+            ops.sleep_task(a1);
             ret = 0;
         } else if (std.mem.eql(u8, name, "CreateThread")) {
             // threading-волна: RCX=attrs, RDX=stackSize, R8=start, R9=param,
@@ -3438,6 +3452,12 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
         if (std.mem.eql(u8, name, "strerror")) {
             // fix-волна №3: NULL у trap-стаба = пустые сообщения об ошибках
             ret = kstrerror(a1);
+        } else if (std.mem.eql(u8, name, "strerror_s")) {
+            // v0.15.0 (CDD №6): Annex K secure-вариант — TLS-ошибки curl
+            ret = kstrerror_s(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "_wcserror_s")) {
+            // v0.15.0 (CDD №6): wide-вариант (UTF-16LE)
+            ret = kwcserror_s(a1, a2, a3);
         } else if (std.mem.eql(u8, name, "__p___argc")) {
             ensureArgv();
             ret = if (ctx) |*c| c.argc_ptr else 0;
@@ -4013,10 +4033,9 @@ pub fn kstrtoul(s: u64, endptr: u64, base: u64) u64 {
     return raw & 0xFFFFFFFF;
 }
 
-/// strerror(errnum): текст ошибки CRT. Выделяем 64Б-блок в heap (bump —
-/// ошибки редки, утечка ограничена числом вызовов). errno-таблица: 7 общих.
-pub fn kstrerror(errnum: u64) u64 {
-    const msg: []const u8 = switch (errnum) {
+/// errno → сообщение CRT (общая таблица для strerror/strerror_s/_wcserror_s).
+fn strerrorMsg(errnum: u64) []const u8 {
+    return switch (errnum) {
         0 => "No error",
         1 => "Operation not permitted",
         2 => "No such file or directory",
@@ -4044,12 +4063,50 @@ pub fn kstrerror(errnum: u64) u64 {
         122 => "Disk quota exceeded",
         else => "Unknown error",
     };
+}
+
+/// strerror(errnum): текст ошибки CRT. Выделяем 64Б-блок в heap (bump —
+/// ошибки редки, утечка ограничена числом вызовов). errno-таблица: 7 общих.
+pub fn kstrerror(errnum: u64) u64 {
+    const msg = strerrorMsg(errnum);
     const p = kmalloc(64);
     if (p == 0) return 0;
     if (!ops.validate_write(p, msg.len + 1)) return 0;
     @memcpy(userPtr(p)[0..msg.len], msg);
     userPtr(p)[msg.len] = 0;
     return p;
+}
+
+/// strerror_s(buf, bufsz, errnum) — C11 Annex K (UCRT): копия сообщения
+/// в буфер вызывающего, усечение с NUL. Возврат errno_t: 0 = успех,
+/// 22 (EINVAL) = buf==NULL или bufsz==0. v0.15.0 (CDD №6): TLS-ошибки
+/// curl-OpenSSL печатались пустыми — теперь честный текст.
+pub fn kstrerror_s(buf: u64, bufsz: u64, errnum: u64) u64 {
+    if (buf == 0 or bufsz == 0) return 22; // EINVAL
+    const msg = strerrorMsg(errnum);
+    const sz: usize = @intCast(bufsz);
+    // копируем min(sz-1, msg.len) байт + NUL — НИКОГДА не покидаем буфер
+    const n = @min(sz - 1, msg.len);
+    if (!ops.validate_write(buf, n + 1)) return 22;
+    if (n > 0) @memcpy(userPtr(buf)[0..n], msg[0..n]);
+    userPtr(buf + n)[0] = 0;
+    return 0;
+}
+
+/// _wcserror_s(wbuf, bufsz_in_wchars, errnum) — wide-вариант (UTF-16LE).
+/// Сообщения ASCII → каждый байт = u16. errno_t-семантика как у narrow.
+pub fn kwcserror_s(buf: u64, bufsz: u64, errnum: u64) u64 {
+    if (buf == 0 or bufsz == 0) return 22; // EINVAL
+    const msg = strerrorMsg(errnum);
+    const sz: usize = @intCast(bufsz); // в wchar-единицах!
+    const n = @min(sz - 1, msg.len);
+    if (!ops.validate_write(buf, (n + 1) * 2)) return 22;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        userW(buf + i * 2).* = msg[i];
+    }
+    userW(buf + n * 2).* = 0;
+    return 0;
 }
 
 /// setlocale(category, locale): «C»-локаль. Ленивый слот, КЭШИРУЕМЫЙ —
@@ -4190,6 +4247,7 @@ fn tOps() Ops {
         .net_tcp_recv = noRecv,
         .net_tcp_poll = noPoll,
         .net_tcp_close = noClose,
+    .sleep_task = noSleep,
     };
 }
 
@@ -4773,6 +4831,7 @@ test "dispatch: дефолтные ops-параноики — отказ без 
         .net_tcp_recv = noRecv,
         .net_tcp_poll = noPoll,
         .net_tcp_close = noClose,
+    .sleep_task = noSleep,
     };
     ctx = null;
     var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
@@ -5624,6 +5683,73 @@ test "str: strerror/setlocale — статические строки, стаб�
     const l2 = reg.call(id_sl, 6, 0, 0, 0); // повторный вызов
     try testing.expect(l1 != 0 and l1 == l2);
     try testing.expectEqualStrings("C", std.mem.sliceTo(@as([*:0]const u8, @ptrFromInt(l1)), 0));
+}
+
+// ─── Тесты: v0.15.0 (CDD №6) — strerror_s / _wcserror_s (Annex K) ───────────
+
+test "str: strerror_s — копия, усечение с NUL, EINVAL" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id = reg.add("api-ms-win-crt-runtime-l1-1-0.dll", "strerror_s", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+
+    // полный копирующийся случай: errno 22 → «Invalid argument» (16Б+NUL)
+    @memset(g_mem[0x100..0x140], 0xEE);
+    try testing.expectEqual(@as(u64, 0), reg.call(id, mb + 0x100, 64, 22, 0));
+    try testing.expectEqualStrings("Invalid argument", std.mem.sliceTo(@as([*:0]const u8, @ptrFromInt(mb + 0x100)), 0));
+
+    // усечение: bufsz=8 → 7 символов + NUL, буфер не покинут
+    @memset(g_mem[0x200..0x210], 0xEE);
+    try testing.expectEqual(@as(u64, 0), reg.call(id, mb + 0x200, 8, 22, 0));
+    try testing.expectEqualStrings("Invalid", std.mem.sliceTo(@as([*:0]const u8, @ptrFromInt(mb + 0x200)), 0));
+    try testing.expectEqual(@as(u8, 0xEE), g_mem[0x208]); // за NUL — не тронуто
+
+    // bufsz=1 → только NUL
+    g_mem[0x240] = 0xEE;
+    try testing.expectEqual(@as(u64, 0), reg.call(id, mb + 0x240, 1, 22, 0));
+    try testing.expectEqual(@as(u8, 0), g_mem[0x240]);
+
+    // buf=NULL / bufsz=0 → EINVAL(22)
+    try testing.expectEqual(@as(u64, 22), reg.call(id, 0, 64, 22, 0));
+    try testing.expectEqual(@as(u64, 22), reg.call(id, mb + 0x100, 0, 22, 0));
+
+    // неизвестный errno → «Unknown error»
+    try testing.expectEqual(@as(u64, 0), reg.call(id, mb + 0x280, 32, 9999, 0));
+    try testing.expectEqualStrings("Unknown error", std.mem.sliceTo(@as([*:0]const u8, @ptrFromInt(mb + 0x280)), 0));
+}
+
+test "str: _wcserror_s — UTF-16LE, усечение, EINVAL" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id = reg.add("api-ms-win-crt-runtime-l1-1-0.dll", "_wcserror_s", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+
+    // errno 2 → «No such file or directory» (25 wchar) — UTF-16LE
+    @memset(g_mem[0x100..0x140], 0xEE);
+    try testing.expectEqual(@as(u64, 0), reg.call(id, mb + 0x100, 32, 2, 0));
+    try testing.expectEqual(@as(u16, 'N'), userW(mb + 0x100 + 0).*);
+    try testing.expectEqual(@as(u16, 'o'), userW(mb + 0x100 + 2).*);
+    try testing.expectEqual(@as(u16, 0), userW(mb + 0x100 + 25 * 2).*); // NUL
+    try testing.expectEqual(@as(u8, 0xEE), g_mem[0x100 + 26 * 2]); // не тронуто
+
+    // усечение до 4 wchar: «No \0» (3 символа + NUL — буфер не покидаем)
+    @memset(g_mem[0x200..0x220], 0xEE);
+    try testing.expectEqual(@as(u64, 0), reg.call(id, mb + 0x200, 4, 2, 0));
+    try testing.expectEqual(@as(u16, 'N'), userW(mb + 0x200 + 0).*);
+    try testing.expectEqual(@as(u16, 'o'), userW(mb + 0x200 + 2).*);
+    try testing.expectEqual(@as(u16, ' '), userW(mb + 0x200 + 4).*);
+    try testing.expectEqual(@as(u16, 0), userW(mb + 0x200 + 6).*); // NUL
+    try testing.expectEqual(@as(u8, 0xEE), g_mem[0x208]); // за NUL — не тронуто
+
+    // EINVAL
+    try testing.expectEqual(@as(u64, 22), reg.call(id, 0, 32, 2, 0));
+    try testing.expectEqual(@as(u64, 22), reg.call(id, mb + 0x100, 0, 2, 0));
 }
 
 // ─── Тесты: event-волна (WSA-event loop + stdio-интроспекция) ───────────────
