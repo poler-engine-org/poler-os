@@ -819,6 +819,64 @@ pub const Dispatcher = struct {
         return false;
     }
 
+    // ─── v0.14.0 (CDD №5): native qsort (175Б, 4 слота) ──────────────────
+
+    /// qsort(base=RCX, nmemb=RDX, size=R8, compar=R9): insertion-sort с
+    /// вызовом компаратора ПРИЛОЖЕНИЯ в Ring 3 (прецедент native-bsearch
+    /// v0.12; OpenSSL в curl.exe сортирует cipher-списки — trap-стаб давал
+    /// livelock). Код GNU as (scripts/qsort-native.s), 175Б, objdump-
+    /// сверен; все указатели — пересчёт из callee-saved (урок v0.12 №3).
+    fn writeNativeQsort(out: []u8) void {
+        @memset(out, 0);
+        const code = [175]u8{
+            0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
+            0x41, 0x57, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x89,
+            0xCB, 0x48, 0x89, 0xD5, 0x4D, 0x89, 0xC4, 0x4D,
+            0x89, 0xCD, 0x48, 0x85, 0xED, 0x76, 0x7F, 0x4D,
+            0x85, 0xE4, 0x74, 0x7A, 0x48, 0x83, 0xFD, 0x01,
+            0x76, 0x74, 0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00,
+            0x00, 0x49, 0x39, 0xEE, 0x73, 0x68, 0x4D, 0x89,
+            0xF7, 0x4D, 0x85, 0xFF, 0x74, 0x5B, 0x4C, 0x89,
+            0xF8, 0x48, 0xFF, 0xC8, 0x49, 0x0F, 0xAF, 0xC4,
+            0x48, 0x8D, 0x0C, 0x03, 0x4C, 0x89, 0xFA, 0x49,
+            0x0F, 0xAF, 0xD4, 0x48, 0x8D, 0x14, 0x13, 0x41,
+            0xFF, 0xD5, 0x85, 0xC0, 0x7E, 0x3B, 0x4C, 0x89,
+            0xF8, 0x48, 0xFF, 0xC8, 0x49, 0x0F, 0xAF, 0xC4,
+            0x4C, 0x8D, 0x04, 0x03, 0x4C, 0x89, 0xFA, 0x49,
+            0x0F, 0xAF, 0xD4, 0x4C, 0x8D, 0x0C, 0x13, 0x48,
+            0x31, 0xC9, 0x4C, 0x39, 0xE1, 0x73, 0x15, 0x45,
+            0x8A, 0x14, 0x08, 0x45, 0x8A, 0x1C, 0x09, 0x45,
+            0x88, 0x1C, 0x08, 0x45, 0x88, 0x14, 0x09, 0x48,
+            0xFF, 0xC1, 0xEB, 0xE6, 0x49, 0xFF, 0xCF, 0xEB,
+            0xA0, 0x49, 0xFF, 0xC6, 0xEB, 0x93, 0x31, 0xC0,
+            0x48, 0x83, 0xC4, 0x28, 0x41, 0x5F, 0x41, 0x5E,
+            0x41, 0x5D, 0x41, 0x5C, 0x5D, 0x5B, 0xC3,
+        };
+        @memcpy(out[0..code.len], &code);
+    }
+
+    /// Пометить dll!func как native-qsort (код в слотах [count+6..count+10),
+    /// ПОСЛЕ моста и bsearch). Возврат — нашли ли запись.
+    pub fn implementNativeQsort(self: *Dispatcher, dll_needle: []const u8, func_needle: []const u8) bool {
+        if (self.code == null) return false;
+        const code_buf = self.code.?;
+        const off = (self.count + 6) * STUB_CODE_SIZE; // после моста(3)+bsearch(3)
+        if (off + 4 * STUB_CODE_SIZE > code_buf.len) return false;
+        for (self.entries[0..self.count]) |*e| {
+            if (!std.ascii.eqlIgnoreCase(e.dll, dll_needle)) continue;
+            switch (e.func) {
+                .by_name => |n| if (std.mem.eql(u8, n, func_needle)) {
+                    writeNativeQsort(code_buf[off..][0..4 * STUB_CODE_SIZE]);
+                    e.kind = .native;
+                    e.stub_addr = self.stubAddr(off);
+                    return true;
+                },
+                .by_ordinal => {},
+            }
+        }
+        return false;
+    }
+
     /// Патчит IAT скопированного образа: каждый слот получает адрес стаба.
     /// image_mem — identity-указатель ЗАГРУЖЕННОГО образа (запись из CPL=0);
     /// записываемое значение — ЛОГИЧЕСКИЙ (user-VA) адрес стаба.
@@ -1523,6 +1581,73 @@ test "native-bsearch: бинарный поиск с КОМПАРАТОРОМ п
         keybuf[4] = 0;
         try testing.expectEqual(@intFromPtr(&tbl[0]), win64Call5(bs.stub_addr, @intFromPtr(&key2), @intFromPtr(&tbl), 8, 16, cc_va));
     }
+}
+
+test "native-qsort: insertion-sort с КОМПАРАТОРОМ приложения (Ring 3)" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+    // Драйвер бага v0.14.0 (CDD №5): OpenSSL в curl.exe сортирует
+    // cipher-списки qsort'ом — trap-стаб → livelock-kill (как bsearch
+    // в v0.12). Native 175Б (scripts/qsort-native.s) вызывает компаратор
+    // приложения из Ring 3 по Win64-контракту.
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try Pe.parse(data);
+    const counts = image.countImports();
+    // запас: мост 3 + bsearch 3 + qsort 4 + компаратор 1 + 1
+    const entries = try testing.allocator.alloc(StubEntry, counts.functions);
+    defer testing.allocator.free(entries);
+    const code_len = (counts.functions + 12) * STUB_CODE_SIZE + 4096;
+    const code_buf = try std.posix.mmap(
+        null,
+        code_len,
+        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(code_buf);
+
+    var disp = Dispatcher.init(entries, code_buf[0..code_len], .int3);
+    _ = try disp.generateFor(&image);
+
+    try testing.expect(disp.implementNativeQsort("api-ms-win-crt-utility-l1-1-0.dll", "qsort"));
+    const qs = disp.findByNameAnyDll("qsort") orelse return error.NoQsort;
+    try testing.expectEqual(StubKind.native, qs.kind);
+
+    // компаратор: int cmp(const void* a, const void* b) → *(u32*)a - *(u32*)b
+    const cmp_off = (disp.count + 10) * STUB_CODE_SIZE;
+    const cmp_code = [_]u8{ 0x8B, 0x01, 0x2B, 0x02, 0xC3 };
+    @memcpy(code_buf[cmp_off..][0..cmp_code.len], &cmp_code);
+    const cmp_va = disp.stubAddr(cmp_off);
+
+    // сортировка 8 u32 по возрастанию (элементы 8Б: ключ u32@0 + мусор)
+    var arr = [_]u64{ 42, 7, 99, 1, 55, 13, 700, 3 };
+    const base: u64 = @intFromPtr(&arr);
+    _ = win64Call5(qs.stub_addr, base, 8, 8, cmp_va, 0);
+    var expect = [_]u64{ 1, 3, 7, 13, 42, 55, 99, 700 };
+    try testing.expectEqualSlices(u64, &expect, &arr);
+
+    // обратный порядок: компаратор (b - a)
+    var arr2 = [_]u64{ 5, 1, 9, 2 };
+    // cmp_rev: 8B 02 mov eax,[rdx]; 2B 01 sub eax,[rcx]; C3 ret
+    const cmp_rev_code = [_]u8{ 0x8B, 0x02, 0x2B, 0x01, 0xC3 };
+    @memcpy(code_buf[cmp_off..][0..cmp_rev_code.len], &cmp_rev_code);
+    _ = win64Call5(qs.stub_addr, @intFromPtr(&arr2), 4, 8, cmp_va, 0);
+    var expect2 = [_]u64{ 9, 5, 2, 1 };
+    try testing.expectEqualSlices(u64, &expect2, &arr2);
+
+    // уже сортировано / пусто / 1 элемент — не падает
+    var one = [_]u64{77};
+    _ = win64Call5(qs.stub_addr, @intFromPtr(&one), 1, 8, cmp_va, 0);
+    try testing.expectEqual(@as(u64, 77), one[0]);
+    _ = win64Call5(qs.stub_addr, base, 0, 8, cmp_va, 0);
+
+    // элементы НЕкратного размера (5Б): побайтовый свап
+    var bytes = [_]u8{ 5, 1, 9, 2, 7, 0, 8, 0, 4, 0, 6, 0, 3, 0, 1, 0, 2, 0, 9, 0 };
+    // интерпретируем как 4×5Б структур с ключом u8@0 → лексикографический
+    // порядок ключей после сортировки: 0,1,2,4,5... (ключи: 5,1,9,2 | 7,0,8,0 ...)
+    _ = win64Call5(qs.stub_addr, @intFromPtr(&bytes), 4, 5, cmp_va, 0);
+    try testing.expect(bytes[0] <= bytes[5] and bytes[5] <= bytes[10]);
 }
 
 test "findByNameAnyDll: case-insensitive, все DLL" {

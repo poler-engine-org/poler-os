@@ -44,7 +44,7 @@ Linux-программы работают нативно — POLER-OS реали
 
 ---
 
-## Текущая версия: v0.13.0
+## Текущая версия: v0.14.0
 
 | Подсистема | Статус | Описание |
 |---|---|---|
@@ -58,6 +58,7 @@ Linux-программы работают нативно — POLER-OS реали
 | Keyboard | Готово | PS/2 Set 2 → Set 1 translation через i8042 controller (bit 6) |
 | Serial | Готово | COM1 (115200 baud, 8N1) |
 | Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
+| VirtIO-Net | Готово | PCI legacy-драйвер, RX/TX VirtQueue, ARP/IPv4/TCP/DNS мини-стек (SLIRP, реальный интернет) |
 | PUF | Готово | Привязка аппаратной энтропии: TSC-джиттер → сид PRNG ядра + identity; анти-клон enrollment (спека POST_QUANTUM_HARDWARE_ENTROPY) |
 | Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen, win32_call (#6), cb_done (#7) |
 | **Win32 PE Runtime** | **CDD-циклы 1–4** | **curl.exe в Ring 3 — ПОЛНЫЙ HTTP-ОБМЕН**: CRT-init → main() → 2 Win64-треда (Happy Eyeballs) → getaddrinfo → socket() → connect() → select → **send(«GET / HTTP/1.1…», 75Б)** → recv(HTTP/1.1 200 OK, 52Б) → **«Hello POLER!» в консоли ОС** → штатный exit(0). 128 имплементаций + 6 native-стабов, SocketState-движок (опции/события FD_*/loopback-I/O), мультиплексор select с перезаписью fd_set, мост колбэка InitOnce, Enrollment-Gate |
@@ -204,8 +205,9 @@ zig-kernel/
 - [x] Интерактивные команды шелла `peinfo`, `pestubs` и `peload` (загрузка + запуск)
 - [x] VMM-маппинг секций PE64 в Ring 3 по ImageBase с посекционными правами (RW/NX/USER)
 - [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → socket() → connect() → select → send() → recv() → печать тела → exit(0) (v0.10–v0.13, CDD-циклы 1–4)
-- [x] Реализация базовых API kernel32/UCRT/WS2_32 «по мере запросов» (CDD): 128 syscall-трамплинов + 6 native-стабов (memset/memcpy/memmove/strlen/strcmp/strncmp + native-bsearch), block-heap, GetProcAddress, QPF/QPC (TSC), НАСТОЯЩИЕ Win64-треды, Enrollment-Gate, SocketState-движок с событиями FD_* и loopback-HTTP
-- [ ] Следующие CDD-циклы: TLS-стек (SChannel: InitializeSecurityContext/AcquireCredentials через SSPI-таблицу — https://), DNS-резолвер реальный (сейчас — синтез TEST-NET), .reloc для DYNAMIC_BASE, сетевой стек virtio-net (замена loopback-шиму) — по логу цепочки v0.13.0
+- [x] Реализация базовых API kernel32/UCRT/WS2_32 «по мере запросов» (CDD): 138 syscall-трамплинов + 6 native-стабов + native-bsearch + native-qsort (175Б), block-heap, GetProcAddress, QPF/QPC (TSC), НАСТОЯЩИЕ Win64-треды, Enrollment-Gate, SocketState-движок с событиями FD_* и loopback-HTTP
+- [x] **CDD-цикл №5 (v0.14.0): РЕАЛЬНЫЙ СЕТЕВОЙ ОБМЕН** — драйвер VirtIO-Net (PCI legacy, RX/TX VirtQueue, 10Б-виртуальный-заголовок) + мини-стек ARP/IPv4/TCP (трёхстороннее рукопожатие, отложенные ACKи)/DNS (UDP→SLIRP): `curl.exe http://example.com` в Ring 3 получил НАСТОЯЩИЙ HTML из интернета и напечатал его в консоли ОС, штатный exit(0). SSPI/SChannel SYNTHETIC-TLS-движок построен (таблица + QuerySecurityPackageInfo/AcquireCredentialsHandle/InitializeSecurityContext/EncryptMessage/DecryptMessage); настоящий TLS-ClientHello (1539Б, OpenSSL внутри curl) отправлен на example.com
+- [ ] Следующие CDD-циклы: полное HTTPS-замыкание (curl-OpenSSL: анализ серверного FIN после handshake-флайта; CA-хранилище), strerror_s и прочие остатки CRT-семьи, .reloc для DYNAMIC_BASE, ICMP/ping, TCP-ретрансмиты с окном
 - [ ] Подмножество Linux system call interface
 - [ ] POSIX compatibility layer
 
@@ -218,6 +220,16 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.14.0 — CDD-цикл №5: МОМЕНТ ИСТИНЫ №5 — РЕАЛЬНЫЙ сетевой обмен (VirtIO-Net + SLIRP)
+- **МОМЕНТ ИСТИНЫ №5 — НАСТОЯЩИЙ ИНТЕРНЕТ В RING 3**: `curl.exe http://example.com` в QEMU (`-netdev user` + `-device virtio-net-pci`): наш ARP-резолвинг шлюза SLIRP (10.0.2.2) → наш DNS-резолвер (UDP → 10.0.2.3, A-запись example.com → 172.66.147.243) → наше TCP-рукопожатие (SYN → SYN-ACK → ACK) → GET / HTTP/1.1 (75Б) через наш virtio-net TX → **РЕАЛЬНЫЙ HTML-ответ (870Б) «Example Domain» через наш RX** → напечатан curl.exe в консоли ОС (MB2WC → WriteConsoleW) → **штатный ExitProcess(0x0)**. Бэклог трапов ПУСТ. Без единой строки Windows — вся сеть наша.
+- **Драйвер VirtIO-Net** (`virtio_net.zig`, 840+ строк): PCI-скан (0x1AF4:0x1000, subsystem 1 — фикс чтения на 0x2E вместо 0x2C), очереди RX (queue 0, posted WRITE-буферы) и TX (queue 1, поллинг used-ring как virtio-blk), MAC из device-config, legacy-контракт **10Б виртуального заголовка перед каждым кадром** (диагноз: pcap-дамп показывал обрезанные 32Б-фреймы вместо 42Б ARP — девайс съедал первые 10Б как заголовок).
+- **Мини-стек ядра**: ARP (запрос/ответ, кэш шлюза, ответы на probe SLIRP), IPv4 (RFC 1071 чексуммы, обрезка по total_len — фикс «фантомных данных» из Ethernet-паддинга), TCP (тройное рукопожатие с ретрансмитами SYN, PSH-данные с нарезкой по MSS, RX-кольцо 64КБ на соединение, отложенные ACKи need_ack — фикс анти-реентерабельности: sendTcpAck из pollRx перезаписывал TX-дескриптор в спине sendFrame), DNS (A-записи, сжатие имён).
+- **Интеграция сокетов** (плавный fallback по спеке): `net_ready/net_dns_resolve/net_tcp_*` в Ops-инъекции; getaddrinfo при активном драйвере делает НАСТОЯЩИЙ резолв (иначе синтез TEST-NET), connect — настоящее TCP-соединение (иначе loopback-шим), send/recv — данные через virtio (лог `[NET-SEND]`/`[NET-RECV]`), select — активный RX-поллинг. Регрессия pe-run4 (loopback-путь) — ALL PASS.
+- **SSPI/SChannel TLS Engine (SYNTHETIC-TLS)**: полная таблица SecurityFunctionTable + QuerySecurityPackageInfo/AcquireCredentialsHandle/InitializeSecurityContext (генерация НАСТОЯЩЕГО TLS ClientHello: record 0x16, random, cipher-suites, SNI/ALPN; парсинг ServerHello)/EncryptMessage/DecryptMessage (XOR-поток по сессионному ключу, STREAM_HEADER/TRAILER по контрактам SChannel)/QueryContextAttributes(STREAM_SIZES)/Delete/Free; сокет-машина https (порт 443 → синтетический сервер). Разведка: curl.exe 8.21 MSYS2 содержит ВСТРОЕННЫЙ OpenSSL (сертификат: настоящий ClientHello 1539Б из Ring 3 отправлен и server-flight принят+расшифрован) — полный SChannel-путь не активируется этой сборкой; HTTPS-финализация — цикл №6.
+- **Wave-A + ctype + byteswap**: CreateMutexA (пул 0x400+, WaitFor→WAIT_OBJECT_0), bcrypt!BCryptGenRandom (xorshift-энтропия), ReleaseMutex, strnlen, inet_pton, isalnum/isdigit/isalpha/isupper/islower/isxdigit/ispunct (punycode-резолвер: isalnum-trap → livelock), _byteswap_ulong/ushort/uint64 (OpenSSL TLS-потоки).
+- **Native qsort (175Б, GNU as)**: insertion-sort с вызовом КОМПАРАТОРА приложения из Ring 3 (прецедент native-bsearch v0.12); OpenSSL сортирует cipher-списки — trap → livelock. kStackArg расширен до arg10 (InitializeSecurityContext — 10 аргументов).
+- Тесты: 288/288 (+17 к v0.13: 10 virtio_net-билдеры/чексуммы/DNS-парсеры, 5 SSPI/TLS-движка, Wave-A, qsort). E2E: **pe-run5 ALL PASS** (момент №5: реальный HTML + exit(0), pcap-дамп 2399Б) + pe-run4 ALL PASS (loopback-регрессия).
 
 ### v0.13.0 — CDD-цикл №4: МОМЕНТ ИСТИНЫ №4 — первый HTTP-обмен в POLER-OS
 - **МОМЕНТ ИСТИНЫ №4 — ПОЛНЫЙ ЗАМКНУТЫЙ ЦИКЛ**: `curl.exe http://example.com` в Ring 3: … → connect(192.0.2.1:80) → select (WRITABLE) → **send(«GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/8.21.0…», 75Б)** → recv(«HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello POLER!\n», 52Б) → MultiByteToWideChar → WriteConsoleW → **«Hello POLER!» напечатан curl.exe в консоли ОС** → **штатный ExitProcess(0x0)**. Бэклог трапов ПУСТ — цепочка дошла до конца без новых падений.

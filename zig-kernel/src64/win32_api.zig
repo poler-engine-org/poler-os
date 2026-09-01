@@ -38,6 +38,7 @@ const vmm = @import("vmm64.zig");
 const win32 = @import("win32_stubs.zig");
 const crt = @import("win32_crt.zig");
 const scheduler = @import("scheduler.zig");
+const virtio_net = @import("virtio_net.zig");
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -62,7 +63,80 @@ pub fn installOps() void {
         .exit_task = kExitTask,
         .object_signaled = kObjectSignaled,
         .current_tid = kCurrentTid,
+        // v0.14.0 (CDD №5): реальный сетевой обмен (virtio-net → SLIRP)
+        .net_ready = kNetReady,
+        .net_dns_resolve = kNetDnsResolve,
+        .net_tcp_connect = kNetTcpConnect,
+        .net_tcp_send = kNetTcpSend,
+        .net_tcp_recv = kNetTcpRecv,
+        .net_tcp_poll = kNetTcpPoll,
+        .net_tcp_close = kNetTcpClose,
     };
+}
+
+// ─── v0.14.0 (CDD №5): virtio-net мост (syscall-контекст, CR3=user — CPL=0
+//     читает USER-страницы и пишет supervisor identity-DMA: без SMAP ок) ────
+
+fn kNetReady() bool {
+    return virtio_net.isInitialized();
+}
+
+fn kNetDnsResolve(host: [*]const u8, host_len: usize) u64 {
+    if (host_len == 0 or host_len > 127) return 0;
+    const h = host[0..host_len];
+    const ip = virtio_net.dnsResolve(h) orelse return 0;
+    hal.Serial.puts("[VNET] DNS ");
+    hal.Serial.puts(h);
+    hal.Serial.puts(" -> ");
+    hal.Serial.putDecimal(ip[0]);
+    hal.Serial.puts(".");
+    hal.Serial.putDecimal(ip[1]);
+    hal.Serial.puts(".");
+    hal.Serial.putDecimal(ip[2]);
+    hal.Serial.puts(".");
+    hal.Serial.putDecimal(ip[3]);
+    hal.Serial.puts("\n");
+    return (@as(u64, ip[0]) << 24) | (@as(u64, ip[1]) << 16) |
+        (@as(u64, ip[2]) << 8) | ip[3];
+}
+
+fn kNetTcpConnect(be_ip: u64, port: u16) i64 {
+    const ip = [4]u8{
+        @truncate(be_ip >> 24),
+        @truncate(be_ip >> 16),
+        @truncate(be_ip >> 8),
+        @truncate(be_ip),
+    };
+    const slot = virtio_net.tcpConnect(ip, port) catch |err| {
+        hal.Serial.puts("[VNET] tcpConnect failed: ");
+        hal.Serial.puts(@errorName(err));
+        hal.Serial.puts("\n");
+        return -1;
+    };
+    return @intCast(slot);
+}
+
+fn kNetTcpSend(slot: i64, data: [*]const u8, len: usize) i64 {
+    if (len == 0) return 0;
+    if (len > 64 * 1024 * 1024) return -1;
+    const sent = virtio_net.tcpSend(@intCast(slot), data[0..len]) catch return -1;
+    return @intCast(sent);
+}
+
+fn kNetTcpRecv(slot: i64, out: [*]u8, cap: usize) i64 {
+    const n = virtio_net.tcpRecv(@intCast(slot), out[0..cap], false) catch |err| {
+        if (err == error.ConnClosed) return -1;
+        return 0;
+    };
+    return @intCast(n);
+}
+
+fn kNetTcpPoll(slot: i64) i64 {
+    return virtio_net.tcpPoll(@intCast(slot));
+}
+
+fn kNetTcpClose(slot: i64) void {
+    virtio_net.tcpClose(@intCast(slot));
 }
 
 // ─── v0.12.0 (threading-волна): НАСТОЯЩИЕ Win64-треды ────────────────────────
@@ -388,7 +462,9 @@ pub fn callbackDone(cookie: u64, result: u64) u64 {
 /// При входе в стаб [rsp]=ret; стаб сделал 2 push (rsi/rdi) → при SYSCALL
 /// user_rsp = entry_rsp-16 → arg5 = +0x38, arg6 = +0x40.
 fn kStackArg(idx: u64) u64 {
-    if (idx > 2) return 0;
+    // v0.14.0 (CDD №5): расширено до arg10 (InitializeSecurityContext —
+    // 10 аргументов: pInput=arg7/[0], phNewContext=arg9, pOutput=arg10)
+    if (idx > 5) return 0;
     const addr = scheduler.user_rsp + 0x38 + idx * 8;
     if (!kValidateRead(addr, 8)) return 0;
     return @as(*align(1) const u64, @ptrFromInt(addr)).*;

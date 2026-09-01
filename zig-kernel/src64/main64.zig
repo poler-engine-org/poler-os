@@ -26,6 +26,7 @@ const multiboot2 = @import("multiboot2.zig");
 const framebuffer = @import("framebuffer.zig");
 const pci = @import("pci.zig");
 const virtio_blk = @import("virtio_blk.zig");
+const virtio_net = @import("virtio_net.zig");
 const fat32 = @import("fat32.zig");
 const pe = @import("pe.zig");
 const win32 = @import("win32_stubs.zig");
@@ -909,6 +910,20 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         puts("[VIRTIO-BLK] No virtio-blk device found (expected with -drive)\n");
     }
 
+    // 9b. (v0.14.0, CDD №5) VirtIO-Net: сетевой драйвер + мини-стек
+    //     (ARP/IPv4/TCP/DNS) — реальный сетевой обмен через QEMU SLIRP.
+    //     Ожидается при -netdev user,id=net0 -device virtio-net-pci.
+    virtio_net.init() catch |err| {
+        puts("[VNET] Init failed: ");
+        puts(@errorName(err));
+        puts("\n");
+    };
+    if (virtio_net.isInitialized()) {
+        puts("[VNET] virtio-net готов: реальный TCP/DNS для Ring 3 (SLIRP)\n");
+    } else {
+        puts("[VNET] No virtio-net device (expected without -netdev)\n");
+    }
+
     // 8.7. Initialize and parse Initrd/CPIO modules
     // mb2: модуль из тега (GRUB ISO-загрузка); PVH: modlist[0] из
     // hvm_start_info (уже разобран в parsePvhStartInfo).
@@ -1680,7 +1695,7 @@ fn cmd_peload(args: []const u8) void {
     const counts = image.countImports();
     const SSPI_EXTRA: u64 = 25; // SecurityFunctionTable-имена (см. ниже)
     const BRIDGE_SLOTS: u64 = 3;
-    const NATIVE2_SLOTS: u64 = 3; // bsearch (alias-таблица опций curl)
+    const NATIVE2_SLOTS: u64 = 7; // bsearch (3 слота) + qsort (4 слота, CDD №5)
     const EXITTHREAD_SLOTS: u64 = 1;
     const stub_bytes: u64 = (counts.functions + SSPI_EXTRA + BRIDGE_SLOTS + NATIVE2_SLOTS + EXITTHREAD_SLOTS) * win32.STUB_CODE_SIZE;
     const stub_region = pe_loader.mapRegion(
@@ -1794,6 +1809,16 @@ fn cmd_peload(args: []const u8) void {
         sys_print("[PE] Native bsearch: OK (Ring 3, компаратор приложения; код после mailbox)\n");
     } else {
         sys_print("[PE] Native bsearch: НЕ НАЙДЕН в импортах (пропускаем)\n");
+    }
+
+    // 6a5. (v0.14.0, CDD №5) NATIVE qsort: OpenSSL в curl.exe сортирует
+    //      cipher-списки/точки кривых — trap-стаб → livelock-kill задачи.
+    //      Insertion-sort 175Б, компаратор приложения из Ring 3
+    //      (прецедент bsearch); слоты после bsearch.
+    if (kdisp.implementNativeQsort("api-ms-win-crt-utility-l1-1-0.dll", "qsort")) {
+        sys_print("[PE] Native qsort: OK (Ring 3, insertion-sort 175Б, компаратор приложения)\n");
+    } else {
+        sys_print("[PE] Native qsort: НЕ НАЙДЕН в импортах (пропускаем)\n");
     }
 
     // 6b. Топ-функции CDD-циклов №1+№2 + CRT-startup-kit: syscall-трамплины.
@@ -1968,6 +1993,30 @@ fn cmd_peload(args: []const u8) void {
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_get_osfhandle" },
         .{ "KERNEL32.dll", "MultiByteToWideChar" },
         .{ "KERNEL32.dll", "WriteConsoleW" },
+        // Wave-A (CDD №5, по живому логу https-разведки): пред-SSPI волна —
+        // без валидного мьютекса и энтропии curl не доходит до
+        // AcquireCredentialsHandle (WaitForSingleObject(0)-retry-loop +
+        // мусорный BCryptGenRandom-буфер от trap-стаба).
+        .{ "KERNEL32.dll", "CreateMutexA" },
+        .{ "KERNEL32.dll", "ReleaseMutex" },
+        .{ "bcrypt.dll", "BCryptGenRandom" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "strnlen" },
+        .{ "WS2_32.dll", "inet_pton" },
+        // ctype-семейство (по логу: punycode/IDNA резолвер-треда зовёт
+        // isalnum ЧЕРЕЗ УКАЗАТЕЛЬ (call r15) — резолв GetProcAddress'ом
+        // по реестру стабов; trap → livelock-kill задачи).
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "isalnum" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "isdigit" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "isalpha" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "isupper" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "islower" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "isxdigit" },
+        .{ "api-ms-win-crt-string-l1-1-0.dll", "ispunct" },
+        // byteswap-семейство (OpenSSL-путь, TLS-записи): _byteswap_ulong
+        // — trap → livelock (финальный бэклог живого https-прогона)
+        .{ "api-ms-win-crt-utility-l1-1-0.dll", "_byteswap_ulong" },
+        .{ "api-ms-win-crt-utility-l1-1-0.dll", "_byteswap_ushort" },
+        .{ "api-ms-win-crt-utility-l1-1-0.dll", "_byteswap_uint64" },
     };
     var impls: usize = 0;
     for (impl_specs) |spec| {
@@ -1977,7 +2026,7 @@ fn cmd_peload(args: []const u8) void {
     printDec(impls);
     sys_print(" / ");
     printDec(impl_specs.len);
-    sys_print(" — cycles 1+2+3+4 (waves: 17+20 fn) + CRT-startup-kit\n");
+    sys_print(" — cycles 1+2+3+4+5 (waves: 17+20 fn + Wave-A/ctype/byteswap) + CRT-startup-kit\n");
 
     // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
     kdisp.applyToImage(img.backing);
@@ -2039,12 +2088,17 @@ fn cmd_peload(args: []const u8) void {
         .sspi_table = 0,
         .locale_str = 0,
         .next_event_handle = 0x200,
+        // v0.14.0 (CDD №5): SSPI/SChannel TLS-движок (SYNTHETIC-TLS)
+        .next_mutex_handle = 0x400,
+        .tls_sessions = undefined,
+        .tls_last_fd = 0,
         // v0.13.0-fix: массив состояния сокетов — ЦИКЛ после литерала, НЕ
         // гигантский стековый темп (8КБ-переполнение cmd_peload затирало
         // tasks[1] нулями — kernel-panic каскад; см. scheduler.zig).
         .sockets = undefined,
     };
     for (&win32_crt.ctx.?.sockets) |*sk| sk.* = .{};
+    for (&win32_crt.ctx.?.tls_sessions) |*ts| ts.* = .{};
     sys_print("[PE] TSC calibrated: ");
     printDec(tsc_freq);
     sys_print(" Hz (QPF/QPC source, 5 APIC ticks)\n");

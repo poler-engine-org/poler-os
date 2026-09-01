@@ -159,7 +159,9 @@ pub fn scan() void {
 
 /// Find a VirtIO block device among the scanned devices.
 /// VirtIO legacy devices: vendor 0x1AF4, device ID 0x1000-0x103F.
-/// The subsystem ID identifies the device type (2 = block).
+/// The subsystem ID (offset 0x2E — НЕ 0x2C, там subsystem VENDOR!)
+/// identifies the device type (2 = block).
+/// v0.14.0-fix: читали 0x2C → subsystem_vendor (0x1AF4) → всегда мисматч.
 pub fn findVirtioBlk() ?PciDeviceInfo {
     for (0..device_count) |i| {
         const dev = found_devices[i];
@@ -167,19 +169,17 @@ pub fn findVirtioBlk() ?PciDeviceInfo {
             dev.device_id >= 0x1000 and
             dev.device_id <= 0x103F)
         {
-            // Read subsystem ID to identify device type
-            const subsystem_id = pciRead16(dev.bus, dev.slot, dev.func, 0x2C);
+            const subsystem_id = pciRead16(dev.bus, dev.slot, dev.func, 0x2E);
             if (subsystem_id == 2) { // VIRTIO_ID_BLOCK
                 return dev;
             }
-            // Also accept transitional device ID 0x1001 with subsystem 2
-            // Some QEMU versions use device_id = 0x1001 for virtio-blk
         }
     }
     return null;
 }
 
 /// Find any VirtIO device (by subsystem type).
+/// v0.14.0-fix: subsystem DEVICE id на 0x2E (0x2C = subsystem vendor).
 pub fn findVirtioDevice(subsystem_type: u16) ?PciDeviceInfo {
     for (0..device_count) |i| {
         const dev = found_devices[i];
@@ -187,7 +187,7 @@ pub fn findVirtioDevice(subsystem_type: u16) ?PciDeviceInfo {
             dev.device_id >= 0x1000 and
             dev.device_id <= 0x103F)
         {
-            const subsystem_id = pciRead16(dev.bus, dev.slot, dev.func, 0x2C);
+            const subsystem_id = pciRead16(dev.bus, dev.slot, dev.func, 0x2E);
             if (subsystem_id == subsystem_type) {
                 return dev;
             }

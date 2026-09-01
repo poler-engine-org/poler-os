@@ -124,6 +124,23 @@ pub const Ops = struct {
     /// v0.12.0: текущий TID (scheduler.current_task_id + 0x1000) — ГЛАВНЫЙ
     /// тред и тред резолвера получают РАЗНЫЕ GetCurrentThreadId().
     current_tid: *const fn () u64,
+    /// v0.14.0 (CDD №5): реальный сетевой обмен через virtio-net (ядро:
+    /// драйвер + SLIRP; тесты: параноики — fallback на loopback-синтетику).
+    /// Драйвер инициализирован?
+    net_ready: *const fn () bool,
+    /// DNS-резолв (реальный UDP→10.0.2.3): host → u64-упаковка BE-байт IP
+    /// (ip[0] — старший байт u64; 0 = не резолвится).
+    net_dns_resolve: *const fn (host: [*]const u8, host_len: usize) u64,
+    /// TCP-connect (SYN→SYN-ACK→ACK): слот соединения или -1.
+    net_tcp_connect: *const fn (be_ip: u64, port: u16) i64,
+    /// Отправка данных слота: сколько ушло или -1.
+    net_tcp_send: *const fn (slot: i64, data: [*]const u8, len: usize) i64,
+    /// Приём: >0 — байты, 0 — нет данных, -1 — соединение закрыто.
+    net_tcp_recv: *const fn (slot: i64, out: [*]u8, cap: usize) i64,
+    /// Активный поллинг RX (select-путь): байт в ринге после полла.
+    net_tcp_poll: *const fn (slot: i64) i64,
+    /// Закрытие соединения (FIN).
+    net_tcp_close: *const fn (slot: i64) void,
 };
 
 fn denyAll(_: u64, _: u64) bool {
@@ -148,6 +165,25 @@ fn denySignaled(_: u64) bool {
 fn fakeTid() u64 {
     return 2;
 }
+fn denyNet() bool {
+    return false;
+}
+fn noDns(_: [*]const u8, _: usize) u64 {
+    return 0;
+}
+fn noConnect(_: u64, _: u16) i64 {
+    return -1;
+}
+fn noSend(_: i64, _: [*]const u8, _: usize) i64 {
+    return -1;
+}
+fn noRecv(_: i64, _: [*]u8, _: usize) i64 {
+    return 0;
+}
+fn noPoll(_: i64) i64 {
+    return 0;
+}
+fn noClose(_: i64) void {}
 
 /// Дефолт: параноик. win32_api.installOps() ставит настоящие примитивы.
 pub var ops: Ops = .{
@@ -164,6 +200,13 @@ pub var ops: Ops = .{
     .exit_task = noopExitTask,
     .object_signaled = denySignaled,
     .current_tid = fakeTid,
+    .net_ready = denyNet,
+    .net_dns_resolve = noDns,
+    .net_tcp_connect = noConnect,
+    .net_tcp_send = noSend,
+    .net_tcp_recv = noRecv,
+    .net_tcp_poll = noPoll,
+    .net_tcp_close = noClose,
 };
 
 fn emptyWriter(_: []const u8) void {}
@@ -212,6 +255,11 @@ pub const Ctx = struct {
     sspi_table: u64, // InitSecurityInterfaceA: кэш таблицы (0 = нет)
     locale_str: u64, // setlocale: ленивый слот "C" (0 = не выделен)
     next_event_handle: u64, // WSACreateEvent/CreateEventA: пул 0x200+
+
+    // v0.14.0 (CDD №5)
+    next_mutex_handle: u64, // CreateMutexA: пул 0x400+ (сигнальные всегда)
+    tls_sessions: [MAX_TLS]TlsSession, // SSPI/SChannel TLS-контексты
+    tls_last_fd: u64, // сокет последней TLS-активности (ISC-связка)
 
     // v0.13.0 (CDD №4)
     sockets: [MAX_SOCKS]Sock, // состояния сокетов (fd = 0x100 + индекс)
@@ -1019,6 +1067,721 @@ fn initSecurityInterface(disp: *win32.Dispatcher, wide: bool) u64 {
     return tbl;
 }
 
+// ─── v0.14.0 (CDD №5): SSPI/SChannel TLS Engine — SYNTHETIC-TLS ──────────────
+//
+// Разведка (живой прогон https://example.com на v0.13.0 + дизасм-анализ):
+//   1. curl до SSPI-таблицы не доходит: Wave-A-препятствия — CreateMutexA
+//      (NULL → WaitForSingleObject(0)-retry-loop), bcrypt!BCryptGenRandom
+//      (trap: буфер с мусором), strnlen/inet_pton.
+//   2. curl вызывает SSPI-функции ЧЕРЕЗ ТАБЛИЦУ lld-трамплином «jmp rax»
+//      (глобал-указатель + call [глобал]) — оффсеты полей читаются из
+//      фактического дизасма curl.exe (см. scripts/sspi-offsets*.py).
+//
+// Дизайн (МОМЕНТ ИСТИНЫ №5 — HTTPS-обмен в Ring 3):
+//   AcquireCredentialsHandle → ISC-1 (генерация НАСТОЯЩЕГО TLS ClientHello:
+//   record 0x16/0x0301 + handshake 0x01 + random 32Б + cipher suites +
+//   extensions SNI/ALPN) → send → recv (синтет. ServerHello+CCS+Finished) →
+//   ISC-2 (парсинг ServerHello, established) → EncryptMessage (обёртка
+//   в record 0x17 + XOR-key) → send → recv → DecryptMessage (XOR-обратно) →
+//   «Hello POLER!» в консоли. Сокет с peer_port==443 переключается в
+//   TLS-машину автоматически.
+
+const SEC_I_CONTINUE_NEEDED: u64 = 0x0009_0312; // первый вызов ISC
+const SECBUFFER_EMPTY: u32 = 0;
+const SECBUFFER_DATA: u32 = 1;
+const SECBUFFER_TOKEN: u32 = 2;
+const SECBUFFER_EXTRA: u32 = 5;
+const SECBUFFER_STREAM_TRAILER: u32 = 6;
+const SECBUFFER_STREAM_HEADER: u32 = 7;
+const SECBUFFER_VERSION: u32 = 0;
+const SECPKG_ATTR_STREAM_SIZES: u64 = 4; // SecPkgContext_Sizes
+
+/// Название «пакета» SChannel, которое просит curl (UNISP_NAME).
+const UNISP_NAME = "Microsoft Unified Security Protocol Provider";
+
+/// SecHandle (Cred/Ctxt): dwLower = слот+1 (1..MAX_TLS), dwUpper = magic.
+/// Чтение/запись хэндла в user-памяти: 16Б, {u64, u64}.
+fn tlsSessionByHandle(h_va: u64) ?*TlsSession {
+    if (h_va == 0 or !ops.validate_read(h_va, 16)) return null;
+    const dw_lower = userQ(h_va).*;
+    const dw_upper = userQ(h_va + 8).*;
+    if (dw_upper != TLS_MAGIC or dw_lower == 0 or dw_lower > MAX_TLS) return null;
+    const s = &(ctx orelse return null).tls_sessions[@as(usize, @intCast(dw_lower - 1))];
+    if (!s.in_use) return null;
+    return s;
+}
+
+/// Записать хэндл сессии (16Б) в user-структуру.
+fn tlsWriteHandle(h_va: u64, idx: usize) bool {
+    if (h_va == 0 or !ops.validate_write(h_va, 16)) return false;
+    userQ(h_va).* = idx + 1;
+    userQ(h_va + 8).* = TLS_MAGIC;
+    return true;
+}
+
+/// КЭШЭРОВАННЫЙ лог о непонятных хэндлах: найти свободный слот.
+fn tlsAllocSession() ?usize {
+    const c = &(ctx orelse return null);
+    for (&c.tls_sessions, 0..) |*s, i| {
+        if (!s.in_use) {
+            s.* = .{};
+            s.in_use = true;
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Псевдо-энтропия (SYNTHETIC): TSC-микс + LCG — для client_random и
+/// BCryptGenRandom. НЕ криптостойко — задокументировано в UNISP-логе.
+fn tlsEntropy(buf: []u8, seed: u64) void {
+    var st: u64 = if (seed != 0) seed else ops.read_tsc() ^ 0xA5A5_5A5A_A5A5_5A5A;
+    for (buf) |*b| {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17; // xorshift64
+        b.* = @truncate(st >> 32);
+    }
+}
+
+/// Сессионный ключ: f(client_random, server_random, magic) — XOR-маска.
+fn tlsDeriveKey(s: *TlsSession) void {
+    const label = "POLER-SYNTHETIC-SCHANNEL";
+    for (&s.key, 0..) |*k, i| {
+        k.* = s.client_random[i % 32] ^ s.server_random[(i + 7) % 32] ^
+            label[i % label.len] ^ @as(u8, @truncate(i *% 31));
+    }
+}
+
+/// XOR-поток по ключу с индексом от номера записи.
+fn tlsCrypt(s: *const TlsSession, data: []u8, seq: u64) void {
+    for (data, 0..) |*b, i| {
+        const k = (seq *% 37 + i) % 32;
+        b.* ^= s.key[@intCast(k)];
+    }
+}
+
+// ── ClientHello (генерация, ISC-1) ──────────────────────────────────────────
+
+/// Сборка НАСТОЯЩЕГО TLS 1.2 ClientHello (RFC 5246 §7.4.1.2) в буфер out.
+/// Record: 0x16 03 01 len16; Handshake: 01 len24 {03 03, random32,
+/// session_id_len 0, cipher_suites {1301,1302,1303}, comp {00},
+/// extensions {SNI(server), supported_versions(TLS1.3), ALPN(h2,http/1.1)}}.
+/// Возврат — размер записанных байт (0 = буфер мал).
+pub fn tlsBuildClientHello(s: *TlsSession, out: []u8) usize {
+    if (out.len < 160) return 0;
+    // Handshake body
+    var p: usize = 0;
+    out[p] = 0x03;
+    out[p + 1] = 0x03; // client_version TLS 1.2
+    p += 2;
+    @memcpy(out[p .. p + 32], &s.client_random);
+    p += 32;
+    out[p] = 0; // session_id_len
+    p += 1;
+    // cipher_suites: 3 × u16 BE
+    out[p] = 0;
+    out[p + 1] = 6; // len
+    p += 2;
+    inline for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |cs| {
+        out[p] = @intCast(cs >> 8);
+        out[p + 1] = @intCast(cs & 0xFF);
+        p += 2;
+    }
+    out[p] = 1; // compression_methods_len
+    out[p + 1] = 0; // null
+    p += 2;
+    // extensions: SNI + supported_versions + ALPN
+    var ext: [96]u8 = undefined;
+    var q: usize = 0;
+    // SNI (0x0000): server_name_list{len16, type 0, len16, name}
+    {
+        const name_len: u16 = @intCast(s.sni_len);
+        const list_len: u16 = 3 + name_len;
+        const ext_len: u16 = 2 + list_len;
+        ext[q] = 0x00;
+        ext[q + 1] = 0x00; // type SNI
+        ext[q + 2] = @intCast(ext_len >> 8);
+        ext[q + 3] = @intCast(ext_len & 0xFF);
+        ext[q + 4] = @intCast(list_len >> 8);
+        ext[q + 5] = @intCast(list_len & 0xFF);
+        ext[q + 6] = 0x00; // host_name
+        ext[q + 7] = @intCast(name_len >> 8);
+        ext[q + 8] = @intCast(name_len & 0xFF);
+        q += 9;
+        @memcpy(ext[q .. q + s.sni_len], s.sni[0..s.sni_len]);
+        q += s.sni_len;
+    }
+    // supported_versions (0x002B): TLS 1.3 (0x0304)
+    {
+        ext[q] = 0x00;
+        ext[q + 1] = 0x2B;
+        ext[q + 2] = 0x00;
+        ext[q + 3] = 0x03; // ext len 3
+        ext[q + 4] = 0x02; // list len
+        ext[q + 5] = 0x03;
+        ext[q + 6] = 0x04;
+        q += 7;
+    }
+    // ALPN (0x0010): h2, http/1.1
+    {
+        const protos = [_][]const u8{ "h2", "http/1.1" };
+        var body: [32]u8 = undefined;
+        var b: usize = 0;
+        for (protos) |pr| {
+            body[b] = @intCast(pr.len);
+            b += 1;
+            @memcpy(body[b .. b + pr.len], pr);
+            b += pr.len;
+        }
+        ext[q] = 0x00;
+        ext[q + 1] = 0x10;
+        ext[q + 2] = 0x00;
+        ext[q + 3] = @intCast(b + 2);
+        ext[q + 4] = 0x00;
+        ext[q + 5] = @intCast(b); // list len
+        q += 6;
+        @memcpy(ext[q .. q + b], body[0..b]);
+        q += b;
+    }
+    // extensions_len (u16 BE)
+    out[p] = @intCast(q >> 8);
+    out[p + 1] = @intCast(q & 0xFF);
+    p += 2;
+    @memcpy(out[p .. p + q], ext[0..q]);
+    p += q;
+
+    // Handshake header: 0x01 + len24
+    const hs_len = p;
+    var hdr: [4]u8 = .{ 0x01, 0, 0, 0 };
+    hdr[1] = @intCast(hs_len >> 16);
+    hdr[2] = @intCast((hs_len >> 8) & 0xFF);
+    hdr[3] = @intCast(hs_len & 0xFF);
+    // Record header: 0x16 03 01 len16 (= 4 + hs_len)
+    var rec: [5]u8 = .{ 0x16, 0x03, 0x03, 0, 0 };
+    const rec_len = hs_len + 4;
+    rec[3] = @intCast(rec_len >> 8);
+    rec[4] = @intCast(rec_len & 0xFF);
+    // сдвиг тела на 9 байт (record 5 + handshake 4)
+    std.mem.copyBackwards(u8, out[9 .. 9 + p], out[0..p]);
+    @memcpy(out[0..5], &rec);
+    @memcpy(out[5..9], &hdr);
+    return 9 + p;
+}
+
+// ── ServerHello (парсинг ISC-2 + синтез recv-потока) ────────────────────────
+
+/// Парсинг ServerHello-потока (наш синтетический сервер шлёт SH+CCS+Fin):
+/// проверяем record 0x16, handshake 0x02, забираем server_random.
+pub fn tlsParseServerHello(s: *TlsSession, in: []const u8) bool {
+    if (in.len < 47) return false; // 5+4+2+32+1+2+2+... минимум
+    if (in[0] != 0x16 or in[1] != 0x03) return false; // record handshake
+    if (in[5] != 0x02) return false; // handshake ServerHello
+    @memcpy(&s.server_random, in[11..43]); // 5+4+2 = смещение random
+    const sid_len = in[43];
+    var p: usize = 44 + sid_len;
+    if (p + 3 > in.len) return false;
+    const cipher: u16 = (@as(u16, in[p]) << 8) | in[p + 1];
+    p += 2;
+    if (in[p] != 0) return false; // compression null
+    _ = cipher;
+    return true;
+}
+
+/// Синтез серверного потока после ClientHello (recv, stage 2):
+/// ServerHello (random+cipher 1301) + ChangeCipherSpec + Finished(synth).
+pub fn tlsBuildServerStream(s: *TlsSession, out: []u8) usize {
+    if (out.len < 128) return 0;
+    // ServerHello body: version, random32, sid_len=0, cipher 1301, comp 0
+    var p: usize = 0;
+    var body: [40]u8 = undefined;
+    body[0] = 0x03;
+    body[1] = 0x03;
+    @memcpy(body[2..34], &s.server_random);
+    body[34] = 0; // session_id_len
+    body[35] = 0x13;
+    body[36] = 0x01; // cipher TLS_AES_128_GCM_SHA256
+    body[37] = 0x00; // compression
+    p = 38;
+    // Record 0x16 + Handshake 0x02
+    const hs_body_len = p;
+    out[0] = 0x16;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    out[3] = @intCast((hs_body_len + 4) >> 8);
+    out[4] = @intCast((hs_body_len + 4) & 0xFF);
+    out[5] = 0x02; // handshake type
+    out[6] = 0;
+    out[7] = @intCast(hs_body_len >> 8);
+    out[8] = @intCast(hs_body_len & 0xFF);
+    @memcpy(out[9 .. 9 + p], body[0..p]);
+    var n = 9 + p;
+    // ChangeCipherSpec: 14 03 03 00 01 01
+    const ccs = [6]u8{ 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
+    @memcpy(out[n .. n + ccs.len], &ccs);
+    n += ccs.len;
+    // Finished (SYNTHETIC): record 0x16, handshake 0x14, 32Б «подписи»
+    out[n] = 0x16;
+    out[n + 1] = 0x03;
+    out[n + 2] = 0x03;
+    out[n + 3] = 0x00;
+    out[n + 4] = 0x24; // 36 = 4 + 32
+    out[n + 5] = 0x14; // handshake Finished
+    out[n + 6] = 0;
+    out[n + 7] = 0;
+    out[n + 8] = 32;
+    tlsEntropy(out[n + 9 .. n + 41], 0x5151_5151); // «HMAC»
+    n += 41;
+    return n;
+}
+
+/// Синтез TLS application-data записи (recv, stage 3): record 0x17 +
+/// XOR-«зашифрованный» plaintext + MAC 16Б. size = 5 + len + 16.
+pub fn tlsBuildAppRecord(s: *TlsSession, plaintext: []const u8, seq: u64, out: []u8) usize {
+    if (out.len < 5 + plaintext.len + 16) return 0;
+    out[0] = 0x17;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    const plen: u16 = @intCast(plaintext.len + 16); // ciphertext + MAC
+    out[3] = @intCast(plen >> 8);
+    out[4] = @intCast(plen & 0xFF);
+    @memcpy(out[5 .. 5 + plaintext.len], plaintext);
+    tlsCrypt(s, out[5 .. 5 + plaintext.len], seq);
+    tlsEntropy(out[5 + plaintext.len .. 5 + plaintext.len + 16], seq); // MAC
+    return 5 + plaintext.len + 16;
+}
+
+// ── SSPI-функции (SecurityFunctionTable-волна CDD №5) ──────────────────────
+
+/// QuerySecurityPackageInfoA/W(pszPackageName, ppPackageInfo): SecPkgInfo в
+/// block-heap (cbMaxToken 16384, флаги SECPKG_FLAG_CONNECTION|INTEGRITY).
+/// FreeContextBuffer уже SEC_E_OK (block-heap без reuse).
+fn sspiQuerySecurityPackageInfo(pkg_va: u64, pp_va: u64) u64 {
+    if (pp_va == 0 or !ops.validate_write(pp_va, 8)) {
+        return SEC_E_INVALID_HANDLE;
+    }
+    var pkg_name: []const u8 = "(null)";
+    if (pkg_va != 0) {
+        if (userStrLen(pkg_va)) |len| {
+            if (len > 0 and len < 128) pkg_name = userPtr(pkg_va)[0..@intCast(len)];
+        }
+    }
+    const name = kmalloc(UNISP_NAME.len + 1);
+    const cmt = kmalloc(32);
+    const info = kmalloc(32); // SecPkgInfoW: 4+2+2+4+pad+8+8 = 32
+    if (name == 0 or cmt == 0 or info == 0) return SEC_E_INSUFFICIENT_MEMORY;
+    @memcpy(userPtr(name)[0..UNISP_NAME.len], UNISP_NAME);
+    userPtr(name)[UNISP_NAME.len] = 0;
+    @memcpy(userPtr(cmt)[0..24], "POLER SYNTHETIC SChannel");
+    userPtr(cmt)[24] = 0;
+    @memset(userPtr(info)[0..32], 0);
+    userD(info + 0).* = 0x0000_0113; // fCapabilities: CONNECTION|INTEGRITY|PRIVACY|STREAM|MUTUAL_AUTH
+    userW(info + 4).* = 2; // wVersion
+    userW(info + 6).* = 14; // wRPCID (UNISP)
+    userD(info + 8).* = 16384; // cbMaxToken
+    userQ(info + 16).* = name; // Name (A: char* — curl читает как ANSI)
+    userQ(info + 24).* = cmt; // Comment
+    userQ(pp_va).* = info;
+    logf("[SSPI] QuerySecurityPackageInfo(\"{s}\") -> UNISP, cbMaxToken=16384\n", .{pkg_name});
+    return SEC_E_OK;
+}
+
+/// AcquireCredentialsHandleA/W (9 аргументов, 5-9 через стек):
+/// RCX=principal, RDX=package, R8=fCredentialUse, R9=pvLogonId,
+/// стек[0]=pAuthData, [1]=pGetKeyFn, [2]=pvGetKeyArg, [3]=phCredential,
+/// [4]=ptsExpiry. Выделяем cred-хэндл (dwLower=0xC100+n, dwUpper=magic)
+/// — сессия создаётся позже в InitializeSecurityContext.
+fn sspiAcquireCredentialsHandle(pkg_va: u64, ph_cred: u64, pts_expiry: u64) u64 {
+    var pkg_name: []const u8 = "(null)";
+    if (pkg_va != 0) {
+        if (userStrLen(pkg_va)) |len| {
+            if (len > 0 and len < 128) pkg_name = userPtr(pkg_va)[0..@intCast(len)];
+        }
+    }
+    const c = &(ctx orelse return SEC_E_INVALID_HANDLE);
+    if (ph_cred == 0 or !ops.validate_write(ph_cred, 16)) {
+        return SEC_E_INVALID_HANDLE;
+    }
+    c.next_mutex_handle += 0; // keep struct usage (кред-счётчик в dwLower)
+    const cred_id = c.implemented_calls +% 1; // уникальный номер cred
+    userQ(ph_cred).* = 0xC100 + cred_id; // dwLower: cred-пул 0xC100+
+    userQ(ph_cred + 8).* = TLS_MAGIC; // dwUpper
+    if (pts_expiry != 0 and ops.validate_write(pts_expiry, 8)) {
+        userQ(pts_expiry).* = 0x0000_01FF_FFFF_FFFF; // far future
+    }
+    logf("[SSPI] AcquireCredentialsHandle(pkg=\"{s}\") -> cred 0x{x}\n", .{ pkg_name, userQ(ph_cred).* });
+    return SEC_E_OK;
+}
+
+/// InitializeSecurityContextA/W (10 аргументов): RCX=phCredential,
+/// RDX=phContext (NULL/нуль-структура = первый вызов), R8=pszTargetName
+/// (SNI!), R9=fContextReq, стек[2]=pInput, стек[3]=Reserved2,
+/// стек[4]=phNewContext, стек[5]=pOutput.
+fn sspiInitializeSecurityContext(ph_cred: u64, ph_context: u64, target_va: u64, p_input: u64, ph_new: u64, p_output: u64) u64 {
+    _ = ph_cred; // cred-хэндл валидирован в AcquireCredentialsHandle
+    // Определить: первый вызов или продолжение
+    var existing: ?*TlsSession = null;
+    if (ph_context != 0 and ops.validate_read(ph_context, 16)) {
+        if (userQ(ph_context + 8).* == TLS_MAGIC and userQ(ph_context).* >= 1) {
+            existing = tlsSessionByHandle(ph_context);
+        }
+    }
+    if (existing != null) {
+        // ── Второй вызов: вход = ServerHello-поток → established ──
+        const s = existing.?;
+        if (p_input != 0 and ops.validate_read(p_input, 16)) {
+            const c_buffers = userD(p_input + 4).*;
+            const p_buffers = userQ(p_input + 8).*;
+            var i: u32 = 0;
+            while (i < c_buffers and i < 8) : (i += 1) {
+                const sb_va = p_buffers + @as(u64, i) * 16;
+                if (!ops.validate_read(sb_va, 16)) continue;
+                const cb = userD(sb_va).*;
+                const btype = userD(sb_va + 4).*;
+                const pv = userQ(sb_va + 8).*;
+                if ((btype == SECBUFFER_TOKEN or btype == SECBUFFER_DATA) and cb > 0 and pv != 0) {
+                    if (ops.validate_read(pv, cb)) {
+                        if (tlsParseServerHello(s, userPtr(pv)[0..@intCast(@min(cb, 256))])) {
+                            tlsDeriveKey(s);
+                            s.established = true;
+                            // связать с последним TLS-активным сокетом
+                            const c = &(ctx orelse return SEC_E_OK);
+                            if (c.tls_last_fd != 0) s.fd = c.tls_last_fd;
+                            if (sockByFd(s.fd)) |sk| {
+                                if (sk.tls_stage == 2) sk.tls_stage = 3;
+                            }
+                            logf("[SSPI] InitializeSecurityContext: ServerHello принят ({d}Б) — established, SNI \"{s}\"\n", .{
+                                cb, s.sni[0..@intCast(s.sni_len)],
+                            });
+                            return SEC_E_OK;
+                        }
+                    }
+                }
+            }
+        }
+        logf("[SSPI] InitializeSecurityContext: ServerHello НЕ распознан -> SEC_E_INVALID_TOKEN\n", .{});
+        return SEC_E_INVALID_TOKEN;
+    }
+
+    // ── Первый вызов: создать сессию + ClientHello в pOutput ──
+    const idx = tlsAllocSession() orelse {
+        logf("[SSPI] InitializeSecurityContext: нет свободных слотов TLS\n", .{});
+        return SEC_E_INSUFFICIENT_MEMORY;
+    };
+    const s = &(ctx orelse return SEC_E_INVALID_HANDLE).tls_sessions[idx];
+    // SNI = pszTargetName (имя хоста)
+    if (target_va != 0) {
+        if (userStrLen(target_va)) |len| {
+            const n = @min(len, 63);
+            if (n > 0 and ops.validate_read(target_va, n)) {
+                @memcpy(s.sni[0..@intCast(n)], userPtr(target_va)[0..@intCast(n)]);
+                s.sni_len = @intCast(n);
+            }
+        }
+    }
+    tlsEntropy(&s.client_random, 0); // TSC-энтропия
+    tlsEntropy(&s.server_random, 0x5E5E_5E5E);
+    tlsDeriveKey(s);
+
+    // out-буферы: pOutput → SecBufferDesc {version, count, pBuffers*}
+    var hello: [256]u8 = undefined;
+    const hello_len = tlsBuildClientHello(s, &hello);
+    if (hello_len == 0) return SEC_E_INTERNAL_ERROR;
+    var written: usize = 0;
+    if (p_output != 0 and ops.validate_read(p_output, 16)) {
+        const c_buffers = userD(p_output + 4).*;
+        const p_buffers = userQ(p_output + 8).*;
+        var i: u32 = 0;
+        while (i < c_buffers and i < 8) : (i += 1) {
+            const sb_va = p_buffers + @as(u64, i) * 16;
+            if (!ops.validate_read(sb_va, 16)) continue;
+            const cb = userD(sb_va).*;
+            const btype = userD(sb_va + 4).*;
+            const pv = userQ(sb_va + 8).*;
+            if ((btype == SECBUFFER_TOKEN or btype == SECBUFFER_DATA) and pv != 0 and cb >= hello_len) {
+                if (ops.validate_write(pv, hello_len)) {
+                    @memcpy(userPtr(pv)[0..hello_len], hello[0..hello_len]);
+                    // cbBuffer-поле выходного буфера: фактическая длина
+                    if (ops.validate_write(sb_va, 16)) userD(sb_va).* = @intCast(hello_len);
+                    written = hello_len;
+                    break;
+                }
+            }
+        }
+    }
+    // phNewContext: хэндл новой сессии
+    _ = tlsWriteHandle(ph_new, idx);
+    logf("[SSPI] InitializeSecurityContext: ClientHello {d}Б (SNI \"{s}\") -> SEC_I_CONTINUE_NEEDED\n", .{
+        hello_len, s.sni[0..@intCast(s.sni_len)],
+    });
+    if (written == 0) {
+        // буферов не было — просто сообщим продолжение (ClientHello в логе)
+    }
+    return SEC_I_CONTINUE_NEEDED;
+}
+
+/// EncryptMessage(phContext, fQOP, pMessage, MessageSeqNo):
+/// SECBUFFER_STREAM_HEADER ← record header (5Б), SECBUFFER_DATA ←
+/// XOR-«шифрование» in-place, SECBUFFER_STREAM_TRAILER ← MAC 16Б.
+fn sspiEncryptMessage(ph_context: u64, p_message: u64) u64 {
+    const s = tlsSessionByHandle(ph_context) orelse {
+        logf("[SSPI] EncryptMessage: невалидный контекст\n", .{});
+        return SEC_E_INVALID_HANDLE;
+    };
+    if (!s.established) {
+        logf("[SSPI] EncryptMessage: handshake не завершён\n", .{});
+        return SEC_E_CONTEXT_EXPIRED;
+    }
+    if (p_message == 0 or !ops.validate_read(p_message, 16)) {
+        return SEC_E_INVALID_HANDLE;
+    }
+    const c_buffers = userD(p_message + 4).*;
+    const p_buffers = userQ(p_message + 8).*;
+    var data_va: u64 = 0;
+    var data_len: u64 = 0;
+    var hdr_va: u64 = 0;
+    var trailer_va: u64 = 0;
+    var i: u32 = 0;
+    while (i < c_buffers and i < 8) : (i += 1) {
+        const sb_va = p_buffers + @as(u64, i) * 16;
+        if (!ops.validate_read(sb_va, 16)) continue;
+        const btype = userD(sb_va + 4).*;
+        const pv = userQ(sb_va + 8).*;
+        switch (btype) {
+            SECBUFFER_STREAM_HEADER => hdr_va = pv,
+            SECBUFFER_DATA => {
+                data_va = pv;
+                data_len = userD(sb_va).*;
+            },
+            SECBUFFER_STREAM_TRAILER => trailer_va = pv,
+            else => {},
+        }
+    }
+    if (data_va == 0 or data_len == 0 or !ops.validate_read(data_va, data_len)) {
+        return SEC_E_INVALID_TOKEN;
+    }
+    // первый вызов: лог plaintext (МОМЕНТ ИСТИНЫ №5 — исходящий HTTPS-запрос)
+    if (!s.first_data_logged) {
+        s.first_data_logged = true;
+        var esc: [96]u8 = undefined;
+        var n: usize = 0;
+        const cap: u64 = @min(data_len, 64);
+        var j: u64 = 0;
+        while (j < cap and n + 2 < esc.len) : (j += 1) {
+            const ch = userPtr(data_va)[@as(usize, @intCast(j))];
+            if (ch == '\r') {
+                esc[n] = '\\';
+                esc[n + 1] = 'r';
+                n += 2;
+            } else if (ch == '\n') {
+                esc[n] = '\\';
+                esc[n + 1] = 'n';
+                n += 2;
+            } else {
+                esc[n] = if (ch >= 0x20 and ch < 0x7F) ch else '.';
+                n += 1;
+            }
+        }
+        logf("[TLS-SEND] {d}Б plaintext: \"{s}\"\n", .{ data_len, esc[0..n] });
+    }
+    // «шифрование» DATA in-place
+    tlsCrypt(s, userPtr(data_va)[0..@intCast(data_len)], s.send_seq);
+    // STREAM_HEADER: record 0x17 03 03 len16 (data+MAC)
+    if (hdr_va != 0 and ops.validate_write(hdr_va, 5)) {
+        userPtr(hdr_va)[0] = 0x17;
+        userPtr(hdr_va)[1] = 0x03;
+        userPtr(hdr_va)[2] = 0x03;
+        const plen: u16 = @intCast(data_len + 16);
+        userPtr(hdr_va)[3] = @intCast(plen >> 8);
+        userPtr(hdr_va)[4] = @intCast(plen & 0xFF);
+    }
+    // STREAM_TRAILER: MAC 16Б
+    if (trailer_va != 0 and ops.validate_write(trailer_va, 16)) {
+        tlsEntropy(userPtr(trailer_va)[0..16], s.send_seq ^ 0xABCD);
+    }
+    s.send_seq += 1;
+    logf("[SSPI] EncryptMessage: {d}Б DATA (record 0x17, seq={d})\n", .{ data_len, s.send_seq - 1 });
+    return SEC_E_OK;
+}
+
+/// DecryptMessage(phContext, pMessage, MessageSeqNo, pfQOP):
+/// DATA-буфер содержит поток record 0x17 (header 5Б + ciphertext + MAC) —
+/// расшифровка XOR in-place, cbBuffer ← plaintext-длина, EXTRA ← 0.
+fn sspiDecryptMessage(ph_context: u64, p_message: u64) u64 {
+    const s = tlsSessionByHandle(ph_context) orelse {
+        logf("[SSPI] DecryptMessage: невалидный контекст\n", .{});
+        return SEC_E_INVALID_HANDLE;
+    };
+    if (p_message == 0 or !ops.validate_read(p_message, 16)) {
+        return SEC_E_INVALID_HANDLE;
+    }
+    const c_buffers = userD(p_message + 4).*;
+    const p_buffers = userQ(p_message + 8).*;
+    var i: u32 = 0;
+    while (i < c_buffers and i < 8) : (i += 1) {
+        const sb_va = p_buffers + @as(u64, i) * 16;
+        if (!ops.validate_read(sb_va, 16)) continue;
+        const cb = userD(sb_va).*;
+        const btype = userD(sb_va + 4).*;
+        const pv = userQ(sb_va + 8).*;
+        if (btype != SECBUFFER_DATA or cb < 21 or pv == 0) continue;
+        if (!ops.validate_read(pv, @min(cb, 16384))) continue;
+        const stream = userPtr(pv)[0..@intCast(@min(cb, 16384))];
+        if (stream[0] != 0x17) continue; // application_data
+        const plen = (@as(u16, stream[3]) << 8) | stream[4];
+        if (5 + @as(u32, plen) > stream.len or plen < 16) continue;
+        const plain_len: u32 = plen - 16;
+        // расшифровка in-place, plaintext остаётся в pv+5
+        tlsCrypt(s, stream[5 .. 5 + plain_len], s.recv_seq);
+        s.recv_seq += 1;
+        // сдвиг plaintext к началу буфера? НЕТ: SChannel оставляет данные
+        // в том же буфере, cbBuffer = plaintext_len, pvBuffer НЕ двигаем
+        // (curl читает pvBuffer[0..cbBuffer]); header/trailer остаются в
+        // потоке — curl обрезает по cbBuffer.
+        if (ops.validate_write(sb_va, 16)) {
+            userD(sb_va).* = plain_len; // cbBuffer
+            // pvBuffer: указывает на расшифрованные данные (pv+5)
+            userQ(sb_va + 8).* = pv + 5;
+        }
+        // EXTRA-буфер (если есть): 0 непотреблённых байт
+        var j: u32 = 0;
+        while (j < c_buffers and j < 8) : (j += 1) {
+            const eb_va = p_buffers + @as(u64, j) * 16;
+            if (!ops.validate_read(eb_va, 16)) continue;
+            if (userD(eb_va + 4).* == SECBUFFER_EXTRA and ops.validate_write(eb_va, 16)) {
+                userD(eb_va).* = 0;
+            }
+        }
+        logf("[SSPI] DecryptMessage: {d}Б plaintext (seq={d})\n", .{ plain_len, s.recv_seq - 1 });
+        return SEC_E_OK;
+    }
+    logf("[SSPI] DecryptMessage: SECBUFFER_DATA с записью 0x17 не найден\n", .{});
+    return SEC_E_INCOMPLETE_MESSAGE;
+}
+
+/// QueryContextAttributesA/W(phContext, ulAttribute, pBuffer):
+/// SECPKG_ATTR_STREAM_SIZES (4) → SecPkgContext_Sizes (curl буферизует).
+fn sspiQueryContextAttributes(ph_context: u64, attr: u64, p_buffer: u64) u64 {
+    _ = ph_context;
+    if (attr != SECPKG_ATTR_STREAM_SIZES) {
+        logf("[SSPI] QueryContextAttributes(attr={d}) — не поддержан\n", .{attr});
+        return SEC_E_UNSUPPORTED_METHOD;
+    }
+    if (p_buffer == 0 or !ops.validate_write(p_buffer, 20)) {
+        return SEC_E_INVALID_HANDLE;
+    }
+    userD(p_buffer + 0).* = 5; // cbHeader: record header
+    userD(p_buffer + 4).* = 16; // cbTrailer: MAC
+    userD(p_buffer + 8).* = 16384; // cbMaxToken
+    userD(p_buffer + 12).* = 1; // cbBlockSize
+    userD(p_buffer + 16).* = 16384; // cbMaximumMessage
+    logf("[SSPI] QueryContextAttributes(STREAM_SIZES) -> hdr=5, trailer=16, max=16384\n", .{});
+    return SEC_E_OK;
+}
+
+/// DeleteSecurityContext(phContext): освободить слот сессии.
+fn sspiDeleteSecurityContext(ph_context: u64) u64 {
+    if (tlsSessionByHandle(ph_context)) |s| {
+        s.in_use = false;
+        logf("[SSPI] DeleteSecurityContext — сессия освобождена\n", .{});
+    }
+    return SEC_E_OK;
+}
+
+/// FreeCredentialsHandle(phCred): cred-хэндлы — счётчики, освобождение no-op.
+fn sspiFreeCredentialsHandle(ph_cred: u64) u64 {
+    _ = ph_cred;
+    logf("[SSPI] FreeCredentialsHandle -> SEC_E_OK\n", .{});
+    return SEC_E_OK;
+}
+
+const SEC_E_INVALID_HANDLE: u64 = 0x8009_0004;
+const SEC_E_INSUFFICIENT_MEMORY: u64 = 0x8009_0001;
+const SEC_E_INVALID_TOKEN: u64 = 0x8009_0855;
+const SEC_E_CONTEXT_EXPIRED: u64 = 0x8009_0312 + 0x1000;
+const SEC_E_INCOMPLETE_MESSAGE: u64 = 0x8009_0322;
+const SEC_E_INTERNAL_ERROR: u64 = 0x8009_0304;
+
+// ─── v0.14.0 (CDD №5): Wave-A — пред-SSPI препятствия (по живому логу) ──────
+
+/// CreateMutexA(attrs, bInitialOwner, lpName): пул хэндлов 0x400+.
+/// Мьютекс в однопоточном CDD всегда «свободен» → WaitFor → WAIT_OBJECT_0.
+fn kCreateMutexA(attrs: u64, initial_owner: u64, name_va: u64) u64 {
+    _ = attrs;
+    _ = initial_owner;
+    if (name_va != 0) {
+        if (userStrLen(name_va)) |len| {
+            if (len > 0 and len < 64) {
+                logf("[WIN32] CreateMutexA(\"{s}\")\n", .{userPtr(name_va)[0..@intCast(len)]});
+            }
+        }
+    } else {
+        logf("[WIN32] CreateMutexA(unnamed)\n", .{});
+    }
+    const c = &(ctx orelse return 0);
+    const h = c.next_mutex_handle;
+    c.next_mutex_handle += 1;
+    return h;
+}
+
+/// ReleaseMutex(h): TRUE — мьютекс «отпущен» (счётчик владельцев не нужен).
+fn kReleaseMutex(h: u64) u64 {
+    _ = h;
+    return 1; // BOOL TRUE
+}
+
+/// bcrypt.dll!BCryptGenRandom(hAlgorithm, pbBuffer, cbBuffer, dwFlags):
+/// 0 (STATUS_SUCCESS), буфер — TSC-микс xorshift (SYNTHETIC-энтропия:
+/// честно для CDD — настоящий CSPRNG в ядре появится с энтропийным хабом).
+fn kBCryptGenRandom(pb: u64, cb: u64) u64 {
+    if (cb == 0) return 0;
+    if (cb > 4096) return 0xC000_0009; // STATUS_INVALID_PARAMETER
+    if (pb == 0 or !ops.validate_write(pb, cb)) return 0xC000_000D; // STATUS_INVALID_HANDLE? min win
+    tlsEntropy(userPtr(pb)[0..@intCast(cb)], 0x7E5C_A01B);
+    return 0; // STATUS_SUCCESS
+}
+
+/// strnlen(s, maxsize): длина до NUL, не дальше maxsize.
+fn kstrnlen(va: u64, maxsize: u64) u64 {
+    if (va == 0 or maxsize == 0) return 0;
+    const n = @min(maxsize, MAX_STR_LEN);
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        if (!ops.validate_read(va + i, 1)) return i;
+        if (userPtr(va)[@as(usize, @intCast(i))] == 0) return i;
+    }
+    return i;
+}
+
+/// inet_pton(af, src, dst): AF_INET «192.0.2.1» → BE-u32 в dst. AF_INET6 → 0.
+fn wsaInetPton(af: u64, src_va: u64, dst_va: u64) u64 {
+    if (af != 2) return 0; // AF_INET6 не поддержан (curl идёт IPv4-путём)
+    const slen = userStrLen(src_va) orelse return 0;
+    if (slen == 0 or slen > 15 or !ops.validate_write(dst_va, 4)) return 0;
+    var oct: [4]u8 = .{ 0, 0, 0, 0 };
+    var oi: usize = 0;
+    var val: u32 = 0;
+    var digits: u32 = 0;
+    for (userPtr(src_va)[0..@intCast(slen)], 0..) |ch, i| {
+        if (ch == '.') {
+            if (digits == 0 or oi >= 4) return 0;
+            oct[oi] = @intCast(val);
+            oi += 1;
+            val = 0;
+            digits = 0;
+        } else if (ch >= '0' and ch <= '9') {
+            val = val * 10 + (ch - '0');
+            digits += 1;
+            if (val > 255) return 0;
+        } else return 0;
+        _ = i;
+    }
+    if (digits == 0 or oi != 3) return 0;
+    oct[3] = @intCast(val);
+    @memcpy(userPtr(dst_va)[0..4], &oct);
+    return 1; // успех
+}
+
 // ─── v0.13.0 (CDD №4): SocketState — опции, состояние, события, loopback ──
 
 /// FD_*-события (WSAEventSelect/WSAEnumNetworkEvents)
@@ -1071,11 +1834,40 @@ pub const Sock = struct {
     pending: u32 = 0,
     connect_reported: bool = false, // FD_CONNECT одноразовый
     write_reported: bool = false, // FD_WRITE перезапускается send()
-    // loopback-I/O
+    // v0.14.0 (CDD №5): TLS-машина (https-порт 443 → синтетический SChannel)
+    is_tls: bool = false,
+    tls_stage: u8 = 0, // 1=ждём ClientHello, 2=отдаём ServerHello-поток, 3=данные 0x17, 4=EOF
+    tls_recv_cursor: usize = 0, // позиция в синтетическом серверном потоке
+    // v0.14.0 (CDD №5): реальный TCP через virtio-net (слот драйвера)
+    net_slot: i64 = -1, // -1 = loopback-синтетика
+    // loopback-I/O (http-путь; для https используется tls_recv_cursor)
     sent_bytes: u64 = 0,
     send_logged: bool = false, // первый payload → [HTTP-SEND]
     recv_cursor: usize = 0, // позиция в HTTP_RESP
     recv_eof: bool = false, // ответ исчерпан: recv → 0
+};
+
+/// TLS-сессия SSPI/SChannel (CDD №5): SYNTHETIC-TLS — НАСТОЯЩИЙ формат
+/// записей (record layer + handshake headers + SNI-extension), но
+/// потоковое «шифрование» XOR по сессионному ключу вместо настоящей
+/// криптографии (TLS 1.2/1.3 стек — за пределами честного CDD-цикла).
+/// Ключ = f(client_random, server_random) — обе стороны наши, контур
+/// замкнут в Ring 3, формат байтовый совместим с RFC 5246 §6.2.1.
+pub const MAX_TLS: usize = 8;
+const TLS_MAGIC: u64 = 0x504F_4C45_5353_4C31; // "POLESSL1"
+
+pub const TlsSession = struct {
+    in_use: bool = false,
+    established: bool = false, // handshake завершён (ISC-2 вернул SEC_E_OK)
+    sni_len: usize = 0, // pszTargetName (SNI для ClientHello + лог)
+    sni: [64]u8 = [_]u8{0} ** 64,
+    client_random: [32]u8 = [_]u8{0} ** 32,
+    server_random: [32]u8 = [_]u8{0} ** 32,
+    key: [32]u8 = [_]u8{0} ** 32, // SYNTHETIC stream key (XOR)
+    send_seq: u64 = 0, // номер исходящей записи (EncryptMessage)
+    recv_seq: u64 = 0, // номер входящей записи (DecryptMessage)
+    fd: u64 = 0, // связанный сокет (после send ClientHello)
+    first_data_logged: bool = false, // [TLS-SEND] plaintext одноразово
 };
 
 /// Socket по fd (таблица 0x100..). null = вне таблицы/не открыт.
@@ -1148,14 +1940,33 @@ fn wsaConnect(s: u64, name_va: u64, namelen: u64) u64 {
     if (family == 2 and namelen >= 16 and ops.validate_read(name_va, 16)) {
         const port = std.mem.bigToNative(u16, userW(name_va + 2).*);
         const ip = userPtr(name_va + 4)[0..4];
-        logf("[WS2] connect(fd=0x{x}, AF_INET, {d}.{d}.{d}.{d}:{d})\n", .{ s, ip[0], ip[1], ip[2], ip[3], port });
+        logf("[WS2] connect(fd=0x{x}, AF_INET, {d}.{d}.{d}.{d}:{d}){s}\n", .{ s, ip[0], ip[1], ip[2], ip[3], port, if (port == 443) " — TLS" else "" });
         if (sockByFd(s)) |sk| {
             sk.connected = true;
             sk.peer_ip = .{ ip[0], ip[1], ip[2], ip[3] };
             sk.peer_port = port;
             sk.pending |= FD_CONNECT | FD_WRITE; // событие завершения connect
+            // v0.14.0: https-порт → TLS-машина сокета (SYNTHETIC-SChannel;
+            // для реального virtio-пути TLS делает сам curl — OpenSSL)
+            if (port == 443) {
+                sk.is_tls = true;
+                sk.tls_stage = 1;
+            }
+            // v0.14.0: РЕАЛЬНЫЙ TCP через virtio-net (SYN→SYN-ACK→ACK);
+            // при отсутствии устройства — loopback-синтетика (плавный fallback)
+            if (ops.net_ready()) {
+                const be_ip = (@as(u64, ip[0]) << 24) | (@as(u64, ip[1]) << 16) |
+                    (@as(u64, ip[2]) << 8) | ip[3];
+                const slot = ops.net_tcp_connect(be_ip, port);
+                if (slot >= 0) {
+                    sk.net_slot = slot;
+                    logf("[WS2] connect: РЕАЛЬНОЕ TCP-соединение через virtio-net (slot {d})\n", .{slot});
+                } else {
+                    logf("[WS2] connect: virtio-TCP не удался — loopback-fallback\n", .{});
+                }
+            }
         }
-        return 0; // loopback: «соединён» немедленно, ответ ждёт в recv
+        return 0;
     }
     if (family == 23 and namelen >= 28 and ops.validate_read(name_va, 28)) {
         const port = std.mem.bigToNative(u16, userW(name_va + 2).*);
@@ -1175,7 +1986,11 @@ fn wsaConnect(s: u64, name_va: u64, namelen: u64) u64 {
 
 /// closesocket(s): 0 = NO_ERROR, состояние освобождается.
 fn wsaClosesocket(s: u64) u64 {
-    if (sockByFd(s)) |sk| sk.* = .{};
+    if (sockByFd(s)) |sk| {
+        // v0.14.0: закрыть реальное TCP-соединение (FIN)
+        if (sk.net_slot >= 0) ops.net_tcp_close(sk.net_slot);
+        sk.* = .{};
+    }
     logf("[WS2] closesocket(fd=0x{x})\n", .{s});
     return 0;
 }
@@ -1374,7 +2189,17 @@ fn fdSetFilter(fd_set: u64, kind: SockFilter) ?u64 {
         const fd = userQ(fd_set + 8 + i * 8).*;
         const ready = if (sockByFd(fd)) |sk| switch (kind) {
             .write => sk.connected and !sk.recv_eof, // WRITABLE (после connect)
-            .read => sk.sent_bytes > 0, // READABLE (ответ «пришёл» после send)
+            .read => blk: {
+                // v0.14.0: для реального TCP-сокета — активный RX-поллинг
+                // (данные пришли в буфер драйвера → READABLE)
+                if (sk.net_slot >= 0) {
+                    const have = ops.net_tcp_poll(sk.net_slot);
+                    if (have > 0) break :blk true;
+                    if (have < 0) break :blk true; // закрытие: пусть recv узнает EOF
+                    break :blk false;
+                }
+                break :blk sk.sent_bytes > 0; // READABLE (ответ «пришёл» после send)
+            },
         } else false;
         if (ready) {
             userQ(fd_set + 8 + kept * 8).* = fd;
@@ -1426,9 +2251,10 @@ fn wsaSelect(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u6
 }
 
 /// send(s, buf, len, flags): loopback-отправка — буфер валидируется
-/// (validate_read: USER-страницы!), все len байт «уходят» (возврат len),
-/// ПЕРВЫЙ payload логируется как [HTTP-SEND] — МОМЕНТ ИСТИНЫ №4: в логе
-/// виден исходящий HTTP-запрос curl. После send «приходит» ответ (FD_READ).
+/// (validate_read: USER-страницы!), все len байт «уходят» (возврат len).
+/// v0.14.0: TLS-сокет распознаёт записи по типу (0x16 handshake / 0x17
+/// data) — [TLS-SEND]-лог (ClientHello —МОМЕНТ ИСТИНЫ №5) + привязка
+/// сессии к сокету (ctx.tls_last_fd). После send «приходит» ответ (FD_READ).
 fn wsaSend(s: u64, buf: u64, len: u64, flags: u64) u64 {
     _ = flags;
     if (len > 64 * 1024 * 1024) {
@@ -1447,6 +2273,41 @@ fn wsaSend(s: u64, buf: u64, len: u64, flags: u64) u64 {
         sk.sent_bytes += len;
         sk.pending |= FD_READ; // «ответ пришёл» — событие чтения
         sk.write_reported = false; // буфер «опустошён» — снова WRITABLE
+        // v0.14.0: РЕАЛЬНАЯ отправка через virtio-net TCP
+        if (sk.net_slot >= 0 and len > 0) {
+            const n = ops.net_tcp_send(sk.net_slot, @ptrFromInt(buf), @intCast(len));
+            if (n >= 0) {
+                logf("[NET-SEND] fd=0x{x}: {d}/{d}Б через virtio-net\n", .{ s, n, len });
+                return @intCast(n);
+            }
+            logf("[NET-SEND] fd=0x{x}: ОШИБКА отправки\n", .{s});
+            setLastError(WSAENETDOWN);
+            return INVALID_SOCKET;
+        }
+        if (sk.is_tls and len >= 3) {
+            // TLS-запись: 0x16 handshake (ClientHello от curl после ISC-1)
+            // или 0x17 data (EncryptMessage-потом: header+data+trailer)
+            const rec_type = userPtr(buf)[0];
+            const c = &(ctx orelse return len);
+            c.tls_last_fd = s;
+            if (rec_type == 0x16) {
+                if (sk.tls_stage == 1) sk.tls_stage = 2; // ждём recv ServerHello
+                var hex: [64]u8 = undefined;
+                var hn: usize = 0;
+                const hc: u64 = @min(len, 24);
+                var b: u64 = 0;
+                while (b < hc and hn + 2 < hex.len) : (b += 1) {
+                    const v = userPtr(buf)[@as(usize, @intCast(b))];
+                    hex[hn] = "0123456789abcdef"[v >> 4];
+                    hex[hn + 1] = "0123456789abcdef"[v & 0xF];
+                    hn += 2;
+                }
+                logf("[TLS-SEND] fd=0x{x}: handshake-запись {d}Б (record 0x16): {s}\n", .{ s, len, hex[0..hn] });
+                return len;
+            }
+            logf("[TLS-SEND] fd=0x{x}: data-запись {d}Б (record 0x17, зашифровано)\n", .{ s, len });
+            return len;
+        }
         if (!sk.send_logged and len > 0) {
             sk.send_logged = true;
             logSendPayload(s, buf, len);
@@ -1488,10 +2349,12 @@ fn logSendPayload(s: u64, buf: u64, len: u64) void {
     logf("[HTTP-SEND] fd=0x{x}, len={d}: \"{s}\"{s}\n", .{ s, len, esc[0..n], more });
 }
 
-/// recv(s, buf, len, flags): loopback-приём синтетического HTTP-ответа
-/// шима (HTTP/1.1 200 OK + Content-Length: 13 + "Hello POLER!\n").
-/// Первый recv отдаёт ответ (частями по len), по исчерпании — 0 = EOF
-/// (соединение «закрыто» сервером: FD_CLOSE).
+/// recv(s, buf, len, flags): loopback-приём. http-сокет — синтетический
+/// ответ шима (HTTP/1.1 200 OK + «Hello POLER!\n"). v0.14.0: TLS-сокет —
+/// стадиийная машина синтетического SChannel-сервера:
+///   stage 2: ServerHello+CCS+Finished (после ClientHello в send)
+///   stage 3: запись 0x17 с XOR-«зашифрованным» HTTP-ответом
+///   stage 4: EOF (0) + FD_CLOSE — сервер «закрыл» соединение.
 fn wsaRecv(s: u64, buf: u64, len: u64, flags: u64) u64 {
     _ = flags;
     const sk = sockByFd(s) orelse {
@@ -1502,6 +2365,29 @@ fn wsaRecv(s: u64, buf: u64, len: u64, flags: u64) u64 {
         // запрос ещё не «отправлен» — данных нет (неблокирующий сокет)
         setLastError(WSAEWOULDBLOCK);
         return INVALID_SOCKET;
+    }
+    // v0.14.0: РЕАЛЬНЫЙ приём через virtio-net TCP
+    if (sk.net_slot >= 0) {
+        const cap: usize = @intCast(@min(len, 64 * 1024 * 1024));
+        if (cap > 0 and !ops.validate_write(buf, cap)) {
+            setLastError(WSAEFAULT);
+            return INVALID_SOCKET;
+        }
+        const n = ops.net_tcp_recv(sk.net_slot, @ptrFromInt(buf), cap);
+        if (n > 0) {
+            logf("[NET-RECV] fd=0x{x}: {d}Б через virtio-net\n", .{ s, n });
+            return @intCast(n);
+        }
+        if (n < 0) {
+            sk.pending |= FD_CLOSE; // сервер закрыл
+            logf("[NET-RECV] fd=0x{x} -> 0 (EOF)\n", .{s});
+            return 0;
+        }
+        setLastError(WSAEWOULDBLOCK); // данных пока нет
+        return INVALID_SOCKET;
+    }
+    if (sk.is_tls) {
+        return wsaRecvTls(s, sk, buf, len);
     }
     if (sk.recv_eof) {
         sk.pending |= FD_CLOSE; // сервер закрыл соединение
@@ -1521,6 +2407,73 @@ fn wsaRecv(s: u64, buf: u64, len: u64, flags: u64) u64 {
     }
     if (sk.recv_cursor >= total) sk.recv_eof = true;
     logf("[HTTP-RECV] fd=0x{x}: {d} байт ({d}/{d})\n", .{ s, n, sk.recv_cursor, total });
+    return n;
+}
+
+/// recv для TLS-сокета: синтетический серверный поток по стадиям.
+/// Сессия находится через ctx.tls_last_fd (последняя TLS-активность —
+/// в однопоточном CDD-процессе активна одна handshake-сессия).
+fn wsaRecvTls(s: u64, sk: *Sock, buf: u64, len: u64) u64 {
+    if (sk.tls_stage >= 4 or (sk.tls_stage == 3 and sk.recv_eof)) {
+        sk.pending |= FD_CLOSE;
+        logf("[TLS-RECV] fd=0x{x} -> 0 (EOF, соединение закрыто)\n", .{s});
+        return 0;
+    }
+    if (sk.tls_stage == 0 or sk.tls_stage == 1) {
+        // handshake ещё не начался — данных нет
+        setLastError(WSAEWOULDBLOCK);
+        return INVALID_SOCKET;
+    }
+    const c = &(ctx orelse return 0);
+    // найти сессию по fd (или последнюю активную)
+    var sess: ?*TlsSession = null;
+    for (&c.tls_sessions) |*t| {
+        if (t.in_use and t.fd == s) sess = t;
+    }
+    if (sess == null) {
+        for (&c.tls_sessions) |*t| {
+            if (t.in_use and c.tls_last_fd == s) {
+                t.fd = s;
+                sess = t;
+            }
+        }
+    }
+    const ss = sess orelse {
+        // сессии нет (curl шлёт hello раньше ISC? невозможно, но защита)
+        setLastError(WSAEWOULDBLOCK);
+        return INVALID_SOCKET;
+    };
+    var stream: [512]u8 = undefined;
+    var total: usize = 0;
+    if (sk.tls_stage == 2) {
+        // ServerHello + CCS + Finished
+        total = tlsBuildServerStream(ss, &stream);
+        logf("[TLS-RECV] fd=0x{x}: ServerHello-поток {d}Б\n", .{ s, total });
+    } else {
+        // stage 3: application-data запись с HTTP-ответом
+        total = tlsBuildAppRecord(ss, HTTP_RESP, ss.recv_seq, &stream);
+        logf("[TLS-RECV] fd=0x{x}: application-data {d}Б (record 0x17)\n", .{ s, total });
+    }
+    const remaining = total - sk.tls_recv_cursor;
+    const n = @min(@as(usize, @intCast(@min(len, 64 * 1024 * 1024))), remaining);
+    if (n > 0) {
+        if (!ops.validate_write(buf, n)) {
+            setLastError(WSAEFAULT);
+            return INVALID_SOCKET;
+        }
+        @memcpy(userPtr(buf)[0..n], stream[sk.tls_recv_cursor .. sk.tls_recv_cursor + n]);
+        sk.tls_recv_cursor += n;
+    }
+    if (sk.tls_recv_cursor >= total) {
+        sk.tls_recv_cursor = 0; // следующая порция
+        if (sk.tls_stage == 2) {
+            // серверный handshake-поток исчерпан — ISC-2 сделает established,
+            // следом curl вызовет EncryptMessage и send(0x17); recv-данные
+            sk.tls_stage = 3;
+        } else {
+            sk.recv_eof = true; // ответ исчерпан — следующий recv: EOF
+        }
+    }
     return n;
 }
 
@@ -1575,11 +2528,34 @@ fn wsaGetAddrInfo(node_va: u64, serv_va: u64, hints_va: u64, pp_result: u64) u64
     userQ(ai + 0x28).* = 0; // ai_next
     userW(sa + 0).* = 2; // sin_family
     userW(sa + 2).* = std.mem.nativeToBig(u16, port); // sin_port (BE)
+    // v0.14.0: РЕАЛЬНЫЙ DNS-резолв через virtio-net (UDP → SLIRP 10.0.2.3);
+    // при недоступности — синтез TEST-NET-1 (192.0.2.1) как раньше
+    var resolved: ?[4]u8 = null;
+    if (ops.net_ready() and hostname.len > 0 and hostname.len < 128) {
+        const be_ip = ops.net_dns_resolve(@ptrCast(userPtr(node_va)), @intCast(hostname.len));
+        if (be_ip != 0) {
+            resolved = .{
+                @truncate(be_ip >> 24),
+                @truncate(be_ip >> 16),
+                @truncate(be_ip >> 8),
+                @truncate(be_ip),
+            };
+        }
+    }
     const ip4 = userPtr(sa + 4)[0..4];
+    if (resolved) |rip| {
+        ip4[0] = rip[0];
+        ip4[1] = rip[1];
+        ip4[2] = rip[2];
+        ip4[3] = rip[3];
+        userQ(pp_result).* = ai;
+        logf("[WS2] getaddrinfo(\"{s}\") -> РЕАЛЬНЫЙ DNS: {d}.{d}.{d}.{d}:{d} (virtio-net/SLIRP)\n", .{ hostname, rip[0], rip[1], rip[2], rip[3], port });
+        return 0;
+    }
     ip4[0] = 192;
     ip4[1] = 0;
     ip4[2] = 2;
-    ip4[3] = 1; // TEST-NET-1
+    ip4[3] = 1; // TEST-NET-1 (fallback — драйвера/резолва нет)
     userQ(pp_result).* = ai;
     logf("[WS2] getaddrinfo(\"{s}\") -> синтез 192.0.2.1:{d} (DNS-резолвер: цикл №4)\n", .{ hostname, port });
     return 0; // 0 = успех (EAI_SUCCESS)
@@ -1723,7 +2699,18 @@ const WSA_INVALID_HANDLE: u64 = 6;
 
 /// WaitForSingleObject(h, ms): сигнальный объект → WAIT_OBJECT_0
 /// (тред-хэндл: задача Killed), иначе — WAIT_TIMEOUT.
+/// Мьютексные хэндлы (CDD №5): пул 0x400+. В однопоточном CDD-процессе
+/// мьютекс всегда «свободен» — WaitFor → WAIT_OBJECT_0 (curl не крутится
+/// в retry-цикле с хэндлом NULL от trap-стаба).
+const MUTEX_HANDLE_BASE: u64 = 0x400;
+const MUTEX_HANDLE_LIMIT: u64 = 0x500;
+
 fn kWaitForSingleObject(h: u64, ms: u64) u64 {
+    // v0.14.0: мьютексы — «свободны» (SRWLock-прецедент v0.11)
+    if (h >= MUTEX_HANDLE_BASE and h < MUTEX_HANDLE_LIMIT) {
+        logf("[WIN32] WaitForSingleObject(mutex=0x{x}) -> WAIT_OBJECT_0 (свободен)\n", .{h});
+        return WAIT_OBJECT_0;
+    }
     if (ops.object_signaled(h)) {
         logf("[WIN32] WaitForSingleObject(handle=0x{x}) -> WAIT_OBJECT_0 (сигнален)\n", .{h});
         return WAIT_OBJECT_0;
@@ -2352,6 +3339,14 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
         } else if (std.mem.eql(u8, name, "CreateEventA")) {
             // event-волна: единый пул хэндлов с WSACreateEvent (4 рег-аргумента)
             ret = kCreateEventA(a1, a2, a3, a4);
+        } else if (std.mem.eql(u8, name, "CreateMutexA") or
+            std.mem.eql(u8, name, "CreateMutexW"))
+        {
+            // v0.14.0 (CDD №5): Wave-A — сессионный кэш SChannel в curl
+            // требует валидный хэндл мьютекса (пул 0x400+)
+            ret = kCreateMutexA(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "ReleaseMutex")) {
+            ret = kReleaseMutex(a1);
         } else if (std.mem.eql(u8, name, "WaitForSingleObject")) {
             ret = kWaitForSingleObject(a1, a2);
         } else if (std.mem.eql(u8, name, "WaitForSingleObjectEx")) {
@@ -2488,6 +3483,9 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = kmemset(a1, a2, a3);
         } else if (std.mem.eql(u8, name, "strlen")) {
             ret = userStrLen(a1) orelse 0;
+        } else if (std.mem.eql(u8, name, "strnlen")) {
+            // v0.14.0 (CDD №5): Wave-A — schannel-путь (cbMaxToken-границы)
+            ret = kstrnlen(a1, a2);
         } else if (std.mem.eql(u8, name, "_strdup")) {
             // fix-волна №3: NULL у trap-стаба → «out of memory» у curl
             ret = kstrdup(a1);
@@ -2501,6 +3499,23 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = ktoupper(a1);
         } else if (std.mem.eql(u8, name, "isspace")) {
             ret = kisspace(a1);
+        } else if (std.mem.eql(u8, name, "isalnum")) {
+            // v0.14.0 (CDD №5): punycode/IDNA-валидация хостнейма в
+            // резолвер-треде (isalnum-trap → livelock-kill задачи).
+            ret = @intFromBool(std.ascii.isAlphanumeric(@as(u8, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "isdigit")) {
+            ret = @intFromBool(std.ascii.isDigit(@as(u8, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "isalpha")) {
+            ret = @intFromBool(std.ascii.isAlphabetic(@as(u8, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "isupper")) {
+            ret = @intFromBool(std.ascii.isUpper(@as(u8, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "islower")) {
+            ret = @intFromBool(std.ascii.isLower(@as(u8, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "isxdigit")) {
+            ret = @intFromBool(std.ascii.isHex(@as(u8, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "ispunct")) {
+            const ch: u8 = @truncate(a1);
+            ret = @intFromBool(ch >= 0x21 and ch <= 0x7E and !std.ascii.isAlphanumeric(ch));
         } else if (std.mem.eql(u8, name, "strcspn")) {
             // event-волна: разбор URL/конфигов — префикс до символа из набора
             ret = kstrcspn(a1, a2);
@@ -2621,24 +3636,86 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = wsaSetLastError(a1);
         } else if (std.mem.eql(u8, name, "__WSAFDIsSet")) {
             ret = wsaFdIsSet(a1, a2);
+        } else if (std.mem.eql(u8, name, "inet_pton")) {
+            // v0.14.0 (CDD №5): Wave-A — резолвер curl парсит IP-строки
+            ret = wsaInetPton(a1, a2, a3);
+        } else {
+            handled = false;
+        }
+    } else if (std.ascii.eqlIgnoreCase(e.dll, "api-ms-win-crt-utility-l1-1-0.dll")) {
+        // v0.14.0 (CDD №5): byteswap-семейство — OpenSSL htonl/ntohl-путь
+        // (TLS-записи); trap → livelock (финальный бэклог живого прогона).
+        // bsearch/qsort здесь же — НО они native-стабы (Ring 3), диспетчер
+        // сюда их не получит.
+        if (std.mem.eql(u8, name, "_byteswap_ulong")) {
+            ret = @as(u64, @byteSwap(@as(u32, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "_byteswap_ushort")) {
+            ret = @as(u64, @byteSwap(@as(u16, @truncate(a1))));
+        } else if (std.mem.eql(u8, name, "_byteswap_uint64")) {
+            ret = @byteSwap(a1);
         } else {
             handled = false;
         }
     } else if (std.ascii.eqlIgnoreCase(e.dll, "Secur32.dll")) {
-        // v0.12.0 (CDD №3): SSPI. curl.exe импортирует только
-        // InitSecurityInterfaceA; остальные имена — extra-записи реестра
-        // (таблица SSPI), диспетчеризуются тем же syscall-трамплином.
+        // v0.12.0 (CDD №3): SSPI-таблица; v0.14.0 (CDD №5): полный
+        // SYNTHETIC-SChannel TLS-движок (вызовы ЧЕРЕЗ ТАБЛИЦУ, lld-трамплин).
+        // Сигнатурная разведка: аргументы в лог (сверка оффсетов SFT).
+        logf("[SSPI] dispatch: {s}(a1=0x{x}, a2=0x{x}, a3=0x{x}, a4=0x{x}, s0=0x{x}, s2=0x{x}, s3=0x{x}, s4=0x{x})\n", .{
+            name, a1, a2, a3, a4, ops.stack_arg(0), ops.stack_arg(2), ops.stack_arg(3), ops.stack_arg(4),
+        });
         if (std.mem.eql(u8, name, "InitSecurityInterfaceA")) {
             ret = initSecurityInterface(disp, false);
         } else if (std.mem.eql(u8, name, "InitSecurityInterfaceW")) {
             ret = initSecurityInterface(disp, true);
         } else if (std.mem.eql(u8, name, "FreeContextBuffer")) {
             ret = SEC_E_OK; // освобождение NULL/нашего буфера — успех
+        } else if (std.mem.eql(u8, name, "QuerySecurityPackageInfoA") or
+            std.mem.eql(u8, name, "QuerySecurityPackageInfoW"))
+        {
+            ret = sspiQuerySecurityPackageInfo(a1, a2);
+        } else if (std.mem.eql(u8, name, "AcquireCredentialsHandleA") or
+            std.mem.eql(u8, name, "AcquireCredentialsHandleW"))
+        {
+            // RCX=principal, RDX=package; phCredential=arg8, ptsExpiry=arg9
+            ret = sspiAcquireCredentialsHandle(a2, ops.stack_arg(3), ops.stack_arg(4));
+        } else if (std.mem.eql(u8, name, "InitializeSecurityContextA") or
+            std.mem.eql(u8, name, "InitializeSecurityContextW"))
+        {
+            // RCX=phCred, RDX=phContext, R8=targetName, R9=fContextReq;
+            // arg7=pInput, arg8=Reserved2, arg9=phNewContext, arg10=pOutput
+            // (stack_arg(i) = arg(5+i): pInput=s2, phNew=s4, pOutput=s5)
+            ret = sspiInitializeSecurityContext(a1, a2, a3, ops.stack_arg(2), ops.stack_arg(4), ops.stack_arg(5));
+        } else if (std.mem.eql(u8, name, "EncryptMessage")) {
+            // RCX=phContext, RDX=fQOP, R8=pMessage, R9=MessageSeqNo
+            ret = sspiEncryptMessage(a1, a3);
+        } else if (std.mem.eql(u8, name, "DecryptMessage")) {
+            // RCX=phContext, RDX=pMessage, R8=MessageSeqNo, R9=pfQOP
+            ret = sspiDecryptMessage(a1, a2);
+        } else if (std.mem.eql(u8, name, "QueryContextAttributesA") or
+            std.mem.eql(u8, name, "QueryContextAttributesW"))
+        {
+            // RCX=phContext, RDX=ulAttribute, R8=pBuffer
+            ret = sspiQueryContextAttributes(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "DeleteSecurityContext")) {
+            ret = sspiDeleteSecurityContext(a1);
+        } else if (std.mem.eql(u8, name, "FreeCredentialsHandle")) {
+            ret = sspiFreeCredentialsHandle(a1);
+        } else if (std.mem.eql(u8, name, "ApplyControlToken") or
+            std.mem.eql(u8, name, "CompleteAuthToken"))
+        {
+            ret = SEC_E_OK; // контроль-токены: no-op (graceful-shutdown путь)
         } else {
-            // QuerySecurityPackageInfo/AcquireCredentials/Initialize…:
-            // метод не поддержан — БЕЗ записи в out-параметры (SEC_E_*
-            // не ноль! trap-стаб вернул бы 0 = SEC_E_OK и мусор в указателях)
+            // EnumerateSecurityPackages/Accept/Impersonate…: не поддержано —
+            // БЕЗ записи в out-параметры (SEC_E_* не ноль!)
             ret = SEC_E_UNSUPPORTED_METHOD;
+        }
+    } else if (std.ascii.eqlIgnoreCase(e.dll, "bcrypt.dll")) {
+        // v0.14.0 (CDD №5): Wave-A — BCryptGenRandom (TLS-энтропия curl)
+        if (std.mem.eql(u8, name, "BCryptGenRandom")) {
+            // RCX=hAlgorithm, RDX=pbBuffer, R8=cbBuffer, R9=dwFlags
+            ret = kBCryptGenRandom(a2, a3);
+        } else {
+            ret = 0xC000_0002; // STATUS_NOT_IMPLEMENTED
         }
     } else {
         handled = false;
@@ -3019,7 +4096,8 @@ var t_launched_init_once: u64 = 0;
 var t_launched_init_fn: u64 = 0;
 var t_launched_parameter: u64 = 0;
 var t_launched_context: u64 = 0;
-var t_stack_args: [3]u64 = .{ 0, 0, 0 };
+// v0.14.0: 6 стек-аргументов (ISC-10 арг: pInput/arg7, phNew/arg9, pOutput/arg10)
+var t_stack_args: [6]u64 = .{ 0, 0, 0, 0, 0, 0 };
 
 fn tReset() void {
     t_console_len = 0;
@@ -3033,7 +4111,7 @@ fn tReset() void {
     t_launched_init_fn = 0;
     t_launched_parameter = 0;
     t_launched_context = 0;
-    t_stack_args = .{ 0, 0, 0 };
+    t_stack_args = .{ 0, 0, 0, 0, 0, 0 };
     t_thread_calls = 0;
     t_thread_start = 0;
     t_thread_param = 0;
@@ -3085,7 +4163,7 @@ fn tLaunchCallback(init_once: u64, init_fn: u64, parameter: u64, context: u64) b
 }
 
 fn tStackArg(idx: u64) u64 {
-    if (idx > 2) return 0;
+    if (idx > 5) return 0;
     return t_stack_args[@intCast(idx)];
 }
 
@@ -3104,6 +4182,14 @@ fn tOps() Ops {
         .exit_task = tExitTask,
         .object_signaled = tObjectSignaled,
         .current_tid = tCurrentTid,
+        // v0.14.0: фейк-сети нет — fallback на loopback (как в ядре без virtio)
+        .net_ready = denyNet,
+        .net_dns_resolve = noDns,
+        .net_tcp_connect = noConnect,
+        .net_tcp_send = noSend,
+        .net_tcp_recv = noRecv,
+        .net_tcp_poll = noPoll,
+        .net_tcp_close = noClose,
     };
 }
 
@@ -3201,6 +4287,10 @@ fn tCtx(cmdline: []const u8) void {
         .sspi_table = 0,
         .locale_str = 0,
         .next_event_handle = 0x200,
+        // v0.14.0 (CDD №5)
+        .next_mutex_handle = 0x400,
+        .tls_sessions = [_]TlsSession{.{}} ** MAX_TLS,
+        .tls_last_fd = 0,
         .sockets = [_]Sock{.{}} ** MAX_SOCKS,
     };
 }
@@ -3676,6 +4766,13 @@ test "dispatch: дефолтные ops-параноики — отказ без 
         .exit_task = noopExitTask,
         .object_signaled = denySignaled,
         .current_tid = fakeTid,
+        .net_ready = denyNet,
+        .net_dns_resolve = noDns,
+        .net_tcp_connect = noConnect,
+        .net_tcp_send = noSend,
+        .net_tcp_recv = noRecv,
+        .net_tcp_poll = noPoll,
+        .net_tcp_close = noClose,
     };
     ctx = null;
     var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
@@ -3915,9 +5012,10 @@ test "sspi: InitSecurityInterfaceA — таблица, extra-стабы, SEC_E_U
     try testing.expectEqual(tbl, reg.call(id_isi, 0, 0, 0, 0));
     try testing.expect(logHas("InitSecurityInterfaceA: таблица"));
 
-    // диспетчеризация extra-записи: SEC_E_UNSUPPORTED (не SEC_E_OK —
+    // диспетчеризация extra-записи (v0.14.0: QuerySecurityPackageInfoA
+    // РЕАЛИЗОВАНА — мусорный pp → SEC_E_INVALID_HANDLE, НЕ SEC_E_OK:
     // ноль затирал бы out-параметры мусором!)
-    try testing.expectEqual(@as(u64, 0x8009_0302), reg.call(id_qspi, 0x1000, 0x2000, 0, 0));
+    try testing.expectEqual(@as(u64, 0x8009_0004), reg.call(id_qspi, 0x1000, 0x2000, 0, 0));
 
     // FreeContextBuffer → SEC_E_OK (id_fcb указывает на запись с этим именем)
     const id_fcb = reg.add("Secur32.dll", "FreeContextBuffer", fcb_addr);
@@ -4888,4 +5986,278 @@ test "crt: memchr/_time64/GetSystemTimeAsFileTime/GetTickCount64" {
     // GetTickCount64: TSC 3ГГц → мс
     t_tsc = 3_000_000_000; // 1 секунда
     try testing.expectEqual(@as(u64, 1000), reg.call(id_tc, 0, 0, 0, 0));
+}
+
+// ─── Тесты: CDD №5 (SSPI/SChannel SYNTHETIC-TLS + Wave-A) ──────────────────
+
+test "sspi5: QuerySecurityPackageInfo + AcquireCredentialsHandle" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_qspi = reg.add("Secur32.dll", "QuerySecurityPackageInfoA", 0);
+    const id_ach = reg.add("Secur32.dll", "AcquireCredentialsHandleA", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memset(&g_mem, 0);
+
+    // Пакет: имя на mb+0x100, ppPackageInfo на mb+0x200
+    @memcpy(g_mem[0x100..0x100 + 7], "Kerbero");
+    g_mem[0x107] = 0;
+    const pp = mb + 0x200;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_qspi, mb + 0x100, pp, 0, 0));
+    const info = std.mem.readInt(u64, g_mem[0x200..0x208], .little);
+    try testing.expect(info != 0);
+    // SecPkgInfo: fCapabilities, wVersion, wRPCID, cbMaxToken, Name, Comment
+    const info_ptr: [*]const u8 = @ptrFromInt(info);
+    try testing.expectEqual(@as(u32, 0x113), std.mem.readInt(u32, info_ptr[0..4], .little));
+    try testing.expectEqual(@as(u32, 16384), std.mem.readInt(u32, info_ptr[8..12], .little));
+    const name_va = std.mem.readInt(u64, info_ptr[16..24], .little);
+    try testing.expectEqualStrings(UNISP_NAME, @as([*]const u8, @ptrFromInt(name_va))[0..UNISP_NAME.len]);
+    try testing.expect(logHas("QuerySecurityPackageInfo(\"Kerbero\") -> UNISP"));
+
+    // AcquireCredentialsHandle: phCredential = mb+0x300 (стек-арг3), pts = mb+0x310
+    t_stack_args[3] = mb + 0x300;
+    t_stack_args[4] = mb + 0x310;
+    @memcpy(g_mem[0x320..0x320 + UNISP_NAME.len], UNISP_NAME);
+    g_mem[0x320 + UNISP_NAME.len] = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_ach, 0, mb + 0x320, 0, 0));
+    const cred = std.mem.readInt(u64, g_mem[0x300..0x308], .little);
+    try testing.expect(cred >= 0xC100);
+    try testing.expectEqual(TLS_MAGIC, std.mem.readInt(u64, g_mem[0x308..0x310], .little));
+}
+
+test "sspi5: InitializeSecurityContext — ClientHello + ServerHello (SYNTHETIC-TLS)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_isc = reg.add("Secur32.dll", "InitializeSecurityContextA", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memset(&g_mem, 0);
+
+    // pszTargetName = "example.com" на mb+0x40
+    @memcpy(g_mem[0x40..0x40 + 11], "example.com");
+    g_mem[0x4B] = 0;
+    // pOutput: SecBufferDesc{version=0, cBuffers=1, pBuffers} @mb+0x100
+    // SecBuffer{cb=256, type=TOKEN(2), pv=mb+0x200} @mb+0x180
+    userD(mb + 0x100).* = 0; // version
+    userD(mb + 0x104).* = 1; // cBuffers
+    userQ(mb + 0x108).* = mb + 0x180;
+    userD(mb + 0x180).* = 256;
+    userD(mb + 0x184).* = 2; // SECBUFFER_TOKEN
+    userQ(mb + 0x188).* = mb + 0x200;
+    // phNewContext = mb+0x50 (стек-арг4), pInput=0, pOutput=стек-арг5(idx 4)
+    t_stack_args[2] = 0; // pInput
+    t_stack_args[3] = 0; // Reserved2
+    t_stack_args[4] = mb + 0x50; // phNewContext
+    t_stack_args[5] = mb + 0x100; // pOutput
+
+    // Первый вызов: phContext = NULL
+    const r1 = reg.call(id_isc, 0xC100, 0, mb + 0x40, 0);
+    try testing.expectEqual(SEC_I_CONTINUE_NEEDED, r1);
+    try testing.expect(logHas("ClientHello"));
+    // phNewContext: {idx+1, magic}
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, g_mem[0x50..0x58], .little));
+    try testing.expectEqual(TLS_MAGIC, std.mem.readInt(u64, g_mem[0x58..0x60], .little));
+    // ClientHello в выходном буфере: record 0x16 03 03, handshake 01,
+    // TLS1.2 (03 03), SNI-расширение с "example.com"
+    const hello = g_mem[0x200..0x200 + 160];
+    try testing.expectEqual(@as(u8, 0x16), hello[0]);
+    try testing.expectEqual(@as(u8, 0x03), hello[1]);
+    try testing.expectEqual(@as(u8, 0x01), hello[5]); // handshake ClientHello
+    try testing.expectEqual(@as(u8, 0x03), hello[9]); // client_version 1.2
+    // SNI: поиск "example.com" в теле hello
+    try testing.expect(std.mem.indexOf(u8, hello[0..120], "example.com") != null);
+    // cbBuffer выходного буфера = фактическая длина
+    try testing.expect(userD(mb + 0x180).* > 100);
+
+    // Второй вызов: phContext = handle, pInput = ServerHello-поток
+    // (синтезируем серверный поток через наш же tlsBuildServerStream:
+    // сессия уже создана — байты должны распарситься)
+    const c = &(ctx orelse return error.NoCtx);
+    const s = &c.tls_sessions[0];
+    var srv: [512]u8 = undefined;
+    const srv_len = win32crtTlsBuildServerStream(s, &srv);
+    try testing.expect(srv_len > 90); // SH(47) + CCS(6) + Finished(41)
+    // pInput: SecBufferDesc @mb+0x400, SecBuffer @mb+0x480, данные @mb+0x500
+    userD(mb + 0x400).* = 0;
+    userD(mb + 0x404).* = 1;
+    userQ(mb + 0x408).* = mb + 0x480;
+    userD(mb + 0x480).* = @intCast(srv_len);
+    userD(mb + 0x484).* = 2; // TOKEN
+    userQ(mb + 0x488).* = mb + 0x500;
+    @memcpy(g_mem[0x500 .. 0x500 + srv_len], srv[0..srv_len]);
+    t_stack_args[2] = mb + 0x400; // pInput
+    t_stack_args[4] = mb + 0x50; // phNewContext (тот же)
+    t_stack_args[5] = 0; // pOutput
+
+    const r2 = reg.call(id_isc, 0xC100, mb + 0x50, 0, 0);
+    try testing.expectEqual(@as(u64, 0), r2); // SEC_E_OK
+    try testing.expect(s.established);
+    try testing.expect(logHas("ServerHello принят"));
+}
+
+/// Обёртка для теста (tlsBuildServerStream — приватная):
+const win32crtTlsBuildServerStream = tlsBuildServerStream;
+
+test "sspi5: EncryptMessage/DecryptMessage — XOR-roundtrip STREAM" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_enc = reg.add("Secur32.dll", "EncryptMessage", 0);
+    const id_dec = reg.add("Secur32.dll", "DecryptMessage", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memset(&g_mem, 0);
+
+    // Сессия: создадим напрямую (установленная)
+    const c = &(ctx orelse return error.NoCtx);
+    const s = &c.tls_sessions[0];
+    s.in_use = true;
+    s.established = true;
+    s.client_random = [_]u8{1} ** 32;
+    s.server_random = [_]u8{2} ** 32;
+    tlsDeriveKey(s);
+    var key_copy = s.key;
+
+    // Контекст-хэндл: mb+0x40 = {1, magic}
+    userQ(mb + 0x40).* = 1;
+    userQ(mb + 0x48).* = TLS_MAGIC;
+
+    // Сообщение: 4 SecBuffer {STREAM_HEADER(5Б), DATA("GET /" 5Б), TRAILER(16Б), EMPTY}
+    // desc @mb+0x100: {0, 4, pBuffers}
+    userD(mb + 0x100).* = 0;
+    userD(mb + 0x104).* = 4;
+    userQ(mb + 0x108).* = mb + 0x180;
+    // b0: header @mb+0x200 (5Б)
+    userD(mb + 0x180).* = 5;
+    userD(mb + 0x184).* = 7; // STREAM_HEADER
+    userQ(mb + 0x188).* = mb + 0x200;
+    // b1: data @mb+0x220 (16Б)
+    userD(mb + 0x190).* = 16;
+    userD(mb + 0x194).* = 1; // DATA
+    userQ(mb + 0x198).* = mb + 0x220;
+    @memcpy(g_mem[0x220..0x225], "GET /");
+    // b2: trailer @mb+0x240 (16Б)
+    userD(mb + 0x1A0).* = 16;
+    userD(mb + 0x1A4).* = 6; // STREAM_TRAILER
+    userQ(mb + 0x1A8).* = mb + 0x240;
+    // b3: empty
+    userD(mb + 0x1B0).* = 0;
+    userD(mb + 0x1B4).* = 0;
+    userQ(mb + 0x1B8).* = 0;
+
+    try testing.expectEqual(@as(u64, 0), reg.call(id_enc, mb + 0x40, 0, mb + 0x100, 0));
+    // header: 0x17 03 03 len=(16+16)
+    try testing.expectEqual(@as(u8, 0x17), g_mem[0x200]);
+    try testing.expectEqual(@as(u8, 0x03), g_mem[0x201]);
+    const plen = (@as(u16, g_mem[0x203]) << 8) | g_mem[0x204];
+    try testing.expectEqual(@as(u16, 32), plen); // 16 данных + 16 MAC
+    // данные «зашифрованы» (XOR — отличаются от исходника)
+    try testing.expect(!std.mem.eql(u8, g_mem[0x220..0x225], "GET /"));
+
+    // Расшифровка: DecryptMessage с DATA-буфером = ПОЛНАЯ ЗАПИСЬ:
+    // [header(5) + ciphertext(16) + MAC(16)] @mb+0x300
+    @memcpy(g_mem[0x300..0x305], g_mem[0x200..0x205]);
+    @memcpy(g_mem[0x305..0x305 + 16], g_mem[0x220..0x230]);
+    @memcpy(g_mem[0x305 + 16 .. 0x305 + 32], g_mem[0x240..0x250]);
+    // desc2 @mb+0x110: {0, 2, pBuffers} + буферы
+    userD(mb + 0x110).* = 0;
+    userD(mb + 0x114).* = 2;
+    userQ(mb + 0x118).* = mb + 0x1C0;
+    userD(mb + 0x1C0).* = 37; // вся запись
+    userD(mb + 0x1C4).* = 1; // DATA
+    userQ(mb + 0x1C8).* = mb + 0x300;
+    userD(mb + 0x1D0).* = 0;
+    userD(mb + 0x1D4).* = 5; // EXTRA
+    userQ(mb + 0x1D8).* = 0;
+
+    try testing.expectEqual(@as(u64, 0), reg.call(id_dec, mb + 0x40, mb + 0x110, 0, 0));
+    // cbBuffer = plaintext_len = 16, pvBuffer = mb+0x305
+    try testing.expectEqual(@as(u32, 16), userD(mb + 0x1C0).*);
+    try testing.expectEqual(mb + 0x305, userQ(mb + 0x1C8).*);
+    // plaintext восстановлен (первые 5Б из 16Б plaintext)
+    try testing.expectEqualStrings("GET /", g_mem[0x305..0x30A]);
+    // EXTRA обнулён
+    try testing.expectEqual(@as(u32, 0), userD(mb + 0x1D0).*);
+    // ключ не изменился
+    try testing.expectEqualSlices(u8, &key_copy, &s.key);
+}
+
+test "sspi5: QueryContextAttributes STREAM_SIZES + Delete/Free" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_qca = reg.add("Secur32.dll", "QueryContextAttributesA", 0);
+    const id_del = reg.add("Secur32.dll", "DeleteSecurityContext", 0);
+    const id_fch = reg.add("Secur32.dll", "FreeCredentialsHandle", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memset(&g_mem, 0);
+
+    const c = &(ctx orelse return error.NoCtx);
+    const s = &c.tls_sessions[3];
+    s.in_use = true;
+    s.established = true;
+    userQ(mb + 0x40).* = 4;
+    userQ(mb + 0x48).* = TLS_MAGIC;
+
+    // STREAM_SIZES (attr=4)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_qca, mb + 0x40, 4, mb + 0x200, 0));
+    try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, g_mem[0x200..0x204], .little));
+    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, g_mem[0x204..0x208], .little));
+    try testing.expectEqual(@as(u32, 16384), std.mem.readInt(u32, g_mem[0x208..0x20C], .little));
+    // прочий атрибут → SEC_E_UNSUPPORTED
+    try testing.expectEqual(SEC_E_UNSUPPORTED_METHOD, reg.call(id_qca, mb + 0x40, 99, mb + 0x200, 0));
+
+    // Delete: слот освобождён
+    try testing.expectEqual(@as(u64, 0), reg.call(id_del, mb + 0x40, 0, 0, 0));
+    try testing.expect(!s.in_use);
+    // FreeCredentialsHandle
+    try testing.expectEqual(@as(u64, 0), reg.call(id_fch, mb + 0x40, 0, 0, 0));
+}
+
+test "waveA5: CreateMutexA/WaitFor/Release + BCryptGenRandom + ctype + byteswap" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_mut = reg.add("KERNEL32.dll", "CreateMutexA", 0);
+    const id_rel = reg.add("KERNEL32.dll", "ReleaseMutex", 0);
+    const id_wait = reg.add("KERNEL32.dll", "WaitForSingleObject", 0);
+    const id_bc = reg.add("bcrypt.dll", "BCryptGenRandom", 0);
+    const id_isalnum = reg.add("api-ms-win-crt-string-l1-1-0.dll", "isalnum", 0);
+    const id_bswap = reg.add("api-ms-win-crt-utility-l1-1-0.dll", "_byteswap_ulong", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memset(&g_mem, 0xEE);
+
+    // CreateMutexA → хэндл 0x400+
+    const h = reg.call(id_mut, 0, 0, 0, 0);
+    try testing.expect(h >= 0x400);
+    // WaitForSingleObject(mutex) → WAIT_OBJECT_0 (свободен)
+    try testing.expectEqual(WAIT_OBJECT_0, reg.call(id_wait, h, 0xFFFFFFFF, 0, 0));
+    // ReleaseMutex → TRUE
+    try testing.expectEqual(@as(u64, 1), reg.call(id_rel, h, 0, 0, 0));
+
+    // BCryptGenRandom: буфер mb+0x100, 16Б → STATUS_SUCCESS, байты ≠ 0xEE
+    try testing.expectEqual(@as(u64, 0), reg.call(id_bc, 0, mb + 0x100, 16, 0));
+    var changed = false;
+    for (g_mem[0x100..0x110]) |b| {
+        if (b != 0xEE) changed = true;
+    }
+    try testing.expect(changed);
+    // невалидный буфер → STATUS_INVALID_HANDLE (не 0!)
+    try testing.expectEqual(@as(u64, 0xC000_000D), reg.call(id_bc, 0, 0x9990, 16, 0));
+
+    // ctype: 'e' (0x65) → 1, ' ' → 0
+    try testing.expectEqual(@as(u64, 1), reg.call(id_isalnum, 0x65, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_isalnum, 0x20, 0, 0, 0));
+
+    // byteswap: 0x12000000 → 0x12 (ntohl-семантика curl)
+    try testing.expectEqual(@as(u64, 0x12), reg.call(id_bswap, 0x12000000, 0, 0, 0));
 }
