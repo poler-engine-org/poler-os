@@ -22,6 +22,11 @@ const hal = @import("hal.zig");
 
 pub const MAX_TASKS = 8;
 
+/// v0.13.0-fix: канарейка переполнения kstack (низ 256Б каждого стека
+/// заполняется паттерном при создании; schedule проверяет — smash = overflow).
+const KSTACK_CANARY: u64 = 0xC0FFEE_BEEF_1234;
+const CANARY_BYTES: usize = 256;
+
 pub const TaskState = enum {
     Ready,
     Running,
@@ -38,7 +43,12 @@ pub const Task = struct {
     state: TaskState,
     privilege: TaskPrivilege,
     rsp: u64, // Saved stack pointer (points to saved InterruptFrame in kernel_stack)
-    kernel_stack: [8192]u8 align(16), // Ring 0 stack (8KB — larger for safety)
+    // v0.13.0-fix: 8КБ МАЛО — cmd_peload (PE-загрузка: Zig-Debug каскад
+    // pe→win32→стабы + литерал ctx) упирался в дно kstack[1] и ЗАТИРАЛ
+    // НУЛЯМИ header НИЖЕЛЕЖАЩЕЙ tasks[1] (id/rsp → 0) → каскад
+    // task-state-расхождений и kernel-panic @ptrFromInt (E2E-цикл №4).
+    // 32КБ × MAX_TASKS=8 = 256КБ .bss (Zig-Debug каскады PE-моста глубоки).
+    kernel_stack: [32768]u8 align(16), // Ring 0 stack (32KB)
     cr3: u64, // Per-process PML4 physical address (0 = use kernel CR3)
     user_stack_top: u64, // Top of user stack (virtual address, for reference/cleanup)
 };
@@ -59,6 +69,16 @@ pub export var current_kernel_stack: u64 = 0;
 /// Раскладка (порядок push'ей): [0]=r15 [1]=r14 [2]=r13 [3]=r12
 /// [4]=rbp [5]=rbx [6]=r11(user RFLAGS) [7]=rcx(user RIP после syscall).
 pub export var syscall_frame: [8]u64 = .{0} ** 8;
+
+/// v0.13.0-fix (КРИТИЧНО, CDD №4): транзакция syscall Ring-3 активна.
+/// isr64.S ставит 1 на входе syscall_entry и 0 перед sysretq (IF=0 —
+/// атомарно). Пока флаг поднят, schedule НЕ ПЕРЕКЛЮЧАЕТ задачу: тик,
+/// прервавший syscall-обработчик, и свитч на ДРУГОЙ Ring-3 контекст
+/// (треды!) приводили к перезаписи глобального user_rsp чужим стеком —
+/// sysretq выбрасывал задачу на ЧУЖОЙ стек (латентная гонка v0.12,
+/// взорвавшаяся на 3 Ring-3 задачах: main + 2 resolver-треда).
+pub export var in_win32_syscall: u64 = 0;
+
 
 // v0.7.0: CR3 tracking for per-process address spaces
 var kernel_cr3: u64 = 0; // Boot/kernel PML4 physical address
@@ -105,6 +125,10 @@ pub fn init() void {
 /// Called by HAL when a user process invokes syscall 4 (exit).
 /// Kills the current task. The scheduler will skip it on the next tick.
 pub fn exitCurrentTask() callconv(.C) void {
+    // v0.13.0-fix: путь завершения уходит в hlt-цикл ИЗНУТРИ syscall-
+    // транзакции — сбросить флаг, иначе таймер не сможет вытеснить задачу
+    // (schedule видит in_win32_syscall=1 и не переключает — deadlock).
+    in_win32_syscall = 0;
     if (current_task_id == 0) {
         hal.Serial.puts("[SCHED] ERROR: Cannot kill idle task!\n");
         return;
@@ -174,6 +198,8 @@ pub fn createTask(entry_point: u64) !usize {
 
     // Save stack pointer to task control block
     task.rsp = @intFromPtr(frame_ptr);
+    fillCanary(task);
+    fillCanary(task);
 
     hal.Serial.puts("[SCHED] Created kernel task ");
     hal.Serial.putHex(id);
@@ -246,6 +272,7 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
 
     // Save stack pointer to task control block
     task.rsp = @intFromPtr(frame_ptr);
+    fillCanary(task);
 
     hal.Serial.puts("[SCHED] Created user task ");
     hal.Serial.putHex(id);
@@ -297,6 +324,7 @@ pub fn createUserThreadTask(entry_point: u64, user_cr3: u64, thread_rsp: u64, pa
     frame_ptr.rcx = param_rcx; // ThreadProc(LPVOID) — Win64 RCX
 
     task.rsp = @intFromPtr(frame_ptr);
+    fillCanary(task);
 
     hal.Serial.puts("[SCHED] Created user THREAD ");
     hal.Serial.putDecimal(id);
@@ -322,10 +350,49 @@ pub fn threadHandleDead(handle: u64) bool {
     return tasks[id].state == .Killed;
 }
 
+/// v0.13.0-fix: структурная валидность кадра задачи — rsp обязан указывать
+/// в ЕЁ СОбственный kernel_stack (idle — бут-стек [stack_bottom, stack_top)
+/// = [0x108000, 0x10C000), см. linker64.ld).
+fn taskRspValid(id: usize, rsp: u64) bool {
+    if (rsp == 0 or rsp & 7 != 0) return false;
+    if (id == 0) {
+        // idle/boot: кадры на главном бут-стеке линкера
+        return rsp >= 0x108000 and rsp < 0x10C000;
+    }
+    if (id >= task_count) return false;
+    const base: u64 = @intFromPtr(&tasks[id].kernel_stack);
+    return rsp >= base and rsp < base + tasks[id].kernel_stack.len;
+}
+
+/// v0.13.0-fix: заполнить низ kstack задачи паттерном (детектор overflow).
+fn fillCanary(task: *Task) void {
+    const base: usize = @intFromPtr(&task.kernel_stack);
+    var i: usize = 0;
+    while (i < CANARY_BYTES) : (i += 8) {
+        @as(*volatile u64, @ptrFromInt(base + i)).* = KSTACK_CANARY ^ @as(u64, task.id << 32) ^ i;
+    }
+}
+
+/// Проверить канарейку задачи (true = цела).
+fn canaryOk(id: usize) bool {
+    if (id == 0 or id >= task_count) return true; // idle — бут-стек, без канарейки
+    const base: usize = @intFromPtr(&tasks[id].kernel_stack);
+    var i: usize = 0;
+    while (i < CANARY_BYTES) : (i += 8) {
+        const v = @as(*volatile u64, @ptrFromInt(base + i)).*;
+        if (v != (KSTACK_CANARY ^ @as(u64, @as(u64, id) << 32) ^ i)) return false;
+    }
+    return true;
+}
+
 pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     if (task_count <= 1) return current_rsp; // Only idle/kernel task exists
-
+    // v0.13.0-fix: syscall-транзакция активна — НЕ трогаем контекст задачи
+    // (user_rsp/current_kernel_stack глобальны — свитч между Ring-3
+    // задачами внутри syscall = порча; ждем sysretq, потом свободный тик).
+    if (in_win32_syscall != 0) return current_rsp;
     scheduler_ticks += 1;
+
 
     // DEBUG: periodic log to confirm schedule is running
     if (scheduler_ticks % 100 == 1) {
@@ -339,21 +406,59 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     }
 
     // Save RSP of the current task
+    if (current_rsp == 0) {
+        // v0.13.0-fix (диагностика): ЗАПИСЬ НУЛЯ в tasks[].rsp — источник
+        // kernel-panic @ptrFromInt(0). Кто передал current_rsp=0?
+        hal.Serial.puts("[SCHED] !!! WRITE-0: current_task=");
+        hal.Serial.putDecimal(current_task_id);
+        hal.Serial.puts(" tick=");
+        hal.Serial.putDecimal(scheduler_ticks);
+        hal.Serial.puts(" tasks=");
+        hal.Serial.putDecimal(task_count);
+        hal.Serial.puts("\n");
+    }
     tasks[current_task_id].rsp = current_rsp;
     if (tasks[current_task_id].state == .Running) {
         tasks[current_task_id].state = .Ready;
     }
 
-    // Select the next task using Round-Robin
+    // Select the next task using Round-Robin. v0.13.0-fix: валидация
+    // КАНДИДАТА до мутации состояния — СТРУКТУРНАЯ: кадр обязан лежать
+    // В СОБСТВЕННОМ kstack задачи (idle — бут-стек). Мусорный rsp (порча/
+    // переполнение/расхождение) → задача ПРОПУСКАЕТСЯ; живой fallback —
+    // остаться в текущей (current_rsp валиден по построению).
     var next_id = (current_task_id + 1) % task_count;
     var checked: usize = 0;
+    var found = false;
+    var bad_rsp: u64 = 0;
+    var bad_id: usize = 0;
     while (checked < task_count) : ({
         next_id = (next_id + 1) % task_count;
         checked += 1;
     }) {
         if (tasks[next_id].state == .Ready or tasks[next_id].state == .Running) {
-            break;
+            if (taskRspValid(next_id, tasks[next_id].rsp)) {
+                found = true;
+                break;
+            }
+            if (bad_rsp == 0) {
+                bad_rsp = tasks[next_id].rsp;
+                bad_id = next_id;
+            }
         }
+    }
+    if (bad_rsp != 0) {
+        // CDD-трейс: ПОРЧА кадров — не роняем ядро, пропускаем задачу
+        hal.Serial.puts("[SCHED] WARN: task ");
+        hal.Serial.putDecimal(bad_id);
+        hal.Serial.puts(" rsp=0x");
+        hal.Serial.putHex(bad_rsp);
+        hal.Serial.puts(" вне собственного стека — skip\n");
+    }
+    if (!found) {
+        // Никто не готов С валидным кадром — не переключаемся вообще:
+        // возвращаем ТЕКУЩИЙ кадр (никакой мутации current_task_id/TSS).
+        return current_rsp;
     }
 
     // Safety: if no Ready/Running task found, stay on current if it's not Killed

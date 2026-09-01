@@ -420,7 +420,34 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                 Serial.puts("[HAL] First APIC timer tick received!\n");
             }
             if (timerTickCallback) |cb| {
-                next_frame = @ptrFromInt(cb(@intFromPtr(frame)));
+                // v0.13.0-fix (КРИТИЧНО, CDD №4): переключение задач —
+                // АТОМАРНАЯ секция. Раньше cb() (schedule) исполнялся с IF=1
+                // (тик прерывал syscall-обработчик после его sti()) — и
+                // МЕДЛЕННАЯ печать "[SCHED] tick/Switching…" пропускала
+                // СЛЕДУЮЩИЙ тик (10мс, serial): вложенный schedule менял
+                // current_task_id/TSS.rsp0 ПОСРЕДИ внешнего переключения,
+                // а внешний продолжал возвращать СВОЙ кадр → IRETQ в кадр
+                // от состояния другого тика → задачи на ЧУЖИХ стеках,
+                // tasks[].rsp=0/мусор, kernel-panic @ptrFromInt (лаг v0.12).
+                // cli(): вложенный тик ждёт; IRETQ восстановит IF из кадра.
+                // Дополнительно: кадр обязан быть ненулевым и 8-выровнен.
+                cli();
+                const next_rsp = cb(@intFromPtr(frame));
+                if (next_rsp != 0 and next_rsp & 7 == 0) {
+                    next_frame = @ptrFromInt(next_rsp);
+                } else {
+                    // 0/мусор = битый кадр (state-расхождение или порча) —
+                    // остаёмся в текущем кадре; паники @ptrFromInt нет.
+                    Serial.puts("[HAL] tick: rsp=0x");
+                    Serial.putHex(next_rsp);
+                    Serial.puts(" invalid (frame=0x");
+                    Serial.putHex(@intFromPtr(frame));
+                    Serial.puts(" cur_task=");
+                    Serial.putDecimal(@import("scheduler.zig").current_task_id);
+                    Serial.puts(" kstack=0x");
+                    Serial.putHex(@import("scheduler.zig").current_kernel_stack);
+                    Serial.puts(") — no switch\n");
+                }
             }
         },
         33 => {
@@ -488,6 +515,21 @@ fn handleException(frame: *InterruptFrame) void {
     Serial.putHex(frame.rsp);
     Serial.puts("\nSS: ");
     Serial.putHex(frame.ss);
+    // v0.13.0-fix (диагностика CDD №4): дамп стека юзера — ret-адрес укажет
+    // ВЫЗЫВАЮЩЕГО функции NULL-вызова (RIP=0: call reg с reg=0).
+    if (from_user and frame.rsp > 0x1000) {
+        const usp: *volatile [12]u64 = @ptrFromInt(frame.rsp);
+        var i: usize = 0;
+        while (i < 12) : (i += 1) {
+            const v = usp[i];
+            if (v >= 0x140000000 and v < 0x1403C0000) {
+                Serial.puts("\n  [rsp+");
+                Serial.putDecimal(i * 8);
+                Serial.puts("] ret=0x");
+                Serial.putHex(v);
+            }
+        }
+    }
 
     if (from_user) {
         // User-mode exception — kill the offending process instead of kernel panic

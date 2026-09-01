@@ -942,7 +942,7 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 9. Ready!
     vga_setcolor(0x0B);
     puts("\n╔══════════════════════════════════════════════════════╗\n");
-    puts("║         POLER-OS v0.12.0 — BOOT COMPLETE             ║\n");
+    puts("║         POLER-OS v0.13.0 — BOOT COMPLETE             ║\n");
     puts("║  HAL+PUF+Enrollment-Gate+PE Runtime — all systems GO║\n");
     puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
@@ -1002,7 +1002,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.12.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.13.0 Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
@@ -1073,9 +1073,9 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  enroll test - Forge-test: анти-клон (подделка отпечатка → MISMATCH)\n");
         sys_print("  peinfo <f> - Analyze PE/COFF executable from initrd (headers, sections, imports)\n");
         sys_print("  pestubs <f> - Generate Win32 stub table for PE executable (CDD: log+int3)\n");
-        sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (CDD cycle 3)\n");
+        sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (CDD cycle 4)\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.12.0 (x86_64 Long Mode)\n");
+        sys_print("POLER-OS v0.13.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
     } else if (eq(cmd, "clear")) {
         sys_clear_screen();
@@ -1614,7 +1614,7 @@ fn cmd_peload(args: []const u8) void {
         return;
     };
 
-    sys_print("=== PE Load & Run (CDD cycle 3): ");
+    sys_print("=== PE Load & Run (CDD cycle 4): ");
     sys_print(file);
     if (args.len > file_end) {
         sys_print(" — cmdline: ");
@@ -1927,6 +1927,16 @@ fn cmd_peload(args: []const u8) void {
         .{ "WS2_32.dll", "WSAIoctl" },
         .{ "WS2_32.dll", "WSASetLastError" },
         .{ "WS2_32.dll", "__WSAFDIsSet" },
+        // sockopt-волна (CDD №4, по логу v0.12.0-run): curl после connect
+        // вызывает setsockopt/getsockopt(SO_ERROR)/getsockname и ЖДЁТ
+        // завершения соединения в select/WSAEnumNetworkEvents — без них
+        // вечный поллинг. send/recv — loopback-шим HTTP-обмена.
+        .{ "WS2_32.dll", "setsockopt" },
+        .{ "WS2_32.dll", "getsockopt" },
+        .{ "WS2_32.dll", "getsockname" },
+        .{ "WS2_32.dll", "getpeername" },
+        .{ "WS2_32.dll", "select" },
+        .{ "WS2_32.dll", "shutdown" },
         .{ "KERNEL32.dll", "CreateEventA" },
         .{ "KERNEL32.dll", "WaitForSingleObject" },
         .{ "KERNEL32.dll", "WaitForSingleObjectEx" },
@@ -1950,6 +1960,14 @@ fn cmd_peload(args: []const u8) void {
         .{ "KERNEL32.dll", "SleepConditionVariableCS" },
         .{ "api-ms-win-crt-private-l1-1-0.dll", "memchr" },
         .{ "api-ms-win-crt-time-l1-1-0.dll", "_time64" },
+        // финал-волна (CDD №4): SleepEx — сон-поллинг резолвера после recv;
+        // _get_osfhandle — mingw-UCRT печать тела ответа (fwrite-путь);
+        // MultiByteToWideChar — UCRT конвертация перед WriteFile (без него
+        // «curl: (23) ERROR on write of 13 bytes» — тело не печаталось).
+        .{ "KERNEL32.dll", "SleepEx" },
+        .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_get_osfhandle" },
+        .{ "KERNEL32.dll", "MultiByteToWideChar" },
+        .{ "KERNEL32.dll", "WriteConsoleW" },
     };
     var impls: usize = 0;
     for (impl_specs) |spec| {
@@ -1959,13 +1977,14 @@ fn cmd_peload(args: []const u8) void {
     printDec(impls);
     sys_print(" / ");
     printDec(impl_specs.len);
-    sys_print(" — cycles 1+2+3 (waves: 17+20 fn) + CRT-startup-kit\n");
+    sys_print(" — cycles 1+2+3+4 (waves: 17+20 fn) + CRT-startup-kit\n");
 
     // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
     kdisp.applyToImage(img.backing);
     sys_print("[PE] IAT patched: ");
     printDec(generated);
     sys_print(" slots\n");
+
 
     // 8. User-контекст Win64: стек, TEB, PEB, params+cmdline, TLS
     const uctx = pe_loader.buildUserContext(ops, user_pml4, layout, img.base_va, args) catch |err| {
@@ -2020,7 +2039,12 @@ fn cmd_peload(args: []const u8) void {
         .sspi_table = 0,
         .locale_str = 0,
         .next_event_handle = 0x200,
+        // v0.13.0-fix: массив состояния сокетов — ЦИКЛ после литерала, НЕ
+        // гигантский стековый темп (8КБ-переполнение cmd_peload затирало
+        // tasks[1] нулями — kernel-panic каскад; см. scheduler.zig).
+        .sockets = undefined,
     };
+    for (&win32_crt.ctx.?.sockets) |*sk| sk.* = .{};
     sys_print("[PE] TSC calibrated: ");
     printDec(tsc_freq);
     sys_print(" Hz (QPF/QPC source, 5 APIC ticks)\n");
@@ -2398,10 +2422,14 @@ fn cmd_rm(filename: []const u8) void {
 
 pub fn panic(msg: []const u8, error_return_trace: ?*@import("std").builtin.StackTrace, ret_addr: ?usize) noreturn {
     _ = error_return_trace;
-    _ = ret_addr;
     vga_setcolor(0x0C); // Light red
     puts("\n!!! KERNEL PANIC !!!\n");
     puts(msg);
+    if (ret_addr) |ra| {
+        puts("\n[panic] ret_addr=0x");
+        putHex(ra);
+        puts(" (addr2line poler-os64)");
+    }
     puts("\nHalting CPU...\n");
     while (true) {
         hal.cli();

@@ -414,6 +414,7 @@ isr_stub_table:
 .extern syscall_frame          // v0.12.0: снапшот кадра (8 слов, .bss)
 .extern zig_syscall_handler
 .extern ucl_pending            // v0.12.0: мост Win64-колбэка (win32_api)
+.extern in_win32_syscall      // v0.13.0: транзакция syscall (schedule-guard)
 .extern ucl_rsp
 .extern ucl_rip
 .extern ucl_rflags
@@ -470,8 +471,19 @@ syscall_entry:
     movq 56(%rsp), %rax
     movq %rax, 56(%r11)        // rcx (user RIP после syscall)
 
+    // v0.13.0-fix: транзакция syscall активна — таймерный тик НЕ должен
+    // переключать Ring-3 задачу внутри обработки (глобальные user_rsp/
+    // current_kernel_stack перезаписал бы чужой контекст — латентная
+    // гонка v0.12, взорвалась на 3 Ring-3 задачах: sysretq на чужой стек).
+    // IF=0 от SYSCALL — запись атомарна.
+    movq $1, in_win32_syscall(%rip)
+
     // Call Zig syscall handler
     call zig_syscall_handler
+
+    // Транзакция завершена: сброс ДО pop'ов (IF всё ещё 0 — атомарно;
+    // после sysretq тик волен переключать).
+    movq $0, in_win32_syscall(%rip)
 
     // v0.12.0 (CDD №3): запуск Win64-колбэка? (InitOnceExecuteOnce:
     // обработчик сохранил кадр в CallbackState и заполнил ucl_*)

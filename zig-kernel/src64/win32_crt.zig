@@ -44,11 +44,13 @@
 //                                              (QuerySecurityPackageInfo…,
 //                                              AcquireCredentialsHandle… —
 //                                              SEC_E_UNSUPPORTED)
-//   WS2_32.dll!socket/connect/closesocket/ioctlsocket — сокетные заглушки
-//                                              с логированием IP/портов
+//   WS2_32.dll!socket/connect/closesocket/ioctlsocket — SocketState: опции,
+//                                              состояние, события FD_* (№4)
 //   WS2_32.dll!getaddrinfo/freeaddrinfo       — синтез TEST-NET (DNS: №4)
-//   WS2_32.dll!send/recv                      — SOCKET_ERROR: стек сети в
-//                                              следующем цикле
+//   WS2_32.dll!setsockopt/getsockopt/getsockname/getpeername/shutdown —
+//                                              сокетные опции/адреса (№4)
+//   WS2_32.dll!select — мультиплексор: fd_set перезаписывается (готовые)
+//   WS2_32.dll!send/recv — loopback-шим: [HTTP-SEND] запроса, синтет-ответ
 //   WS2_32.dll!htons/htonl/ntohs/ntohl/WSAGetLastError
 //
 // ИНВАРИАНТ ДОСТУПА К USER-ПАМЯТИ (жизненно важный):
@@ -210,6 +212,9 @@ pub const Ctx = struct {
     sspi_table: u64, // InitSecurityInterfaceA: кэш таблицы (0 = нет)
     locale_str: u64, // setlocale: ленивый слот "C" (0 = не выделен)
     next_event_handle: u64, // WSACreateEvent/CreateEventA: пул 0x200+
+
+    // v0.13.0 (CDD №4)
+    sockets: [MAX_SOCKS]Sock, // состояния сокетов (fd = 0x100 + индекс)
 };
 
 pub var ctx: ?Ctx = null;
@@ -534,6 +539,8 @@ const WSAEFAULT: u32 = 10014;
 const WSAEINVAL: u32 = 10022;
 const WSAENETDOWN: u32 = 10050;
 const WSAETIMEDOUT: u32 = 10060;
+const WSAEWOULDBLOCK: u32 = 10035; // v0.13.0 (CDD №4): неблокирующий recv
+const WSAENOTCONN: u32 = 10057; // v0.13.0 (CDD №4): send/recv без connect
 const INVALID_SOCKET: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 fn setLastError(code: u32) void {
@@ -1012,10 +1019,99 @@ fn initSecurityInterface(disp: *win32.Dispatcher, wide: bool) u64 {
     return tbl;
 }
 
-// ─── v0.12.0 (CDD №3): WS2_32 — сокетные заглушки (цель: socket/connect) ───
+// ─── v0.13.0 (CDD №4): SocketState — опции, состояние, события, loopback ──
+
+/// FD_*-события (WSAEventSelect/WSAEnumNetworkEvents)
+const FD_READ: u32 = 0x01;
+const FD_WRITE: u32 = 0x02;
+const FD_CONNECT: u32 = 0x10;
+const FD_CLOSE: u32 = 0x20;
+
+/// WSANETWORKEVENTS: { long iNetworkEvents; int iErrorCode[FD_MAX_EVENTS]; }
+const FD_MAX_EVENTS: usize = 10;
+const WSANETWORKEVENTS_SIZE: u64 = 4 + FD_MAX_EVENTS * 4; // 44
+const FD_CONNECT_BIT: usize = 4;
+const FD_CLOSE_BIT: usize = 5;
+
+/// Уровни/опции сокета
+const SOL_SOCKET: u32 = 0xFFFF;
+const SO_KEEPALIVE: u32 = 0x0008;
+const SO_SNDBUF: u32 = 0x1001;
+const SO_RCVBUF: u32 = 0x1002;
+const SO_ERROR: u32 = 0x1007;
+const SO_TYPE: u32 = 0x1008;
+const IPPROTO_TCP: u32 = 6;
+const TCP_NODELAY: u32 = 0x0001;
+const SOCK_STREAM: u32 = 1;
+
+/// Loopback-ответ шима: минимальный валидный HTTP/1.1 (Content-Length
+/// важен — curl завершит передачу ровно по телу, без EOF-ожидания).
+const HTTP_RESP = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello POLER!\n";
+
+/// Число отслеживаемых сокетов (curl открывает 2-3: Happy Eyeballs + IPv6).
+pub const MAX_SOCKS: usize = 32;
+
+/// Состояние сокета WS2-машины (таблица в Ctx, fd = 0x100 + индекс).
+pub const Sock = struct {
+    in_use: bool = false,
+    family: u16 = 0,
+    nonblocking: bool = false, // FIONBIO
+    connected: bool = false, // connect() шима = мгновенно
+    peer_ip: [4]u8 = .{ 0, 0, 0, 0 }, // адрес «сервера» (getpeername)
+    peer_port: u16 = 0,
+    local_port: u16 = 0, // эфемерный (getsockname: 127.0.0.1)
+    // опции (setsockopt → getsockopt)
+    opt_keepalive: bool = false,
+    opt_nodelay: bool = false,
+    opt_rcvbuf: u32 = 65536,
+    opt_sndbuf: u32 = 65536,
+    // события: интерес (WSAEventSelect) → pending → отчёт (Enum с авто-сбросом)
+    event_handle: u64 = 0,
+    event_mask: u32 = 0,
+    pending: u32 = 0,
+    connect_reported: bool = false, // FD_CONNECT одноразовый
+    write_reported: bool = false, // FD_WRITE перезапускается send()
+    // loopback-I/O
+    sent_bytes: u64 = 0,
+    send_logged: bool = false, // первый payload → [HTTP-SEND]
+    recv_cursor: usize = 0, // позиция в HTTP_RESP
+    recv_eof: bool = false, // ответ исчерпан: recv → 0
+};
+
+/// Socket по fd (таблица 0x100..). null = вне таблицы/не открыт.
+fn sockByFd(fd: u64) ?*Sock {
+    const c = &(ctx orelse return null);
+    if (fd < 0x100) return null;
+    const idx: usize = @intCast(fd - 0x100);
+    if (idx >= MAX_SOCKS or !c.sockets[idx].in_use) return null;
+    return &c.sockets[idx];
+}
+
+/// Имена FD-бит для логов ("FD_CONNECT|FD_WRITE").
+fn fdNames(mask: u32, buf: []u8) []const u8 {
+    var n: usize = 0;
+    const entries = [_]struct { bit: u32, name: []const u8 }{
+        .{ .bit = FD_READ, .name = "FD_READ" },
+        .{ .bit = FD_WRITE, .name = "FD_WRITE" },
+        .{ .bit = FD_CONNECT, .name = "FD_CONNECT" },
+        .{ .bit = FD_CLOSE, .name = "FD_CLOSE" },
+    };
+    for (entries) |e| {
+        if (mask & e.bit == 0) continue;
+        if (n > 0 and n < buf.len) {
+            buf[n] = '|';
+            n += 1;
+        }
+        if (n + e.name.len > buf.len) break;
+        @memcpy(buf[n .. n + e.name.len], e.name);
+        n += e.name.len;
+    }
+    return buf[0..n];
+}
 
 /// socket(af, type, protocol): псевдо-хэндл из ctx (с 0x100, различимы в
-/// логах). Поддерживаем AF_INET(2)/AF_INET6(23) — прочее WSAEAFNOSUPPORT.
+/// логах) + запись состояния в таблице. AF_INET(2)/AF_INET6(23) — прочее
+/// WSAEAFNOSUPPORT.
 fn wsaSocket(af: u64, sock_type: u64, protocol: u64) u64 {
     const c = &(ctx orelse return INVALID_SOCKET);
     if (af != 2 and af != 23) {
@@ -1025,13 +1121,24 @@ fn wsaSocket(af: u64, sock_type: u64, protocol: u64) u64 {
     const fd = c.next_socket_fd;
     c.next_socket_fd += 1;
     c.sockets_opened += 1;
+    if (fd >= 0x100 + MAX_SOCKS) {
+        // за пределами таблицы: хэндл валиден, состояние не трекается
+        logf("[WS2] socket(af={d}, type={d}, proto={d}) -> fd=0x{x} (untracked)\n", .{ af, sock_type, protocol, fd });
+        return fd;
+    }
+    const s = &c.sockets[@as(usize, @intCast(fd - 0x100))];
+    s.* = .{};
+    s.in_use = true;
+    s.family = @intCast(af);
+    s.local_port = 0xC000 + @as(u16, @truncate(fd - 0x100)); // эфемерный
     logf("[WS2] socket(af={d}, type={d}, proto={d}) -> fd=0x{x}\n", .{ af, sock_type, protocol, fd });
     return fd;
 }
 
 /// connect(s, name, namelen): sockaddr разбирается и ЛОГИРУЕТСЯ (цель
-/// атаки: IP:порт) — это CDD-маяк волны. Возврат 0 = «соединён мгновенно»
-/// (loopback-семантика шима): curl пойдёт к send → честный SOCKET_ERROR.
+/// атаки: IP:порт) — это CDD-маяк волны. Loopback-семантика: 0 = «соединён
+/// мгновенно», состояние connected + pending FD_CONNECT — curl узнает о
+/// завершении через WSAEnumNetworkEvents/select и перейдёт к send().
 fn wsaConnect(s: u64, name_va: u64, namelen: u64) u64 {
     if (namelen < 2 or !ops.validate_read(name_va, 2)) {
         setLastError(WSAEFAULT);
@@ -1042,26 +1149,39 @@ fn wsaConnect(s: u64, name_va: u64, namelen: u64) u64 {
         const port = std.mem.bigToNative(u16, userW(name_va + 2).*);
         const ip = userPtr(name_va + 4)[0..4];
         logf("[WS2] connect(fd=0x{x}, AF_INET, {d}.{d}.{d}.{d}:{d})\n", .{ s, ip[0], ip[1], ip[2], ip[3], port });
-        return 0; // мгновенное «соединение» (шим; сеть — цикл №4)
+        if (sockByFd(s)) |sk| {
+            sk.connected = true;
+            sk.peer_ip = .{ ip[0], ip[1], ip[2], ip[3] };
+            sk.peer_port = port;
+            sk.pending |= FD_CONNECT | FD_WRITE; // событие завершения connect
+        }
+        return 0; // loopback: «соединён» немедленно, ответ ждёт в recv
     }
     if (family == 23 and namelen >= 28 and ops.validate_read(name_va, 28)) {
         const port = std.mem.bigToNative(u16, userW(name_va + 2).*);
         const ip = userPtr(name_va + 8)[0..16];
         logf("[WS2] connect(fd=0x{x}, AF_INET6, [{d}:{d}:{d}:{d}…]:{d})\n", .{ s, ip[0], ip[1], ip[2], ip[3], port });
+        if (sockByFd(s)) |sk| {
+            sk.connected = true;
+            sk.peer_ip = .{ 0, 0, 0, 0 };
+            sk.peer_port = port;
+            sk.pending |= FD_CONNECT | FD_WRITE;
+        }
         return 0;
     }
     setLastError(WSAEINVAL);
     return INVALID_SOCKET;
 }
 
-/// closesocket(s): 0 = NO_ERROR.
+/// closesocket(s): 0 = NO_ERROR, состояние освобождается.
 fn wsaClosesocket(s: u64) u64 {
+    if (sockByFd(s)) |sk| sk.* = .{};
     logf("[WS2] closesocket(fd=0x{x})\n", .{s});
     return 0;
 }
 
 /// ioctlsocket(s, cmd, argp): FIONBIO(0x8004667E) читает u_long-флаг —
-/// логируем режим; FIONREAD пишет 0. Возврат 0.
+/// сохраняем nonblocking-режим в SocketState; FIONREAD пишет 0.
 fn wsaIoctlsocket(s: u64, cmd: u64, argp: u64) u64 {
     const FIONBIO: u64 = 0x8004_667E;
     const FIONREAD: u64 = 0x4004_667F;
@@ -1071,6 +1191,7 @@ fn wsaIoctlsocket(s: u64, cmd: u64, argp: u64) u64 {
             return INVALID_SOCKET;
         }
         const mode = userD(argp).*;
+        if (sockByFd(s)) |sk| sk.nonblocking = mode != 0;
         logf("[WS2] ioctlsocket(fd=0x{x}, FIONBIO, {d}) — {s}\n", .{ s, mode, if (mode != 0) "nonblocking" else "blocking" });
         return 0;
     }
@@ -1086,8 +1207,228 @@ fn wsaIoctlsocket(s: u64, cmd: u64, argp: u64) u64 {
     return 0;
 }
 
-/// send(s, buf, len, flags): сетевого стека в v0.12 нет — честный
-/// SOCKET_ERROR + WSAENETDOWN (curl напечатает через FormatMessageA).
+/// shutdown(s, how): 0 = ок (loopback: приём «закрывается» — следующий
+/// recv вернёт 0/EOF).
+fn wsaShutdown(s: u64, how: u64) u64 {
+    const hows = [_][]const u8{ "SD_RECEIVE", "SD_SEND", "SD_BOTH" };
+    const hw: usize = @intCast(@min(how, 2));
+    if (sockByFd(s)) |sk| {
+        if (how == 0 or how == 2) sk.recv_eof = true;
+    }
+    logf("[WS2] shutdown(fd=0x{x}, {s}) -> 0\n", .{ s, hows[hw] });
+    return 0;
+}
+
+// ── Сокетные опции (setsockopt/getsockopt) и адреса (getsockname/…ername) ──
+
+/// Текстовое имя опции для логов (уровень+optname).
+fn sockoptName(lvl: u32, opt: u32, buf: []u8) []const u8 {
+    const entries = [_]struct { lvl: u32, opt: u32, name: []const u8 }{
+        .{ .lvl = SOL_SOCKET, .opt = SO_KEEPALIVE, .name = "SO_KEEPALIVE" },
+        .{ .lvl = SOL_SOCKET, .opt = SO_SNDBUF, .name = "SO_SNDBUF" },
+        .{ .lvl = SOL_SOCKET, .opt = SO_RCVBUF, .name = "SO_RCVBUF" },
+        .{ .lvl = SOL_SOCKET, .opt = SO_ERROR, .name = "SO_ERROR" },
+        .{ .lvl = SOL_SOCKET, .opt = SO_TYPE, .name = "SO_TYPE" },
+        .{ .lvl = IPPROTO_TCP, .opt = TCP_NODELAY, .name = "TCP_NODELAY" },
+    };
+    for (entries) |e| {
+        if (e.lvl == lvl and e.opt == opt) return e.name;
+    }
+    return std.fmt.bufPrint(buf, "opt 0x{x}", .{opt}) catch "opt";
+}
+
+/// setsockopt(s, level, optname, optval, optlen): опции СОХРАНЯЮТСЯ в
+/// SocketState (getsockopt вернёт сохранённое), возврат 0 = успех.
+/// optlen — 5-й арг Win64 (стек вызова).
+fn wsaSetsockopt(s: u64, level: u64, optname: u64, optval: u64, optlen: u64) u64 {
+    const lvl: u32 = @truncate(level);
+    const opt: u32 = @truncate(optname);
+    if (optlen == 0) return 0; // пустая опция — принимаем (no-op)
+    if (optval == 0 or !ops.validate_read(optval, @min(optlen, 4))) {
+        setLastError(WSAEFAULT);
+        return INVALID_SOCKET;
+    }
+    const val = userD(optval).*; // int-опции Winsock (bool/размер буфера)
+    var nb: [24]u8 = undefined;
+    const opt_name = sockoptName(lvl, opt, &nb);
+    const lvl_name = if (lvl == SOL_SOCKET) "SOL_SOCKET" else if (lvl == IPPROTO_TCP) "IPPROTO_TCP" else "lvl";
+    if (sockByFd(s)) |sk| {
+        if (lvl == SOL_SOCKET) {
+            switch (opt) {
+                SO_KEEPALIVE => sk.opt_keepalive = val != 0,
+                SO_RCVBUF => sk.opt_rcvbuf = val,
+                SO_SNDBUF => sk.opt_sndbuf = val,
+                else => {}, // прочие — no-op (успех)
+            }
+        } else if (lvl == IPPROTO_TCP and opt == TCP_NODELAY) {
+            sk.opt_nodelay = val != 0;
+        }
+    }
+    logf("[WS2] setsockopt(fd=0x{x}, {s}, {s}={d}) -> 0\n", .{ s, lvl_name, opt_name, val });
+    return 0;
+}
+
+/// getsockopt(s, level, optname, optval, optlen): SO_ERROR → 0 (connect
+/// без ошибок — статус неблокирующего соединения), SO_TYPE → SOCK_STREAM,
+/// буферы/флаги — из SocketState. optlen — int* (in: размер буфера,
+/// out: фактический). 5-й арг — стек.
+fn wsaGetsockopt(s: u64, level: u64, optname: u64, optval: u64, optlen: u64) u64 {
+    const lvl: u32 = @truncate(level);
+    const opt: u32 = @truncate(optname);
+    if (optlen == 0 or !ops.validate_read(optlen, 4) or !ops.validate_write(optlen, 4)) {
+        setLastError(WSAEFAULT);
+        return INVALID_SOCKET;
+    }
+    const in_len = userD(optlen).*;
+    if (optval == 0 or in_len < 4 or !ops.validate_write(optval, 4)) {
+        setLastError(WSAEFAULT);
+        return INVALID_SOCKET;
+    }
+    var value: u32 = 0;
+    if (sockByFd(s)) |sk| {
+        if (lvl == SOL_SOCKET) {
+            switch (opt) {
+                SO_ERROR => value = 0, // соединение установлено без ошибок
+                SO_TYPE => value = SOCK_STREAM,
+                SO_KEEPALIVE => value = if (sk.opt_keepalive) 1 else 0,
+                SO_RCVBUF => value = sk.opt_rcvbuf,
+                SO_SNDBUF => value = sk.opt_sndbuf,
+                else => {},
+            }
+        } else if (lvl == IPPROTO_TCP and opt == TCP_NODELAY) {
+            value = if (sk.opt_nodelay) 1 else 0;
+        }
+    } else if (opt == SO_ERROR) {
+        value = 0; // не-сокет: пермиссивно (нет ошибок соединения)
+    }
+    userD(optval).* = value;
+    userD(optlen).* = 4;
+    var nb: [24]u8 = undefined;
+    const opt_name = sockoptName(lvl, opt, &nb);
+    const lvl_name = if (lvl == SOL_SOCKET) "SOL_SOCKET" else if (lvl == IPPROTO_TCP) "IPPROTO_TCP" else "lvl";
+    logf("[WS2] getsockopt(fd=0x{x}, {s}, {s}) -> {d}\n", .{ s, lvl_name, opt_name, value });
+    return 0;
+}
+
+/// sockaddr_in (16Б) → user-буфер + *namelen = 16 (семантика Win64).
+fn writeSockaddr(name: u64, namelen: u64, ip: [4]u8, port: u16) bool {
+    if (!ops.validate_read(namelen, 4) or !ops.validate_write(namelen, 4)) return false;
+    if (userD(namelen).* < 16) return false; // буфер меньше sockaddr_in
+    if (!ops.validate_write(name, 16)) return false;
+    userW(name).* = 2; // sin_family = AF_INET
+    userW(name + 2).* = std.mem.nativeToBig(u16, port); // sin_port (BE)
+    @memcpy(userPtr(name + 4)[0..4], &ip);
+    @memset(userPtr(name + 8)[0..8], 0); // sin_zero
+    userD(namelen).* = 16;
+    return true;
+}
+
+/// getsockname(s, name, namelen): локальный конец соединения —
+/// 127.0.0.1:эфемерный_порт (Win64 заполняет после connect).
+fn wsaGetsockname(s: u64, name: u64, namelen: u64) u64 {
+    var port: u16 = 0;
+    if (sockByFd(s)) |sk| port = sk.local_port;
+    if (!writeSockaddr(name, namelen, .{ 127, 0, 0, 1 }, port)) {
+        setLastError(WSAEFAULT);
+        return INVALID_SOCKET;
+    }
+    logf("[WS2] getsockname(fd=0x{x}) -> 127.0.0.1:{d}\n", .{ s, port });
+    return 0;
+}
+
+/// getpeername(s, name, namelen): удалённый конец — адрес из connect().
+fn wsaGetpeername(s: u64, name: u64, namelen: u64) u64 {
+    const k = sockByFd(s) orelse {
+        setLastError(WSAENOTCONN);
+        return INVALID_SOCKET;
+    };
+    if (!k.connected) {
+        setLastError(WSAENOTCONN);
+        return INVALID_SOCKET;
+    }
+    if (!writeSockaddr(name, namelen, k.peer_ip, k.peer_port)) {
+        setLastError(WSAEFAULT);
+        return INVALID_SOCKET;
+    }
+    logf("[WS2] getpeername(fd=0x{x}) -> {d}.{d}.{d}.{d}:{d}\n", .{ s, k.peer_ip[0], k.peer_ip[1], k.peer_ip[2], k.peer_ip[3], k.peer_port });
+    return 0;
+}
+
+// ── Мультиплексор select (КЛЮЧЕВОЙ путь волны №4 к send) ──
+
+const SockFilter = enum { read, write };
+
+/// fd_set: { u32 fd_count; SOCKET fd_array[64]; } — массив с СМЕЩЕНИЯ 8.
+/// НАСТОЯЩАЯ семантика select: набор ПЕРЕЗАПИСЫВАЕТСЯ — в fd_array
+/// остаются только ГОТОВЫЕ дескрипторы, fd_count = их число. null = битый
+/// указатель (WSAEFAULT).
+fn fdSetFilter(fd_set: u64, kind: SockFilter) ?u64 {
+    if (!ops.validate_read(fd_set, 8) or !ops.validate_write(fd_set, 8)) return null;
+    const count = userD(fd_set).*;
+    if (count > 64) return null; // мусорный count — не наш набор
+    if (count > 0 and (!ops.validate_read(fd_set + 8, @as(u64, count) * 8) or
+        !ops.validate_write(fd_set + 8, @as(u64, count) * 8))) return null;
+    var kept: u64 = 0;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const fd = userQ(fd_set + 8 + i * 8).*;
+        const ready = if (sockByFd(fd)) |sk| switch (kind) {
+            .write => sk.connected and !sk.recv_eof, // WRITABLE (после connect)
+            .read => sk.sent_bytes > 0, // READABLE (ответ «пришёл» после send)
+        } else false;
+        if (ready) {
+            userQ(fd_set + 8 + kept * 8).* = fd;
+            kept += 1;
+        }
+    }
+    userD(fd_set).* = @truncate(kept);
+    return kept;
+}
+
+/// select(nfds, readfds, writefds, exceptfds, timeout): мультиплексор
+/// дескрипторов. Подключённый сокет — WRITABLE (curl: неблокирующий
+/// connect завершён → отправка запроса); после send — READABLE.
+/// Наборы перезаписываются (готовые), exceptfds очищается, возврат —
+/// число готовых дескрипторов. timeout (timeval*, 5-й арг — стек) не
+/// блокируем (неблокирующий опрос — ядро без sleep-примитива для Ring 3).
+fn wsaSelect(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64) u64 {
+    _ = nfds; // границы задаёт содержимое наборов (Winsock игнорирует nfds)
+    _ = timeout; // {i64 s; i64 us} — не блокируем
+    var ready: u64 = 0;
+    var wr: u64 = 0;
+    if (readfds != 0) {
+        if (fdSetFilter(readfds, .read)) |n| {
+            ready += n;
+        } else {
+            setLastError(WSAEFAULT);
+            return INVALID_SOCKET;
+        }
+    }
+    if (writefds != 0) {
+        if (fdSetFilter(writefds, .write)) |n| {
+            ready += n;
+            wr = n;
+        } else {
+            setLastError(WSAEFAULT);
+            return INVALID_SOCKET;
+        }
+    }
+    if (exceptfds != 0) {
+        // исключений нет (out-of-band отсутствует) — набор очищается
+        if (ops.validate_read(exceptfds, 4) and ops.validate_write(exceptfds, 4)) {
+            userD(exceptfds).* = 0;
+        }
+    }
+    if (ready > 0) {
+        logf("[WS2] select -> {d} ready (writable={d}, readable={d})\n", .{ ready, wr, ready - wr });
+    }
+    return ready;
+}
+
+/// send(s, buf, len, flags): loopback-отправка — буфер валидируется
+/// (validate_read: USER-страницы!), все len байт «уходят» (возврат len),
+/// ПЕРВЫЙ payload логируется как [HTTP-SEND] — МОМЕНТ ИСТИНЫ №4: в логе
+/// виден исходящий HTTP-запрос curl. После send «приходит» ответ (FD_READ).
 fn wsaSend(s: u64, buf: u64, len: u64, flags: u64) u64 {
     _ = flags;
     if (len > 64 * 1024 * 1024) {
@@ -1098,19 +1439,89 @@ fn wsaSend(s: u64, buf: u64, len: u64, flags: u64) u64 {
         setLastError(WSAEFAULT);
         return INVALID_SOCKET;
     }
-    logf("[WS2] send(fd=0x{x}, len={d}) — SOCKET_ERROR WSAENETDOWN (стек сети: цикл №4)\n", .{ s, len });
-    setLastError(WSAENETDOWN);
-    return INVALID_SOCKET;
+    if (sockByFd(s)) |sk| {
+        if (!sk.connected) {
+            setLastError(WSAENOTCONN);
+            return INVALID_SOCKET;
+        }
+        sk.sent_bytes += len;
+        sk.pending |= FD_READ; // «ответ пришёл» — событие чтения
+        sk.write_reported = false; // буфер «опустошён» — снова WRITABLE
+        if (!sk.send_logged and len > 0) {
+            sk.send_logged = true;
+            logSendPayload(s, buf, len);
+        } else {
+            logf("[WS2] send(fd=0x{x}, len={d}) -> {d}\n", .{ s, len, len });
+        }
+    } else {
+        logf("[WS2] send(fd=0x{x}, len={d}) -> {d} (untracked)\n", .{ s, len, len });
+    }
+    return len;
 }
 
-/// recv(s, buf, len, flags): SOCKET_ERROR + WSAETIMEDOUT (нет сети).
+/// Лог первого payload: \r/\n экранируются ("\\r\\n"), до 96 байт.
+fn logSendPayload(s: u64, buf: u64, len: u64) void {
+    var esc: [128]u8 = undefined;
+    var n: usize = 0;
+    const cap: u64 = @min(len, 96);
+    var i: u64 = 0;
+    while (i < cap and n + 2 < esc.len) : (i += 1) {
+        const ch = userPtr(buf)[@as(usize, @intCast(i))];
+        switch (ch) {
+            '\r' => {
+                esc[n] = '\\';
+                esc[n + 1] = 'r';
+                n += 2;
+            },
+            '\n' => {
+                esc[n] = '\\';
+                esc[n + 1] = 'n';
+                n += 2;
+            },
+            else => {
+                esc[n] = if (ch >= 0x20 and ch < 0x7F) ch else '.';
+                n += 1;
+            },
+        }
+    }
+    const more = if (len > cap) "..." else "";
+    logf("[HTTP-SEND] fd=0x{x}, len={d}: \"{s}\"{s}\n", .{ s, len, esc[0..n], more });
+}
+
+/// recv(s, buf, len, flags): loopback-приём синтетического HTTP-ответа
+/// шима (HTTP/1.1 200 OK + Content-Length: 13 + "Hello POLER!\n").
+/// Первый recv отдаёт ответ (частями по len), по исчерпании — 0 = EOF
+/// (соединение «закрыто» сервером: FD_CLOSE).
 fn wsaRecv(s: u64, buf: u64, len: u64, flags: u64) u64 {
-    _ = buf;
-    _ = len;
     _ = flags;
-    logf("[WS2] recv(fd=0x{x}) — SOCKET_ERROR WSAETIMEDOUT (стек сети: цикл №4)\n", .{s});
-    setLastError(WSAETIMEDOUT);
-    return INVALID_SOCKET;
+    const sk = sockByFd(s) orelse {
+        setLastError(WSAENOTCONN);
+        return INVALID_SOCKET;
+    };
+    if (sk.sent_bytes == 0) {
+        // запрос ещё не «отправлен» — данных нет (неблокирующий сокет)
+        setLastError(WSAEWOULDBLOCK);
+        return INVALID_SOCKET;
+    }
+    if (sk.recv_eof) {
+        sk.pending |= FD_CLOSE; // сервер закрыл соединение
+        logf("[HTTP-RECV] fd=0x{x} -> 0 (EOF)\n", .{s});
+        return 0;
+    }
+    const total = HTTP_RESP.len;
+    const remaining = total - sk.recv_cursor;
+    const n = @min(@as(usize, @intCast(@min(len, 64 * 1024 * 1024))), remaining);
+    if (n > 0) {
+        if (!ops.validate_write(buf, n)) {
+            setLastError(WSAEFAULT);
+            return INVALID_SOCKET;
+        }
+        @memcpy(userPtr(buf)[0..n], HTTP_RESP[sk.recv_cursor .. sk.recv_cursor + n]);
+        sk.recv_cursor += n;
+    }
+    if (sk.recv_cursor >= total) sk.recv_eof = true;
+    logf("[HTTP-RECV] fd=0x{x}: {d} байт ({d}/{d})\n", .{ s, n, sk.recv_cursor, total });
+    return n;
 }
 
 /// htons/htonl/ntohs/ntohl: byte-swap (little-endian хост).
@@ -1211,38 +1622,79 @@ fn wsaResetEvent(h: u64) u64 {
     return 1;
 }
 
-/// WSAEventSelect(s, h, events): 0 = успех. События сокета НЕ приходят
-/// (нет сетевого стека) — curl узнает об этом через EnumNetworkEvents.
+/// WSAEventSelect(s, h, events): регистрация ИНТЕРЕСА сокета к событиям
+/// (events=0 — разарма). Арма «проигрывает» накопленное состояние — событие
+/// объекта сигнализирует немедленно (Win64-семантика): не-отчитанный
+/// FD_CONNECT, WRITABLE после connect, доступный ответ, EOF.
 fn wsaEventSelect(s: u64, h: u64, events: u64) u64 {
+    const mask: u32 = @truncate(events);
+    if (sockByFd(s)) |sk| {
+        sk.event_handle = if (mask != 0) h else 0;
+        sk.event_mask = mask;
+        if (mask != 0) {
+            if (mask & FD_CONNECT != 0 and !sk.connect_reported) sk.pending |= FD_CONNECT;
+            if (mask & FD_WRITE != 0 and sk.connected and !sk.write_reported) sk.pending |= FD_WRITE;
+            if (mask & FD_READ != 0 and sk.sent_bytes > 0) sk.pending |= FD_READ;
+            if (mask & FD_CLOSE != 0 and sk.recv_eof) sk.pending |= FD_CLOSE;
+        }
+    }
     logf("[WS2] WSAEventSelect(fd=0x{x}, handle=0x{x}, events=0x{x}) -> 0\n", .{ s, h, events });
     return 0;
 }
 
-/// WSAEnumNetworkEvents(s, h, lpNetworkEvents): 0 = успех, структура
-/// обнулена (событий нет). WSANETWORKEVENTS: fd=0,s1=0,dw=0,fd2=0… iErrorCode[6].
+/// WSAEnumNetworkEvents(s, h, lpNetworkEvents): ОТЧЁТ о накопленных
+/// событиях сокета (WSANETWORKEVENTS, 44Б) + авто-сброс записей и события
+/// объекта (Win64-семантика). КЛЮЧ волны №4: FD_CONNECT с
+/// iErrorCode[FD_CONNECT_BIT]=0 — curl узнаёт, что неблокирующий
+/// connect() УСПЕШНО завершён, и переходит к send() HTTP-запроса.
 fn wsaEnumNetworkEvents(s: u64, h: u64, lp: u64) u64 {
-    if (lp != 0 and ops.validate_write(lp, 32)) {
-        @memset(userPtr(lp)[0..32], 0); // lNetworkEvents = 0
-    }
-    logf("[WS2] WSAEnumNetworkEvents(fd=0x{x}) -> 0 событий\n", .{s});
     _ = h;
+    var ev: u32 = 0;
+    if (sockByFd(s)) |sk| ev = sk.pending;
+    if (lp != 0 and ops.validate_write(lp, WSANETWORKEVENTS_SIZE)) {
+        // { long iNetworkEvents; int iErrorCode[FD_MAX_EVENTS]; }
+        @memset(userPtr(lp)[0..@as(usize, @intCast(WSANETWORKEVENTS_SIZE))], 0);
+        if (ev != 0) {
+            userD(lp).* = ev; // iNetworkEvents
+            if (ev & FD_CONNECT != 0) {
+                userD(lp + 4 + FD_CONNECT_BIT * 4).* = 0; // iErrorCode[FD_CONNECT_BIT]: 0 = успех
+            }
+            if (ev & FD_CLOSE != 0) {
+                userD(lp + 4 + FD_CLOSE_BIT * 4).* = 0; // закрытие без ошибок
+            }
+        }
+    }
+    if (ev != 0) {
+        if (sockByFd(s)) |sk| {
+            if (ev & FD_CONNECT != 0) sk.connect_reported = true; // FD_CONNECT одноразовый
+            if (ev & FD_WRITE != 0) sk.write_reported = true; // до следующего send
+            sk.pending = 0; // авто-сброс: события отчитаны
+        }
+        var nb: [48]u8 = undefined;
+        logf("[WS2] WSAEnumNetworkEvents(fd=0x{x}) -> 0x{x} ({s})\n", .{ s, ev, fdNames(ev, &nb) });
+    }
     return 0;
 }
 
 /// WSAWaitForMultipleEvents(n, events, waitAll, timeout, alertable):
-/// события никогда не сигналятся → WSA_WAIT_TIMEOUT. Это честная граница
-/// (нет сигнальных объектов — kernel-task не блокируется, планировщик
-/// переключает задачи; curl крутит свой неблокирующий цикл).
+/// сигнальные объекты — тред-хэндлы (Killed) и WSA-события сокетов
+/// (производная сигнальность: pending & mask != 0 — события ПРОИЗОШЛИ
+/// и ждут WSAEnumNetworkEvents). Иначе — WSA_WAIT_TIMEOUT (неблокирующее
+/// ядро: curl крутит свой цикл, планировщик работает).
 fn wsaWaitForMultipleEvents(n: u64, events_va: u64, wait_all: u64, timeout: u64, alertable: u64) u64 {
     if (n == 0 or n > 64) return @as(u64, WSA_INVALID_HANDLE);
     if (events_va == 0 or !ops.validate_read(events_va, n * 8)) {
         return @as(u64, WSA_INVALID_HANDLE);
     }
-    // сигнальный объект? (тред-хэндл завершившегося резолвера)
     var i: u64 = 0;
     while (i < n) : (i += 1) {
-        if (ops.object_signaled(userQ(events_va + i * 8).*)) {
+        const h = userQ(events_va + i * 8).*;
+        if (ops.object_signaled(h)) {
             logf("[WS2] WSAWaitForMultipleEvents(n={d}) -> EVENT {d} signaled\n", .{ n, i });
+            return WSA_WAIT_EVENT_0 + i;
+        }
+        if (sockEventSignaled(h)) {
+            logf("[WS2] WSAWaitForMultipleEvents(n={d}) -> EVENT {d} (сокетные события)\n", .{ n, i });
             return WSA_WAIT_EVENT_0 + i;
         }
     }
@@ -1252,6 +1704,19 @@ fn wsaWaitForMultipleEvents(n: u64, events_va: u64, wait_all: u64, timeout: u64,
     }
     _ = alertable;
     return WSA_WAIT_TIMEOUT;
+}
+
+/// Событие сокета сигнально? Сигнальность ПРОИЗВОДНА от pending —
+/// интерес армлен (WSAEventSelect) и есть неотчитанные события.
+fn sockEventSignaled(h: u64) bool {
+    const c = &(ctx orelse return false);
+    var i: usize = 0;
+    while (i < MAX_SOCKS) : (i += 1) {
+        const sk = &c.sockets[i];
+        if (sk.in_use and sk.event_handle == h and sk.event_mask != 0 and
+            (sk.pending & sk.event_mask) != 0) return true;
+    }
+    return false;
 }
 
 const WSA_INVALID_HANDLE: u64 = 6;
@@ -1459,6 +1924,100 @@ fn kfileno(file: u64) u64 {
 /// прочее — не tty (0). curl решает: раскраска/прогресс vs pipe-режим.
 fn kisatty(fd: u64) u64 {
     return if (fd <= 2) 1 else 0;
+}
+
+/// _get_osfhandle(fd): int fd → Win32 HANDLE (mingw-UCRT печатает тело
+/// ответа fwrite'ом через osfhandle-путь; 0/1/2 → stdio-псевдохэндлы).
+/// v0.13.0 (CDD №4, финальный шаг цикла).
+fn kGetOsfHandle(fd: u64) u64 {
+    const h: u64 = switch (fd) {
+        0 => FAKE_STDIN,
+        1 => FAKE_STDOUT,
+        2 => FAKE_STDERR,
+        else => 0xFFFFFFFF_FFFF_FFFF, // -1: не-stdio fd
+    };
+    logf("[WIN32] _get_osfhandle({d}) -> 0x{x}\n", .{ fd, h });
+    return h;
+}
+
+/// MultiByteToWideChar(cp, flags, src, cb, dst, cch): ANSI/UTF-8 →
+/// UTF-16LE. ASCII-маппинг (байт → u16); не-ASCII байты — '.' (честный
+/// CDD: реальная таблица CP — цикл №5 при не-ASCII потребности).
+/// cb=-1: NUL-терминированный источник (NUL копируется, входит в счёт).
+/// dst=0/cch=0: только ДЛИНА (UCRT-двухфазный вызов). 0 = неудача.
+fn kMultiByteToWideChar(src_va: u64, cb_in: u64, dst_va: u64, cch: u64) u64 {
+    const cp_flags_unused = true; // cp/flags: CP_ACP/CP_UTF8 экв. для ASCII
+    _ = cp_flags_unused;
+    // Длина источника
+    var n: u64 = 0;
+    var nul_term = false;
+    if (@as(i64, @bitCast(cb_in)) == -1) {
+        const len = userStrLen(src_va) orelse return 0; // битый указатель
+        n = len + 1; // с NUL
+        nul_term = true;
+    } else {
+        n = cb_in;
+        if (n > MAX_STR_LEN) return 0;
+    }
+    if (n > 0 and !ops.validate_read(src_va, n)) return 0;
+
+    // Двухфазность: запрос длины
+    if (dst_va == 0 or cch == 0) {
+        return n;
+    }
+    if (cch < n) {
+        setLastError(122); // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    if (!ops.validate_write(dst_va, n * 2)) return 0;
+
+    // Копирование ASCII → UTF-16LE
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        var ch: u16 = userPtr(src_va)[@as(usize, @intCast(i))];
+        if (ch >= 0x80) {
+            ch = '.'; // не-ASCII — CDD-граница (таблицы CP: цикл №5)
+        }
+        if (nul_term and i + 1 == n) ch = 0; // завершающий NUL
+        userW(dst_va + i * 2).* = ch;
+    }
+    logf("[WIN32] MultiByteToWideChar: {d} симв\n", .{n});
+    return n;
+}
+
+/// WriteConsoleW(h, lpBuffer(WCHAR*), nChars, lpWritten, lpReserved):
+/// ФИНАЛ печати: UTF-16LE-буфер → консоль ОС (побайтово в UTF-8-терминал).
+/// UCRT: fwrite(stdout) → MB2WC → WriteConsoleW. Тело «Hello POLER!»
+/// приходит сюда (v0.13.0, CDD №4 — замыкание HTTP-обмена).
+fn kWriteConsoleW(handle: u64, buf_va: u64, n_chars: u64, lp_written: u64) u64 {
+    _ = handle;
+    if (n_chars > MAX_STR_LEN) return 0;
+    if (n_chars > 0 and !ops.validate_read(buf_va, n_chars * 2)) return 0;
+    var utf8: [512]u8 = undefined;
+    var n: usize = 0;
+    var i: u64 = 0;
+    while (i < n_chars and n < utf8.len) : (i += 1) {
+        const ch = userW(buf_va + i * 2).*;
+        if (ch < 0x80) {
+            utf8[n] = @intCast(ch);
+            n += 1;
+        } else if (ch < 0x800 and n + 2 < utf8.len) {
+            // 2-байтовый UTF-8
+            utf8[n] = @intCast(0xC0 | (ch >> 6));
+            utf8[n + 1] = @intCast(0x80 | (ch & 0x3F));
+            n += 2;
+        } else if (n + 3 < utf8.len) {
+            utf8[n] = 0xE0;
+            utf8[n + 1] = @intCast(0x80 | ((ch >> 6) & 0x3F));
+            utf8[n + 2] = @intCast(0x80 | (ch & 0x3F));
+            n += 3;
+        }
+    }
+    if (n > 0) ops.write_console(utf8[0..n]);
+    if (lp_written != 0 and ops.validate_write(lp_written, 4)) {
+        userD(lp_written).* = @intCast(n_chars); // все символы «записаны»
+    }
+    return 1; // BOOL TRUE
 }
 
 /// _setmode(fd, mode): возвращает ПРЕДЫДУЩИЙ режим (UCRT-конвенция).
@@ -1752,6 +2311,15 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = verifyVersionInfoW(a1, a2, a3);
         } else if (std.mem.eql(u8, name, "GetEnvironmentVariableA")) {
             ret = getEnvironmentVariableA(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "MultiByteToWideChar")) {
+            // v0.13.0 (CDD №4, финал): CP_UTF8/CP_ACP → UTF-16LE (ASCII-путь —
+            // тело ответа «Hello POLER!» печатается UCRT-fwrite через это).
+            // Win64: RCX=cp, RDX=flags, R8=src, R9=cb, стек[0]=dst, стек[1]=cch
+            ret = kMultiByteToWideChar(a3, a4, ops.stack_arg(0), ops.stack_arg(1));
+        } else if (std.mem.eql(u8, name, "WriteConsoleW")) {
+            // v0.13.0 (CDD №4, ФИНАЛ): UTF-16LE → консоль ОС — тело ответа
+            // Win64: RCX=h, RDX=buf, R8=n, R9=lpWritten, стек[0]=lpReserved
+            ret = kWriteConsoleW(a1, a2, a3, a4);
         } else if (std.mem.eql(u8, name, "GetEnvironmentVariableW")) {
             ret = getEnvironmentVariableW(a1, a2, a3);
         } else if (std.mem.eql(u8, name, "FormatMessageA")) {
@@ -1800,6 +2368,11 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
         } else if (std.mem.eql(u8, name, "SleepConditionVariableCS")) {
             // CV свободна (никто не ждёт под тем же CS) — мгновенный TRUE
             ret = kSleepConditionVariableCS(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "SleepEx")) {
+            // v0.13.0 (CDD №4, финальный шаг): сон «пройден» — 0 (ядро без
+            // sleep-примитива для Ring 3; curl ждёт готовности сокета)
+            logf("[WIN32] SleepEx({d}ms) -> 0 (проснулся)\n", .{a1});
+            ret = 0;
         } else if (std.mem.eql(u8, name, "CreateThread")) {
             // threading-волна: RCX=attrs, RDX=stackSize, R8=start, R9=param,
             // стек[0]=flags, стек[1]=pThreadId
@@ -1838,6 +2411,10 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
         } else if (std.mem.eql(u8, name, "_fileno")) {
             // event-волна: FILE* → fd (stdin/stdout/stderr = 0/1/2)
             ret = kfileno(a1);
+        } else if (std.mem.eql(u8, name, "_get_osfhandle")) {
+            // v0.13.0 (CDD №4): fd → HANDLE (тело ответа печатается fwrite'ом
+            // через osfhandle-путь mingw-UCRT: 0/1/2 → псевдо-хэндлы stdio)
+            ret = kGetOsfHandle(a1);
         } else if (std.mem.eql(u8, name, "_isatty")) {
             ret = kisatty(a1);
         } else if (std.mem.eql(u8, name, "_setmode")) {
@@ -1992,6 +2569,20 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = wsaClosesocket(a1);
         } else if (std.mem.eql(u8, name, "ioctlsocket")) {
             ret = wsaIoctlsocket(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "setsockopt")) {
+            // v0.13.0 (CDD №4): опции сокета (optlen — 5-й арг, стек)
+            ret = wsaSetsockopt(a1, a2, a3, a4, ops.stack_arg(0));
+        } else if (std.mem.eql(u8, name, "getsockopt")) {
+            ret = wsaGetsockopt(a1, a2, a3, a4, ops.stack_arg(0));
+        } else if (std.mem.eql(u8, name, "getsockname")) {
+            ret = wsaGetsockname(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "getpeername")) {
+            ret = wsaGetpeername(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "select")) {
+            // v0.13.0 (CDD №4): мультиплексор (timeout — 5-й арг, стек)
+            ret = wsaSelect(a1, a2, a3, a4, ops.stack_arg(0));
+        } else if (std.mem.eql(u8, name, "shutdown")) {
+            ret = wsaShutdown(a1, a2);
         } else if (std.mem.eql(u8, name, "send")) {
             ret = wsaSend(a1, a2, a3, a4);
         } else if (std.mem.eql(u8, name, "recv")) {
@@ -2610,6 +3201,7 @@ fn tCtx(cmdline: []const u8) void {
         .sspi_table = 0,
         .locale_str = 0,
         .next_event_handle = 0x200,
+        .sockets = [_]Sock{.{}} ** MAX_SOCKS,
     };
 }
 
@@ -3403,26 +3995,281 @@ test "ws2: htons/htonl/ntohs/ntohl + WSAGetLastError" {
     try testing.expectEqual(@as(u64, 10060), reg.call(id_wgle, 0, 0, 0, 0));
 }
 
-test "ws2: send/recv — SOCKET_ERROR (честная граница: нет сетевого стека)" {
+test "ws2: send/recv — loopback HTTP-обмен: [HTTP-SEND], 200 OK, EOF" {
     ops = tOps();
     tReset();
     tCtx("");
     var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
     reg.init();
+    const id_sock = reg.add("WS2_32.dll", "socket", 0);
+    const id_conn = reg.add("WS2_32.dll", "connect", 0);
     const id_send = reg.add("WS2_32.dll", "send", 0);
     const id_recv = reg.add("WS2_32.dll", "recv", 0);
+    const id_sel = reg.add("WS2_32.dll", "select", 0);
 
     const mb: u64 = @intFromPtr(&g_mem);
-    @memcpy(g_mem[0x100..0x100 + 14], "GET / HTTP/1.1");
-    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_send, 0x100, mb + 0x100, 16, 0));
-    try testing.expectEqual(@as(u32, 10050), ctx.?.last_error);
-    try testing.expect(logHas("send(fd=0x100, len=16)"));
-    // мусорный буфер → SOCKET_ERROR + WSAEFAULT (не паника)
-    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_send, 0x100, 0x9990, 16, 0));
+    const fd = reg.call(id_sock, 2, 1, 6, 0);
+    // sockaddr_in {AF_INET, 80 BE, 192.0.2.1}
+    const sa = mb + 0x200;
+    userW(sa).* = 2;
+    userW(sa + 2).* = std.mem.nativeToBig(u16, 80);
+    @memcpy(g_mem[0x204..0x208], &[_]u8{ 192, 0, 2, 1 });
+    try testing.expectEqual(@as(u64, 0), reg.call(id_conn, fd, sa, 16, 0));
+
+    // send ДО connect на ВТОРОМ сокете → WSAENOTCONN
+    const fd2 = reg.call(id_sock, 2, 1, 6, 0);
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_send, fd2, mb + 0x600, 4, 0));
+    try testing.expectEqual(@as(u32, 10057), ctx.?.last_error);
+
+    // recv ДО send (неблокирующий) → WSAEWOULDBLOCK
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_recv, fd, mb + 0x700, 64, 0));
+    try testing.expectEqual(@as(u32, 10035), ctx.?.last_error);
+
+    // select(writefds) ДО send: connected → WRITABLE → 1 ready
+    const wfds = mb + 0x300;
+    userD(wfds).* = 1;
+    userQ(wfds + 8).* = fd;
+    userQ(wfds + 16).* = fd2;
+    userD(wfds).* = 2;
+    try testing.expectEqual(@as(u64, 1), reg.call(id_sel, 0, 0, wfds, 0));
+    try testing.expectEqual(@as(u32, 1), userD(wfds).*); // набор отфильтрован
+    try testing.expectEqual(fd, userQ(wfds + 8).*); // остался ТОЛЬКО готовый
+    try testing.expect(logHas("[WS2] select -> 1 ready"));
+
+    // send: GET-запрос (момент истины №4)
+    const req = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    @memcpy(g_mem[0x600 .. 0x600 + req.len], req);
+    try testing.expectEqual(@as(u64, req.len), reg.call(id_send, fd, mb + 0x600, req.len, 0));
+    try testing.expect(logHas("[HTTP-SEND]"));
+    try testing.expect(logHas("GET / HTTP/1.1\\r\\nHost: example.com"));
+
+    // select(readfds) ПОСЛЕ send → READABLE
+    const rfds = mb + 0x380;
+    userD(rfds).* = 1;
+    userQ(rfds + 8).* = fd;
+    try testing.expectEqual(@as(u64, 1), reg.call(id_sel, 0, rfds, 0, 0));
+
+    // recv: полный ответ (52Б), тело в конце
+    const rb = mb + 0x700;
+    try testing.expectEqual(@as(u64, 52), reg.call(id_recv, fd, rb, 4096, 0));
+    try testing.expectEqualStrings("HTTP/1.1 200 OK", @as([*]u8, @ptrFromInt(rb))[0..15]);
+    try testing.expectEqualStrings("Hello POLER!\n", @as([*]u8, @ptrFromInt(rb))[39..52]);
+    try testing.expect(logHas("[HTTP-RECV]"));
+    // recv частями: второй сокет, len=10 → 10 байт, потом остаток
+    const fd3 = reg.call(id_sock, 2, 1, 6, 0);
+    @memcpy(g_mem[0x204..0x208], &[_]u8{ 127, 0, 0, 1 });
+    try testing.expectEqual(@as(u64, 0), reg.call(id_conn, fd3, sa, 16, 0));
+    @memcpy(g_mem[0x640 .. 0x640 + 4], "HEAD");
+    _ = reg.call(id_send, fd3, mb + 0x640, 4, 0);
+    // мусорный буфер recv при ждущих данных → WSAEFAULT (валидация!)
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_recv, fd3, 0x9990, 16, 0));
     try testing.expectEqual(@as(u32, 10014), ctx.?.last_error);
-    // recv → SOCKET_ERROR + WSAETIMEDOUT
-    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_recv, 0x100, mb + 0x200, 64, 0));
-    try testing.expectEqual(@as(u32, 10060), ctx.?.last_error);
+    const rb3 = mb + 0x780;
+    try testing.expectEqual(@as(u64, 10), reg.call(id_recv, fd3, rb3, 10, 0));
+    try testing.expectEqual(@as(u64, 42), reg.call(id_recv, fd3, rb3, 100, 0));
+    // EOF: ответ исчерпан → 0
+    try testing.expectEqual(@as(u64, 0), reg.call(id_recv, fd3, rb3, 100, 0));
+    try testing.expect(logHas("(EOF)"));
+    // после EOF fd3 не WRITABLE
+    userD(wfds).* = 1;
+    userQ(wfds + 8).* = fd3;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sel, 0, 0, wfds, 0));
+
+    // мусорный буфер send → SOCKET_ERROR + WSAEFAULT (валидация!)
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_send, fd, 0x9990, 16, 0));
+    try testing.expectEqual(@as(u32, 10014), ctx.?.last_error);
+}
+
+test "ws2: setsockopt/getsockopt — опции сохраняются, SO_ERROR=0" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_sock = reg.add("WS2_32.dll", "socket", 0);
+    const id_conn = reg.add("WS2_32.dll", "connect", 0);
+    const id_sso = reg.add("WS2_32.dll", "setsockopt", 0);
+    const id_gso = reg.add("WS2_32.dll", "getsockopt", 0);
+
+    const mb: u64 = @intFromPtr(&g_mem);
+    const fd = reg.call(id_sock, 2, 1, 6, 0);
+    const sa = mb + 0x200;
+    userW(sa).* = 2;
+    userW(sa + 2).* = std.mem.nativeToBig(u16, 80);
+    @memcpy(g_mem[0x204..0x208], &[_]u8{ 192, 0, 2, 1 });
+    _ = reg.call(id_conn, fd, sa, 16, 0);
+
+    // setsockopt(TCP_NODELAY, 1): optlen — 5-й арг (стек) = 4
+    userD(mb + 0x100).* = 1;
+    t_stack_args[0] = 4;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sso, fd, 6, 0x0001, mb + 0x100));
+    try testing.expect(logHas("setsockopt(fd=0x100, IPPROTO_TCP, TCP_NODELAY=1)"));
+    // SO_KEEPALIVE = 1
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sso, fd, 0xFFFF, 0x0008, mb + 0x100));
+    // SO_RCVBUF = 65536
+    userD(mb + 0x100).* = 65536;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sso, fd, 0xFFFF, 0x1002, mb + 0x100));
+
+    // getsockopt(SO_ERROR) → 0 (connect без ошибок)
+    const val = mb + 0x104;
+    const plen = mb + 0x108;
+    userD(plen).* = 4;
+    t_stack_args[0] = plen;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gso, fd, 0xFFFF, 0x1007, val));
+    try testing.expectEqual(@as(u32, 0), userD(val).*);
+    try testing.expectEqual(@as(u32, 4), userD(plen).*); // out: фактический размер
+    try testing.expect(logHas("getsockopt(fd=0x100, SOL_SOCKET, SO_ERROR)"));
+    // getsockopt(SO_TYPE) → SOCK_STREAM
+    userD(plen).* = 4;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gso, fd, 0xFFFF, 0x1008, val));
+    try testing.expectEqual(@as(u32, 1), userD(val).*);
+    // getsockopt(TCP_NODELAY) → 1 (сохранено setsockopt'ом)
+    userD(plen).* = 4;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gso, fd, 6, 0x0001, val));
+    try testing.expectEqual(@as(u32, 1), userD(val).*);
+    // getsockopt(SO_KEEPALIVE) → 1
+    userD(plen).* = 4;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gso, fd, 0xFFFF, 0x0008, val));
+    try testing.expectEqual(@as(u32, 1), userD(val).*);
+    // getsockopt(SO_RCVBUF) → 65536
+    userD(plen).* = 4;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gso, fd, 0xFFFF, 0x1002, val));
+    try testing.expectEqual(@as(u32, 65536), userD(val).*);
+    // дефолт после нового сокета: SO_KEEPALIVE = 0
+    const fd2 = reg.call(id_sock, 2, 1, 6, 0);
+    userD(plen).* = 4;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gso, fd2, 0xFFFF, 0x0008, val));
+    try testing.expectEqual(@as(u32, 0), userD(val).*);
+
+    // битый optlen-указатель → WSAEFAULT (не паника)
+    t_stack_args[0] = 0x9990;
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_gso, fd, 0xFFFF, 0x1007, val));
+    try testing.expectEqual(@as(u32, 10014), ctx.?.last_error);
+    // битый optval у setsockopt → WSAEFAULT
+    t_stack_args[0] = 4;
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_sso, fd, 6, 0x0001, 0x9990));
+    try testing.expectEqual(@as(u32, 10014), ctx.?.last_error);
+    // optlen=0 → no-op успех
+    t_stack_args[0] = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sso, fd, 6, 0x0001, 0));
+}
+
+test "ws2: getsockname/getpeername — sockaddr_in локальный/удалённый" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_sock = reg.add("WS2_32.dll", "socket", 0);
+    const id_conn = reg.add("WS2_32.dll", "connect", 0);
+    const id_gsn = reg.add("WS2_32.dll", "getsockname", 0);
+    const id_gpn = reg.add("WS2_32.dll", "getpeername", 0);
+
+    const mb: u64 = @intFromPtr(&g_mem);
+    const fd = reg.call(id_sock, 2, 1, 6, 0);
+    const sa = mb + 0x200;
+    userW(sa).* = 2;
+    userW(sa + 2).* = std.mem.nativeToBig(u16, 80);
+    @memcpy(g_mem[0x204..0x208], &[_]u8{ 192, 0, 2, 1 });
+
+    // ДО connect: getpeername → WSAENOTCONN
+    const nl = mb + 0x110;
+    userD(nl).* = 16;
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_gpn, fd, mb + 0x130, nl, 0));
+    try testing.expectEqual(@as(u32, 10057), ctx.?.last_error);
+    // но getsockname работает и до connect (порт эфемерный)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gsn, fd, mb + 0x120, nl, 0));
+    try testing.expectEqual(@as(u16, 2), userW(mb + 0x120).*); // AF_INET
+    try testing.expectEqual(std.mem.nativeToBig(u16, 0xC000), userW(mb + 0x122).*); // порт
+    try testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, @as([*]u8, @ptrFromInt(mb + 0x124))[0..4]);
+    try testing.expectEqual(@as(u32, 16), userD(nl).*); // *namelen = 16
+    try testing.expect(logHas("getsockname(fd=0x100) -> 127.0.0.1:49152"));
+
+    _ = reg.call(id_conn, fd, sa, 16, 0);
+    // ПОСЛЕ connect: getpeername → 192.0.2.1:80
+    userD(nl).* = 16;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_gpn, fd, mb + 0x130, nl, 0));
+    try testing.expectEqual(@as(u16, 2), userW(mb + 0x130).*);
+    try testing.expectEqual(std.mem.nativeToBig(u16, 80), userW(mb + 0x132).*);
+    try testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2, 1 }, @as([*]u8, @ptrFromInt(mb + 0x134))[0..4]);
+    try testing.expectEqual(@as(u32, 16), userD(nl).*);
+    try testing.expect(logHas("getpeername(fd=0x100) -> 192.0.2.1:80"));
+    // буфер меньше sockaddr_in → WSAEFAULT
+    userD(nl).* = 8;
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_gpn, fd, mb + 0x130, nl, 0));
+    try testing.expectEqual(@as(u32, 10014), ctx.?.last_error);
+}
+
+test "ws2: WSAEventSelect/Enum/Wait — FD_CONNECT сигнал, авто-сброс" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_sock = reg.add("WS2_32.dll", "socket", 0);
+    const id_conn = reg.add("WS2_32.dll", "connect", 0);
+    const id_es = reg.add("WS2_32.dll", "WSAEventSelect", 0);
+    const id_en = reg.add("WS2_32.dll", "WSAEnumNetworkEvents", 0);
+    const id_wait = reg.add("WS2_32.dll", "WSAWaitForMultipleEvents", 0);
+    const id_send = reg.add("WS2_32.dll", "send", 0);
+
+    const mb: u64 = @intFromPtr(&g_mem);
+    const fd = reg.call(id_sock, 2, 1, 6, 0);
+    const sa = mb + 0x200;
+    userW(sa).* = 2;
+    userW(sa + 2).* = std.mem.nativeToBig(u16, 80);
+    @memcpy(g_mem[0x204..0x208], &[_]u8{ 192, 0, 2, 1 });
+    _ = reg.call(id_conn, fd, sa, 16, 0);
+
+    // арм: FD_WRITE|FD_CONNECT|FD_CLOSE (0x32 — как curl)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_es, fd, 0x200, 0x32, 0));
+    // wait → событие 0 сигнально (pending FD_CONNECT|FD_WRITE)
+    userQ(mb + 0x400).* = 0x200;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_wait, 1, mb + 0x400, 0, 10));
+    try testing.expect(logHas("EVENT 0 (сокетные события)"));
+    // enum → 0x12 (FD_CONNECT|FD_WRITE), iErrorCode[FD_CONNECT_BIT]=0
+    const ne = mb + 0x500;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_en, fd, 0x200, ne, 0));
+    try testing.expectEqual(@as(u32, 0x12), userD(ne).*);
+    try testing.expectEqual(@as(u32, 0), userD(ne + 4 + 4 * 4).*);
+    try testing.expect(logHas("FD_WRITE|FD_CONNECT"));
+    // авто-сброс: повторный enum → 0
+    try testing.expectEqual(@as(u64, 0), reg.call(id_en, fd, 0x200, ne, 0));
+    try testing.expectEqual(@as(u32, 0), userD(ne).*);
+    // wait после сброса → TIMEOUT
+    try testing.expectEqual(@as(u64, 258), reg.call(id_wait, 1, mb + 0x400, 0, 10));
+
+    // повторный arm: FD_CONNECT одноразовый, FD_WRITE погашен (до send) —
+    // авто-сброс семантики: событий 0 (реальный Windows — edge-triggered)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_es, fd, 0x200, 0x12, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_en, fd, 0x200, ne, 0));
+    try testing.expectEqual(@as(u32, 0), userD(ne).*);
+
+    // arm без интереса к WRITE (только FD_READ|FD_CLOSE=0x21): pending=0
+    try testing.expectEqual(@as(u64, 0), reg.call(id_en, fd, 0x200, ne, 0));
+    // …но после send FD_READ появляется
+    _ = reg.call(id_es, fd, 0x200, 0x21, 0);
+    @memcpy(g_mem[0x600..0x604], "HEAD");
+    try testing.expectEqual(@as(u64, 4), reg.call(id_send, fd, mb + 0x600, 4, 0));
+    userQ(mb + 0x400).* = 0x200;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_wait, 1, mb + 0x400, 0, 10));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_en, fd, 0x200, ne, 0));
+    try testing.expectEqual(@as(u32, 0x1), userD(ne).*); // FD_READ
+    // разарма (events=0): событий нет
+    _ = reg.call(id_es, fd, 0x200, 0x21, 0);
+    _ = reg.call(id_es, fd, 0x200, 0, 0);
+    try testing.expectEqual(@as(u64, 258), reg.call(id_wait, 1, mb + 0x400, 0, 10));
+}
+
+test "ws2: shutdown — SD_BOTH, recv-EOF" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_shut = reg.add("WS2_32.dll", "shutdown", 0);
+    try testing.expectEqual(@as(u64, 0), reg.call(id_shut, 0x100, 2, 0, 0));
+    try testing.expect(logHas("shutdown(fd=0x100, SD_BOTH) -> 0"));
 }
 
 test "ws2: getaddrinfo/freeaddrinfo — синтез TEST-NET-1 + порт из service" {
@@ -3847,6 +4694,51 @@ test "str: strcspn — префикс до символа из набора" {
     // пустой reject → длина всей строки
     g_mem[0x160] = 0;
     try testing.expectEqual(@as(u64, 14), reg.call(id_cs, mb + 0x180, mb + 0x160, 0, 0));
+}
+
+test "crt: MultiByteToWideChar — длина, UTF-16LE, буфер" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_mw = reg.add("KERNEL32.dll", "MultiByteToWideChar", 0);
+
+    const mb: u64 = @intFromPtr(&g_mem);
+    const msg = "Hello POLER!\n";
+    @memcpy(g_mem[0x100 .. 0x100 + msg.len], msg);
+    g_mem[0x100 + msg.len] = 0;
+
+    // Двухфазный вызов: dst=0 → длина (13 + NUL = 14)
+    t_stack_args[0] = 0;
+    t_stack_args[1] = 0;
+    try testing.expectEqual(@as(u64, 14), reg.call(id_mw, 0, 0, mb + 0x100, 0xFFFF_FFFF_FFFF_FFFF));
+
+    // Полный вызов: dst/cch достаточно → 14, UTF-16LE корректен
+    const dst = mb + 0x200;
+    t_stack_args[0] = dst;
+    t_stack_args[1] = 32;
+    try testing.expectEqual(@as(u64, 14), reg.call(id_mw, 0, 0, mb + 0x100, 0xFFFF_FFFF_FFFF_FFFF));
+    try testing.expectEqual(@as(u16, 'H'), userW(dst).*);
+    try testing.expectEqual(@as(u16, 'e'), userW(dst + 2).*);
+    var buf: [13]u16 = undefined;
+    var i: usize = 0;
+    while (i < 13) : (i += 1) buf[i] = userW(dst + i * 2).*;
+    var exp: [13]u16 = undefined;
+    for ("Hello POLER!\n", 0..) |ch, k| exp[k] = ch;
+    try testing.expectEqualSlices(u16, &exp, &buf);
+    try testing.expectEqual(@as(u16, 0), userW(dst + 13 * 2).*); // NUL
+    // cch < n → 0 + ERROR_INSUFFICIENT_BUFFER
+    t_stack_args[0] = dst;
+    t_stack_args[1] = 4;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_mw, 0, 0, mb + 0x100, 0xFFFF_FFFF_FFFF_FFFF));
+    try testing.expectEqual(@as(u32, 122), ctx.?.last_error);
+    // явный cb (без NUL): длина = cb
+    t_stack_args[0] = 0;
+    t_stack_args[1] = 0;
+    try testing.expectEqual(@as(u64, 5), reg.call(id_mw, 0, 0, mb + 0x100, 5));
+    // битый src → 0 (не паника)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_mw, 0, 0, 0x9990, 8));
 }
 
 test "crt: mbstowcs_s — ANSI → UTF-16LE с NUL и счётчиком" {

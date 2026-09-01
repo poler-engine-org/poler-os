@@ -44,7 +44,7 @@ Linux-программы работают нативно — POLER-OS реали
 
 ---
 
-## Текущая версия: v0.12.0
+## Текущая версия: v0.13.0
 
 | Подсистема | Статус | Описание |
 |---|---|---|
@@ -52,17 +52,17 @@ Linux-программы работают нативно — POLER-OS реали
 | HAL | Готово | GDT, IDT, PIC remap, Local APIC timer (vector 48), IO-APIC, TSS IST1 |
 | ACPI | Готово | RSDP/RSDT/MADT/HPET parsing |
 | Memory | Готово | PMM (bitmap), VMM (4-level paging + OOM rollback), kernel heap (free-list + SipHash-2-4) |
-| Scheduler | Готово | Round-robin с APIC timer preemption (8 задач, divisor 16) |
-| Ring 3 | Готово | User mode: ELF64 loader, per-process CR3, syscall/sysretq, TSS IST |
+| Scheduler | Готово | Round-robin с APIC timer preemption (8 задач, 32КБ kernel-стеки, атомарное переключение, структурная валидация кадров) |
+| Ring 3 | Готово | User mode: ELF64 loader, per-process CR3, syscall/sysretq, TSS IST, транзакции syscall (in_win32_syscall — многотредовая безопасность) |
 | Framebuffer | Готово | Linear framebuffer (1024x768x32bpp) + bitmap font |
 | Keyboard | Готово | PS/2 Set 2 → Set 1 translation через i8042 controller (bit 6) |
 | Serial | Готово | COM1 (115200 baud, 8N1) |
 | Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
 | PUF | Готово | Привязка аппаратной энтропии: TSC-джиттер → сид PRNG ядра + identity; анти-клон enrollment (спека POST_QUANTUM_HARDWARE_ENTROPY) |
-| Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen, win32_call (#6) |
-| **Win32 PE Runtime** | **CDD-циклы 1–3** | **curl.exe в Ring 3 до connect()**: CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → getaddrinfo → socket() → **connect(192.0.2.1:80)**. 118 имплементаций + 6 native-стабов (strcmp/strncmp/bsearch — Ring-3-код), НАСТОЯЩИЕ Win64-треды (задачи планировщика на общем CR3), мост колбэка InitOnce (sysretq→launcher→trampoline→syscall #7), Enrollment-Gate (bindEnrolled — кремниевый отпечаток при буте), VerSetConditionMask/VerifyVersionInfoW (нативная «Win10»-семантика) |
+| Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen, win32_call (#6), cb_done (#7) |
+| **Win32 PE Runtime** | **CDD-циклы 1–4** | **curl.exe в Ring 3 — ПОЛНЫЙ HTTP-ОБМЕН**: CRT-init → main() → 2 Win64-треда (Happy Eyeballs) → getaddrinfo → socket() → connect() → select → **send(«GET / HTTP/1.1…», 75Б)** → recv(HTTP/1.1 200 OK, 52Б) → **«Hello POLER!» в консоли ОС** → штатный exit(0). 128 имплементаций + 6 native-стабов, SocketState-движок (опции/события FD_*/loopback-I/O), мультиплексор select с перезаписью fd_set, мост колбэка InitOnce, Enrollment-Gate |
 | SMP | Планируется | Многоядерность |
-| Networking | Планируется | virtio-net |
+| Networking | Планируется | virtio-net (реальный стек вместо loopback-штора) |
 | VFS | Планируется | Виртуальная файловая система |
 | Package verifier | Планируется | Криптографическая верификация пакетов на уровне ядра |
 
@@ -203,9 +203,9 @@ zig-kernel/
 - [x] Генератор динамических Win32-заглушек (Stub Dispatcher) с int3 контролируемым остановом (Crash-Driven Development)
 - [x] Интерактивные команды шелла `peinfo`, `pestubs` и `peload` (загрузка + запуск)
 - [x] VMM-маппинг секций PE64 в Ring 3 по ImageBase с посекционными правами (RW/NX/USER)
-- [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → socket() → connect() (v0.10–v0.12, CDD-циклы 1–3)
-- [x] Реализация базовых API kernel32/UCRT/WS2_32 «по мере запросов» (CDD): 118 syscall-трамплинов + 6 native-стабов (memset/memcpy/memmove/strlen/strcmp/strncmp + native-bsearch), block-heap, GetProcAddress, QPF/QPC (TSC), НАСТОЯЩИЕ Win64-треды, Enrollment-Gate
-- [ ] Следующие CDD-циклы: setsockopt/getsockopt/getsockname/select (сокетные опции и мультиплексирование — путь к send()), TLS-стек (SChannel), .reloc для DYNAMIC_BASE — по логу цепочки v0.12.0
+- [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → socket() → connect() → select → send() → recv() → печать тела → exit(0) (v0.10–v0.13, CDD-циклы 1–4)
+- [x] Реализация базовых API kernel32/UCRT/WS2_32 «по мере запросов» (CDD): 128 syscall-трамплинов + 6 native-стабов (memset/memcpy/memmove/strlen/strcmp/strncmp + native-bsearch), block-heap, GetProcAddress, QPF/QPC (TSC), НАСТОЯЩИЕ Win64-треды, Enrollment-Gate, SocketState-движок с событиями FD_* и loopback-HTTP
+- [ ] Следующие CDD-циклы: TLS-стек (SChannel: InitializeSecurityContext/AcquireCredentials через SSPI-таблицу — https://), DNS-резолвер реальный (сейчас — синтез TEST-NET), .reloc для DYNAMIC_BASE, сетевой стек virtio-net (замена loopback-шиму) — по логу цепочки v0.13.0
 - [ ] Подмножество Linux system call interface
 - [ ] POSIX compatibility layer
 
@@ -218,6 +218,17 @@ zig-kernel/
 ---
 
 ## История версий
+
+### v0.13.0 — CDD-цикл №4: МОМЕНТ ИСТИНЫ №4 — первый HTTP-обмен в POLER-OS
+- **МОМЕНТ ИСТИНЫ №4 — ПОЛНЫЙ ЗАМКНУТЫЙ ЦИКЛ**: `curl.exe http://example.com` в Ring 3: … → connect(192.0.2.1:80) → select (WRITABLE) → **send(«GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/8.21.0…», 75Б)** → recv(«HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello POLER!\n», 52Б) → MultiByteToWideChar → WriteConsoleW → **«Hello POLER!» напечатан curl.exe в консоли ОС** → **штатный ExitProcess(0x0)**. Бэклог трапов ПУСТ — цепочка дошла до конца без новых падений.
+- **SocketState-движок** (`win32_crt.zig`): таблица состояний сокетов (fd=0x100+индекс): опции (TCP_NODELAY/SO_KEEPALIVE/SO_RCVBUF/SO_SNDBUF), nonblocking, connected, peer/local адреса, события FD_* (pending/mask/авто-сброс). setsockopt/getsockopt (SO_ERROR=0 — статус неблокирующего connect), getsockname/getpeername (заполнение sockaddr_in, эфемерный порт), shutdown.
+- **Мультиплексор select с НАСТОЯЩЕЙ семантикой**: fd_set перезаписывается (остаются только готовые дескрипторы — curl проверяет через __WSAFDIsSet), подключённый сокет WRITABLE, после send — READABLE; exceptfds очищается.
+- **Event-машина WS2**: WSAEventSelect/EnumNetworkEvents с ОТЧЁТОМ FD_CONNECT (iErrorCode[FD_CONNECT_BIT]=0 — curl узнаёт о завершении неблокирующего connect — КЛЮЧ волны: до этого вечный поллинг), авто-сброс записей, производная сигнальность WSAWaitForMultipleEvents.
+- **Loopback-HTTP**: send — валидация буфера + лог первого payload `[HTTP-SEND]` + возврат len; recv — синтет-ответ «HTTP/1.1 200 OK…Hello POLER!\n» (Content-Length честен — curl завершает передачу по телу), по исчерпании 0=EOF+FD_CLOSE.
+- **КРИТИЧЕСКИЙ фикс планировщика — гонка user_rsp (латентная с v0.12, взорвалась на 3 Ring-3 задачах)**: глобальный user_rsp в isr64.S перезаписывался чужим тредом, когда таймерный тик прерывал syscall-обработчик и переключал задачу — sysretq выбрасывал задачу на ЧУЖОЙ стек. Лечение: флаг in_win32_syscall (isr64.S ставит/снимает при IF=0; schedule не переключает задачу внутри syscall-транзакции; сброс в exit-пути — иначе deadlock hlt).
+- **Прочие фиксы планировщика**: атомарность переключения (cli вокруг schedule в handleIRQ — вложенные тики меняли состояние среди кадра), структурная валидация кадров (rsp обязан лежать в собственном kstack задачи; мусор → задача пропускается), kernel_stack 8→32КБ (переполнение cmd_peload затирало header нижележащей tasks[] — kernel-panic каскад), канарейки внизу каждого kstack (детектор переполнения), guard @ptrFromInt(0) в таймерном пути (паники «cast causes pointer to be null»/«incorrect alignment»).
+- **Финал-волна печати**: SleepEx, _get_osfhandle (fd → stdio-псевдохэндлы), MultiByteToWideChar (ASCII→UTF-16LE, двухфазный вызов UCRT), WriteConsoleW (UTF-16LE → UTF-8 → консоль ОС) — без них curl печатал «(23) ERROR on write».
+- Тесты: 271/271 (+5 к v0.12: send/recv-loopback, sockopt, sockname, events, MB2WC). E2E: **pe-run4 ALL PASS** (момент №4 + Hello POLER! + exit(0); цикло №1-совместимые pe-run v1 + kbd 9/9 + pe-e2e PASS — все регрессии зелёные).
 
 ### v0.12.0 — CDD-цикл №3: нативная версия/SSPI/окружение, МОСТ КОЛБЭКА, Win64-треды, connect()
 - **МОМЕНТ ИСТИНЫ №3c**: `curl.exe` (реальный PE32+, 3.8МБ) в Ring 3 проходит ПОЛНЫЙ путь сетевой инициализации: CRT-init → main() → парсинг URL (`--url` через native-bsearch) → конфиг/CA-поиск → WSAStartup → InitSecurityInterfaceA (SSPI-таблица 25/25) → **два Dns-треда** (Happy Eyeballs) → getaddrinfo (синтез TEST-NET) → socket(AF_INET) → ioctlsocket(FIONBIO) → **connect(192.0.2.1:80) — ЦЕЛЬ ЦИКЛА ДОСТИГНУТА**.
