@@ -385,7 +385,18 @@ fn kCurrentTid() u64 {
 // ─── Точка входа syscall #6 (hal.win32SyscallCallback) ──────────────────────
 
 pub fn syscallDispatch(entry_id: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
-    return crt.syscallDispatch(entry_id, a1, a2, a3, a4);
+    const ret = crt.syscallDispatch(entry_id, a1, a2, a3, a4);
+    // v0.17.0-fix (CDD №8): ЗАКРЫТИЕ КОРНЕВОЙ ГОНКИ cks — «sysretq-выход
+    // не восстанавливает current_kernel_stack» (цитата v0.16-коммента!):
+    // после нашего sysretq следующий syscall ЛЮБОЙ задачи писал кадр на
+    // СТАРОМ kstack (чужом!) → cross-stack порча (WARN «task N rsp вне»,
+    // застой резолвера curl, FRAME-GUARD 7za). Синхрон на ВЫХОДЕ:
+    // cks = kstack_top ТЕКУЩЕЙ задачи — инвариант для следующего syscall.
+    if (scheduler.current_task_id != 0 and scheduler.current_task_id < scheduler.task_count) {
+        const t = &scheduler.tasks[scheduler.current_task_id];
+        scheduler.current_kernel_stack = @intFromPtr(&t.kernel_stack) + t.kernel_stack.len;
+    }
+    return ret;
 }
 
 // ─── Платформенные примитивы (kernel) ───────────────────────────────────────

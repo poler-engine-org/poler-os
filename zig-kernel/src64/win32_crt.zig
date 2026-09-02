@@ -3855,7 +3855,11 @@ fn kWaitForSingleObject(h: u64, ms: u64) u64 {
         logf("[WIN32] WaitForSingleObject(handle=0x{x}) -> WAIT_OBJECT_0 (сигнален)\n", .{h});
         return WAIT_OBJECT_0;
     }
-    if (ms == 0) return WAIT_TIMEOUT; // Win32: нулевой таймаут — только проверка
+    // v0.17.0-фикс (урок curl): КОРОТКИЕ таймауты (≤20мс) — мгновенный
+    // возврат БЕЗ парковки: retry-циклы резолвера curl (мс-поллинг, десятки
+    // тысяч итераций в v0.16) при 10мс-паркинге каждый — стали 10мс-медленными
+    // → таймаут DNS/connect. Парковка — только для реальных ожиданий (7-Zip).
+    if (ms == 0 or ms <= 20) return WAIT_TIMEOUT;
     const INFINITE: u64 = 0xFFFF_FFFF;
     const deadline_ticks: u64 = if (ms == INFINITE) 0 else (ms / 10) + 1; // 10мс-тики
     var waited: u64 = 0;
@@ -3918,7 +3922,7 @@ fn kWaitForMultipleObjects(n: u64, handles_va: u64, wait_all: u64, ms: u64) u64 
                 }
             }
         }
-        if (ms == 0) return WAIT_TIMEOUT;
+        if (ms == 0 or ms <= 20) return WAIT_TIMEOUT; // короткий — без парковки (урок curl)
         ops.sleep_task(10);
         waited += 1;
         if (deadline_ticks != 0 and waited >= deadline_ticks) {
