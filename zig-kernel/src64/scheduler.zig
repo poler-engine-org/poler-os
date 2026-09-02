@@ -69,10 +69,13 @@ var warned_tasks: [MAX_TASKS]usize = .{0} ** MAX_TASKS;
 var warned_n: usize = 0;
 // v0.16.0-fix (CDD №7, SELF-HEAL): теневые валидные rsp (см. schedule)
 pub var shadow_rsp: [MAX_TASKS]u64 = .{0} ** MAX_TASKS;
+// v0.17.0-fix (CDD №8 p7): дедуп SAVE-REROUTE-печати (анти-спам 100Гц)
+var last_reroute_key: u64 = 0;
 
 // Exported variables for assembly syscall_entry
 pub export var user_rsp: u64 = 0;
 pub export var current_kernel_stack: u64 = 0;
+
 
 /// v0.12.0 (CDD №3): снапшот syscall-кадра активной задачи. isr64.S (путь
 /// syscall_entry) копирует сюда 8 слов СПУЩЕННОГО кадра при IF=0 — ДО sti()
@@ -424,17 +427,14 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     // v0.13.0-fix: syscall-транзакция активна — НЕ трогаем контекст задачи
     // (user_rsp/current_kernel_stack глобальны — свитч между Ring-3
     // задачами внутри syscall = порча; ждем sysretq, потом свободный тик).
-    // v0.16.0-fix (CDD №7, ЗАСТРЯВШИЕ CV-ТРЕДЫ): РЕ-СИНХРОНИЗАЦИЯ cks —
-    // sysretq-выход не восстанавливает current_kernel_stack, и латентная
-    // гонка могла оставить ЧУЖОЕ значение: следующий syscall задачи
-    // читает чужой kstack (кадры вне собственного стека → WARN → вечная
-    // парковка треда → deadlocks curl). Инвариант: cks == kstack_top
-    // ТЕКУЩЕЙ задачи — восстанавливаем его на каждом тике транзакции.
+    // v0.17.0-fix (CDD №8 p5-lite): РЕ-СИНК cks из flag-guard УДАЛЁН — при
+    // рассинхронизированном current_task_id (окна паркинга: эмпирика
+    // QEMU -d int — hlt-парк задачи X прерывался тиком при current==X+1)
+    // ресинк ИНЖЕКТИРОВАЛ чужой kstack-топ → следующий syscall задачи
+    // входил на ЧУЖОЙ стек (каскад WARN/FRAME-GUARD). Единственный писец
+    // cks теперь — диспетчеризация ниже (iretq-авторитет: куда ушли —
+    // тот стек и актуален).
     if (in_win32_syscall != 0) {
-        if (current_task_id != 0 and current_task_id < task_count) {
-            const ktop: u64 = @intFromPtr(&tasks[current_task_id].kernel_stack) + tasks[current_task_id].kernel_stack.len;
-            if (current_kernel_stack != ktop) current_kernel_stack = ktop;
-        }
         return current_rsp;
     }
     scheduler_ticks += 1;
@@ -463,15 +463,64 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
         hal.Serial.putDecimal(task_count);
         hal.Serial.puts("\n");
     }
-    tasks[current_task_id].rsp = current_rsp;
-    // v0.16.0-fix (CDD №7, SELF-HEAL): теневой слепок валидного rsp — кадр
-    // на СОБСТВЕННОМ kstack. Латентная гонка (sysretq не восстанавливает
-    // cks) изредка сохраняет КАДР-НА-ЧУЖОМ-СТЕКЕ (WARN «вне собственного
-    // стека» → тред застревает навечно → deadlock curl). САМ КАДР на своём
-    // стеке НЕ тронут (гонка портит только УКАЗАТЕЛЬ) — восстановление
-    // теневой копии полностью реанимирует тред.
-    if (current_task_id != 0 and taskRspValid(current_task_id, current_rsp)) {
-        shadow_rsp[current_task_id] = current_rsp;
+    // v0.17.0-fix (CDD №8 p7): SCAN-SAVE — адресат = ВЛАДЕЛЕЦ стека кадра.
+    // Эмпирика QEMU -d int: current_task_id рассинхронизируется в окнах
+    // паркинга (hlt-парк задачи X прерывается тиком при current==X+1),
+    // при этом сам кадр (с p6/TSS-входом) лежит НА СВОЁМ kstack. Отказ
+    // от сохранения валидного кадра оставлял tasks[X].rsp на стале
+    // (инициальный кадр, затёртый syscall-слотами) → FRAME-GUARD ложно
+    // убивал ЖИВЫЕ треды резолвера curl. Лечение: кадр сохраняется задаче,
+    // НА ЧЬЁМ kstack он физически лежит (≤8 слотов; task 0 — бут-стек);
+    // вне всех стеков — отказ (SAVE-GUARD, раз на задачу — анти-спам).
+    var save_id: usize = current_task_id;
+    if (!taskRspValid(save_id, current_rsp)) {
+        var owner_found = false;
+        var oid: usize = 0;
+        while (oid < task_count) : (oid += 1) {
+            if (taskRspValid(oid, current_rsp)) {
+                save_id = oid;
+                owner_found = true;
+                break;
+            }
+        }
+        if (owner_found and save_id != current_task_id) {
+            // Печать — ТОЛЬКО при смене пары (cur,owner): анти-спам (эмпирика:
+            // рассинхрон висел долго → сотни одинаковых строк на 100Гц).
+            const key: u64 = @as(u64, @intCast(current_task_id)) * 16 + @as(u64, @intCast(save_id));
+            if (key != last_reroute_key) {
+                last_reroute_key = key;
+                hal.Serial.puts("[SCHED] SAVE-REROUTE: кадр 0x");
+                hal.Serial.putHex(current_rsp);
+                hal.Serial.puts(" -> task ");
+                hal.Serial.putDecimal(save_id);
+                hal.Serial.puts(" (cur был ");
+                hal.Serial.putDecimal(current_task_id);
+                hal.Serial.puts(")\n");
+            }
+        }
+        if (!owner_found) {
+            var sg_warn = true;
+            for (warned_tasks) |w| {
+                if (w == current_task_id) sg_warn = false;
+            }
+            if (sg_warn and warned_n < warned_tasks.len) {
+                warned_tasks[warned_n] = current_task_id;
+                warned_n += 1;
+                hal.Serial.puts("[SCHED] SAVE-GUARD: кадр rsp=0x");
+                hal.Serial.putHex(current_rsp);
+                hal.Serial.puts(" вне всех kstack (cur=");
+                hal.Serial.putDecimal(current_task_id);
+                hal.Serial.puts(") — НЕ сохранён\n");
+            }
+            save_id = 0; // отказ: ниже валидация отсечёт
+        }
+    }
+    if (save_id != 0 and taskRspValid(save_id, current_rsp)) {
+        tasks[save_id].rsp = current_rsp;
+        // v0.16.0-fix (CDD №7, SELF-HEAL): теневой слепок валидного rsp —
+        // кадр на СОБСТВЕННОМ kstack (портился только УКАЗАТЕЛЬ — теневая
+        // копия полностью реанимирует тред).
+        if (save_id != 0) shadow_rsp[save_id] = current_rsp;
     }
     if (tasks[current_task_id].state == .Running) {
         tasks[current_task_id].state = .Ready;
@@ -498,6 +547,23 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
         if (tasks[next_id].state == .Ready or tasks[next_id].state == .Running) {
             if (taskRspValid(next_id, tasks[next_id].rsp)) {
                 if (frameContentValid(tasks[next_id].rsp)) {
+                    found = true;
+                    break;
+                }
+                // v0.17.0-fix (CDD №8 p5+): СНАЧАЛА ТЕНЬ. Кадр-мусор = чаще
+                // всего STALE-указатель (инициальный кадр, затёртый syscall-
+                // слотами — эмпирика curl-тредов), а НЕ реальная порча:
+                // теневая копия (последний валидный кадр парка) полностью
+                // реанимирует тред. Килл — только если и тень мертва.
+                if (shadow_rsp[next_id] != 0 and taskRspValid(next_id, shadow_rsp[next_id])
+                    and frameContentValid(shadow_rsp[next_id]))
+                {
+                    tasks[next_id].rsp = shadow_rsp[next_id];
+                    hal.Serial.puts("[SCHED] FRAME-HEAL: task ");
+                    hal.Serial.putDecimal(next_id);
+                    hal.Serial.puts(" кадр восстановлен из тени (0x");
+                    hal.Serial.putHex(shadow_rsp[next_id]);
+                    hal.Serial.puts(")\n");
                     found = true;
                     break;
                 }

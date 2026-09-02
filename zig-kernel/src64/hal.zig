@@ -169,6 +169,18 @@ pub fn sti() void {
     asm volatile ("sti");
 }
 
+/// v0.17.0-fix (CDD №8 p5): чтение IF — крит-секции должны СОХРАНЯТЬ
+/// состояние прерываний, а не безусловно sti() (урок: heap-аллокатор
+/// из IRQ-обработчика (timer→net-worker→kmalloc) возвращался с IF=1 —
+/// pop-фаза ISR шла с открытыми прерываниями → вложенный тик сохранял
+/// tasks[Y].rsp кадром на ЧУЖОМ стеке (WARN «rsp вне», застой curl).
+pub fn interruptsEnabled() bool {
+    const f: u64 = asm volatile ("pushfq; popq %[out]"
+        : [out] "=r" (-> u64),
+    );
+    return (f & 0x200) != 0;
+}
+
 pub fn hlt() void {
     asm volatile ("hlt");
 }
@@ -644,9 +656,37 @@ fn handleException(frame: *InterruptFrame) void {
             Serial.putHex(usp2.*);
             Serial.puts("\n");
         }
-        // Kill the current task via the exit callback (same mechanism as syscall exit)
-        if (exitCallback) |cb| {
-            cb();
+        // Kill the task via the exit callback (same mechanism as syscall exit).
+        // v0.17.0-fix (CDD №8 p7): если виновник уже убит выше (рассинхрон
+        // current) — НЕ зовём exitCallback: он убил бы НЕВИНОВНУЮ current-
+        // задачу (эмпирика: curl-main погибал от #PF треда 5).
+        var killed_above = false;
+        {
+            const sched = @import("scheduler.zig");
+            const fault_rsp: u64 = @intFromPtr(frame);
+            var faulter: usize = 0;
+            var fid: usize = 0;
+            while (fid < sched.task_count) : (fid += 1) {
+                const kb: u64 = @intFromPtr(&sched.tasks[fid].kernel_stack);
+                if (fault_rsp >= kb and fault_rsp < kb + sched.tasks[fid].kernel_stack.len) {
+                    faulter = fid;
+                    break;
+                }
+            }
+            if (faulter != 0 and faulter != sched.current_task_id) {
+                Serial.puts("[EXCEPTION] виновник task ");
+                Serial.putDecimal(faulter);
+                Serial.puts(" (cur=");
+                Serial.putDecimal(sched.current_task_id);
+                Serial.puts(" — рассинхрон; cur не трогаем)\n");
+                sched.killTask(faulter) catch {};
+                killed_above = true;
+            }
+        }
+        if (!killed_above) {
+            if (exitCallback) |cb| {
+                cb();
+            }
         }
         // After killing, we can't return to the faulting user code.
         // Modify the interrupt frame to point to a safe idle loop in Ring 0
@@ -1156,6 +1196,10 @@ pub const TSS = packed struct {
 // IST1 stack for Double Fault (#DF, vector 8)
 var ist1_stack: [4096]u8 align(16) = undefined;
 
+// TSS.rsp0: пишет ТОЛЬКО диспетчеризация (schedule→setKernelStack) —
+// иретк-авторитет. Зеркало ниже экспортировано для isr64.S (Zig не
+// экспортирует packed struct): пишется в setKernelStack АТОМАРНО там же
+// (IF=0 ISR-контекста) — рассинхрон-иммунный источник syscall-стека.
 var tss: TSS = .{
     ._reserved0 = 0,
     .rsp0 = 0,
@@ -1174,8 +1218,20 @@ var tss: TSS = .{
     .iomap_base = 104,
 };
 
+/// v0.17.0-fix (CDD №8 p6): зеркало TSS.rsp0 для isr64.S (символ tss —
+/// локальный; packed struct не экспортируется) — единый писец: диспетчеризация.
+pub export var tss_rsp0_mirror: u64 = 0;
+
 pub fn setKernelStack(stack: u64) void {
     tss.rsp0 = stack;
+    tss_rsp0_mirror = stack;
+}
+
+/// v0.17.0-fix (CDD №8 p6): kstack-топ ИСПОЛНЯЮЩЕЙ задачи (TSS.rsp0) —
+/// тот же источник, что и syscall-вход в isr64.S (callbackDone: кадр
+/// колбэка обязан лежать на стеке владельца исполнения).
+pub fn getKernelStackTop() u64 {
+    return tss.rsp0;
 }
 
 // ============================================================================

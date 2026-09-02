@@ -338,8 +338,12 @@ fn alloc(
     const aligned_len = alignUp(len, 16);
     if (aligned_len < len) return null; // overflow detected
 
+    // v0.17.0-fix (CDD №8 p5): СОХРАНЕНИЕ IF (а не безусловный sti):
+    // аллокатор зовётся и из IRQ-обработчиков (IF=0) — sti() на выходе
+    // открывал прерывания в pop-фазе ISR → вложенный тик портил rsp.
+    const if_was: bool = hal.interruptsEnabled();
     hal.cli();
-    defer hal.sti();
+    defer if (if_was) hal.sti();
 
     var current = first_block;
     var prev: ?*Block = null;
@@ -489,8 +493,12 @@ fn resize(
     const aligned_new_len = alignUp(new_len, 16);
     if (aligned_new_len < new_len) return false;
 
+    // v0.17.0-fix (CDD №8 p5): СОХРАНЕНИЕ IF (а не безусловный sti):
+    // аллокатор зовётся и из IRQ-обработчиков (IF=0) — sti() на выходе
+    // открывал прерывания в pop-фазе ISR → вложенный тик портил rsp.
+    const if_was: bool = hal.interruptsEnabled();
     hal.cli();
-    defer hal.sti();
+    defer if (if_was) hal.sti();
 
     const block = getBlockFromPayload(buf.ptr) orelse return false;
 
@@ -597,8 +605,12 @@ fn free(
 
     if (buf.len == 0) return;
 
+    // v0.17.0-fix (CDD №8 p5): СОХРАНЕНИЕ IF (а не безусловный sti):
+    // аллокатор зовётся и из IRQ-обработчиков (IF=0) — sti() на выходе
+    // открывал прерывания в pop-фазе ISR → вложенный тик портил rsp.
+    const if_was: bool = hal.interruptsEnabled();
     hal.cli();
-    defer hal.sti();
+    defer if (if_was) hal.sti();
 
     _ = freeInternal(buf.ptr);
 }
@@ -637,8 +649,12 @@ pub fn kmalloc(len: usize) ?[*]u8 {
 /// and SipHash integrity verification.
 /// Uses shared freeInternal to eliminate code duplication.
 pub fn kfree(ptr: [*]u8) void {
+    // v0.17.0-fix (CDD №8 p5): СОХРАНЕНИЕ IF (а не безусловный sti):
+    // аллокатор зовётся и из IRQ-обработчиков (IF=0) — sti() на выходе
+    // открывал прерывания в pop-фазе ISR → вложенный тик портил rsp.
+    const if_was: bool = hal.interruptsEnabled();
     hal.cli();
-    defer hal.sti();
+    defer if (if_was) hal.sti();
 
     if (!freeInternal(ptr)) {
         // Error already logged by freeInternal (tag mismatch, double-free,

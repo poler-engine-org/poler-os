@@ -309,14 +309,12 @@ fn kSleepTask(ms: u64) void {
     // поднят — чужие syscall его затереть не могли)
     const my_rsp = scheduler.user_rsp;
 
-    // v0.16.0-fix (CDD №7): РЕ-СИНК cks ПЕРЕД парковкой — инвариант
-    // «current_kernel_stack == kstack_top ТЕКУЩЕЙ задачи»: хвост нашего
-    // syscall-кадра (asm-exit pops / callbackDone [top-64..top)) обязан
-    // лежать на НАШЕМ kstack, а кадры парковки — не на чужом.
-    if (scheduler.current_task_id != 0 and scheduler.current_task_id < scheduler.task_count) {
-        const t = &scheduler.tasks[scheduler.current_task_id];
-        scheduler.current_kernel_stack = @intFromPtr(&t.kernel_stack) + t.kernel_stack.len;
-    }
+    // v0.17.0-fix (CDD №8 p5-lite): ресинк cks перед парковкой УДАЛЁН —
+    // при рассинхронизированном current он ИНЖЕКТИРОВАЛ чужой kstack-топ
+    // (каскад cross-stack). cks пишет только schedule() (диспетчеризация);
+    // хвост нашего syscall-кадра выходит через RSP (pop'ы asm-exit) —
+    // значение cks на исход кадра не влияет.
+    _ = scheduler;
 
     // Будильник планировщику: слайс паркованной не давать
     scheduler.setTaskSleep(capped);
@@ -386,16 +384,12 @@ fn kCurrentTid() u64 {
 
 pub fn syscallDispatch(entry_id: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
     const ret = crt.syscallDispatch(entry_id, a1, a2, a3, a4);
-    // v0.17.0-fix (CDD №8): ЗАКРЫТИЕ КОРНЕВОЙ ГОНКИ cks — «sysretq-выход
-    // не восстанавливает current_kernel_stack» (цитата v0.16-коммента!):
-    // после нашего sysretq следующий syscall ЛЮБОЙ задачи писал кадр на
-    // СТАРОМ kstack (чужом!) → cross-stack порча (WARN «task N rsp вне»,
-    // застой резолвера curl, FRAME-GUARD 7za). Синхрон на ВЫХОДЕ:
-    // cks = kstack_top ТЕКУЩЕЙ задачи — инвариант для следующего syscall.
-    if (scheduler.current_task_id != 0 and scheduler.current_task_id < scheduler.task_count) {
-        const t = &scheduler.tasks[scheduler.current_task_id];
-        scheduler.current_kernel_stack = @intFromPtr(&t.kernel_stack) + t.kernel_stack.len;
-    }
+    // v0.17.0-fix (CDD №8 p5-lite): ресинк УДАЛЁН — он был ИНЖЕКТОРОМ
+    // десинка: при рассинхронизированном current_task_id (окна паркинга,
+    // эмпирика QEMU -d int: hlt-парк задачи X прерывался при current==X+1)
+    // ресинк писал ЧУЖОЙ kstack-топ → следующий syscall входил на чужой
+    // стек → каскад cross-stack порчи. Теперь cks пишет ТОЛЬКО schedule()
+    // при диспетчеризации (авторитетный источник = куда iretq ушёл).
     return ret;
 }
 
@@ -643,6 +637,9 @@ pub fn callbackDone(cookie: u64, result: u64) u64 {
 
     // Перезапись кадра asm-возврата (слоты [top-64..top)) — под cli:
     // между записью и pop'ами в isr64.S не должно быть прерываний.
+    // v0.17.0 (CDD №8 p7-ship): возврат к cks — единый источник с входом
+    // (урок p6: рассогласование источников вход/колбэк = детерминированный
+    // Ring-3 краш в CB-мосте).
     hal.cli();
     const top = scheduler.current_kernel_stack;
     const f: *volatile [8]u64 = @ptrFromInt(top - 64);

@@ -425,6 +425,7 @@ isr_stub_table:
 
 .extern user_rsp
 .extern current_kernel_stack
+.extern tss_rsp0_mirror           // v0.17.0-fix (CDD №8 p6): зеркало TSS.rsp0 — источник syscall-стека
 .extern syscall_frame          // v0.12.0: снапшот кадра (8 слов, .bss)
 .extern zig_syscall_handler
 .extern ucl_pending            // v0.12.0: мост Win64-колбэка (win32_api)
@@ -438,7 +439,12 @@ syscall_entry:
     // Save user RSP to user_rsp
     movq %rsp, user_rsp(%rip)
 
-    // Load kernel RSP of the active task
+    // v0.17.0 (CDD №8 p7-ship): вход по cks (как v0.16). Уроки p6: TSS.rsp0-
+    // вход давал ДЕТЕРМИНИРОВАННЫЙ Ring-3 краш «call 0x200000283B» в CB-мосте
+    // (3/3 прогона) — регресс, отклонён. Защита от десинхронов осталась в
+    // scheduler.zig: SAVE-GUARD/SAVE-REROUTE + FRAME-HEAL + heap IF-фикс +
+    // kill виновника по kstack. Полный фикс = per-task syscall state —
+    // v0.18-бэклог (так и запланировано в p4).
     movq current_kernel_stack(%rip), %rsp
 
     // Now we are on the kernel stack!
@@ -559,3 +565,11 @@ syscall_entry:
     xorl %eax, %eax
     sysretq
 
+
+// ============================================================================
+//  v0.17.0 (CDD №8 p5-lite): per-task asm-вход (kstack_tops[owner] +
+//  syscall-скретчи) отложен в v0.18-бэклог — эмпирика сессии: рассинхрон
+//  current в окнах паркинга надёжно ловится Zig-защитами (SAVE-GUARD
+//  отказ + FRAME-HEAL из тени + heap IF-фикс) без хрупких изменений
+//  семантики asm-входа/выхода. Уроки задокументированы в AGENT_STATE.md.
+// ============================================================================
