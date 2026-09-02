@@ -41,6 +41,7 @@ const scheduler = @import("scheduler.zig");
 const virtio_net = @import("virtio_net.zig");
 const cpio = @import("cpio.zig");
 const fat32 = @import("fat32.zig");
+const acpi = @import("acpi.zig");
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -80,6 +81,14 @@ pub fn installOps() void {
         .entropy_fill = kEntropyFill,
         .vfs_file_size = kVfsFileSize,
         .vfs_file_read = kVfsFileRead,
+        // v0.17.0 (CDD №8): FAT32 RW — запись/создание/усечение/удаление
+        // + CPU/память для 7-Zip-волны (GetSystemInfo/GlobalMemoryStatusEx)
+        .vfs_file_write = kVfsFileWrite,
+        .vfs_file_create = kVfsFileCreate,
+        .vfs_file_truncate = kVfsFileTruncate,
+        .vfs_file_delete = kVfsFileDelete,
+        .cpu_count = kCpuCount,
+        .phys_mem_kb = kPhysMemKb,
         .wall_time = kWallTime,
     };
 }
@@ -147,6 +156,72 @@ fn kVfsFileRead(name: [*]const u8, name_len: usize, offset: u64, out: [*]u8, len
         return fs.readFile(&file, out[0..want], want);
     }
     return 0;
+}
+
+// ─── v0.17.0 (CDD №8): FAT32 RW-мосты (initrd — RO, честный отказ) ─────────
+
+/// VFS: запись data в [offset..) файла. CPIO-initrd — RO (0);
+/// FAT32 — open (8.3-fallback-матчинг) + позиция + writeFile.
+fn kVfsFileWrite(name: [*]const u8, name_len: usize, offset: u64, data: [*]const u8, len: usize) u64 {
+    if (name_len == 0 or name_len > 260) return 0;
+    if (vfsFindCpio(name[0..name_len]) != null) return 0; // initrd — RO
+    const fs = fat32.getFs() orelse return 0;
+    var file = fs.openFile(name[0..name_len]) orelse return 0;
+    if (offset > 0xFFFFFFFF) return 0; // FAT32 — u32-мир
+    file.position = @intCast(offset);
+    // Позиция за концом — writeFile достроит цепочку (кластеры — нули)
+    if (file.position > file.file_size) {
+        // выровнять размер до позиции (setFileSize) — «дыры» нулями
+        _ = fs.setFileSize(&file, file.position);
+    }
+    const want: u32 = @intCast(len);
+    const wrote = fs.writeFile(&file, data[0..want]);
+    if (wrote > 0) hal.Serial.puts("[VFS] write: FAT32\n");
+    return wrote;
+}
+
+/// VFS: создание файла (FAT32 createFile). initrd-имена — отказ (0).
+fn kVfsFileCreate(name: [*]const u8, name_len: usize) u64 {
+    if (name_len == 0 or name_len > 260) return 0;
+    if (vfsFindCpio(name[0..name_len]) != null) return 0;
+    const fs = fat32.getFs() orelse return 0;
+    // Уже есть? (8.3-матчинг) — «существует» тоже успех (CREATE_ALWAYS-путь)
+    if (fs.openFile(name[0..name_len]) != null) return 1;
+    const f = fs.createFile(fs.root_cluster, name[0..name_len]) orelse return 0;
+    _ = f;
+    hal.Serial.puts("[VFS] create: FAT32\n");
+    return 1;
+}
+
+/// VFS: усечение/расширение (FAT32 setFileSize). initrd — 0.
+fn kVfsFileTruncate(name: [*]const u8, name_len: usize, new_size: u64) u64 {
+    if (name_len == 0 or name_len > 260) return 0;
+    if (vfsFindCpio(name[0..name_len]) != null) return 0;
+    const fs = fat32.getFs() orelse return 0;
+    var file = fs.openFile(name[0..name_len]) orelse return 0;
+    if (new_size > 0xFFFFFFFF) return 0;
+    if (fs.setFileSize(&file, @intCast(new_size))) return 1;
+    return 0;
+}
+
+/// VFS: удаление (FAT32 deleteFile). initrd — 0.
+fn kVfsFileDelete(name: [*]const u8, name_len: usize) u64 {
+    if (name_len == 0 or name_len > 260) return 0;
+    if (vfsFindCpio(name[0..name_len]) != null) return 0;
+    const fs = fat32.getFs() orelse return 0;
+    if (fs.deleteFile(name[0..name_len])) return 1;
+    return 0;
+}
+
+/// Число логических CPU (GetSystemInfo): acpi.cpu_count (MADT-таблица).
+fn kCpuCount() u64 {
+    return acpi.cpu_count;
+}
+
+/// Физическая память (КБ) для GlobalMemoryStatusEx: PMM-статистика.
+fn kPhysMemKb() u64 {
+    const st = pmm.getStats();
+    return st.total_kb;
 }
 
 // ─── v0.14.0 (CDD №5): virtio-net мост (syscall-контекст, CR3=user — CPL=0

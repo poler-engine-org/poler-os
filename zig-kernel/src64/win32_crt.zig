@@ -157,6 +157,21 @@ pub const Ops = struct {
     /// v0.16.0 (CDD №7): чтение [offset..offset+len) файла → out (USER-VA,
     /// валидация НА ВЫЗЫВАЮЩЕМ до вызова). Возврат = прочитано байт.
     vfs_file_read: *const fn (name: [*]const u8, name_len: usize, offset: u64, out: [*]u8, len: usize) u64,
+    /// v0.17.0 (CDD №8): ЗАПИСЬ data в [offset..) файла по имени (FAT32 RW;
+    /// initrd — RO → 0). Возврат = записано байт.
+    vfs_file_write: *const fn (name: [*]const u8, name_len: usize, offset: u64, data: [*]const u8, len: usize) u64,
+    /// v0.17.0 (CDD №8): создать файл (FAT32 createFile; 1 = ок/существует).
+    vfs_file_create: *const fn (name: [*]const u8, name_len: usize) u64,
+    /// v0.17.0 (CDD №8): усечь/расширить до new_size (FAT32 setFileSize).
+    vfs_file_truncate: *const fn (name: [*]const u8, name_len: usize, new_size: u64) u64,
+    /// v0.17.0 (CDD №8): удалить файл (FAT32 deleteFile; initrd — 0).
+    vfs_file_delete: *const fn (name: [*]const u8, name_len: usize) u64,
+    /// v0.17.0 (CDD №8): число логических CPU (GetSystemInfo — 7-Zip
+    /// бенчмарк заводит треды по этому числу). Ядро: acpi.cpu_count.
+    cpu_count: *const fn () u64,
+    /// v0.17.0 (CDD №8): физическая память КБ (GlobalMemoryStatusEx).
+    /// Ядро: pmm.getStats().total_kb; тесты: фиксированное число.
+    phys_mem_kb: *const fn () u64,
     /// v0.16.0 (CDD №7): РЕАЛЬНОЕ wall-clock время (Unix-секунды, CMOS RTC
     /// — QEMU подаёт время хоста). null по умолчанию → статика v0.12-эпохи
     /// (нативные тесты не зависят от живой даты). Потребители: _time64
@@ -213,6 +228,24 @@ fn noVfsSize(_: [*]const u8, _: usize) u64 {
 fn noVfsRead(_: [*]const u8, _: usize, _: u64, _: [*]u8, _: usize) u64 {
     return 0;
 }
+fn noVfsWrite(_: [*]const u8, _: usize, _: u64, _: [*]const u8, _: usize) u64 {
+    return 0; // RO-бекенд (нативные тесты без ФС)
+}
+fn noVfsCreate(_: [*]const u8, _: usize) u64 {
+    return 0;
+}
+fn noVfsTruncate(_: [*]const u8, _: usize, _: u64) u64 {
+    return 0;
+}
+fn noVfsDelete(_: [*]const u8, _: usize) u64 {
+    return 0;
+}
+fn fakeCpuCount() u64 {
+    return 2; // тесты: двухъядерная модель
+}
+fn fakePhysMemKb() u64 {
+    return 262144; // 256МБ
+}
 
 /// Дефолт: параноик. win32_api.installOps() ставит настоящие примитивы.
 pub var ops: Ops = .{
@@ -240,6 +273,12 @@ pub var ops: Ops = .{
     .entropy_fill = noEntropy,
     .vfs_file_size = noVfsSize,
     .vfs_file_read = noVfsRead,
+    .vfs_file_write = noVfsWrite,
+    .vfs_file_create = noVfsCreate,
+    .vfs_file_truncate = noVfsTruncate,
+    .vfs_file_delete = noVfsDelete,
+    .cpu_count = fakeCpuCount,
+    .phys_mem_kb = fakePhysMemKb,
 };
 
 fn emptyWriter(_: []const u8) void {}
@@ -299,8 +338,44 @@ pub const Ctx = struct {
 
     // v0.16.0 (CDD №7)
     next_file_handle: u64, // CreateFileA/W: пул 0x800+ (файлы VFS)
-    files: [MAX_FILES]FileState, // дескрипторы открытых файлов (RO-VFS)
+    files: [MAX_FILES]FileState, // дескрипторы открытых файлов (RW-VFS)
+
+    // v0.17.0 (CDD №8): события/семафоры с РЕАЛЬНЫМ сигнальным состоянием
+    // (7-Zip: WaitForSingleObject(event, INFINITE) на вореорах — без этого
+    // мгновенный WAIT_TIMEOUT ломал синхронизацию тредов бенчмарка).
+    events: [MAX_EVENTS]EventState,
+    /// v0.17.0 (CDD №8): блок DATA-импортов msvcrt (_fmode/_commode/__initenv/
+    /// _iob) — патчится в IAT (patchDataImports, main64); FILE* из этого
+    /// блока в stdio-функциях маршрутизируются на консоль.
+    iob_block: u64 = 0,
+    /// v0.17.0 (CDD №8): argv-массив (ensureArgv) — для __getmainargs.
+    argv_arr: u64 = 0,
+    env_arr: u64 = 0,
 };
+
+/// v0.17.0 (CDD №8): состояние события/семафора (хэндлы 0x200+).
+pub const MAX_EVENTS: usize = 32;
+pub const EventState = struct {
+    in_use: bool = false,
+    signaled: bool = false,
+    manual_reset: bool = false,
+    /// Семафор: текущий счётчик (ReleaseSemaphore += n, Wait -= 1, floor 0).
+    is_semaphore: bool = false,
+    count: u32 = 0,
+};
+
+/// v0.17.0 (CDD №8): диапазон хэндлов событий (совпадает с WSA-пулом v0.12 —
+/// события едины; SetEvent теперь меняет РЕАЛЬНОЕ состояние).
+pub const EVENT_HANDLE_BASE: u64 = 0x200;
+pub const EVENT_HANDLE_LIMIT: u64 = 0x400;
+
+fn eventByHandle(h: u64) ?*EventState {
+    if (h < EVENT_HANDLE_BASE or h >= EVENT_HANDLE_BASE + MAX_EVENTS) return null;
+    const c = &(ctx orelse return null);
+    const ev = &c.events[@as(usize, @intCast(h - EVENT_HANDLE_BASE))];
+    if (!ev.in_use) return null;
+    return ev;
+}
 
 pub var ctx: ?Ctx = null;
 
@@ -326,6 +401,9 @@ pub const FileState = struct {
     pos: u64 = 0,
     size: u64 = 0,
     eof: bool = false, // CRT-семантика: флаг ставится при ЧТЕНИИ ЗА концом
+    /// v0.17.0 (CDD №8): файл открыт на запись (GENERIC_WRITE / fopen «w/a/+")
+    /// — WriteFile/fwrite/_write пишут в FAT32 через ops.vfs_file_write.
+    writable: bool = false,
 };
 
 /// Запись окружения процесса (ядро-предоставленные переменные; тест — свои).
@@ -473,31 +551,97 @@ fn vfsOpenByName(path_va: u64, wide: bool) ?VfsFound {
 /// Статический скретч нормализации (один PE-процесс — конкуренции нет).
 var vfs_norm_scratch: [MAX_PATH_LEN]u8 = undefined;
 
-/// CreateFileA/W (7 аргументов; диспозиция — arg5/стек[0], доступ — arg2):
-/// OPEN_EXISTING + read → хэндл 0x800+; запись/создание в RO-VFS → отказ.
+/// CreateFileA/W (7 аргументов; диспозиция — arg5/стек[0], доступ — arg2).
+/// v0.17.0 (CDD №8): ПОЛНЫЙ RW — диспозиции 1..5 по Win32-семантике:
+///   CREATE_NEW(1)      — есть → ERROR_FILE_EXISTS; нет → создать (FAT32)
+///   CREATE_ALWAYS(2)   — есть → усечь в 0; нет → создать
+///   OPEN_EXISTING(3)   — нет → ERROR_FILE_NOT_FOUND
+///   OPEN_ALWAYS(4)     — есть → открыть; нет → создать
+///   TRUNCATE_EXISTING(5) — есть → усечь; нет → 2
+/// GENERIC_WRITE → writable (WriteFile/fwrite/_write пишут на FAT32-диск;
+/// initrd — RO: создание/запись → ACCESS_DENIED, как в v0.16).
 fn createFileCommon(lp_file_name: u64, desired_access: u64, creation: u64, wide: bool) u64 {
-    const found = vfsOpenByName(lp_file_name, wide) orelse {
+    const want_write = (desired_access & GENERIC_WRITE) != 0;
+    const found = vfsOpenByName(lp_file_name, wide);
+
+    // ── Диспозиции создания/усечения ──
+    if (creation == CREATE_NEW or creation == CREATE_ALWAYS or creation == TRUNCATE_EXISTING or creation == OPEN_ALWAYS) {
+        if (found == null and (creation == CREATE_NEW or creation == CREATE_ALWAYS or creation == OPEN_ALWAYS)) {
+            // Создать файл через бекенд (FAT32). Initrd/RO → 0 → ACCESS_DENIED.
+            if (!createVfsFile(lp_file_name, wide)) {
+                setLastError(ERROR_ACCESS_DENIED);
+                logf("[WIN32] CreateFile{c}(?) -> INVALID (RO-VFS: создание запрещено)\n", .{if (wide) @as(u8, 'W') else @as(u8, 'A')});
+                return INVALID_HANDLE_VALUE;
+            }
+        } else if (found == null) {
+            // TRUNCATE_EXISTING без файла
+            setLastError(ERROR_FILE_NOT_FOUND);
+            logf("[WIN32] CreateFile{c}(?) -> INVALID (VFS: не найден, 2)\n", .{if (wide) @as(u8, 'W') else @as(u8, 'A')});
+            return INVALID_HANDLE_VALUE;
+        } else if (creation == CREATE_NEW) {
+            setLastError(ERROR_FILE_EXISTS);
+            logf("[WIN32] CreateFile{c}(\"{s}\") -> INVALID (уже есть, 80)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), found.?.norm });
+            return INVALID_HANDLE_VALUE;
+        }
+        if (creation == CREATE_ALWAYS or creation == TRUNCATE_EXISTING) {
+            // Усечь до 0; отказ бекенда (initrd-RO) → честный ACCESS_DENIED —
+            // как Windows на RO-носителе (граница v0.16 сохранена).
+            if (found) |fex| {
+                if (ops.vfs_file_truncate(fex.norm.ptr, fex.norm.len, 0) != 1) {
+                    setLastError(ERROR_ACCESS_DENIED);
+                    logf("[WIN32] CreateFile{c}(\"{s}\") -> INVALID (RO-файл: усечение запрещено)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), fex.norm });
+                    return INVALID_HANDLE_VALUE;
+                }
+            }
+        }
+    } else if (creation != OPEN_EXISTING) {
+        // Неизвестная диспозиция — Win32 ERROR_INVALID_PARAMETER
+        setLastError(87);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    // Перечитываем состояние ПОСЛЕ create/truncate (диспозиции меняют размер).
+    const f = (if (creation != OPEN_EXISTING) vfsOpenByName(lp_file_name, wide) else found) orelse {
         setLastError(ERROR_FILE_NOT_FOUND);
         logf("[WIN32] CreateFile{c}(?) -> INVALID (VFS: не найден, 2)\n", .{if (wide) @as(u8, 'W') else @as(u8, 'A')});
         return INVALID_HANDLE_VALUE;
     };
-    if (creation == CREATE_NEW or creation == CREATE_ALWAYS or creation == TRUNCATE_EXISTING) {
-        setLastError(if (creation == CREATE_NEW) ERROR_FILE_EXISTS else ERROR_ACCESS_DENIED);
-        logf("[WIN32] CreateFile{c}(\"{s}\") -> INVALID (RO-VFS: создание запрещено)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), found.norm });
-        return INVALID_HANDLE_VALUE;
-    }
-    if (desired_access & GENERIC_WRITE != 0) {
-        setLastError(ERROR_ACCESS_DENIED);
-        logf("[WIN32] CreateFile{c}(\"{s}\") -> INVALID (RO-VFS: GENERIC_WRITE)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), found.norm });
-        return INVALID_HANDLE_VALUE;
-    }
-    const idx = fileSlotAlloc(found.norm, found.size) orelse {
+    const size = f.size;
+
+    const idx = fileSlotAlloc(f.norm, size) orelse {
         setLastError(ERROR_FILE_NOT_FOUND); // таблица полна — как «нет файла»
         return INVALID_HANDLE_VALUE;
     };
+    // v0.17.0: флаг записи — НО initrd-файлы (create=0) остаются RO: запись
+    // пойдёт через ops.vfs_file_write, который для initrd вернёт 0 → честный
+    // частичный отказ (как Win32 на RO-носителе: WriteFile=FALSE, 5).
+    const c = &(ctx orelse return INVALID_HANDLE_VALUE);
+    c.files[idx].writable = want_write;
+    if (want_write and creation == CREATE_ALWAYS) c.files[idx].pos = 0;
     setLastError(0);
-    logf("[WIN32] CreateFile{c}(\"{s}\") -> 0x{x} (VFS, {d}Б)\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), found.norm, FILE_HANDLE_BASE + idx, found.size });
+    logf("[WIN32] CreateFile{c}(\"{s}\") -> 0x{x} (VFS, {d}Б, {s})\n", .{ if (wide) @as(u8, 'W') else @as(u8, 'A'), f.norm, FILE_HANDLE_BASE + idx, size, if (want_write) "RW" else "RO" });
     return FILE_HANDLE_BASE + idx;
+}
+
+/// Создание файла по user-пути (createFileCommon): true = создан/существует.
+fn createVfsFile(lp_file_name: u64, wide: bool) bool {
+    // Переиспользуем нормализатор: собрать путь заново (vfsOpenByName вернул
+    // null — значит файла НЕТ; путь всё равно валиден для создания).
+    const len = if (wide) userStrLenW(lp_file_name) orelse return false else userStrLen(lp_file_name) orelse return false;
+    if (len == 0 or len > MAX_PATH_LEN - 2) return false;
+    var raw: [MAX_PATH_LEN]u8 = undefined;
+    if (wide) {
+        var i: u64 = 0;
+        while (i < len) : (i += 1) {
+            const ch = userW(lp_file_name + i * 2).*;
+            raw[@intCast(i)] = if (ch < 128) @intCast(ch) else '?';
+        }
+    } else {
+        @memcpy(raw[0..@intCast(len)], userPtr(lp_file_name)[0..@intCast(len)]);
+    }
+    const norm_buf: *[MAX_PATH_LEN]u8 = &vfs_norm_scratch;
+    const norm = vfsNormalizePath(raw[0..@intCast(len)], norm_buf) orelse return false;
+    return ops.vfs_file_create(norm.ptr, norm.len) == 1;
 }
 
 /// ReadFile(h, buf, n, lpRead, lpOverlapped): Win64 a1..a4 + стек[0].
@@ -533,7 +677,9 @@ fn readFileCommon(h: u64, buf: u64, n: u64, lp_read: u64, lp_overlapped: u64) u6
 }
 
 /// WriteFile(h, buf, n, lpWritten, lpOverlapped): Win64 a1..a4 + стек[0].
-/// stdout/stderr → консоль ОС; файл RO-VFS → ACCESS_DENIED (честно).
+/// stdout/stderr → консоль ОС. v0.17.0 (CDD №8): файл, открытый с
+/// GENERIC_WRITE → РЕАЛЬНАЯ запись в FAT32 через ops.vfs_file_write
+/// (offset = позиция файла; pos+len > size → size расширяется).
 fn writeFileCommon(h: u64, buf: u64, n: u64, lp_written: u64, lp_overlapped: u64) u64 {
     if (lp_overlapped != 0) {
         setLastError(ERROR_INVALID_PARAMETER);
@@ -550,13 +696,72 @@ fn writeFileCommon(h: u64, buf: u64, n: u64, lp_written: u64, lp_overlapped: u64
         if (lp_written != 0 and ops.validate_write(lp_written, 4)) userD(lp_written).* = @truncate(n);
         return 1;
     }
-    if (fileByHandle(h) != null) {
-        setLastError(ERROR_ACCESS_DENIED); // RO-VFS
-        logf("[WIN32] WriteFile(файл VFS) -> FALSE (RO-VFS, 5)\n", .{});
-        return 0;
+    if (fileByHandle(h)) |f| {
+        // v0.17.0 (CDD №8): RW-файл — писать на диск
+        if (!f.writable) {
+            setLastError(ERROR_ACCESS_DENIED); // RO (initrd или открыли без записи)
+            logf("[WIN32] WriteFile(файл VFS RO) -> FALSE (5)\n", .{});
+            return 0;
+        }
+        if (n == 0) {
+            if (lp_written != 0 and ops.validate_write(lp_written, 4)) userD(lp_written).* = 0;
+            return 1;
+        }
+        if (!ops.validate_read(buf, n)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // Позиция может быть за концом (SetFilePointer RW) — «дыра» нулями
+        // покрывается FAT32-цепочкой (кластеры обнулены allocCluster'ом).
+        const wrote = ops.vfs_file_write(f.name[0..f.name_len].ptr, f.name_len, f.pos, userPtr(buf), @intCast(n));
+        if (wrote == 0) {
+            setLastError(ERROR_ACCESS_DENIED); // initrd-RO / диск полный
+            logf("[WIN32] WriteFile(\"{s}\") -> FALSE (бекенд RO/полон)\n", .{f.name[0..@min(f.name_len, 40)]});
+            return 0;
+        }
+        f.pos += wrote;
+        if (f.pos > f.size) f.size = f.pos; // расширение (SetEndOfFile-семантика)
+        f.eof = false;
+        if (lp_written != 0 and ops.validate_write(lp_written, 4)) userD(lp_written).* = @truncate(wrote);
+        setLastError(0);
+        logf("[WIN32] WriteFile(\"{s}\", {d}Б @+{d}) -> TRUE (FAT32)\n", .{ f.name[0..@min(f.name_len, 40)], wrote, f.pos - wrote });
+        return 1;
     }
     setLastError(ERROR_INVALID_HANDLE_FILE);
     return 0;
+}
+
+/// v0.17.0 (CDD №8): SetEndOfFile(h) — усечь/расширить до ТЕКУЩЕЙ позиции.
+/// TRUE/FALSE (Win32). Расширение — нулями (FAT32 setFileSize).
+fn kSetEndOfFile(h: u64) u64 {
+    const f = fileByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    if (!f.writable) {
+        setLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    if (ops.vfs_file_truncate(f.name[0..f.name_len].ptr, f.name_len, f.pos) == 1) {
+        f.size = f.pos;
+        if (f.pos > 0) f.eof = false;
+        setLastError(0);
+        logf("[WIN32] SetEndOfFile(\"{s}\") -> {d}Б\n", .{ f.name[0..@min(f.name_len, 40)], f.size });
+        return 1;
+    }
+    setLastError(ERROR_ACCESS_DENIED);
+    return 0;
+}
+
+/// v0.17.0 (CDD №8): FlushFileBuffers(h) — FAT32-записи синхронны (кластер
+/// пишется сразу); честный TRUE. Файл-хэндл проверяем для валидности.
+fn kFlushFileBuffers(h: u64) u64 {
+    if (h == FAKE_STDOUT or h == FAKE_STDERR) return 1;
+    if (fileByHandle(h) == null) {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    }
+    return 1;
 }
 
 /// GetFileSize(h, lpHigh): младший 32-бит размера; старший — по указателю.
@@ -607,8 +812,11 @@ fn setFilePointerCommon(h: u64, dist: u64, lp_high: u64, method: u64) u64 {
         },
     };
     var new_pos: i64 = base +% off;
-    if (new_pos < 0) new_pos = 0; // RO-VFS не расширяется — клэмп
-    if (new_pos > @as(i64, @bitCast(f.size))) new_pos = @bitCast(f.size);
+    if (new_pos < 0) new_pos = 0; // отрицательная позиция — клэмп 0
+    // v0.17.0 (CDD №8): RW-файл МОЖЕТ позиционироваться за концом (Windows:
+    // SetFilePointer + запись → «дыра» нулями; SetEndOfFile — расширение).
+    // RO-файл — клэмп в размер (как v0.16).
+    if (!f.writable and new_pos > @as(i64, @bitCast(f.size))) new_pos = @bitCast(f.size);
     f.pos = @bitCast(new_pos);
     f.eof = false;
     setLastError(0);
@@ -633,7 +841,8 @@ fn setFilePointerExCommon(h: u64, dist: u64, lp_new: u64, method: u64) u64 {
     };
     var np: i64 = base +% off;
     if (np < 0) np = 0;
-    if (np > @as(i64, @bitCast(f.size))) np = @bitCast(f.size);
+    // v0.17.0 (CDD №8): RW — за конец можно (дыры/расширение), RO — клэмп
+    if (!f.writable and np > @as(i64, @bitCast(f.size))) np = @bitCast(f.size);
     f.pos = @bitCast(np);
     f.eof = false;
     setLastError(0);
@@ -667,10 +876,51 @@ fn getFileTypeCommon(h: u64) u64 {
 fn kfopenCommon(path_va: u64, mode_va: u64, caller: []const u8) u64 {
     const c = &(ctx orelse return 0);
     var mode: u8 = '?';
-    if (mode_va != 0 and ops.validate_read(mode_va, 1)) {
+    var mode2: u8 = 0; // второй символ («+», «b»)
+    if (mode_va != 0 and ops.validate_read(mode_va, 2)) {
         mode = userPtr(mode_va)[0];
+        mode2 = userPtr(mode_va)[1];
     }
-    const found = vfsOpenByName(path_va, false) orelse {
+    // v0.17.0 (CDD №8): режимы записи — «w»/«a» (+ «+»/«b»-суффиксы):
+    //   w/w+  — создать/усечь (CREATE_ALWAYS-семантика)
+    //   a/a+  — создать если нет, позиция = размер (append)
+    //   r+    — открыть RW без усечения
+    //   r/rb  — RO (как v0.16)
+    const want_write = (mode == 'w' or mode == 'a' or (mode == 'r' and mode2 == '+'));
+    var found = vfsOpenByName(path_va, false);
+
+    if (want_write) {
+        if (found == null) {
+            // создать (FAT32; initrd → отказ EACCES)
+            if (mode == 'r') { // «r+» без файла — EINVAL по CRT
+                if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
+                    @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 2;
+                }
+                logf("[CRT] {s}(mode=\"r+\") -> NULL (файла нет, ENOENT)\n", .{caller});
+                return 0;
+            }
+            if (!createVfsFile(path_va, false)) {
+                if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
+                    @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 13; // EACCES
+                }
+                logf("[CRT] {s}(mode='{c}') -> NULL (RO-VFS: создание запрещено)\n", .{ caller, mode });
+                return 0;
+            }
+            found = vfsOpenByName(path_va, false);
+        } else if (mode == 'w') {
+            // усечь; отказ бекенда (initrd-RO) → честный NULL + EACCES
+            if (ops.vfs_file_truncate(found.?.norm.ptr, found.?.norm.len, 0) != 1) {
+                if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
+                    @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 13; // EACCES
+                }
+                logf("[CRT] {s}(\"{s}\", mode='w') -> NULL (RO-файл: усечение запрещено)\n", .{ caller, found.?.norm });
+                return 0;
+            }
+            found = vfsOpenByName(path_va, false); // перечитать (размер 0)
+        }
+    }
+
+    const f = found orelse {
         if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
             @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 2; // ENOENT
         }
@@ -689,19 +939,15 @@ fn kfopenCommon(path_va: u64, mode_va: u64, caller: []const u8) u64 {
         logf("[CRT] {s}(\"{s}\", mode='{c}') -> NULL (VFS: не найден, ENOENT)\n", .{ caller, name_buf[0..@intCast(name_len)], mode });
         return 0;
     };
-    if (mode != 'r') {
-        if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
-            @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 13; // EACCES
-        }
-        logf("[CRT] {s}(\"{s}\", mode='{c}') -> NULL (RO-VFS: только чтение)\n", .{ caller, found.norm, mode });
-        return 0;
-    }
-    const idx = fileSlotAlloc(found.norm, found.size) orelse {
+    const idx = fileSlotAlloc(f.norm, f.size) orelse {
         if (c.errno_ptr != 0 and ops.validate_write(c.errno_ptr, 4)) {
             @as(*align(1) u32, @ptrFromInt(c.errno_ptr)).* = 24; // EMFILE
         }
         return 0;
     };
+    // v0.17.0 (CDD №8): writable + append-позиция
+    if (want_write) c.files[idx].writable = true;
+    if (mode == 'a') c.files[idx].pos = f.size;
     const blk_va = kmalloc(CRT_FILE_SIZE);
     if (blk_va == 0) {
         c.files[idx].in_use = false;
@@ -710,7 +956,8 @@ fn kfopenCommon(path_va: u64, mode_va: u64, caller: []const u8) u64 {
     @memset(userPtr(blk_va)[0..CRT_FILE_SIZE], 0);
     std.mem.writeInt(u32, userPtr(blk_va)[0..4], CRT_FILE_MAGIC, .little);
     std.mem.writeInt(u32, userPtr(blk_va)[4..8], @intCast(idx), .little);
-    logf("[CRT] {s}(\"{s}\") -> FILE* 0x{x} (VFS, {d}Б)\n", .{ caller, found.norm, blk_va, found.size });
+    // Формат-контракт cdd7-теста: fopen("cacert.pem") -> FILE* 0x… (VFS, …Б)
+    logf("[CRT] {s}(\"{s}\") -> FILE* 0x{x} (VFS, {d}Б, {s})\n", .{ caller, f.norm, blk_va, f.size, if (want_write) "RW" else "RO" });
     return blk_va;
 }
 
@@ -883,7 +1130,8 @@ fn kread(fd: u64, buf: u64, count: u64) u64 {
     return got;
 }
 
-/// _write(fd, buf, count): 1/2 → консоль; файл RO-VFS → -1 (EACCES).
+/// _write(fd, buf, count): 1/2 → консоль; v0.17.0 (CDD №8): RW-файл →
+/// запись в FAT32; RO → -1 (EACCES).
 fn kwrite(fd: u64, buf: u64, count: u64) u64 {
     if (fd == 1 or fd == 2) {
         if (count > 0) {
@@ -892,7 +1140,16 @@ fn kwrite(fd: u64, buf: u64, count: u64) u64 {
         }
         return count;
     }
-    return @bitCast(@as(i64, -1)); // fd 0 / файл RO-VFS
+    const idx = fileIdxByFd(fd) orelse return @bitCast(@as(i64, -1));
+    const f = &ctx.?.files[idx];
+    if (!f.writable) return @bitCast(@as(i64, -1)); // fd 0 / RO-VFS
+    if (count == 0) return 0;
+    if (!ops.validate_read(buf, count)) return @bitCast(@as(i64, -1));
+    const wrote = ops.vfs_file_write(f.name[0..f.name_len].ptr, f.name_len, f.pos, userPtr(buf), @intCast(count));
+    if (wrote == 0) return @bitCast(@as(i64, -1));
+    f.pos += wrote;
+    if (f.pos > f.size) f.size = f.pos;
+    return wrote;
 }
 
 /// _close(fd): слот освобождён → 0.
@@ -915,30 +1172,57 @@ fn klseeki64(fd: u64, offset: u64, whence: u64) u64 {
     };
     var np: i64 = base +% off;
     if (np < 0) np = 0;
-    if (np > @as(i64, @bitCast(f.size))) np = @bitCast(f.size);
+    // v0.17.0 (CDD №8): RW — за конец можно; RO — клэмп
+    if (!f.writable and np > @as(i64, @bitCast(f.size))) np = @bitCast(f.size);
     f.pos = @bitCast(np);
     f.eof = false;
     return f.pos;
 }
 
-/// _sopen_s(pfd, path, oflag, shflag, pmode): *pfd = 3+idx; RO-VFS.
+/// _sopen_s(pfd, path, oflag, shflag, pmode): *pfd = 3+idx.
+/// v0.17.0 (CDD №8): MSVC-флаги _O_WRONLY(1)/_O_RDWR(2)/_O_APPEND(8)/
+/// _O_CREAT(0x100)/_O_TRUNC(0x200) → create/truncate/append (FAT32 RW).
 fn ksopenS(fd_va: u64, path_va: u64, oflag: u64) u64 {
     if (fd_va == 0 or !ops.validate_write(fd_va, 4)) return 22; // EINVAL
     userD(fd_va).* = 0xFFFF_FFFF; // -1 по умолчанию
     const write_flag = oflag & 0x3; // _O_RDONLY=0, _O_WRONLY=1, _O_RDWR=2
-    const found = vfsOpenByName(path_va, false) orelse return 2; // ENOENT
-    if (write_flag != 0) return 13; // EACCES: RO-VFS
-    const idx = fileSlotAlloc(found.norm, found.size) orelse return 24; // EMFILE
+    const O_CREAT: u64 = 0x100;
+    const O_TRUNC: u64 = 0x200;
+    const O_APPEND: u64 = 0x8;
+    var found = vfsOpenByName(path_va, false);
+    if (write_flag != 0) {
+        if (found == null and (oflag & O_CREAT) != 0) {
+            if (!createVfsFile(path_va, false)) return 13; // EACCES (RO-бекенд)
+            found = vfsOpenByName(path_va, false);
+        }
+        if (found == null) return 2; // ENOENT (без _O_CREAT)
+        if ((oflag & O_TRUNC) != 0) {
+            _ = ops.vfs_file_truncate(found.?.norm.ptr, found.?.norm.len, 0);
+            found = vfsOpenByName(path_va, false);
+        }
+    }
+    const f = found orelse return 2; // ENOENT
+    const idx = fileSlotAlloc(f.norm, f.size) orelse return 24; // EMFILE
+    if (write_flag != 0) ctx.?.files[idx].writable = true;
+    if ((oflag & O_APPEND) != 0) ctx.?.files[idx].pos = f.size;
     userD(fd_va).* = @intCast(3 + idx);
-    logf("[CRT] _sopen_s(\"{s}\") -> fd={d} (VFS)\n", .{ found.norm, 3 + idx });
+    logf("[CRT] _sopen_s(\"{s}\", flags=0x{x}) -> fd={d} ({s})\n", .{ f.norm, oflag, 3 + idx, if (write_flag != 0) "RW" else "RO" });
     return 0;
 }
 
-/// _chsize_s(fd, size): RO-VFS — EACCES (13).
+/// _chsize_s(fd, size): v0.17.0 (CDD №8) — РЕАЛЬНОЕ усечение/расширение
+/// (FAT32 setFileSize через vfs_file_truncate); RO → EACCES (13).
 fn kchsizeS(fd: u64, size: u64) u64 {
-    _ = fd;
-    _ = size;
-    return 13; // EACCES
+    const idx = fileIdxByFd(fd) orelse return 9; // EBADF
+    const f = &ctx.?.files[idx];
+    if (!f.writable) return 13; // EACCES
+    if (ops.vfs_file_truncate(f.name[0..f.name_len].ptr, f.name_len, size) == 1) {
+        f.size = size;
+        if (f.pos > size) f.pos = size;
+        f.eof = false;
+        return 0; // успех (контракт _chsize_s: 0 = OK)
+    }
+    return 13;
 }
 
 /// puts(s): строка + '\n' в консоль → неотрицательный код.
@@ -1233,7 +1517,21 @@ fn wsaCleanup() u64 {
 /// fputs(str, stream): ПЕЧАТЬ ТЕКСТА ПРИЛОЖЕНИЯ в консоль ОС. Возврат 1
 /// (nonneg = успех, CRT-контракт). Мусорный указатель → 0 (EOF).
 fn fputs(str_va: u64, stream: u64) u64 {
-    _ = stream; // stdout/stderr одинаково идут в serial (CDD-упрощение)
+    // v0.17.0 (CDD №8): FILE* может быть VFS-файлом (запись) — fwrite-путь;
+    // stdout/stderr (iob или чужой указатель) — консоль (CDD-упрощение).
+    if (crtFileIdx(stream)) |idx| {
+        const c = &(ctx orelse return 0);
+        const f = &c.files[idx];
+        if (!f.writable) return 0;
+        const len = userStrLen(str_va) orelse return 0;
+        if (len == 0) return 1;
+        if (!ops.validate_read(str_va, len)) return 0;
+        const wrote = ops.vfs_file_write(f.name[0..f.name_len].ptr, f.name_len, f.pos, userPtr(str_va), @intCast(len));
+        if (wrote == 0) return 0;
+        f.pos += wrote;
+        if (f.pos > f.size) f.size = f.pos;
+        return 1;
+    }
     const len = userStrLen(str_va) orelse return 0;
     if (len == 0) return 1;
     ops.write_console(userPtr(str_va)[0..@intCast(len)]);
@@ -1241,8 +1539,19 @@ fn fputs(str_va: u64, stream: u64) u64 {
 }
 
 /// fputc(c, stream): один символ; возврат записанного байта (int-контракт).
+/// v0.17.0 (CDD №8): FILE* VFS → запись (если writable); иначе консоль.
 fn fputc(c: u64, stream: u64) u64 {
-    _ = stream;
+    if (crtFileIdx(stream)) |idx| {
+        const cc = &(ctx orelse return 0);
+        const f = &cc.files[idx];
+        if (!f.writable) return 0;
+        const ch: [1]u8 = .{@truncate(c)};
+        const wrote = ops.vfs_file_write(f.name[0..f.name_len].ptr, f.name_len, f.pos, &ch, 1);
+        if (wrote == 0) return 0;
+        f.pos += 1;
+        if (f.pos > f.size) f.size = f.pos;
+        return c & 0xFF;
+    }
     const ch: [1]u8 = .{@truncate(c)};
     ops.write_console(&ch);
     return c & 0xFF;
@@ -1254,15 +1563,55 @@ fn fputc(c: u64, stream: u64) u64 {
 /// ошибки — helpf() пишет его через fwrite). Байты идут в виртуальную
 /// консоль; аргумент 4-й (stream) в Win64 — R9, диспетчер передаёт a4.
 fn fwrite(ptr: u64, size: u64, nmemb: u64, stream: u64) u64 {
-    // v0.16.0 (CDD №7): FILE* VFS — RO-VFS → 0 элементов (отказ записи);
-    // stdout/stderr (iob-блоки без magic) — прежний консольный путь.
-    if (crtFileIdx(stream) != null) return 0;
+    // v0.17.0 (CDD №8): FILE* VFS с writable → РЕАЛЬНАЯ запись (FAT32) —
+    // curl -o пишет тело ответа через fwrite/fflush;
+    // FILE* RO (initrd) → 0 элементов (отказ записи);
+    // stdout/stderr (iob-блоки без magic) — консольный путь (как v0.12).
+    if (crtFileIdx(stream)) |idx| {
+        const c = &(ctx orelse return 0);
+        const f = &c.files[idx];
+        if (!f.writable) return 0; // RO-VFS: CRT-контракт «0 элементов»
+        if (size == 0 or nmemb == 0) return 0;
+        const total = size * nmemb;
+        if (total > 16 * 1024 * 1024) return 0; // защитный лимит
+        if (!ops.validate_read(ptr, total)) return 0;
+        const wrote = ops.vfs_file_write(f.name[0..f.name_len].ptr, f.name_len, f.pos, userPtr(ptr), @intCast(total));
+        if (wrote < total) return 0; // частичная запись = ошибка
+        f.pos += wrote;
+        if (f.pos > f.size) f.size = f.pos;
+        return nmemb; // CRT: успех → nmemb
+    }
+    // msvcrt-_iob FILE* (блок DATA-импортов): stdout/stderr → консоль,
+    // stdin → 0. Блок 3×48Б после заголовка (main64.patchDataImports).
+    if (isMsvcrtIobStream(stream)) |stream_idx| {
+        if (stream_idx == 0) return 0; // stdin
+        if (size == 0 or nmemb == 0) return 0;
+        const total = size * nmemb;
+        if (total > 16 * 1024 * 1024) return 0;
+        if (!ops.validate_read(ptr, total)) return 0;
+        ops.write_console(userPtr(ptr)[0..@intCast(total)]);
+        return nmemb;
+    }
     if (size == 0 or nmemb == 0) return 0;
     const total = size * nmemb;
     if (total > 16 * 1024 * 1024) return 0; // защитный лимит
     if (!ops.validate_read(ptr, total)) return 0; // поток ошибочен → 0
     ops.write_console(userPtr(ptr)[0..@intCast(total)]);
     return nmemb; // контракт CRT: успех → nmemb
+}
+
+/// v0.17.0 (CDD №8): FILE* из блока _iob (msvcrt DATA-импорт 7-Zip):
+/// msvcrt-структура iobuf = 48Б; stdin/_iob[0], stdout/_iob[1], stderr/_iob[2].
+/// Возврат: 0/1/2 (индекс потока) или null (не из блока).
+fn isMsvcrtIobStream(stream: u64) ?usize {
+    const c = &(ctx orelse return null);
+    const blk = c.iob_block;
+    if (blk == 0) return null;
+    if (stream < blk + 0x100 or stream >= blk + 0x100 + 3 * 48) return null;
+    if (!ops.validate_read(stream, 48)) return null;
+    const idx: usize = @intCast((stream - (blk + 0x100)) / 48);
+    if (idx > 2) return null;
+    return idx;
 }
 
 // ─── v0.12.0 (CDD №3): версионирование ОС, окружение, ошибки ───────────────
@@ -3333,9 +3682,9 @@ const WAIT_OBJECT_0: u64 = 0;
 const WAIT_TIMEOUT: u64 = 258;
 
 fn wsaCreateEvent() u64 {
-    const c = &(ctx orelse return 0);
-    const h = c.next_event_handle;
-    c.next_event_handle += 1;
+    // v0.17.0 (CDD №8): единый пул событий с РЕАЛЬНЫМ состоянием (WSA-события
+    // manual-reset по семантике Winsock; WSAEnumNetworkEvents сбрасывает).
+    const h = eventAlloc(true, false, false, 0);
     logf("[WS2] WSACreateEvent -> handle=0x{x}\n", .{h});
     return h;
 }
@@ -3459,18 +3808,71 @@ const WSA_INVALID_HANDLE: u64 = 6;
 const MUTEX_HANDLE_BASE: u64 = 0x400;
 const MUTEX_HANDLE_LIMIT: u64 = 0x500;
 
+/// v0.17.0 (CDD №8): сигнальное состояние хэндла (события/семафоры —
+/// ctx.events; тред-хэндлы 0x1000+ — ops.object_signaled как v0.12).
+fn objectAlive(h: u64) bool {
+    if (eventByHandle(h)) |ev| {
+        if (ev.is_semaphore) return ev.count > 0;
+        return ev.signaled;
+    }
+    return ops.object_signaled(h);
+}
+
+/// Сигнальный захват (auto-reset event: Wait сбрасывает сигнал; семафор:
+/// count -= 1). true = захвачен.
+fn objectAcquire(h: u64) bool {
+    if (eventByHandle(h)) |ev| {
+        if (ev.is_semaphore) {
+            if (ev.count == 0) return false;
+            ev.count -= 1;
+            return true;
+        }
+        if (!ev.signaled) return false;
+        if (!ev.manual_reset) ev.signaled = false; // auto-reset
+        return true;
+    }
+    return ops.object_signaled(h); // тред: состояние читает ядро
+}
+
+/// WaitForSingleObject(h, ms): v0.17.0 (CDD №8) — ПАРКОВКА ожидания:
+/// цикл «sleep 10мс → проверка сигнала» (воркеры 7-Zip ждут INFINITE на
+/// событиях; мгновенный WAIT_TIMEOUT ломал синхронизацию бенчмарка).
+/// Возврат: WAIT_OBJECT_0 / WAIT_TIMEOUT / WAIT_FAILED.
 fn kWaitForSingleObject(h: u64, ms: u64) u64 {
-    // v0.14.0: мьютексы — «свободны» (SRWLock-прецедент v0.11)
+    // Мьютексы (CreateMutexA-пул 0x400+) — «свободны» (SRWLock-прецедент v0.11)
     if (h >= MUTEX_HANDLE_BASE and h < MUTEX_HANDLE_LIMIT) {
         logf("[WIN32] WaitForSingleObject(mutex=0x{x}) -> WAIT_OBJECT_0 (свободен)\n", .{h});
         return WAIT_OBJECT_0;
     }
-    if (ops.object_signaled(h)) {
+    const valid = eventByHandle(h) != null or (h >= 0x1000) or ops.object_signaled(h);
+    if (!valid and h != 0) {
+        // Совсем неизвестный хэндл — не ждём (как v0.12-CDD), но честно логируем.
+        logf("[WIN32] WaitForSingleObject(handle=0x{x}, {d}ms) -> WAIT_FAILED (неизвестный объект)\n", .{ h, ms });
+        return 0xFFFFFFFF; // WAIT_FAILED
+    }
+    // УЖЕ сигнален? — захват без ожидания (fast-path).
+    if (objectAcquire(h)) {
         logf("[WIN32] WaitForSingleObject(handle=0x{x}) -> WAIT_OBJECT_0 (сигнален)\n", .{h});
         return WAIT_OBJECT_0;
     }
-    logf("[WIN32] WaitForSingleObject(handle=0x{x}, timeout={d}ms) -> timeout\n", .{ h, ms });
-    return WAIT_TIMEOUT;
+    if (ms == 0) return WAIT_TIMEOUT; // Win32: нулевой таймаут — только проверка
+    const INFINITE: u64 = 0xFFFF_FFFF;
+    const deadline_ticks: u64 = if (ms == INFINITE) 0 else (ms / 10) + 1; // 10мс-тики
+    var waited: u64 = 0;
+    while (true) {
+        // Парковка задачи 10мс: тред НЕ жжёт CPU, планировщик отдаёт слайсы
+        // другим (крипто/компрессия); SetEvent из другого треда меняет state.
+        ops.sleep_task(10);
+        waited += 1;
+        if (objectAcquire(h)) {
+            logf("[WIN32] WaitForSingleObject(handle=0x{x}) -> WAIT_OBJECT_0 после {d}×10мс парковки\n", .{ h, waited });
+            return WAIT_OBJECT_0;
+        }
+        if (deadline_ticks != 0 and waited >= deadline_ticks) {
+            logf("[WIN32] WaitForSingleObject(handle=0x{x}, {d}ms) -> WAIT_TIMEOUT\n", .{ h, ms });
+            return WAIT_TIMEOUT;
+        }
+    }
 }
 
 fn kWaitForSingleObjectEx(h: u64, ms: u64, alertable: u64) u64 {
@@ -3478,40 +3880,150 @@ fn kWaitForSingleObjectEx(h: u64, ms: u64, alertable: u64) u64 {
     return kWaitForSingleObject(h, ms);
 }
 
-/// WaitForMultipleObjects(n, handles, waitAll, ms): сигнальный → индекс+WAIT_OBJECT_0.
+/// WaitForMultipleObjects(n, handles, waitAll, ms): v0.17.0 (CDD №8) —
+/// парковка: поллинг с sleep 10мс; waitAll=TRUE — все сигнальны (захват
+/// всех), FALSE — первый сигнальный (возврат WAIT_OBJECT_0+индекс).
 fn kWaitForMultipleObjects(n: u64, handles_va: u64, wait_all: u64, ms: u64) u64 {
     if (n == 0 or n > 64) return 0xFFFFFFFF; // WAIT_FAILED
     if (handles_va == 0 or !ops.validate_read(handles_va, n * 8)) {
         return 0xFFFFFFFF;
     }
-    var i: u64 = 0;
-    while (i < n) : (i += 1) {
-        if (ops.object_signaled(userQ(handles_va + i * 8).*)) {
-            logf("[WIN32] WaitForMultipleObjects(n={d}) -> object {d} signaled\n", .{ n, i });
-            return WAIT_OBJECT_0 + i;
+    const INFINITE: u64 = 0xFFFF_FFFF;
+    const deadline_ticks: u64 = if (ms == INFINITE) 0 else (ms / 10) + 1;
+    var waited: u64 = 0;
+    while (true) {
+        // Снимок хэндлов (массив в user-памяти может быть переиспользован)
+        var hs: [64]u64 = undefined;
+        for (0..@intCast(n)) |i| hs[i] = userQ(handles_va + i * 8).*;
+        if (wait_all != 0) {
+            var all = true;
+            for (hs[0..@intCast(n)]) |h| {
+                if (!objectAlive(h)) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) {
+                // Захват всех (auto-reset/семафоры)
+                for (hs[0..@intCast(n)]) |h| _ = objectAcquire(h);
+                logf("[WIN32] WaitForMultipleObjects(n={d}, all) -> WAIT_OBJECT_0\n", .{n});
+                return WAIT_OBJECT_0;
+            }
+        } else {
+            for (hs[0..@intCast(n)], 0..) |h, i| {
+                if (objectAlive(h)) {
+                    _ = objectAcquire(h);
+                    logf("[WIN32] WaitForMultipleObjects(n={d}) -> object {d} signaled\n", .{ n, i });
+                    return WAIT_OBJECT_0 + i;
+                }
+            }
+        }
+        if (ms == 0) return WAIT_TIMEOUT;
+        ops.sleep_task(10);
+        waited += 1;
+        if (deadline_ticks != 0 and waited >= deadline_ticks) {
+            logf("[WIN32] WaitForMultipleObjects(n={d}, waitAll={d}, {d}ms) -> WAIT_TIMEOUT\n", .{ n, wait_all, ms });
+            return WAIT_TIMEOUT;
         }
     }
-    logf("[WIN32] WaitForMultipleObjects(n={d}, waitAll={d}, timeout={d}ms) -> timeout\n", .{ n, wait_all, ms });
-    return WAIT_TIMEOUT;
 }
 
-/// CreateEventA (KERNEL32): тот же пул событий, что у WSA — хэндлы едины.
-fn kCreateEventA(attrs: u64, manual_reset: u64, initial: u64, name_va: u64) u64 {
+/// Создание события/семафора: общий пул 0x200+ (WSA/KERNEL32 едины).
+fn eventAlloc(manual_reset: bool, initial: bool, is_semaphore: bool, count: u32) u64 {
+    const c = &(ctx orelse return 0);
+    for (&c.events, 0..) |*ev, i| {
+        if (!ev.in_use) {
+            ev.* = .{
+                .in_use = true,
+                .signaled = initial,
+                .manual_reset = manual_reset,
+                .is_semaphore = is_semaphore,
+                .count = count,
+            };
+            return EVENT_HANDLE_BASE + i;
+        }
+    }
+    return 0; // пул исчерпан
+}
+
+/// CreateEventA/W (attrs, manualReset, initial, name) — v0.17.0: РЕАЛЬНОЕ
+/// состояние (SetEvent/ResetEvent/Wait работают честно).
+fn kCreateEventW(attrs: u64, manual_reset: u64, initial: u64, name_va: u64, wide: bool) u64 {
     _ = attrs;
-    _ = manual_reset;
-    _ = initial;
     if (name_va != 0) {
-        const nlen = userStrLen(name_va) orelse 0;
-        if (nlen > 0 and ops.validate_read(name_va, @min(nlen, 64))) {
-            logf("[WIN32] CreateEventA(\"{s}\")\n", .{userPtr(name_va)[0..@intCast(@min(nlen, 64))]});
+        if (wide) {
+            const nlen = userStrLenW(name_va) orelse 0;
+            if (nlen > 0 and nlen <= 64) logf("[WIN32] CreateEvent{c}(name)\n", .{@as(u8, if (wide) 'W' else 'A')});
+        } else {
+            const nlen = userStrLen(name_va) orelse 0;
+            if (nlen > 0 and ops.validate_read(name_va, @min(nlen, 64))) {
+                logf("[WIN32] CreateEvent{c}(\"{s}\")\n", .{ @as(u8, if (wide) 'W' else 'A'), userPtr(name_va)[0..@intCast(@min(nlen, 64))] });
+            }
         }
     } else {
-        logf("[WIN32] CreateEventA(unnamed)\n", .{});
+        logf("[WIN32] CreateEvent{c}(unnamed)\n", .{@as(u8, if (wide) 'W' else 'A')});
     }
-    const c = &(ctx orelse return 0);
-    const h = c.next_event_handle;
-    c.next_event_handle += 1;
+    const h = eventAlloc(manual_reset != 0, initial != 0, false, 0);
+    if (h == 0) setLastError(8); // ERROR_NOT_ENOUGH_MEMORY
     return h;
+}
+
+/// SetEvent(h): сигнал (auto-reset сбросится первым же ждущим Wait'ом).
+fn kSetEvent(h: u64) u64 {
+    const ev = eventByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    ev.signaled = true;
+    return 1;
+}
+
+/// ResetEvent(h): снять сигнал.
+fn kResetEvent(h: u64) u64 {
+    const ev = eventByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    ev.signaled = false;
+    return 1;
+}
+
+/// CreateSemaphoreW(attrs, initial, max, name): счётчик-семафор пула 0x200+.
+fn kCreateSemaphoreW(attrs: u64, initial: u64, maximum: u64, name_va: u64) u64 {
+    _ = attrs;
+    _ = maximum;
+    _ = name_va;
+    const h = eventAlloc(true, initial > 0, true, @intCast(@min(initial, 0x7FFFFFFF)));
+    logf("[WIN32] CreateSemaphoreW(initial={d}) -> 0x{x}\n", .{ initial, h });
+    if (h == 0) setLastError(8);
+    return h;
+}
+
+/// ReleaseSemaphore(h, n, lpPrev): count += n; *lpPrev = старое.
+fn kReleaseSemaphore(h: u64, n: u64, lp_prev: u64) u64 {
+    const ev = eventByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    if (!ev.is_semaphore or n == 0 or n > 0x7FFFFFFF) {
+        setLastError(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    if (lp_prev != 0 and ops.validate_write(lp_prev, 4)) {
+        userD(lp_prev).* = ev.count;
+    }
+    ev.count = @min(ev.count + @as(u32, @intCast(n)), 0x7FFFFFFF);
+    ev.signaled = ev.count > 0;
+    return 1;
+}
+
+/// OpenEventW(attrs, inherit, name) — имени нет: новый несигнальный auto-event.
+fn kOpenEventW(attrs: u64, inherit: u64, name_va: u64) u64 {
+    _ = attrs;
+    _ = inherit;
+    _ = name_va;
+    logf("[WIN32] OpenEventW(name) -> новый auto-event (имён-каталога нет)\n", .{});
+    return eventAlloc(false, false, false, 0);
 }
 
 /// __WSAFDIsSet(s, fd_set): тело макроса select() — «есть ли s в наборе?».
@@ -3644,6 +4156,456 @@ fn kGetTickCount64() u64 {
         if (c.tsc_freq > 1000) return ops.read_tsc() / (c.tsc_freq / 1000);
     }
     return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.17.0 (CDD №8): 7-Zip-волна — CPU/память/события/время/файлы
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// GetTickCount(): младшие 32 бита ms-счётчика (wrap ~49 суток — Win32).
+fn getTickCount() u64 {
+    return @truncate(kGetTickCount64());
+}
+
+/// GetSystemTimeAsFileTime-обёртка: текущий FILETIME (u64, 100нс от 1601).
+fn currentFileTime() u64 {
+    const unix: u64 = if (ops.wall_time) |f| f() else 13395187200;
+    return (unix + 11644473600) * 10_000_000;
+}
+
+/// SYSTEM_INFO (Win64, 56+24Б): архитектура/число CPU/гранулярность/диапазон.
+/// 7-Zip benchmark читает dwNumberOfProcessors (слоты 60-63 в x64) и
+/// lpMinimumApplicationAddress. Ядро знает счёт CPU честно — из ops.
+/// Layout (x64): {0: DWORD dwOemId(u64 в выравнивании), 8: DWORD page_size,
+/// 16: LPVOID min_app_addr, 24: LPVOID max_app_addr, 32: DWORD_PTR active_mask,
+/// 40: DWORD nprocessors, 44: DWORD proc_type, 48: DWORD alloc_gran,
+/// 52: WORD proc_level, 54: WORD proc_revision}
+fn getSystemInfo(lp: u64) u64 {
+    if (lp == 0) return 0;
+    if (!ops.validate_write(lp, 64)) return 0;
+    const page = userPtr(lp);
+    @memset(page[0..64], 0);
+    // PROCESSOR_ARCHITECTURE_AMD64 = 9 (wProcessorArchitecture в union)
+    std.mem.writeInt(u16, page[0..2], 0, .little); // wReserved
+    std.mem.writeInt(u16, page[2..4], 9, .little); // AMD64
+    std.mem.writeInt(u32, page[8..12], 4096, .little); // dwPageSize
+    userQ(lp + 16).* = 0x10000; // lpMinimumApplicationAddress
+    userQ(lp + 24).* = 0x0000_7FFF_FFFF_FFFF; // lpMaximumApplicationAddress
+    userQ(lp + 32).* = 0xFF; // dwActiveProcessorMask (8 CPU)
+    std.mem.writeInt(u32, page[40..44], @truncate(ops.cpu_count()), .little); // dwNumberOfProcessors
+    std.mem.writeInt(u32, page[44..48], 8664, .little); // dwProcessorType (PROCESSOR_AMD_X8664)
+    std.mem.writeInt(u32, page[48..52], 4096 * 64, .little); // dwAllocationGranularity
+    std.mem.writeInt(u16, page[52..54], 0, .little); // wProcessorLevel
+    std.mem.writeInt(u16, page[54..56], 0, .little); // wProcessorRevision
+    logf("[WIN32] GetSystemInfo -> {d} CPU (AMD64)\n", .{ops.cpu_count()});
+    return 0;
+}
+
+/// MEMORYSTATUSEX (64-80Б): {0: DWORD dwLength, 4: dwMemoryLoad,
+/// 8: u64 ullTotalPhys, 16: ullAvailPhys, 24: TotalPage, 32: AvailPage,
+/// 40: TotalVirtual, 48: AvailVirtual, 56: ullAvailExtendedVirtual}.
+/// Ядро знает реальную физ-память через ops.phys_mem_kb (PMM-статистика).
+fn globalMemoryStatusEx(lp: u64) u64 {
+    if (lp == 0) return 0;
+    if (!ops.validate_write(lp, 64)) return 0;
+    const page = userPtr(lp);
+    const struct_len = std.mem.readInt(u32, page[0..4], .little);
+    _ = struct_len;
+    @memset(page[0..64], 0);
+    std.mem.writeInt(u32, page[0..4], 64, .little); // dwLength
+    const total_kb = ops.phys_mem_kb();
+    const total: u64 = total_kb * 1024;
+    std.mem.writeInt(u32, page[4..8], 30, .little); // dwMemoryLoad (30%)
+    userQ(lp + 8).* = total; // ullTotalPhys
+    userQ(lp + 16).* = total / 2; // ullAvailPhys
+    userQ(lp + 24).* = 0; // page-файла нет
+    userQ(lp + 32).* = 0;
+    userQ(lp + 40).* = 0x0000_7FFF_FFFF_FFFF; // TotalVirtual
+    userQ(lp + 48).* = 0x0000_7FFF_FFFF_FFFF / 2;
+    userQ(lp + 56).* = 0;
+    logf("[WIN32] GlobalMemoryStatusEx: Total={d}КБ\n", .{total_kb});
+    return 1;
+}
+
+/// OSVERSIONINFOW ({-4: dwOSVersionInfoSize, 0: major, 4: minor, 8: build,
+/// 12: platform, 16: szCSDVersion[128]}) — Win10-совместимо (OS_ACTUAL).
+fn getVersionExW(lp: u64) u64 {
+    if (lp == 0) return 0;
+    if (!ops.validate_write(lp, 20)) return 0;
+    const page = userPtr(lp);
+    @memset(page[0..148], 0);
+    std.mem.writeInt(u32, page[0..4], OS_ACTUAL.major, .little);
+    std.mem.writeInt(u32, page[4..8], OS_ACTUAL.minor, .little);
+    std.mem.writeInt(u32, page[8..12], OS_ACTUAL.build, .little);
+    std.mem.writeInt(u32, page[12..16], OS_ACTUAL.platform, .little);
+    logf("[WIN32] GetVersionExW -> Win{d}.{d} build {d}\n", .{ OS_ACTUAL.major, OS_ACTUAL.minor, OS_ACTUAL.build });
+    return 1;
+}
+
+/// ResumeThread(h): треды CREATE_SUSPENDED не создаём — счётчик приостановок
+/// 0; честный SUCCESS (возврат prev suspend count).
+fn resumeThread(h: u64) u64 {
+    _ = h;
+    return 0;
+}
+
+/// GetProcessTimes(h, lpCreation, lpExit, lpKernel, lpUser):
+/// времена процесса (FILETIME): создание = бут, выход = 0, kernel/user
+/// делим TSC пополам — бенчмарк 7-Zip печатает CPU Usage из них.
+fn getProcessTimes(h: u64, lp_creation: u64, lp_exit: u64, lp_kernel: u64, lp_user: u64) u64 {
+    _ = h;
+    const now = currentFileTime();
+    const cpu_ft: u64 = now / 4; // «четверть времени» — грубая эвристика
+    if (lp_creation != 0 and ops.validate_write(lp_creation, 8)) userQ(lp_creation).* = now - 100 * 10_000_000;
+    if (lp_exit != 0 and ops.validate_write(lp_exit, 8)) userQ(lp_exit).* = 0;
+    if (lp_kernel != 0 and ops.validate_write(lp_kernel, 8)) userQ(lp_kernel).* = cpu_ft;
+    if (lp_user != 0 and ops.validate_write(lp_user, 8)) userQ(lp_user).* = cpu_ft;
+    return 1;
+}
+
+/// SYSTEMTIME {u16 y, m, dow, d, h, min, s, ms} (16Б) из FILETIME (1601-эпоха).
+fn fileTimeToSystemTime(lp_ft: u64, lp_st: u64) u64 {
+    if (lp_ft == 0 or !ops.validate_read(lp_ft, 8)) return 0;
+    if (lp_st == 0 or !ops.validate_write(lp_st, 16)) return 0;
+    const ft = userQ(lp_ft).*;
+    // 100нс-интервалы → Unix-секунды
+    const unix: i64 = @as(i64, @intCast(ft / 10_000_000)) - 11644473600;
+    // civil-from-days (Howard Hinnant)
+    var days: i64 = @divFloor(unix, 86400);
+    var secs: i64 = unix - days * 86400;
+    if (secs < 0) {
+        secs += 86400;
+        days -= 1;
+    }
+    const z: i64 = days + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: i64 = z - era * 146097;
+    const yoe: i64 = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y: i64 = yoe + era * 400;
+    const doy: i64 = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp: i64 = @divFloor(5 * doy + 2, 153);
+    const d: i64 = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m: i64 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (m <= 2) y + 1 else y;
+    const page = userPtr(lp_st);
+    std.mem.writeInt(u16, page[0..2], @intCast(year), .little);
+    std.mem.writeInt(u16, page[2..4], @intCast(m), .little);
+    std.mem.writeInt(u16, page[4..6], 0, .little); // день недели (упрощение)
+    std.mem.writeInt(u16, page[6..8], @intCast(d), .little);
+    std.mem.writeInt(u16, page[8..10], @intCast(@divFloor(secs, 3600)), .little);
+    std.mem.writeInt(u16, page[10..12], @intCast(@mod(@divFloor(secs, 60), 60)), .little);
+    std.mem.writeInt(u16, page[12..14], @intCast(@mod(secs, 60)), .little);
+    std.mem.writeInt(u16, page[14..16], 0, .little);
+    return 1;
+}
+
+/// FileTimeToLocalFileTime / LocalFileTimeToFileTime: часовой пояс UTC
+/// (CMOS-RTC даёт UTC) — копирование без сдвига.
+fn fileTimeToLocalFileTime(lp_in: u64, lp_out: u64) u64 {
+    if (lp_in == 0 or !ops.validate_read(lp_in, 8)) return 0;
+    if (lp_out == 0 or !ops.validate_write(lp_out, 8)) return 0;
+    userQ(lp_out).* = userQ(lp_in).*;
+    return 1;
+}
+fn localFileTimeToFileTime(lp_in: u64, lp_out: u64) u64 {
+    return fileTimeToLocalFileTime(lp_in, lp_out);
+}
+
+/// DosDateTimeToFileTime(wDate, wTime, lpFT): дата DOS ( packed y/m/d ) → FT.
+fn dosDateTimeToFileTime(w_date: u64, w_time: u64, lp_ft: u64) u64 {
+    if (lp_ft == 0 or !ops.validate_write(lp_ft, 8)) return 0;
+    const date: u16 = @truncate(w_date);
+    const time: u16 = @truncate(w_time);
+    const year: i64 = @as(i64, date >> 9) + 1980;
+    const month: i64 = (date >> 5) & 0xF;
+    const day: i64 = date & 0x1F;
+    const hour: i64 = time >> 11;
+    const minute: i64 = (time >> 5) & 0x3F;
+    const sec2: i64 = (time & 0x1F) * 2;
+    // days_from_civil
+    const y2: i64 = if (month <= 2) year - 1 else year;
+    const m2: i64 = month;
+    const era: i64 = @divFloor(if (y2 >= 0) y2 else y2 - 399, 400);
+    const yoe: i64 = y2 - era * 400;
+    const mp2: i64 = @mod(m2 + 9, 12);
+    const doy: i64 = @divFloor(153 * mp2 + 2, 5) + day - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days: i64 = era * 146097 + doe - 719468;
+    const unix: i64 = days * 86400 + hour * 3600 + minute * 60 + sec2;
+    userQ(lp_ft).* = @intCast((unix + 11644473600) * 10_000_000);
+    return 1;
+}
+
+/// FileTimeToDosDateTime(lpFT, lpwDate, lpwTime): обратная конверсия.
+fn fileTimeToDosDateTime(lp_ft: u64, lp_date: u64, lp_time: u64) u64 {
+    if (lp_ft == 0 or !ops.validate_read(lp_ft, 8)) return 0;
+    const ft = userQ(lp_ft).*;
+    const unix: i64 = @as(i64, @intCast(ft / 10_000_000)) - 11644473600;
+    var days: i64 = @divFloor(unix, 86400);
+    const secs: i64 = unix - days * 86400;
+    _ = &days;
+    const z: i64 = days + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: i64 = z - era * 146097;
+    const yoe: i64 = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y: i64 = yoe + era * 400;
+    const doy: i64 = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp: i64 = @divFloor(5 * doy + 2, 153);
+    const d: i64 = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m: i64 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (m <= 2) y + 1 else y;
+    if (year < 1980 or year > 2107) return 0;
+    if (lp_date != 0 and ops.validate_write(lp_date, 2)) {
+        const dw: u16 = (@as(u16, @intCast(year - 1980)) << 9) | (@as(u16, @intCast(m)) << 5) | @as(u16, @intCast(d));
+        std.mem.writeInt(u16, userPtr(lp_date)[0..2], dw, .little);
+    }
+    if (lp_time != 0 and ops.validate_write(lp_time, 2)) {
+        const tw: u16 = (@as(u16, @intCast(@divFloor(secs, 3600))) << 11) |
+            (@as(u16, @intCast(@mod(@divFloor(secs, 60), 60))) << 5) |
+            @as(u16, @intCast(@divFloor(@mod(secs, 60), 2)));
+        std.mem.writeInt(u16, userPtr(lp_time)[0..2], tw, .little);
+    }
+    return 1;
+}
+
+/// CompareFileTime(lpFT1, lpFT2): -1/0/1.
+fn compareFileTime(lp1: u64, lp2: u64) u64 {
+    if (lp1 == 0 or lp2 == 0 or !ops.validate_read(lp1, 8) or !ops.validate_read(lp2, 8)) return 0;
+    const a = userQ(lp1).*;
+    const b = userQ(lp2).*;
+    return if (a < b) @as(u64, @bitCast(@as(i64, -1))) else if (a > b) 1 else 0;
+}
+
+/// BY_HANDLE_FILE_INFORMATION (52Б): {0: attrs, 8: index/serial, 24: nlinks,
+/// 32: size_lo+hi(u64)}. v0.17.0: реальный размер VFS-файла.
+fn getFileInformationByHandle(h: u64, lp: u64) u64 {
+    const f = fileByHandle(h) orelse {
+        setLastError(ERROR_INVALID_HANDLE_FILE);
+        return 0;
+    };
+    if (lp == 0 or !ops.validate_write(lp, 52)) {
+        setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const page = userPtr(lp);
+    @memset(page[0..52], 0);
+    std.mem.writeInt(u32, page[0..4], 0x80, .little); // FILE_ATTRIBUTE_NORMAL
+    std.mem.writeInt(u32, page[24..28], 1, .little); // nNumberOfLinks
+    std.mem.writeInt(u64, page[32..40], f.size, .little); // file size
+    return 1;
+}
+
+/// GetModuleFileNameW(hModule, lpFilename, nSize): путь образа «C:\7za.exe».
+fn getModuleFileNameW(h_module: u64, lp: u64, n: u64) u64 {
+    _ = h_module;
+    if (lp == 0 or n < 8 or !ops.validate_write(lp, n * 2)) return 0;
+    const path = "C:\\7za.exe"; // имя образа (cmdline[0] с путём — beyond-model)
+    var i: usize = 0;
+    while (i < path.len and i < n - 1) : (i += 1) {
+        userW(lp + i * 2).* = path[i];
+    }
+    userW(lp + i * 2).* = 0;
+    return i; // cch без NUL
+}
+
+/// WideCharToMultiByte(cp, flags, src(w), cch, dst, cb, lpDefault, lpUsed):
+/// UTF-16LE → ANSI/UTF-8 (ASCII-путь; зеркала kMultiByteToWideChar).
+fn kWideCharToMultiByte(src_va: u64, cch: u64, dst_va: u64, cb: u64) u64 {
+    var n: u64 = 0;
+    var nul_term = false;
+    if (@as(i64, @bitCast(cch)) == -1) {
+        const len = userStrLenW(src_va) orelse return 0;
+        n = len + 1;
+        nul_term = true;
+    } else {
+        n = cch;
+    }
+    if (n > 16 * 1024 * 1024) return 0;
+    // Только длину?
+    if (dst_va == 0 or cb == 0) {
+        if (nul_term) return n;
+        return n;
+    }
+    const out_len = @min(n, cb);
+    var i: u64 = 0;
+    while (i < out_len) : (i += 1) {
+        const w = userW(src_va + i * 2).*;
+        userPtr(dst_va)[@intCast(i)] = if (w < 128) @intCast(w) else '?';
+    }
+    return out_len;
+}
+
+/// GetLogicalDriveStringsW(n, lp): «C:\<NUL><NUL>».
+fn getLogicalDriveStringsW(n: u64, lp: u64) u64 {
+    const need = 4; // "C:\" + NUL + завершающий NUL
+    if (lp == 0 or n == 0) return need;
+    if (!ops.validate_write(lp, n * 2)) return 0;
+    if (n < 4) return 0;
+    const s = "C:\\";
+    var i: usize = 0;
+    while (i < 3) : (i += 1) userW(lp + i * 2).* = s[i];
+    userW(lp + 3 * 2).* = 0;
+    userW(lp + 4 * 2).* = 0;
+    return 4;
+}
+
+/// GetTempPathW(n, lp): «\tmp\» (VFS-корень; FС-пути нормализуются).
+fn getTempPathW(n: u64, lp: u64) u64 {
+    const s = "\\tmp\\";
+    const need = s.len + 1;
+    if (lp == 0 or n == 0) return need;
+    if (!ops.validate_write(lp, n * 2)) return 0;
+    if (n < need) return need;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) userW(lp + i * 2).* = s[i];
+    userW(lp + s.len * 2).* = 0;
+    return s.len;
+}
+
+/// GetDiskFreeSpaceW(root, lpSectorsPerCluster, lpBytesPerSector,
+/// lpFreeClusters, lpTotalClusters): FAT32-геометрия диска (кластер 4096,
+/// сектор 512; свободно — по FAT32-статистике ядра, упрощённо половина).
+fn getDiskFreeSpaceW(root: u64, lp_spc: u64, lp_bps: u64, lp_free: u64, lp_total: u64) u64 {
+    _ = root;
+    if (lp_spc != 0 and ops.validate_write(lp_spc, 4)) userD(lp_spc).* = 8;
+    if (lp_bps != 0 and ops.validate_write(lp_bps, 4)) userD(lp_bps).* = 512;
+    const total_clusters: u32 = 16348; // 64МБ-образ (make-fat32.py)
+    if (lp_total != 0 and ops.validate_write(lp_total, 4)) userD(lp_total).* = total_clusters;
+    if (lp_free != 0 and ops.validate_write(lp_free, 4)) userD(lp_free).* = total_clusters / 2;
+    return 1;
+}
+
+/// DeleteFileW(name): удаление VFS-файла (FAT32) через ops.vfs_file_delete.
+fn deleteFileW(name_va: u64) u64 {
+    if (name_va == 0) return 0;
+    const len = userStrLenW(name_va) orelse return 0;
+    if (len == 0 or len > MAX_PATH_LEN - 2) {
+        setLastError(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    var raw: [MAX_PATH_LEN]u8 = undefined;
+    var i: u64 = 0;
+    while (i < len) : (i += 1) {
+        const ch = userW(name_va + i * 2).*;
+        raw[@intCast(i)] = if (ch < 128) @intCast(ch) else '?';
+    }
+    const norm_buf: *[MAX_PATH_LEN]u8 = &vfs_norm_scratch;
+    const norm = vfsNormalizePath(raw[0..@intCast(len)], norm_buf) orelse {
+        setLastError(ERROR_FILE_NOT_FOUND);
+        return 0;
+    };
+    if (ops.vfs_file_delete(norm.ptr, norm.len) == 1) {
+        logf("[WIN32] DeleteFileW(\"{s}\") -> TRUE\n", .{norm});
+        return 1;
+    }
+    setLastError(ERROR_FILE_NOT_FOUND);
+    return 0;
+}
+
+/// GetFileAttributesW(name): файл VFS → FILE_ATTRIBUTE_NORMAL.
+fn getFileAttributesW(name_va: u64) u64 {
+    const found = vfsOpenByNameW(name_va) orelse {
+        setLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    };
+    _ = found;
+    return FILE_ATTRIBUTE_NORMAL;
+}
+
+/// WIN32_FIND_DATAW (592Б): минимально валидная запись — имя, размер,
+/// атрибуты. v0.17.0: существование файла проверяем через VFS (первый
+/// вызов); FindNext — FALSE ERROR_NO_MORE_FILES (одна запись на паттерн).
+fn findFirstFileW(pattern_va: u64, lp: u64) u64 {
+    const found = vfsOpenByNameW(pattern_va) orelse {
+        setLastError(2); // ERROR_FILE_NOT_FOUND
+        return 0xFFFFFFFF_FFFF_FFFF; // INVALID_HANDLE_VALUE
+    };
+    if (lp == 0 or !ops.validate_write(lp, 592)) {
+        setLastError(87);
+        return 0xFFFFFFFF_FFFF_FFFF;
+    }
+    const page = userPtr(lp);
+    @memset(page[0..592], 0);
+    std.mem.writeInt(u32, page[0..4], 0x80, .little); // dwFileAttributes
+    std.mem.writeInt(u64, page[28..36], found.size, .little); // nFileSize (64Б в x64)
+    // cFileName @44: utf-16 имя
+    var i: usize = 0;
+    while (i < found.norm.len and i < 259) : (i += 1) {
+        userW(lp + 44 + i * 2).* = found.norm[i];
+    }
+    userW(lp + 44 + i * 2).* = 0;
+    return 0xBEEF; // псевдо-хэндл поиска (одна запись)
+}
+
+fn findNextFileW(h: u64, lp: u64) u64 {
+    _ = h;
+    _ = lp;
+    setLastError(18); // ERROR_NO_MORE_FILES
+    return 0;
+}
+
+/// GetCurrentDirectoryW(n, lp): «\» (корень VFS).
+fn getCurrentDirectoryW(n: u64, lp: u64) u64 {
+    if (n == 0 or lp == 0) return 2;
+    if (!ops.validate_write(lp, n * 2)) return 0;
+    if (n < 2) return 2;
+    userW(lp).* = '\\';
+    userW(lp + 2).* = 0;
+    return 1;
+}
+
+/// vfsOpenByName для W-строк (GetFileAttributesW/FindFirstFileW).
+fn vfsOpenByNameW(path_va: u64) ?VfsFound {
+    if (path_va == 0) return null;
+    const len = userStrLenW(path_va) orelse return null;
+    if (len == 0 or len > MAX_PATH_LEN - 2) return null;
+    var raw: [MAX_PATH_LEN]u8 = undefined;
+    var i: u64 = 0;
+    while (i < len) : (i += 1) {
+        const ch = userW(path_va + i * 2).*;
+        raw[@intCast(i)] = if (ch < 128) @intCast(ch) else '?';
+    }
+    const norm_buf: *[MAX_PATH_LEN]u8 = &vfs_norm_scratch;
+    const norm = vfsNormalizePath(raw[0..@intCast(len)], norm_buf) orelse return null;
+    const size = ops.vfs_file_size(norm.ptr, norm.len);
+    if (size == VFS_NOT_FOUND) return null;
+    return .{ .norm = norm, .size = size };
+}
+
+/// VirtualFree(addr, size, type): MEM_DECOMMIT(2)/MEM_RELEASE(0x8000).
+/// vheap — page-bump: «декоммит» = обнуление страниц (маска NX остаётся);
+/// возврат TRUE (7-Zip не проверяет содержимое после освобождения).
+fn virtualFree(addr: u64, size: u64, free_type: u64) u64 {
+    _ = free_type;
+    if (addr == 0) {
+        setLastError(87);
+        return 0;
+    }
+    if (size == 0) return 1; // size=0 с MEM_RELEASE — валидно
+    // Обнуляем (не снимаем маппинг — bump-аллокатор не переиспользует)
+    var off: u64 = 0;
+    while (off < size) : (off += 4096) {
+        const va = addr + off;
+        if (ops.validate_write(va, 4096)) {
+            @memset(userPtr(va)[0..4096], 0);
+        } else break;
+    }
+    logf("[WIN32] VirtualFree(0x{x}, {d}Б) -> TRUE (обнуление)\n", .{ addr, size });
+    return 1;
+}
+
+/// CharUpperW(lpsz): in-place верхний регистр (ASCII-диапазон).
+fn kCharUpperW(s_va: u64) u64 {
+    if (s_va == 0) return 0;
+    const len = userStrLenW(s_va) orelse return s_va;
+    var i: u64 = 0;
+    while (i < len) : (i += 1) {
+        const w = userW(s_va + i * 2).*;
+        if (w >= 'a' and w <= 'z') {
+            userW(s_va + i * 2).* = w - 32;
+        }
+    }
+    return s_va;
 }
 
 /// Condition-variable семья (curl: CV+CS = синхронизация резолвера):
@@ -3875,6 +4837,17 @@ fn closeHandle(h: u64) u64 {
             }
         }
     }
+    // v0.17.0 (CDD №8): события/семафоры — освобождение слота пула
+    if (h >= EVENT_HANDLE_BASE and h < EVENT_HANDLE_BASE + MAX_EVENTS) {
+        if (ctx) |*c| {
+            const idx: usize = @intCast(h - EVENT_HANDLE_BASE);
+            if (c.events[idx].in_use) {
+                c.events[idx].in_use = false;
+                logf("[WIN32] CloseHandle(0x{x}) -> TRUE (event закрыт)\n", .{h});
+                return 1;
+            }
+        }
+    }
     logf("[WIN32] CloseHandle(0x{x}) -> TRUE\n", .{h});
     return 1;
 }
@@ -4002,14 +4975,307 @@ pub fn syscallDispatch(entry_id: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
     return dispatch(disp, entry_id, a1, a2, a3, a4);
 }
 
-/// Диспетчер по entry_id реестра стабов: имя → реализация. DLL-имена
-/// case-insensitive; api-ms-win-crt-* — UCRT-обёртки mingw.
+/// v0.17.0 (CDD №8): ветка msvcrt.dll (MSVC-CRT — 7-Zip). __getmainargs/
+/// _initterm — стартовый путь CRT; memset/memcpy — syscall-фолбэки
+/// (main64 регистрирует NATIVE-стабы для горячих CRT-функций).
+fn dispatchMsvcrt(name: []const u8, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
+    if (std.mem.eql(u8, name, "__getmainargs")) {
+        // (pargc:int*, pargv:char***, penvp:char***, doWildcard, si)
+        return kGetMainArgs(a1, a2, a3);
+    } else if (std.mem.eql(u8, name, "__set_app_type")) {
+        return 0; // void
+    } else if (std.mem.eql(u8, name, "__setusermatherr")) {
+        return 0; // void
+    } else if (std.mem.eql(u8, name, "_XcptFilter")) {
+        return @bitCast(@as(i64, -1)); // EXCEPTION_CONTINUE_SEARCH
+    } else if (std.mem.eql(u8, name, "_onexit") or std.mem.eql(u8, name, "__dllonexit")) {
+        return a1; // «зарегистрировано» — вернуть саму функцию
+    } else if (std.mem.eql(u8, name, "_purecall")) {
+        logf("[WIN32] msvcrt!_purecall — вызов чистой виртуальной функции!\n", .{});
+        return 0;
+    } else if (std.mem.eql(u8, name, "_CxxThrowException")) {
+        logf("[WIN32] msvcrt!_CxxThrowException — исключение (обработчика нет)\n", .{});
+        return 0;
+    } else if (std.mem.eql(u8, name, "__CxxFrameHandler")) {
+        return @bitCast(@as(i64, -1)); // ExceptionContinueSearch
+    } else if (std.mem.eql(u8, name, "__C_specific_handler")) {
+        return @bitCast(@as(i64, 1)); // ExceptionContinueExecution
+    } else if (std.mem.eql(u8, name, "??1type_info@@UEAA@XZ")) {
+        return 0; // деструктор type_info — no-op
+    } else if (std.mem.eql(u8, name, "?terminate@@YAXXZ")) {
+        return 0; // terminate-обработчика нет — no-op (CDD-честно)
+    } else if (std.mem.eql(u8, name, "_beginthreadex")) {
+        // (security, stack, start, arg, flags, thrd) — CreateThread-эквивалент
+        return kCreateThreadThunk(a1, a2, a3, a4);
+    } else if (std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "_exit")) {
+        ops.exit(a1);
+        return 0;
+    } else if (std.mem.eql(u8, name, "_cexit") or std.mem.eql(u8, name, "_c_exit")) {
+        return 0; // очистка CRT — no-op (консоль уже синхронна)
+    } else if (std.mem.eql(u8, name, "malloc")) {
+        return kmalloc(a1);
+    } else if (std.mem.eql(u8, name, "free")) {
+        kfree(a1);
+        return 0;
+    } else if (std.mem.eql(u8, name, "realloc")) {
+        return krealloc(a1, a2);
+    } else if (std.mem.eql(u8, name, "memset")) {
+        return kmemset(a1, a2, a3);
+    } else if (std.mem.eql(u8, name, "memcpy")) {
+        return kmemcpy(a1, a2, a3);
+    } else if (std.mem.eql(u8, name, "memmove")) {
+        return kmemmove(a1, a2, a3);
+    } else if (std.mem.eql(u8, name, "memcmp")) {
+        return kmemcmp(a1, a2, a3);
+    } else if (std.mem.eql(u8, name, "strlen")) {
+        return userStrLen(a1) orelse 0;
+    } else if (std.mem.eql(u8, name, "strcmp")) {
+        return kstrcmp(a1, a2);
+    } else if (std.mem.eql(u8, name, "wcscmp")) {
+        return kwcscmp(a1, a2);
+    } else if (std.mem.eql(u8, name, "wcsstr")) {
+        return kwcsstr(a1, a2);
+    } else if (std.mem.eql(u8, name, "fflush")) {
+        return 0; // консоль синхронна
+    } else if (std.mem.eql(u8, name, "fputc")) {
+        return fputc(a1, a2);
+    } else if (std.mem.eql(u8, name, "fputs")) {
+        return fputs(a1, a2);
+    } else if (std.mem.eql(u8, name, "fgetc")) {
+        return kfgetc(a1);
+    } else if (std.mem.eql(u8, name, "fclose")) {
+        return kfclose(a1);
+    } else if (std.mem.eql(u8, name, "_isatty")) {
+        return kisatty(a1);
+    } else if (std.mem.eql(u8, name, "_iob")) {
+        // DATA-импорт — сюда не должен попадать (patchDataImports);
+        // на всякий случай: блок _iob (если ядро его выдало)
+        if (ctx) |c| return c.iob_block;
+        return 0;
+    } else if (std.mem.eql(u8, name, "_fmode") or std.mem.eql(u8, name, "_commode") or
+        std.mem.eql(u8, name, "__initenv"))
+    {
+        // DATA-импорт: возвращаем указатель на блок (записываемый) — fallback
+        if (ctx) |c| return if (c.iob_block != 0) c.iob_block else 0;
+        return 0;
+    }
+    logf("[WIN32] msvcrt!{s} — нет реализации (CDD-кандидат)\n", .{name});
+    return 0;
+}
+
+/// __getmainargs(pargc, pargv, penvp, doWildcard, si): argc/argv/envp.
+/// ensureArgv строит массив в user-куче; env-массив — из env-таблицы.
+fn kGetMainArgs(pargc: u64, pargv: u64, penvp: u64) u64 {
+    const c = &(ctx orelse return 0);
+    ensureArgv();
+    // argc
+    if (pargc != 0 and ops.validate_write(pargc, 4)) {
+        if (c.argc_ptr != 0) {
+            userD(pargc).* = userD(c.argc_ptr).*;
+        } else {
+            userD(pargc).* = 0;
+        }
+    }
+    // argv = *argv_slot (сам массив)
+    if (pargv != 0 and ops.validate_write(pargv, 8)) {
+        if (c.argv_slot != 0 and ops.validate_read(c.argv_slot, 8)) {
+            userQ(pargv).* = userQ(c.argv_slot).*;
+            c.argv_arr = userQ(c.argv_slot).*;
+        } else {
+            userQ(pargv).* = 0;
+        }
+    }
+    // envp: массив строк «NAME=VALUE\0…» + NUL-финализатор
+    if (penvp != 0 and ops.validate_write(penvp, 8)) {
+        if (c.env_arr == 0) {
+            var total: usize = 0;
+            for (env_table) |e| total += e.name.len + 1 + e.value.len + 1;
+            total += 1; // финальный NUL-байт двойной терминаторы
+            const blk = kmalloc(total + 8);
+            if (blk != 0) {
+                var off: usize = 0;
+                const page = userPtr(blk);
+                for (env_table) |e| {
+                    @memcpy(page[off..][0..e.name.len], e.name);
+                    off += e.name.len;
+                    page[off] = '=';
+                    off += 1;
+                    @memcpy(page[off..][0..e.value.len], e.value);
+                    off += e.value.len;
+                    page[off] = 0;
+                    off += 1;
+                }
+                page[off] = 0; // terminator
+                c.env_arr = blk;
+            }
+        }
+        userQ(penvp).* = c.env_arr;
+    }
+    logf("[WIN32] __getmainargs: argc={d}, argv=0x{x}, envp=0x{x}\n", .{
+        if (pargc != 0 and ops.validate_read(pargc, 4)) userD(pargc).* else 0,
+        if (pargv != 0 and ops.validate_read(pargv, 8)) userQ(pargv).* else 0,
+        if (penvp != 0 and ops.validate_read(penvp, 8)) userQ(penvp).* else 0,
+    });
+    return 0; // успех
+}
+
+/// _beginthreadex(security, stack, start, arg, flags, thrd): хэндл треда.
+/// (Диспетчер передаёт RCX/RDX/R8/R9; 5-й/6-й аргументы — стек — читает
+/// CreateThread-обёртка ниже через ops.stack_arg.)
+fn kCreateThreadThunk(security: u64, stack: u64, start: u64, arg: u64) u64 {
+    _ = security;
+    // dispatch не имеет disp-контекста здесь — передаём как CreateThread:
+    // flags = стек[0] (5-й арг), pTid = стек[1] (6-й арг)
+    const flags = ops.stack_arg(0);
+    const p_tid = ops.stack_arg(1);
+    _ = stack; // размер ниже сглаживается в kCreateThread
+    // Находим активный Dispatcher (как syscallDispatch)
+    const disp = win32.activeDispatcher() orelse return 0;
+    return kCreateThread(disp, 0x40000, start, arg, flags, p_tid);
+}
+
+/// kmemcmp-msvcrt-обёртка — существующий pub kmemcmp переиспользуем (см. ниже).
+fn kmemcmpMsvcrt(a: u64, b: u64, n: u64) u64 {
+    return kmemcmp(a, b, n);
+}
+
+/// kstrcmp(a, b): 0/±1 (семантика strcmp, только знак).
+fn kstrcmp(a: u64, b: u64) u64 {
+    const la = userStrLen(a) orelse return @bitCast(@as(i64, -1));
+    const lb = userStrLen(b) orelse return 1;
+    if (!ops.validate_read(a, la + 1) or !ops.validate_read(b, lb + 1)) return 0;
+    const x = userPtr(a)[0..@intCast(la)];
+    const y = userPtr(b)[0..@intCast(lb)];
+    const rel = std.mem.order(u8, x, y);
+    return switch (rel) {
+        .eq => 0,
+        .lt => @bitCast(@as(i64, -1)),
+        .gt => 1,
+    };
+}
+
+/// kwcscmp(a, b): 0/±1 по UTF-16LE строкам.
+fn kwcscmp(a: u64, b: u64) u64 {
+    const la = userStrLenW(a) orelse return @bitCast(@as(i64, -1));
+    const lb = userStrLenW(b) orelse return 1;
+    if (!ops.validate_read(a, (la + 1) * 2) or !ops.validate_read(b, (lb + 1) * 2)) return 0;
+    var i: u64 = 0;
+    const n = @min(la, lb);
+    while (i < n) : (i += 1) {
+        const ca = userW(a + i * 2).*;
+        const cb = userW(b + i * 2).*;
+        if (ca != cb) return if (ca < cb) @bitCast(@as(i64, -1)) else 1;
+    }
+    if (la == lb) return 0;
+    return if (la < lb) @bitCast(@as(i64, -1)) else 1;
+}
+
+/// kwcsstr(hay, needle): указатель на ПЕРВОЕ вхождение UTF-16 подстроки.
+fn kwcsstr(hay: u64, needle: u64) u64 {
+    const lh = userStrLenW(hay) orelse return 0;
+    const ln = userStrLenW(needle) orelse return 0;
+    if (ln == 0) return hay;
+    if (ln > lh) return 0;
+    if (!ops.validate_read(hay, (lh + 1) * 2) or !ops.validate_read(needle, (ln + 1) * 2)) return 0;
+    var i: u64 = 0;
+    while (i + ln <= lh) : (i += 1) {
+        var j: u64 = 0;
+        var ok = true;
+        while (j < ln) : (j += 1) {
+            if (userW(hay + (i + j) * 2).* != userW(needle + j * 2).*) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return hay + i * 2;
+    }
+    return 0;
+}
+
+/// fgetc(stream): один байт из VFS-файла (msvcrt-stdin → EOF -1).
+fn kfgetc(stream: u64) u64 {
+    if (crtFileIdx(stream)) |idx| {
+        const c = &(ctx orelse return @bitCast(@as(i64, -1)));
+        const f = &c.files[idx];
+        if (f.pos >= f.size) {
+            f.eof = true;
+            return @bitCast(@as(i64, -1)); // EOF
+        }
+        var b: [1]u8 = .{0};
+        const got = ops.vfs_file_read(f.name[0..f.name_len].ptr, f.name_len, f.pos, &b, 1);
+        if (got == 0) return @bitCast(@as(i64, -1));
+        f.pos += 1;
+        return b[0];
+    }
+    if (isMsvcrtIobStream(stream)) |si| {
+        if (si == 0) return @bitCast(@as(i64, -1)); // stdin пуст
+    }
+    return @bitCast(@as(i64, -1)); // не наш поток — EOF
+}
+
+// ─── OLEAUT32 (SysString-семья; 7-Zip shell-пути) ───────────────────────────
+
+/// SysAllocString(olestr): BSTR = 4Б длина + utf-16 + NUL.
+fn sysAllocString(src_va: u64) u64 {
+    const len = userStrLenW(src_va) orelse return 0;
+    return sysAllocStringLen(src_va, len);
+}
+
+/// SysAllocStringLen(src, chars): BSTR с копией первых chars символов.
+fn sysAllocStringLen(src_va: u64, chars: u64) u64 {
+    const bytes: u64 = 4 + (chars + 1) * 2;
+    const p = kmalloc(bytes);
+    if (p == 0) return 0;
+    std.mem.writeInt(u32, userPtr(p)[0..4], @intCast(chars * 2), .little); // длина в байтах
+    if (src_va != 0 and chars > 0 and ops.validate_read(src_va, chars * 2)) {
+        var i: u64 = 0;
+        while (i < chars) : (i += 1) {
+            userW(p + 4 + i * 2).* = userW(src_va + i * 2).*;
+        }
+    } else {
+        // «wcslen(src)» если chars=0... по спецификации копирует chars; нули уже есть
+    }
+    userW(p + 4 + chars * 2).* = 0;
+    return p + 4; // BSTR указывает ПЕРЕД полем длины
+}
+
+/// SysStringLen(bstr): символов (байт/2).
+fn sysStringLen(bstr: u64) u64 {
+    if (bstr == 0) return 0;
+    if (!ops.validate_read(bstr - 4, 4)) return 0;
+    return std.mem.readInt(u32, userPtr(bstr - 4)[0..4], .little) / 2;
+}
 pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
     if (entry_id >= disp.count) return 0;
     const e = &disp.entries[@intCast(entry_id)];
+    // v0.17.0 (CDD №8): ОРДИНАЛ-импорты — OLEAUT32 (7-Zip: SysAllocString и
+    // семья). Ординалы: 2=SysAllocString, 4=SysReAllocString, 6=SysAllocStringLen,
+    // 7=SysFreeString, 9=SysStringLen, 10=SysStringByteLen.
+    const ordinal: u64 = switch (e.func) {
+        .by_name => 0,
+        .by_ordinal => |o| o,
+    };
+    if (ordinal != 0) {
+        if (std.ascii.eqlIgnoreCase(e.dll, "OLEAUT32.dll")) {
+            switch (ordinal) {
+                2 => return sysAllocString(a1), // SysAllocString(OLESTR)
+                4 => return 0, // SysReAllocString — FALSE (beyond-model)
+                6 => return sysAllocStringLen(a1, a2), // SysAllocStringLen
+                7 => return 1, // SysFreeString — TRUE (память в bheap — GC-модель)
+                9 => return sysStringLen(a1), // SysStringLen
+                10 => return sysStringLen(a1) * 2, // SysStringByteLen
+                else => {
+                    logf("[WIN32] OLEAUT32!#{d} — не реализован (ординал)\n", .{ordinal});
+                    return 0;
+                },
+            }
+        }
+        logf("[WIN32] {s}!#{d} — ординал вне OLEAUT32 не реализован\n", .{ e.dll, ordinal });
+        return 0;
+    }
     const name = switch (e.func) {
         .by_name => |n| n,
-        .by_ordinal => return 0, // ординал-импорты не реализованы (v0.11)
+        .by_ordinal => unreachable,
     };
 
     var ret: u64 = 0;
@@ -4127,7 +5393,149 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = getModuleFileNameA(a1, a2, a3);
         } else if (std.mem.eql(u8, name, "CreateEventA")) {
             // event-волна: единый пул хэндлов с WSACreateEvent (4 рег-аргумента)
-            ret = kCreateEventA(a1, a2, a3, a4);
+            // v0.17.0 (CDD №8): РЕАЛЬНОЕ сигнальное состояние
+            ret = kCreateEventW(a1, a2, a3, a4, false);
+        } else if (std.mem.eql(u8, name, "CreateEventW")) {
+            ret = kCreateEventW(a1, a2, a3, a4, true);
+        } else if (std.mem.eql(u8, name, "SetEvent")) {
+            ret = kSetEvent(a1);
+        } else if (std.mem.eql(u8, name, "ResetEvent")) {
+            ret = kResetEvent(a1);
+        } else if (std.mem.eql(u8, name, "CreateSemaphoreW")) {
+            ret = kCreateSemaphoreW(a1, a2, a3, a4);
+        } else if (std.mem.eql(u8, name, "ReleaseSemaphore")) {
+            // Win64: RCX=h, RDX=n, R8=lpPrev — все рег-аргументы
+            ret = kReleaseSemaphore(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "OpenEventW")) {
+            ret = kOpenEventW(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "SetEndOfFile")) {
+            ret = kSetEndOfFile(a1);
+        } else if (std.mem.eql(u8, name, "FlushFileBuffers")) {
+            ret = kFlushFileBuffers(a1);
+        } else if (std.mem.eql(u8, name, "VirtualFree")) {
+            // v0.17.0 (CDD №8): 7-Zip освобождает буферы бенчмарка.
+            // Win64: RCX=addr, RDX=size, R8=freedom-type (MEM_DECOMMIT/MEM_RELEASE).
+            // Наш vheap — page-bump без free-list: честно «освобождаем»
+            // декоммит-семантикой — обнуляем страницы (NX остаётся).
+            ret = virtualFree(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "GetTickCount")) {
+            // v0.17.0 (CDD №8): ms с старта (QPC/TSC-путь уже откалиброван)
+            ret = getTickCount();
+        } else if (std.mem.eql(u8, name, "GetCurrentProcess")) {
+            ret = 0xFFFF_FFFF_FFFF_FFFF; // псевдо-хэндл (-1) — Win64-конвенция
+        } else if (std.mem.eql(u8, name, "GetCurrentProcessId")) {
+            ret = 1; // PID=1 (TEB.UniqueProcess)
+        } else if (std.mem.eql(u8, name, "GetSystemInfo")) {
+            ret = getSystemInfo(a1);
+        } else if (std.mem.eql(u8, name, "GlobalMemoryStatusEx")) {
+            ret = globalMemoryStatusEx(a1);
+        } else if (std.mem.eql(u8, name, "IsProcessorFeaturePresent")) {
+            // PF_XMMI64_INSTRUCTIONS_AVAILABLE=10 и т.д. — всё «есть» (QEMU x64)
+            ret = 1;
+        } else if (std.mem.eql(u8, name, "GetVersionExW")) {
+            ret = getVersionExW(a1);
+        } else if (std.mem.eql(u8, name, "GetOEMCP")) {
+            ret = 437; // CP437 — консольная OEM-страница (как в QEMU/US)
+        } else if (std.mem.eql(u8, name, "SetFileApisToOEM") or
+            std.mem.eql(u8, name, "SetFileApisToANSI"))
+        {
+            ret = 0; // void — кодировка имён файлов (beyond-model)
+        } else if (std.mem.eql(u8, name, "LocalFree")) {
+            ret = 0; // «освобождено» (блоков FormatMessage не выделяем)
+        } else if (std.mem.eql(u8, name, "ResumeThread")) {
+            ret = resumeThread(a1);
+        } else if (std.mem.eql(u8, name, "SetThreadAffinityMask") or
+            std.mem.eql(u8, name, "SetProcessAffinityMask"))
+        {
+            // v0.17.0 (CDD №8): SMP-маска — вся доступна (возврат = предыдущая)
+            ret = 0xFF; // 8 логических CPU «успешно назначено»
+        } else if (std.mem.eql(u8, name, "GetProcessAffinityMask")) {
+            // (h, lpProcessMask, lpSystemMask): TRUE + маски 0xFF
+            if (a2 != 0 and ops.validate_write(a2, 8)) userQ(a2).* = 0xFF;
+            if (a3 != 0 and ops.validate_write(a3, 8)) userQ(a3).* = 0xFF;
+            ret = 1;
+        } else if (std.mem.eql(u8, name, "GetProcessTimes")) {
+            ret = getProcessTimes(a1, a2, a3, a4, ops.stack_arg(0));
+        } else if (std.mem.eql(u8, name, "FileTimeToSystemTime")) {
+            ret = fileTimeToSystemTime(a1, a2);
+        } else if (std.mem.eql(u8, name, "FileTimeToLocalFileTime")) {
+            ret = fileTimeToLocalFileTime(a1, a2);
+        } else if (std.mem.eql(u8, name, "LocalFileTimeToFileTime")) {
+            ret = localFileTimeToFileTime(a1, a2);
+        } else if (std.mem.eql(u8, name, "DosDateTimeToFileTime")) {
+            ret = dosDateTimeToFileTime(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "FileTimeToDosDateTime")) {
+            ret = fileTimeToDosDateTime(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "CompareFileTime")) {
+            ret = compareFileTime(a1, a2);
+        } else if (std.mem.eql(u8, name, "SetFileTime")) {
+            ret = 1; // TRUE: время файла «записано» (dir-entry-даты beyond-model)
+        } else if (std.mem.eql(u8, name, "GetFileInformationByHandle")) {
+            ret = getFileInformationByHandle(a1, a2);
+        } else if (std.mem.eql(u8, name, "GetModuleFileNameW")) {
+            ret = getModuleFileNameW(a1, a2, a3);
+        } else if (std.mem.eql(u8, name, "LoadLibraryW")) {
+            // msvcrt/kernel32 «уже загружены» — вернуть базу образа
+            // (7-Zip грузит только системные библиотеки)
+            ret = if (ctx) |c| c.image_base else 0;
+        } else if (std.mem.eql(u8, name, "FreeLibrary")) {
+            ret = 1; // TRUE
+        } else if (std.mem.eql(u8, name, "WideCharToMultiByte")) {
+            // Win64: RCX=cp, RDX=flags, R8=src, R9=cch, стек[0]=dst, стек[1]=cb
+            ret = kWideCharToMultiByte(a3, a4, ops.stack_arg(0), ops.stack_arg(1));
+        } else if (std.mem.eql(u8, name, "GetLogicalDriveStringsW")) {
+            ret = getLogicalDriveStringsW(a1, a2);
+        } else if (std.mem.eql(u8, name, "GetTempPathW")) {
+            ret = getTempPathW(a1, a2);
+        } else if (std.mem.eql(u8, name, "GetDiskFreeSpaceW")) {
+            // Win64: RCX=root, RDX=spc, R8=bps, R9=free, стек[0]=total
+            ret = getDiskFreeSpaceW(a1, a2, a3, a4, ops.stack_arg(0));
+        } else if (std.mem.eql(u8, name, "DeviceIoControl")) {
+            // (h, code, in, inlen, out, outlen, lpRet, lpOv): неподдержанный
+            // код — честный FALSE + ERROR_INVALID_FUNCTION (7-Zip SPI-пути)
+            setLastError(1); // ERROR_INVALID_FUNCTION
+            ret = 0;
+        } else if (std.mem.eql(u8, name, "DeleteFileW")) {
+            ret = deleteFileW(a1);
+        } else if (std.mem.eql(u8, name, "CreateDirectoryW") or
+            std.mem.eql(u8, name, "RemoveDirectoryW"))
+        {
+            ret = 0; // FALSE + ERROR_ACCESS_DENIED — FS-каталоги beyond-модели
+            setLastError(ERROR_ACCESS_DENIED);
+        } else if (std.mem.eql(u8, name, "MoveFileW")) {
+            ret = 0;
+            setLastError(ERROR_ACCESS_DENIED);
+        } else if (std.mem.eql(u8, name, "SetCurrentDirectoryW") or
+            std.mem.eql(u8, name, "GetCurrentDirectoryW"))
+        {
+            // CWD beyond-model: Set → FALSE(5); Get → корень «\» (по семантике
+            // len-вызова: n=0 → требуемая длина)
+            if (std.mem.eql(u8, name, "GetCurrentDirectoryW")) {
+                ret = getCurrentDirectoryW(a1, a2);
+            } else {
+                setLastError(ERROR_ACCESS_DENIED);
+                ret = 0;
+            }
+        } else if (std.mem.eql(u8, name, "SetFileAttributesW")) {
+            ret = 1; // TRUE (атрибуты beyond-model)
+        } else if (std.mem.eql(u8, name, "GetFileAttributesW")) {
+            ret = getFileAttributesW(a1);
+        } else if (std.mem.eql(u8, name, "FindFirstFileW")) {
+            ret = findFirstFileW(a1, a2);
+        } else if (std.mem.eql(u8, name, "FindNextFileW")) {
+            ret = findNextFileW(a1, a2);
+        } else if (std.mem.eql(u8, name, "FindClose")) {
+            ret = 1; // TRUE (итератор закончен после первого FindNext FAIL)
+        } else if (std.mem.eql(u8, name, "OpenFileMappingW")) {
+            ret = 0; // file-mapping API beyond-model (7-Zip fallback на ReadFile)
+        } else if (std.mem.eql(u8, name, "MapViewOfFile") or
+            std.mem.eql(u8, name, "UnmapViewOfFile"))
+        {
+            ret = 0; // честный отказ (NULL)
+        } else if (std.mem.eql(u8, name, "SetConsoleMode")) {
+            ret = 1; // TRUE (режим консоли принимаем)
+        } else if (std.mem.eql(u8, name, "GetProcessHeap")) {
+            ret = 0xDEAD_BEE0; // псевдо-хэндл кучи (GetProcessHeap/HeapAlloc)
         } else if (std.mem.eql(u8, name, "CreateMutexA") or
             std.mem.eql(u8, name, "CreateMutexW"))
         {
@@ -4555,6 +5963,48 @@ pub fn dispatch(disp: *win32.Dispatcher, entry_id: u64, a1: u64, a2: u64, a3: u6
             ret = kBCryptGenRandom(a2, a3);
         } else {
             ret = 0xC000_0002; // STATUS_NOT_IMPLEMENTED
+        }
+    } else if (std.ascii.eqlIgnoreCase(e.dll, "msvcrt.dll")) {
+        // v0.17.0 (CDD №8): MSVC-CRT для 7-Zip (/MD msvcrt.dll — «старая»
+        // CRT; mingw-curl использует api-ms-* — та ветка выше). memset/strlen
+        // и memmove СЮДА приходят syscall-путём, если natives не перекрыли.
+        ret = dispatchMsvcrt(name, a1, a2, a3, a4);
+    } else if (std.ascii.eqlIgnoreCase(e.dll, "ADVAPI32.dll")) {
+        // v0.17.0 (CDD №8): реестр/токены/привилегии (7-Zip проверяет
+        // SeBackupPrivilege; честный отказ — приложение живёт с fallback)
+        if (std.mem.eql(u8, name, "SystemFunction036")) {
+            // RtlGenRandom(buf, len) — ЭНТРОПИЯ (как BCryptGenRandom)
+            ret = kBCryptGenRandom(a1, a2);
+        } else if (std.mem.eql(u8, name, "RegCloseKey")) {
+            ret = 0; // ERROR_SUCCESS
+        } else if (std.mem.eql(u8, name, "RegOpenKeyExW")) {
+            setLastError(2); // ERROR_FILE_NOT_FOUND — ключей нет
+            ret = 2;
+        } else if (std.mem.eql(u8, name, "RegQueryValueExW")) {
+            setLastError(2);
+            ret = 2;
+        } else if (std.mem.eql(u8, name, "OpenProcessToken")) {
+            ret = 0; // FALSE: токенов нет (SECURITY-callback 7-Zip fallback)
+        } else if (std.mem.eql(u8, name, "AdjustTokenPrivileges") or
+            std.mem.eql(u8, name, "LookupPrivilegeValueW"))
+        {
+            ret = 0; // FALSE
+        } else if (std.mem.eql(u8, name, "GetFileSecurityW") or
+            std.mem.eql(u8, name, "SetFileSecurityW"))
+        {
+            ret = 0; // FALSE (SECURITY_DESCRIPTOR beyond-model)
+        } else {
+            handled = false;
+        }
+    } else if (std.ascii.eqlIgnoreCase(e.dll, "USER32.dll")) {
+        // v0.17.0 (CDD №8): CharUpperW — верхний регистр in-place
+        if (std.mem.eql(u8, name, "CharUpperW")) {
+            ret = kCharUpperW(a1);
+        } else if (std.mem.eql(u8, name, "CharPrevExA")) {
+            // (codepage, start, current, flags): предыдущий символ = start
+            ret = a2;
+        } else {
+            handled = false;
         }
     } else {
         handled = false;
@@ -4997,6 +6447,8 @@ fn tReset() void {
     t_signaled_handle = 0;
     // v0.16.0 (CDD №7): VFS/энтропия/окружение — чистый старт каждого теста
     t_vfs_n = 0;
+    // v0.17.0 (CDD №8): RW-фейк тоже чистый
+    for (&t_vfs_w) |*f| f.* = .{};
     t_entropy_seed = 0x1234_5678_9ABC_DEF0;
     t_entropy_calls = 0;
     env_table = &.{};
@@ -5075,8 +6527,15 @@ fn tOps() Ops {
         // v0.16.0 (CDD №7): PUF-энтропия (каждый вызов — ДРУГИЕ байты)
         .entropy_fill = tEntropyFill,
         // v0.16.0 (CDD №7): VFS-фейк — t_vfs[0..t_vfs_n] (как мини-initrd)
-        .vfs_file_size = tVfsSize,
-        .vfs_file_read = tVfsRead,
+        // + v0.17.0 (CDD №8): RW-фейк t_vfs_w (как мини-FAT32)
+        .vfs_file_size = tVfsSizeRW,
+        .vfs_file_read = tVfsReadRW,
+        .vfs_file_write = tVfsWrite,
+        .vfs_file_create = tVfsCreate,
+        .vfs_file_truncate = tVfsTruncate,
+        .vfs_file_delete = tVfsDelete,
+        .cpu_count = tCpuCount,
+        .phys_mem_kb = tPhysMemKb,
     };
 }
 
@@ -5105,6 +6564,101 @@ var t_vfs: [4]TVfsFile = .{
     .{ .name = "", .data = "" }, .{ .name = "", .data = "" },
 };
 var t_vfs_n: usize = 0;
+
+/// v0.17.0 (CDD №8): RW-фейк — t_vfs_w[n] (как мини-FAT32: запись/создание/
+/// усечение). Массив отдельный от RO-t_vfs: тесты записи не путают RO-слоты.
+const TVfsWFile = struct {
+    name: [32]u8 = [_]u8{0} ** 32,
+    name_len: usize = 0,
+    data: [128]u8 = [_]u8{0} ** 128,
+    len: usize = 0,
+    exists: bool = false,
+};
+var t_vfs_w: [4]TVfsWFile = .{TVfsWFile{}} ** 4;
+
+fn tVfsWFind(name: []const u8) ?*TVfsWFile {
+    for (&t_vfs_w) |*f| {
+        if (f.exists and std.mem.eql(u8, f.name[0..f.name_len], name)) return f;
+    }
+    return null;
+}
+
+fn tVfsWAlloc(name: []const u8) ?*TVfsWFile {
+    if (name.len > 32) return null;
+    for (&t_vfs_w) |*f| {
+        if (!f.exists) {
+            f.* = .{};
+            f.exists = true;
+            @memcpy(f.name[0..name.len], name);
+            f.name_len = name.len;
+            return f;
+        }
+    }
+    return null;
+}
+
+fn tVfsWrite(name: [*]const u8, name_len: usize, offset: u64, data: [*]const u8, len: usize) u64 {
+    const f = tVfsWFind(name[0..name_len]) orelse return 0;
+    if (offset + len > f.data.len) return 0;
+    @memcpy(f.data[@intCast(offset)..][0..len], data[0..len]);
+    if (offset + len > f.len) f.len = @intCast(offset + len);
+    return len;
+}
+
+fn tVfsCreate(name: [*]const u8, name_len: usize) u64 {
+    if (tVfsWFind(name[0..name_len]) != null) return 1;
+    _ = tVfsWAlloc(name[0..name_len]) orelse return 0;
+    return 1;
+}
+
+fn tVfsTruncate(name: [*]const u8, name_len: usize, new_size: u64) u64 {
+    const f = tVfsWFind(name[0..name_len]) orelse return 0;
+    if (new_size > f.data.len) {
+        // расширение — нулями
+        @memset(f.data[f.len..], 0);
+        f.len = @intCast(new_size);
+    } else {
+        @memset(f.data[@intCast(new_size)..f.len], 0);
+        f.len = @intCast(new_size);
+    }
+    return 1;
+}
+
+fn tVfsDelete(name: [*]const u8, name_len: usize) u64 {
+    if (tVfsWFind(name[0..name_len])) |f| {
+        f.* = .{};
+        return 1;
+    }
+    return 0;
+}
+
+/// RW-размер (CDD №8-тесты): RO-t_vfs перекрывает (как initrd).
+fn tVfsSizeRW(name: [*]const u8, name_len: usize) u64 {
+    const ro = tVfsSize(name, name_len);
+    if (ro != VFS_NOT_FOUND) return ro;
+    if (tVfsWFind(name[0..name_len])) |f| return f.len;
+    return VFS_NOT_FOUND;
+}
+
+fn tVfsReadRW(name: [*]const u8, name_len: usize, offset: u64, out: [*]u8, len: usize) u64 {
+    const ro = tVfsRead(name, name_len, offset, out, len);
+    if (ro > 0) return ro;
+    if (tVfsWFind(name[0..name_len])) |f| {
+        if (offset >= f.len) return 0;
+        const take = @min(f.len - @as(usize, @intCast(offset)), len);
+        @memcpy(out[0..take], f.data[@intCast(offset)..][0..take]);
+        return take;
+    }
+    return 0;
+}
+
+fn tCpuCount() u64 {
+    return 4; // тест-модель: 4 CPU
+}
+
+fn tPhysMemKb() u64 {
+    return 131072; // 128МБ — модель теста
+}
 
 fn tVfsAdd(name: []const u8, data: []const u8) void {
     if (t_vfs_n >= t_vfs.len) return;
@@ -5236,6 +6790,8 @@ fn tCtx(cmdline: []const u8) void {
         // v0.16.0 (CDD №7)
         .next_file_handle = FILE_HANDLE_BASE,
         .files = [_]FileState{.{}} ** MAX_FILES,
+        // v0.17.0 (CDD №8)
+        .events = [_]EventState{.{}} ** MAX_EVENTS,
     };
 }
 
@@ -5721,6 +7277,12 @@ test "dispatch: дефолтные ops-параноики — отказ без 
         .entropy_fill = noEntropy,
         .vfs_file_size = noVfsSize,
         .vfs_file_read = noVfsRead,
+        .vfs_file_write = noVfsWrite,
+        .vfs_file_create = noVfsCreate,
+        .vfs_file_truncate = noVfsTruncate,
+        .vfs_file_delete = noVfsDelete,
+        .cpu_count = fakeCpuCount,
+        .phys_mem_kb = fakePhysMemKb,
     };
     ctx = null;
     var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
@@ -7564,4 +9126,181 @@ test "cdd7-env: GetEnvironmentVariableA/W + getenv — env-таблица (CURL_
     // getenv отсутствующей → NULL
     try testing.expectEqual(@as(u64, 0), reg.call(id_g, mb + 0x120, 0, 0, 0));
     try testing.expect(logHas("getenv(\"CURL_CA_BUNDLE\")"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.17.0 (CDD №8): тесты волны записи FAT32 + 7-Zip-функций
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "cdd8-file: CreateFileW CREATE_ALWAYS + WriteFile + GetFileSize (RW-FAT32)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_cf = reg.add("KERNEL32.dll", "CreateFileW", 0);
+    const id_wf = reg.add("KERNEL32.dll", "WriteFile", 0);
+    const id_gs = reg.add("KERNEL32.dll", "GetFileSize", 0);
+    const id_rf = reg.add("KERNEL32.dll", "ReadFile", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+
+    // Путь wide: «out.html»
+    const name = "out.html";
+    for (name, 0..) |ch, i| userW(mb + 0x100 + i * 2).* = ch;
+    userW(mb + 0x100 + name.len * 2).* = 0;
+    // GENERIC_WRITE + CREATE_ALWAYS(2): файла нет → создаётся (RW-фейк)
+    t_stack_args[0] = 2; // диспозиция = CREATE_ALWAYS
+    const h = reg.call(id_cf, mb + 0x100, 0x40000000, 0, 0);
+    try testing.expect(h >= FILE_HANDLE_BASE);
+    try testing.expect(logHas("out.html"));
+    try testing.expect(logHas("RW"));
+
+    // WriteFile 10Б → TRUE; *lpWritten = 10; GetFileSize = 10
+    @memcpy(g_mem[0x300..0x30A], "POLER-RW!!");
+    userD(mb + 0x400).* = 0; // lpWritten
+    t_stack_args[0] = 0; // lpOverlapped = NULL
+    try testing.expectEqual(@as(u64, 1), reg.call(id_wf, h, mb + 0x300, 10, mb + 0x400));
+    try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, g_mem[0x400..0x404], .little));
+    try testing.expectEqual(@as(u64, 10), reg.call(id_gs, h, 0, 0, 0));
+
+    // ПЕРЕчтение: CreateFileW OPEN_EXISTING(3) RO + ReadFile — данные с диска
+    @memset(g_mem[0x500..0x50A], 0xEE);
+    t_stack_args[0] = 3; // OPEN_EXISTING
+    const h2 = reg.call(id_cf, mb + 0x100, 0x80000000, 0, 0); // GENERIC_READ
+    try testing.expect(h2 >= FILE_HANDLE_BASE);
+    userD(mb + 0x404).* = 0;
+    t_stack_args[0] = 0;
+    try testing.expectEqual(@as(u64, 1), reg.call(id_rf, h2, mb + 0x500, 10, mb + 0x404));
+    try testing.expectEqualStrings("POLER-RW!!", g_mem[0x500..0x50A]);
+}
+
+test "cdd8-sysinfo: GetSystemInfo + GlobalMemoryStatusEx (7-Zip-волна)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_si = reg.add("KERNEL32.dll", "GetSystemInfo", 0);
+    const id_gm = reg.add("KERNEL32.dll", "GlobalMemoryStatusEx", 0);
+    const id_gt = reg.add("KERNEL32.dll", "GetTickCount", 0);
+    const id_cp = reg.add("KERNEL32.dll", "GetCurrentProcess", 0);
+    const id_pf = reg.add("KERNEL32.dll", "IsProcessorFeaturePresent", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memset(g_mem[0x100..0x200], 0);
+
+    // GetSystemInfo: 4 CPU (t-модель), arch AMD64=9 (u16 @+2)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_si, mb + 0x100, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, g_mem[0x100 + 40 ..][0..4], .little));
+    try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, g_mem[0x100 + 2 ..][0..2], .little));
+    try testing.expect(logHas("GetSystemInfo"));
+
+    // GlobalMemoryStatusEx: Total=128МБ, TRUE
+    @memset(g_mem[0x200..0x260], 0);
+    try testing.expectEqual(@as(u64, 1), reg.call(id_gm, mb + 0x200, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 131072 * 1024), std.mem.readInt(u64, g_mem[0x200 + 8 ..][0..8], .little));
+    try testing.expect(logHas("GlobalMemoryStatusEx"));
+
+    // GetTickCount/GetCurrentProcess/IsProcessorFeaturePresent — семантика
+    try testing.expect(reg.call(id_gt, 0, 0, 0, 0) != 0xFFFF_FFFF); // просто u32
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), reg.call(id_cp, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 1), reg.call(id_pf, 10, 0, 0, 0));
+}
+
+test "cdd8-events: CreateEventW/SetEvent/ResetEvent/Wait (реальная сигнальность)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_ce = reg.add("KERNEL32.dll", "CreateEventW", 0);
+    const id_se = reg.add("KERNEL32.dll", "SetEvent", 0);
+    const id_re = reg.add("KERNEL32.dll", "ResetEvent", 0);
+    const id_ws = reg.add("KERNEL32.dll", "WaitForSingleObject", 0);
+    const id_cs = reg.add("KERNEL32.dll", "CreateSemaphoreW", 0);
+    const id_rs = reg.add("KERNEL32.dll", "ReleaseSemaphore", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+
+    // Несигнальный auto-reset: Wait(0) → TIMEOUT (не ждём!)
+    const ev = reg.call(id_ce, 0, 0, 0, 0); // manual=0, initial=0
+    try testing.expect(ev >= EVENT_HANDLE_BASE);
+    try testing.expectEqual(@as(u64, 258), reg.call(id_ws, ev, 0, 0, 0));
+
+    // SetEvent → Wait(0) захватывает (auto-reset сбрасывает сигнал)
+    try testing.expectEqual(@as(u64, 1), reg.call(id_se, ev, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_ws, ev, 0, 0, 0)); // WAIT_OBJECT_0
+    // сигнал снят авто-ресетом → снова TIMEOUT
+    try testing.expectEqual(@as(u64, 258), reg.call(id_ws, ev, 0, 0, 0));
+
+    // manual-reset: сигнал держится после Wait
+    const mev = reg.call(id_ce, 0, 1, 0, 0); // manual=1
+    try testing.expectEqual(@as(u64, 1), reg.call(id_se, mev, 0, 0, 0));
+    _ = reg.call(id_ws, mev, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 0), reg.call(id_ws, mev, 0, 0, 0)); // ещё сигнален
+    try testing.expectEqual(@as(u64, 1), reg.call(id_re, mev, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 258), reg.call(id_ws, mev, 0, 0, 0));
+
+    // Семафор: initial=2 → два захвата, третий — отказ
+    const sem = reg.call(id_cs, 0, 2, 1, 0);
+    try testing.expectEqual(@as(u64, 0), reg.call(id_ws, sem, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_ws, sem, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 258), reg.call(id_ws, sem, 0, 0, 0));
+    // ReleaseSemaphore(+1) → снова один захват
+    userQ(mb + 0x500).* = 0; // lpPrev
+    try testing.expectEqual(@as(u64, 1), reg.call(id_rs, sem, 1, mb + 0x500, 0));
+    try testing.expectEqual(@as(u64, 0), reg.call(id_ws, sem, 0, 0, 0));
+}
+
+test "cdd8-msvcrt: dispatch msvcrt-ветки (strcmp/wcscmp/__getmainargs-семантика)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_sc = reg.add("msvcrt.dll", "strcmp", 0);
+    const id_wc = reg.add("msvcrt.dll", "wcscmp", 0);
+    const id_xc = reg.add("msvcrt.dll", "_XcptFilter", 0);
+    const id_sa = reg.add("msvcrt.dll", "__set_app_type", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+
+    @memcpy(g_mem[0x100..0x103], "abc");
+    g_mem[0x104] = 0;
+    @memcpy(g_mem[0x120..0x123], "abc");
+    g_mem[0x124] = 0;
+    @memcpy(g_mem[0x140..0x144], "abcd");
+    g_mem[0x145] = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sc, mb + 0x100, mb + 0x120, 0, 0));
+    try testing.expect(reg.call(id_sc, mb + 0x100, mb + 0x140, 0, 0) != 0);
+
+    // wcscmp: "ab" == "ab"
+    userW(mb + 0x200).* = 'a';
+    userW(mb + 0x202).* = 'b';
+    userW(mb + 0x204).* = 0;
+    userW(mb + 0x220).* = 'a';
+    userW(mb + 0x222).* = 'b';
+    userW(mb + 0x224).* = 0;
+    try testing.expectEqual(@as(u64, 0), reg.call(id_wc, mb + 0x200, mb + 0x220, 0, 0));
+
+    // _XcptFilter → EXCEPTION_CONTINUE_SEARCH (-1)
+    try testing.expectEqual(@as(u64, @bitCast(@as(i64, -1))), reg.call(id_xc, 1, 0, 0, 0));
+    // __set_app_type → 0
+    try testing.expectEqual(@as(u64, 0), reg.call(id_sa, 1, 0, 0, 0));
+}
+
+test "cdd8-ro-boundary: fopen «w» на RO-initrd файле → NULL (граница v0.16)" {
+    ops = tOps();
+    tReset();
+    tCtx("");
+    tVfsAdd("ro.txt", "READONLY");
+    var reg = FakeRegistry{ .entries = undefined, .disp = undefined };
+    reg.init();
+    const id_fo = reg.add("api-ms-win-crt-stdio-l1-1-0.dll", "fopen", 0);
+    const mb: u64 = @intFromPtr(&g_mem);
+    @memcpy(g_mem[0x100..0x106], "ro.txt");
+    g_mem[0x106] = 0;
+    @memcpy(g_mem[0x120..0x122], "wb");
+    g_mem[0x122] = 0;
+
+    // Файл есть в RO-t_vfs: truncate откажет → NULL + EACCES (как Windows)
+    try testing.expectEqual(@as(u64, 0), reg.call(id_fo, mb + 0x100, mb + 0x120, 0, 0));
+    try testing.expect(logHas("усечение запрещено"));
 }

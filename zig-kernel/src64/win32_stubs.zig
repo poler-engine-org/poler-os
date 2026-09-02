@@ -75,6 +75,11 @@ pub const NativeKind = enum {
     strcmp,
     /// strncmp(s1=RCX, s2=RDX, n=R8) → разница до n байт (int)
     strncmp,
+    /// _initterm(pfnStart=RCX, pfnEnd=RDX): цикл вызова C++-инициализаторов
+    /// (msvcrt — 7-Zip; NULL-пропуск, Win64 ABI) — 38Б, слот 48Б
+    initterm,
+    /// _initterm_e: то же + int-результат (≠0 → немедленный возврат) — 48Б
+    initterm_e,
 };
 
 pub const StubEntry = struct {
@@ -466,6 +471,107 @@ pub const Dispatcher = struct {
                 out[42] = 0x29;
                 out[43] = 0xD0;
                 out[44] = 0xC3; // ret — 45Б (слот 48Б)
+            },
+            // _initterm(pfnStart=RCX, pfnEnd=RDX): цикл C++-инициализаторов
+            // msvcrt (7-Zip, MSVC /MD). GNU as (scripts/initterm-native.s):
+            //   push rbp; push rbx; mov rbx,rcx; mov rbp,rdx; sub rsp,0x28;
+            //   .loop: cmp rbx,rbp; jae .done; mov rax,[rbx]; test rax,rax;
+            //   jz .next; call rax; .next: add rbx,8; jmp .loop;
+            //   .done: add rsp,0x28; pop rbx; pop rbp; ret — 38Б.
+            // ABI: rbx/rbp callee-saved (сохранены), rsp≡0 перед call
+            // (entry ≡8; 2 push → ≡8; −0x28 → ≡0), shadow 32Б в 0x28.
+            .initterm => {
+                out[0] = 0x55; // push rbp
+                out[1] = 0x53; // push rbx
+                out[2] = 0x48; // mov rbx, rcx
+                out[3] = 0x89;
+                out[4] = 0xCB;
+                out[5] = 0x48; // mov rbp, rdx
+                out[6] = 0x89;
+                out[7] = 0xD5;
+                out[8] = 0x48; // sub rsp, 0x28
+                out[9] = 0x83;
+                out[10] = 0xEC;
+                out[11] = 0x28;
+                out[12] = 0x48; // .loop: cmp rbx, rbp
+                out[13] = 0x39;
+                out[14] = 0xEB;
+                out[15] = 0x73; // jae .done (+16 → 33)
+                out[16] = 0x10;
+                out[17] = 0x48; // mov rax, [rbx]
+                out[18] = 0x8B;
+                out[19] = 0x03;
+                out[20] = 0x48; // test rax, rax
+                out[21] = 0x85;
+                out[22] = 0xC0;
+                out[23] = 0x74; // jz .next (+2 → 27)
+                out[24] = 0x02;
+                out[25] = 0xFF; // call rax
+                out[26] = 0xD0;
+                out[27] = 0x48; // .next: add rbx, 8
+                out[28] = 0x83;
+                out[29] = 0xC3;
+                out[30] = 0x08;
+                out[31] = 0xEB; // jmp .loop (-21 → 12)
+                out[32] = 0xEB;
+                out[33] = 0x48; // .done: add rsp, 0x28
+                out[34] = 0x83;
+                out[35] = 0xC4;
+                out[36] = 0x28;
+                out[37] = 0x5B; // pop rbx
+                out[38] = 0x5D; // pop rbp
+                out[39] = 0xC3; // ret — 40Б (слот 48Б)
+            },
+            // _initterm_e: int-инициализаторы (≠0 → немедленный возврат кода):
+            //   … call rax; or eax,eax; jnz .out; … .ok: xor eax,eax; .out: …
+            //   — ровно 48Б (слот 48Б). GNU as — байт-в-байт (см. скрипт).
+            .initterm_e => {
+                out[0] = 0x55; // push rbp
+                out[1] = 0x53; // push rbx
+                out[2] = 0x48; // mov rbx, rcx
+                out[3] = 0x89;
+                out[4] = 0xCB;
+                out[5] = 0x48; // mov rbp, rdx
+                out[6] = 0x89;
+                out[7] = 0xD5;
+                out[8] = 0x48; // sub rsp, 0x28
+                out[9] = 0x83;
+                out[10] = 0xEC;
+                out[11] = 0x28;
+                out[12] = 0x48; // .loop: cmp rbx, rbp
+                out[13] = 0x39;
+                out[14] = 0xEB;
+                out[15] = 0x73; // jae .ok (+20 → 37)
+                out[16] = 0x14;
+                out[17] = 0x48; // mov rax, [rbx]
+                out[18] = 0x8B;
+                out[19] = 0x03;
+                out[20] = 0x48; // test rax, rax
+                out[21] = 0x85;
+                out[22] = 0xC0;
+                out[23] = 0x74; // jz .next (+6 → 31)
+                out[24] = 0x06;
+                out[25] = 0xFF; // call rax
+                out[26] = 0xD0;
+                out[27] = 0x09; // or eax, eax
+                out[28] = 0xC0;
+                out[29] = 0x75; // jnz .out (+8 → 39)
+                out[30] = 0x08;
+                out[31] = 0x48; // .next: add rbx, 8
+                out[32] = 0x83;
+                out[33] = 0xC3;
+                out[34] = 0x08;
+                out[35] = 0xEB; // jmp .loop (-25 → 12)
+                out[36] = 0xE7;
+                out[37] = 0x31; // .ok: xor eax, eax
+                out[38] = 0xC0;
+                out[39] = 0x48; // .out: add rsp, 0x28
+                out[40] = 0x83;
+                out[41] = 0xC4;
+                out[42] = 0x28;
+                out[43] = 0x5B; // pop rbx
+                out[44] = 0x5D; // pop rbp
+                out[45] = 0xC3; // ret — 46Б (слот 48Б)
             },
         }
     }
@@ -1832,4 +1938,101 @@ test "callback-мост: launcher/trampoline/mailbox — байты + РЕАЛЬ
     try testing.expectEqual(@as(u8, 0x05), code2_mem[T + 24]); // syscall
     try testing.expectEqual(@as(u8, 0xEB), code2_mem[T + 25]);
     try testing.expectEqual(@as(u8, 0xFE), code2_mem[T + 26]); // jmp $ — не падаем
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.17.0 (CDD №8): native-тесты _initterm/_initterm_e (msvcrt — 7-Zip)
+// ═══════════════════════════════════════════════════════════════════════════
+
+var t_initterm_calls: u64 = 0;
+fn tInitA() callconv(.C) void {
+    t_initterm_calls = t_initterm_calls * 10 + 1;
+}
+fn tInitB() callconv(.C) void {
+    t_initterm_calls = t_initterm_calls * 10 + 2;
+}
+fn tInitC() callconv(.C) i32 {
+    t_initterm_calls = t_initterm_calls * 10 + 3;
+    return 0; // успех
+}
+fn tInitFail() callconv(.C) i32 {
+    t_initterm_calls = t_initterm_calls * 10 + 4;
+    return 42; // ПРОВАЛ: _initterm_e обязан вернуть 42 немедленно
+}
+fn tInitAfterFail() callconv(.C) i32 {
+    t_initterm_calls = t_initterm_calls * 10 + 5;
+    return 0;
+}
+
+test "native-initterm: цикл C++-инициализаторов msvcrt (7za-реестр, Ring 3)" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+    // 7za.exe импортирует msvcrt!_initterm (MSVC /MD CRT): native-стаб
+    // вызывает таблицу [start, end) инициализаторов, NULL пропускается.
+    const data = try loadFixture("testdata/7za.exe");
+    defer testing.allocator.free(data);
+    const image = try Pe.parse(data);
+    const counts = image.countImports();
+
+    const entries = try testing.allocator.alloc(StubEntry, counts.functions);
+    defer testing.allocator.free(entries);
+    const code_len = (counts.functions + 4) * STUB_CODE_SIZE + 4096;
+    const code_buf = try std.posix.mmap(
+        null,
+        code_len,
+        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(code_buf);
+
+    var disp = Dispatcher.init(entries, code_buf[0..code_len], .int3);
+    _ = try disp.generateFor(&image);
+    try testing.expect(disp.implementNative("msvcrt.dll", "_initterm", .initterm));
+    const it = disp.findByNameAnyDll("_initterm") orelse return error.NoInitterm;
+    try testing.expectEqual(StubKind.native, it.kind);
+
+    // Таблица: NULL, A, B — NULL пропускается, порядок сохраняется
+    t_initterm_calls = 0;
+    var table = [_]u64{ 0, @intFromPtr(&tInitA), @intFromPtr(&tInitB) };
+    _ = win64Call3(it.stub_addr, @intFromPtr(&table), @intFromPtr(&table) + table.len * 8, 0); // void: rax не определён
+    try testing.expectEqual(@as(u64, 12), t_initterm_calls); // A(1), B(2) по порядку
+
+    // Пустая таблица: [x, x) — ни одного вызова
+    t_initterm_calls = 0;
+    _ = win64Call3(it.stub_addr, @intFromPtr(&table), @intFromPtr(&table), 0);
+    try testing.expectEqual(@as(u64, 0), t_initterm_calls);
+
+    // ── _initterm_e: int-инициализаторы, провал прерывает цикл ──
+    // (npm-7za 19.00 импортирует только _initterm — e-вариант регистрируем
+    // через мини-реестр с ручной записью: та же точка входа writeNativeStub)
+    var ite_entries = [_]StubEntry{.{
+        .dll = "msvcrt.dll",
+        .func = .{ .by_name = "_initterm_e" },
+        .stub_addr = 0,
+        .iat_rva = 0,
+        .slot_index = 0,
+        .code_off = 0,
+    }};
+    var disp2 = Dispatcher.init(&ite_entries, code_buf[0..code_len], .int3);
+    disp2.count = 1;
+    try testing.expect(disp2.implementNative("msvcrt.dll", "_initterm_e", .initterm_e));
+    // implementNative не трогает stub_addr (в generateFor он ставится при
+    // генерации) — ручной записи адрес нужен явно:
+    ite_entries[0].stub_addr = disp2.stubAddr(ite_entries[0].code_off);
+    const ite = disp2.findByNameAnyDll("_initterm_e") orelse return error.NoInittermE;
+    try testing.expectEqual(StubKind.native, ite.kind);
+
+    t_initterm_calls = 0;
+    var table_ok = [_]u64{ @intFromPtr(&tInitC), @intFromPtr(&tInitC) };
+    const r_ok = win64Call3(ite.stub_addr, @intFromPtr(&table_ok), @intFromPtr(&table_ok) + table_ok.len * 8, 0);
+    try testing.expectEqual(@as(u64, 0), r_ok); // все успешны → 0
+    try testing.expectEqual(@as(u64, 33), t_initterm_calls); // C(3), C(3)
+
+    // Провал: Fail возвращает 42 → цикл останавливается ДО AfterFail
+    t_initterm_calls = 0;
+    var table_fail = [_]u64{ @intFromPtr(&tInitC), @intFromPtr(&tInitFail), @intFromPtr(&tInitAfterFail) };
+    const r_fail = win64Call3(ite.stub_addr, @intFromPtr(&table_fail), @intFromPtr(&table_fail) + table_fail.len * 8, 0);
+    try testing.expectEqual(@as(u64, 42), r_fail); // код провала
+    try testing.expectEqual(@as(u64, 34), t_initterm_calls); // C, Fail — AfterFail НЕ вызван
 }

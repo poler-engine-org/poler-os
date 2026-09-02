@@ -343,10 +343,10 @@ fn print_banner() void {
     vga_setcolor(0x0B); // Cyan
     puts(
         \\╔══════════════════════════════════════════════════════╗
-        \\║             POLER-OS v0.7.0 (64-bit)                ║
+        \\║           POLER-OS v0.17.0 (64-bit)                ║
         \\║          Semantic Runtime Architecture              ║
         \\║                                                      ║
-        \\║   Zig Kernel · VirtIO-BLK · FAT32 · POLER Core     ║
+        \\║   Zig Kernel · VirtIO-BLK · FAT32 RW · POLER Core  ║
         \\╚══════════════════════════════════════════════════════╝
         \\
     );
@@ -1087,7 +1087,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.16.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.17.0 Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
@@ -1722,7 +1722,7 @@ fn cmd_peload(args: []const u8) void {
         return;
     };
 
-    sys_print("=== PE Load & Run (CDD cycle 7): ");
+    sys_print("=== PE Load & Run (CDD cycle 8): ");
     sys_print(file);
     if (args.len > file_end) {
         sys_print(" — cmdline: ");
@@ -1745,18 +1745,28 @@ fn cmd_peload(args: []const u8) void {
         return;
     };
 
-    // 2. Планировка + ImageBase: маппим по ПРЕДПОЧТЁННОМУ базису (без .reloc).
-    //    Любой другой базис требует обработки .reloc — цикл №2.
+    // 2. Планировка + ImageBase: v0.17.0 (CDD №8) — ПОЛНЫЙ .reloc!
+    //    Предпочтённый базис валиден → грузим по нему (дельта 0, релокации
+    //    не нужны). Невалиден (7za.exe: 0x400000 < 4ГБ — identity-зона
+    //    ядра) → грузим по ВЫСОКОМУ базису 0x140000000 и применяем таблицу
+    //    BASERELOC (DIR64-фикспы) — как Windows ASLR/DYNAMIC_BASE.
     var layout = pe_loader.UserLayout{};
     const preferred = image.imageBase();
     if (pe_loader.validateImageBase(preferred, image.sizeOfImage())) {
         layout.image_base = preferred;
     } else {
+        layout.image_base = 0x140000000; // высокий базис (validate — ниже)
+        if (!pe_loader.validateImageBase(layout.image_base, image.sizeOfImage())) {
+            sys_print("[PE] ImageBase ");
+            putHex(preferred);
+            sys_print(" непригоден И высок. базис не проходит — отказ\n");
+            return;
+        }
         sys_print("[PE] ImageBase ");
         putHex(preferred);
-        sys_print(" непригоден (identity 0-4ГБ / не выровнен / вне canonical user),\n");
-        sys_print("[PE] а релокация .reloc не поддержана в v0.10.0 — отказ\n");
-        return;
+        sys_print(" ниже 4ГБ (identity ядра) — грузим по ");
+        putHex(layout.image_base);
+        sys_print(" + .reloc (DYNAMIC_BASE)\n");
     }
 
     const ops = kernelLoaderOps();
@@ -1768,6 +1778,22 @@ fn cmd_peload(args: []const u8) void {
         sys_print("\n");
         return;
     };
+
+    // 3b. v0.17.0 (CDD №8): БАЗОВЫЕ РЕЛОКАЦИИ — фактический базис ≠
+    //     предпочтённому → применяем DIR64-фикспы (7za: 2258, curl: ~10.9K).
+    //     Статистика в serial — покрываем и skipped-случаи (битые таблицы).
+    if (img.base_va != preferred) {
+        const rstats = pe_loader.applyRelocations(&image, img.backing, img.base_va, preferred);
+        sys_print("[PE] .reloc: ");
+        printDec(rstats.applied);
+        sys_print(" DIR64 fixups, skipped(type)=");
+        printDec(rstats.skipped_type);
+        sys_print(" skipped(bounds)=");
+        printDec(rstats.skipped_bounds);
+        sys_print(" (delta=");
+        putHex(@as(u64, @bitCast(rstats.delta)));
+        sys_print(")\n");
+    }
     sys_print("[PE] Image mapped: base=");
     putHex(img.base_va);
     sys_print(" size=");
@@ -1835,6 +1861,20 @@ fn cmd_peload(args: []const u8) void {
         .{ .dll = "api-ms-win-crt-string-l1-1-0.dll", .func = "strncmp", .kind = .strncmp },
         .{ .dll = "api-ms-win-crt-private-l1-1-0.dll", .func = "memcpy", .kind = .memcpy },
         .{ .dll = "api-ms-win-crt-private-l1-1-0.dll", .func = "memmove", .kind = .memmove },
+        // v0.17.0 (CDD №8): msvcrt.dll (MSVC /MD — 7-Zip) — те же горячие
+        // CRT-функции теперь и для msvcrt-импортов (dll-имя должно совпасть!)
+        .{ .dll = "msvcrt.dll", .func = "memset", .kind = .memset },
+        .{ .dll = "msvcrt.dll", .func = "memcpy", .kind = .memcpy },
+        .{ .dll = "msvcrt.dll", .func = "memmove", .kind = .memmove },
+        .{ .dll = "msvcrt.dll", .func = "strlen", .kind = .strlen },
+        .{ .dll = "msvcrt.dll", .func = "strcmp", .kind = .strcmp },
+        .{ .dll = "msvcrt.dll", .func = "strncmp", .kind = .strncmp },
+        // ⚠ УРОК оборванной сессии: msvcrt!_initterm — НАТИВНЫЙ цикл C++-
+        // инициализаторов (статические конструкторы 7-Zip!); no-op оставлял
+        // глобалы NULL → крах в main. api-ms-вариант (mingw-curl) остаётся
+        // dispatch-no-op: его натив ломал TLS-путь mingw (эмпирика v0.17-dev).
+        .{ .dll = "msvcrt.dll", .func = "_initterm", .kind = .initterm },
+        .{ .dll = "msvcrt.dll", .func = "_initterm_e", .kind = .initterm_e },
     };
     var natives: usize = 0;
     for (native_specs) |spec| {
@@ -2144,6 +2184,107 @@ fn cmd_peload(args: []const u8) void {
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_lseeki64" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_sopen_s" },
         .{ "api-ms-win-crt-stdio-l1-1-0.dll", "_chsize_s" },
+        // ── Волна CDD №8 (v0.17.0): 7-Zip (msvcrt /MD + KERNEL32-heavy) ──
+        // КРТИТ-стартап MSVC + системный слой бенчмарка: __getmainargs/…;
+        // события/семафоры с реальной сигнальностью; CPU/память/времена;
+        // файловая RW-волна (SetEndOfFile/Flush); реестр/токены — честный
+        // отказ (приложение живёт с fallback). Нативы msvcrt — выше.
+        .{ "msvcrt.dll", "__getmainargs" },
+        .{ "msvcrt.dll", "__set_app_type" },
+        .{ "msvcrt.dll", "__setusermatherr" },
+        .{ "msvcrt.dll", "_XcptFilter" },
+        .{ "msvcrt.dll", "_onexit" },
+        .{ "msvcrt.dll", "__dllonexit" },
+        .{ "msvcrt.dll", "_purecall" },
+        .{ "msvcrt.dll", "_CxxThrowException" },
+        .{ "msvcrt.dll", "__CxxFrameHandler" },
+        .{ "msvcrt.dll", "__C_specific_handler" },
+        .{ "msvcrt.dll", "??1type_info@@UEAA@XZ" },
+        .{ "msvcrt.dll", "?terminate@@YAXXZ" },
+        .{ "msvcrt.dll", "_beginthreadex" },
+        .{ "msvcrt.dll", "exit" },
+        .{ "msvcrt.dll", "_exit" },
+        .{ "msvcrt.dll", "_cexit" },
+        .{ "msvcrt.dll", "_c_exit" },
+        .{ "msvcrt.dll", "malloc" },
+        .{ "msvcrt.dll", "free" },
+        .{ "msvcrt.dll", "realloc" },
+        .{ "msvcrt.dll", "memcmp" },
+        .{ "msvcrt.dll", "wcscmp" },
+        .{ "msvcrt.dll", "wcsstr" },
+        .{ "msvcrt.dll", "fflush" },
+        .{ "msvcrt.dll", "fputc" },
+        .{ "msvcrt.dll", "fputs" },
+        .{ "msvcrt.dll", "fgetc" },
+        .{ "msvcrt.dll", "fclose" },
+        .{ "msvcrt.dll", "_isatty" },
+        .{ "KERNEL32.dll", "CreateEventW" },
+        .{ "KERNEL32.dll", "SetEvent" },
+        .{ "KERNEL32.dll", "ResetEvent" },
+        .{ "KERNEL32.dll", "CreateSemaphoreW" },
+        .{ "KERNEL32.dll", "ReleaseSemaphore" },
+        .{ "KERNEL32.dll", "OpenEventW" },
+        .{ "KERNEL32.dll", "SetEndOfFile" },
+        .{ "KERNEL32.dll", "FlushFileBuffers" },
+        .{ "KERNEL32.dll", "VirtualFree" },
+        .{ "KERNEL32.dll", "GetTickCount" },
+        .{ "KERNEL32.dll", "GetCurrentProcess" },
+        .{ "KERNEL32.dll", "GetCurrentProcessId" },
+        .{ "KERNEL32.dll", "GetSystemInfo" },
+        .{ "KERNEL32.dll", "GlobalMemoryStatusEx" },
+        .{ "KERNEL32.dll", "IsProcessorFeaturePresent" },
+        .{ "KERNEL32.dll", "GetVersionExW" },
+        .{ "KERNEL32.dll", "GetOEMCP" },
+        .{ "KERNEL32.dll", "SetFileApisToOEM" },
+        .{ "KERNEL32.dll", "LocalFree" },
+        .{ "KERNEL32.dll", "ResumeThread" },
+        .{ "KERNEL32.dll", "SetThreadAffinityMask" },
+        .{ "KERNEL32.dll", "SetProcessAffinityMask" },
+        .{ "KERNEL32.dll", "GetProcessAffinityMask" },
+        .{ "KERNEL32.dll", "GetProcessTimes" },
+        .{ "KERNEL32.dll", "FileTimeToSystemTime" },
+        .{ "KERNEL32.dll", "FileTimeToLocalFileTime" },
+        .{ "KERNEL32.dll", "LocalFileTimeToFileTime" },
+        .{ "KERNEL32.dll", "DosDateTimeToFileTime" },
+        .{ "KERNEL32.dll", "FileTimeToDosDateTime" },
+        .{ "KERNEL32.dll", "CompareFileTime" },
+        .{ "KERNEL32.dll", "SetFileTime" },
+        .{ "KERNEL32.dll", "GetFileInformationByHandle" },
+        .{ "KERNEL32.dll", "GetModuleFileNameW" },
+        .{ "KERNEL32.dll", "LoadLibraryW" },
+        .{ "KERNEL32.dll", "FreeLibrary" },
+        .{ "KERNEL32.dll", "WideCharToMultiByte" },
+        .{ "KERNEL32.dll", "GetLogicalDriveStringsW" },
+        .{ "KERNEL32.dll", "GetTempPathW" },
+        .{ "KERNEL32.dll", "GetDiskFreeSpaceW" },
+        .{ "KERNEL32.dll", "DeviceIoControl" },
+        .{ "KERNEL32.dll", "DeleteFileW" },
+        .{ "KERNEL32.dll", "CreateDirectoryW" },
+        .{ "KERNEL32.dll", "RemoveDirectoryW" },
+        .{ "KERNEL32.dll", "MoveFileW" },
+        .{ "KERNEL32.dll", "SetCurrentDirectoryW" },
+        .{ "KERNEL32.dll", "GetCurrentDirectoryW" },
+        .{ "KERNEL32.dll", "SetFileAttributesW" },
+        .{ "KERNEL32.dll", "GetFileAttributesW" },
+        .{ "KERNEL32.dll", "FindFirstFileW" },
+        .{ "KERNEL32.dll", "FindNextFileW" },
+        .{ "KERNEL32.dll", "FindClose" },
+        .{ "KERNEL32.dll", "OpenFileMappingW" },
+        .{ "KERNEL32.dll", "MapViewOfFile" },
+        .{ "KERNEL32.dll", "UnmapViewOfFile" },
+        .{ "KERNEL32.dll", "SetConsoleMode" },
+        .{ "KERNEL32.dll", "GetProcessHeap" },
+        .{ "ADVAPI32.dll", "SystemFunction036" },
+        .{ "ADVAPI32.dll", "RegOpenKeyExW" },
+        .{ "ADVAPI32.dll", "RegQueryValueExW" },
+        .{ "ADVAPI32.dll", "RegCloseKey" },
+        .{ "ADVAPI32.dll", "OpenProcessToken" },
+        .{ "ADVAPI32.dll", "AdjustTokenPrivileges" },
+        .{ "ADVAPI32.dll", "LookupPrivilegeValueW" },
+        .{ "ADVAPI32.dll", "GetFileSecurityW" },
+        .{ "ADVAPI32.dll", "SetFileSecurityW" },
+        .{ "USER32.dll", "CharUpperW" },
+        .{ "USER32.dll", "CharPrevExA" },
     };
     var impls: usize = 0;
     for (impl_specs) |spec| {
@@ -2153,7 +2294,7 @@ fn cmd_peload(args: []const u8) void {
     printDec(impls);
     sys_print(" / ");
     printDec(impl_specs.len);
-    sys_print(" — cycles 1+…+7 (волны 17+20 fn + Wave-A + CRT-kit + CDD6 strerror_s + CDD7: FILE/VFS/PUF-энтропия)\n");
+    sys_print(" — cycles 1+…+8 (+CDD8: FAT32-RW/файлы, 7-Zip: события/CPU/память/msvcrt-CRT))\n");
 
     // 7. Патч IAT: слоты → user-VA стабов (запись через identity, CPL=0)
     kdisp.applyToImage(img.backing);
@@ -2226,10 +2367,82 @@ fn cmd_peload(args: []const u8) void {
         // v0.16.0 (CDD №7): файловая волна VFS (хэндлы 0x800+, слоты)
         .next_file_handle = win32_crt.FILE_HANDLE_BASE,
         .files = undefined,
+        // v0.17.0 (CDD №8): события/семафоры с реальным сигнальным состоянием
+        .events = undefined,
     };
     for (&win32_crt.ctx.?.sockets) |*sk| sk.* = .{};
     for (&win32_crt.ctx.?.tls_sessions) |*ts| ts.* = .{};
     for (&win32_crt.ctx.?.files) |*fl| fl.* = .{};
+    for (&win32_crt.ctx.?.events) |*ev| ev.* = .{};
+
+    // 9b. v0.17.0 (CDD №8): DATA-импорты msvcrt — IAT-слоты указывают на
+    //     ЗАПИСЫВАЕМЫЕ переменные CRT (_fmode/_commode — int, __initenv —
+    //     char**, _iob — FILE-массив). applyToImage уже записал туда VA
+    //     RX-стаба → приложение писало бы в RX-страницу (#PF!). Патчим
+    //     слоты на RW+NX-блок (1 страница user-VA), FILE* из блока
+    //     маршрутизируются на консоль (isMsvcrtIobStream в win32_crt).
+    patch_blk: {
+        const data_blk = pe_loader.mapRegion(
+            ops,
+            user_pml4,
+            0x21_0004_0000, // data-импорты: отдельная страница (RW+NX)
+            4096,
+            pe_loader.PTE_USER | pe_loader.PTE_WRITABLE | pe_loader.PTE_NO_EXECUTE,
+        ) catch {
+            sys_print("[PE] patchDataImports: mapRegion FAIL — msvcrt-данные не подключены\n");
+            win32_crt.ctx.?.iob_block = 0;
+            break :patch_blk;
+        };
+        // раскладка блока: _fmode@0, _commode@8, __initenv@16, _iob@0x100(3×48Б)
+        const specs = [_]struct { name: []const u8, off: u64 }{
+            .{ .name = "_fmode", .off = 0x00 },
+            .{ .name = "_commode", .off = 0x08 },
+            .{ .name = "__initenv", .off = 0x10 },
+        };
+        var patched: usize = 0;
+        for (specs) |spec| {
+            for (kdisp.entries[0..kdisp.count]) |*e| {
+                const n = switch (e.func) {
+                    .by_name => |nm| nm,
+                    .by_ordinal => continue,
+                };
+                if (!std.ascii.eqlIgnoreCase(e.dll, "msvcrt.dll")) continue;
+                if (!std.mem.eql(u8, n, spec.name)) continue;
+                // Слот IAT (как applyToImage) → VA блока
+                const slot: *u64 = @ptrFromInt(@intFromPtr(img.backing) + e.iat_rva + e.slot_index * 8);
+                slot.* = data_blk.va + spec.off;
+                patched += 1;
+                break;
+            }
+        }
+        // _iob: FILE-массив (3×48Б нулей — заполняется неявно: страница нулевая)
+        var iob_done = false;
+        for (kdisp.entries[0..kdisp.count]) |*e| {
+            const n = switch (e.func) {
+                .by_name => |nm| nm,
+                .by_ordinal => continue,
+            };
+            if (!std.ascii.eqlIgnoreCase(e.dll, "msvcrt.dll")) continue;
+            if (!std.mem.eql(u8, n, "_iob")) continue;
+            const slot: *u64 = @ptrFromInt(@intFromPtr(img.backing) + e.iat_rva + e.slot_index * 8);
+            slot.* = data_blk.va + 0x100;
+            patched += 1;
+            iob_done = true;
+            break;
+        }
+        if (iob_done) win32_crt.ctx.?.iob_block = data_blk.va;
+        sys_print("[PE] patchDataImports: ");
+        printDec(patched);
+        sys_print(" msvcrt-слотов (");
+        if (iob_done) {
+            sys_print("_fmode/_commode/__initenv/_iob");
+        } else {
+            sys_print("_fmode/_commode/__initenv");
+        }
+        sys_print(") -> RW-блок 0x");
+        putHex(data_blk.va);
+        sys_print("\n");
+    }
     // v0.16.0 (CDD №7): окружение PE-процесса — ядро отвечает за него, как
     // и за «версию Windows» (OS_ACTUAL). CURL_CA_BUNDLE/SSL_CERT_FILE — путь
     // к CA-бандлу в initrd-VFS: верификация сертификата БЕЗ флага -k.
