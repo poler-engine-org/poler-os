@@ -634,6 +634,16 @@ fn handleException(frame: *InterruptFrame) void {
     if (from_user) {
         // User-mode exception — kill the offending process instead of kernel panic
         Serial.puts("\n[EXCEPTION] Ring 3 fault! Killing user process.\n");
+        // DEBUG (CDD №8): компактный дамп при RIP=0 (урок SYSTEM_INFO-48Б)
+        if (frame.rip == 0) {
+            Serial.puts("[DBG] RIP=0: [rsp]=0x");
+            const usp: *volatile u64 = @ptrFromInt(frame.rsp);
+            Serial.putHex(usp.*);
+            Serial.puts(" [rsp+8]=0x");
+            const usp2: *volatile u64 = @ptrFromInt(frame.rsp + 8);
+            Serial.putHex(usp2.*);
+            Serial.puts("\n");
+        }
         // Kill the current task via the exit callback (same mechanism as syscall exit)
         if (exitCallback) |cb| {
             cb();

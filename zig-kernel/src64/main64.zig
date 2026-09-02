@@ -1878,7 +1878,15 @@ fn cmd_peload(args: []const u8) void {
     };
     var natives: usize = 0;
     for (native_specs) |spec| {
-        if (kdisp.implementNative(spec.dll, spec.func, spec.kind)) natives += 1;
+        if (kdisp.implementNative(spec.dll, spec.func, spec.kind)) {
+            natives += 1;
+        } else {
+            sys_print("[PE] native NOT FOUND: ");
+            sys_print(spec.dll);
+            sys_print("!");
+            sys_print(spec.func);
+            sys_print("\n");
+        }
     }
     sys_print("[PE] Native stubs: ");
     printDec(natives);
@@ -2302,6 +2310,14 @@ fn cmd_peload(args: []const u8) void {
     printDec(generated);
     sys_print(" slots\n");
 
+    // DEBUG (CDD №8): контроль слота msvcrt!malloc (RVA 0xDF408 у 7za 21.07)
+    {
+        const dbg_slot: *volatile u64 = @ptrFromInt(@intFromPtr(img.backing) + 0xDF408);
+        sys_print("[DBG] malloc-slot after applyToImage = 0x");
+        putHex(dbg_slot.*);
+        sys_print("\n");
+    }
+
 
     // 8. User-контекст Win64: стек, TEB, PEB, params+cmdline, TLS
     const uctx = pe_loader.buildUserContext(ops, user_pml4, layout, img.base_va, args) catch |err| {
@@ -2431,6 +2447,13 @@ fn cmd_peload(args: []const u8) void {
             break;
         }
         if (iob_done) win32_crt.ctx.?.iob_block = data_blk.va;
+        // DEBUG (CDD №8): контроль слота malloc после patchDataImports
+        {
+            const dbg_slot: *volatile u64 = @ptrFromInt(@intFromPtr(img.backing) + 0xDF408);
+            sys_print("[DBG] malloc-slot after patchDataImports = 0x");
+            putHex(dbg_slot.*);
+            sys_print("\n");
+        }
         sys_print("[PE] patchDataImports: ");
         printDec(patched);
         sys_print(" msvcrt-слотов (");

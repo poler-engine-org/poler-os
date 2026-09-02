@@ -378,6 +378,26 @@ fn taskRspValid(id: usize, rsp: u64) bool {
     return rsp >= base and rsp < base + tasks[id].kernel_stack.len;
 }
 
+/// v0.17.0 (CDD №8): валидность СОДЕРЖИМОГО кадра (InterruptFrame на kstack
+/// задачи). Многопоточный 7-Zip вскрыл: УКАЗАТЕЛЬ tasks[].rsp корректен
+/// (SELF-HEAL), но СОДЕРЖИМОЕ кадра перезаписано чужим syscall-кадром
+/// (гонка syscall-exit — то же v0.12/v0.16-семейство, теперь 4 треда ×
+/// syscalls). Свитч на мусорный кадр = #GP(RIP=heap, CS=0) в ядре → HALT.
+/// Guard: CS обязан быть 0x23/0x1B (user) или 0x08/0x10 (kernel), user-RIP
+/// в canonical-user. Мусор → задача УБИВАЕТСЯ — ядро живёт (CDD-честно).
+fn frameContentValid(rsp: u64) bool {
+    if (rsp == 0) return false;
+    // [rsp+136]=rip, [rsp+144]=cs, [rsp+160]=rsp, [rsp+168]=ss (isr64.S)
+    const cs = @as(*volatile u64, @ptrFromInt(rsp + 144)).*;
+    if (cs == 0x08 or cs == 0x10) return true; // kernel-задача (shell/idle)
+    if (cs != 0x23 and cs != 0x1B) return false; // мусорный CS
+    const rip = @as(*volatile u64, @ptrFromInt(rsp + 136)).*;
+    if (rip < 0x10000 or rip >= 0x0000_8000_0000_0000) return false;
+    const usp = @as(*volatile u64, @ptrFromInt(rsp + 160)).*;
+    if (usp < 0x10000 or usp >= 0x0000_8000_0000_0000) return false;
+    return true;
+}
+
 /// v0.13.0-fix: заполнить низ kstack задачи паттерном (детектор overflow).
 fn fillCanary(task: *Task) void {
     const base: usize = @intFromPtr(&task.kernel_stack);
@@ -477,8 +497,22 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
         }
         if (tasks[next_id].state == .Ready or tasks[next_id].state == .Running) {
             if (taskRspValid(next_id, tasks[next_id].rsp)) {
-                found = true;
-                break;
+                if (frameContentValid(tasks[next_id].rsp)) {
+                    found = true;
+                    break;
+                }
+                // v0.17.0 (CDD №8): указатель корректен, СОДЕРЖИМОЕ кадра —
+                // мусор (гонка syscall-exit многопоточного 7-Zip). Убиваем
+                // задачу — ядро и шелл живут (CDD-честная граница).
+                tasks[next_id].state = .Killed;
+                hal.Serial.puts("[SCHED] FRAME-GUARD: task ");
+                hal.Serial.putDecimal(next_id);
+                hal.Serial.puts(" убита (кадр мусорен: CS=0x");
+                hal.Serial.putHex(@as(*volatile u64, @ptrFromInt(tasks[next_id].rsp + 144)).*);
+                hal.Serial.puts(" RIP=0x");
+                hal.Serial.putHex(@as(*volatile u64, @ptrFromInt(tasks[next_id].rsp + 136)).*);
+                hal.Serial.puts(") — ядро живёт\n");
+                continue;
             }
             if (bad_rsp == 0) {
                 bad_rsp = tasks[next_id].rsp;

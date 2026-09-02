@@ -4173,30 +4173,33 @@ fn currentFileTime() u64 {
     return (unix + 11644473600) * 10_000_000;
 }
 
-/// SYSTEM_INFO (Win64, 56+24Б): архитектура/число CPU/гранулярность/диапазон.
-/// 7-Zip benchmark читает dwNumberOfProcessors (слоты 60-63 в x64) и
-/// lpMinimumApplicationAddress. Ядро знает счёт CPU честно — из ops.
-/// Layout (x64): {0: DWORD dwOemId(u64 в выравнивании), 8: DWORD page_size,
-/// 16: LPVOID min_app_addr, 24: LPVOID max_app_addr, 32: DWORD_PTR active_mask,
-/// 40: DWORD nprocessors, 44: DWORD proc_type, 48: DWORD alloc_gran,
-/// 52: WORD proc_level, 54: WORD proc_revision}
+/// SYSTEM_INFO (Win64, 48Б!): MSVC-лейаут —
+/// {0: WORD wProcessorArchitecture, 2: WORD wReserved,
+///  4: DWORD dwPageSize, 8: LPVOID lpMinAppAddr, 16: LPVOID lpMaxAppAddr,
+///  24: DWORD_PTR dwActiveProcessorMask, 32: DWORD dwNumberOfProcessors,
+///  36: DWORD dwProcessorType, 40: DWORD dwAllocationGranularity,
+///  44: WORD wProcessorLevel, 46: WORD wProcessorRevision} — 48 БАЙТ.
+/// ⚠ УРОК CDD №8: первый вариант писал «56-64Б-лейаут» со сдвинутыми полями
+/// — memset/write ПЕРЕЗАПИСАЛ слот возврата вызывающего (7za: `SYSTEM_INFO
+/// si` = 48Б локал) → ret на 0 → #PF(RIP=0, CR2=0, err=0x15) после
+/// GetSystemInfo. Верифицировано трассой QEMU -d exec,in_asm.
+/// 7-Zip benchmark читает dwNumberOfProcessors (число тредов).
 fn getSystemInfo(lp: u64) u64 {
     if (lp == 0) return 0;
-    if (!ops.validate_write(lp, 64)) return 0;
+    if (!ops.validate_write(lp, 48)) return 0;
     const page = userPtr(lp);
-    @memset(page[0..64], 0);
-    // PROCESSOR_ARCHITECTURE_AMD64 = 9 (wProcessorArchitecture в union)
-    std.mem.writeInt(u16, page[0..2], 0, .little); // wReserved
-    std.mem.writeInt(u16, page[2..4], 9, .little); // AMD64
-    std.mem.writeInt(u32, page[8..12], 4096, .little); // dwPageSize
-    userQ(lp + 16).* = 0x10000; // lpMinimumApplicationAddress
-    userQ(lp + 24).* = 0x0000_7FFF_FFFF_FFFF; // lpMaximumApplicationAddress
-    userQ(lp + 32).* = 0xFF; // dwActiveProcessorMask (8 CPU)
-    std.mem.writeInt(u32, page[40..44], @truncate(ops.cpu_count()), .little); // dwNumberOfProcessors
-    std.mem.writeInt(u32, page[44..48], 8664, .little); // dwProcessorType (PROCESSOR_AMD_X8664)
-    std.mem.writeInt(u32, page[48..52], 4096 * 64, .little); // dwAllocationGranularity
-    std.mem.writeInt(u16, page[52..54], 0, .little); // wProcessorLevel
-    std.mem.writeInt(u16, page[54..56], 0, .little); // wProcessorRevision
+    @memset(page[0..48], 0);
+    std.mem.writeInt(u16, page[0..2], 9, .little); // PROCESSOR_ARCHITECTURE_AMD64
+    std.mem.writeInt(u16, page[2..4], 0, .little); // wReserved
+    std.mem.writeInt(u32, page[4..8], 4096, .little); // dwPageSize
+    userQ(lp + 8).* = 0x10000; // lpMinimumApplicationAddress
+    userQ(lp + 16).* = 0x0000_7FFF_FFFF_FFFF; // lpMaximumApplicationAddress
+    userQ(lp + 24).* = 0xFF; // dwActiveProcessorMask
+    std.mem.writeInt(u32, page[32..36], @truncate(ops.cpu_count()), .little); // dwNumberOfProcessors
+    std.mem.writeInt(u32, page[36..40], 8664, .little); // dwProcessorType
+    std.mem.writeInt(u32, page[40..44], 65536, .little); // dwAllocationGranularity
+    std.mem.writeInt(u16, page[44..46], 0, .little); // wProcessorLevel
+    std.mem.writeInt(u16, page[46..48], 0, .little); // wProcessorRevision
     logf("[WIN32] GetSystemInfo -> {d} CPU (AMD64)\n", .{ops.cpu_count()});
     return 0;
 }
@@ -9186,12 +9189,15 @@ test "cdd8-sysinfo: GetSystemInfo + GlobalMemoryStatusEx (7-Zip-волна)" {
     const id_cp = reg.add("KERNEL32.dll", "GetCurrentProcess", 0);
     const id_pf = reg.add("KERNEL32.dll", "IsProcessorFeaturePresent", 0);
     const mb: u64 = @intFromPtr(&g_mem);
-    @memset(g_mem[0x100..0x200], 0);
+    @memset(g_mem[0x100..0x200], 0xEE);
 
-    // GetSystemInfo: 4 CPU (t-модель), arch AMD64=9 (u16 @+2)
+    // GetSystemInfo (Win64 = 48Б!): 4 CPU (t-модель), arch AMD64=9 (u16 @0)
     try testing.expectEqual(@as(u64, 0), reg.call(id_si, mb + 0x100, 0, 0, 0));
-    try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, g_mem[0x100 + 40 ..][0..4], .little));
-    try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, g_mem[0x100 + 2 ..][0..2], .little));
+    try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, g_mem[0x100 + 32 ..][0..4], .little));
+    try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, g_mem[0x100 + 0 ..][0..2], .little));
+    try testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, g_mem[0x100 + 4 ..][0..4], .little));
+    // байты 48..64 НЕ тронуты (урок: первый вариант затирал слот возврата!)
+    try testing.expectEqual(@as(u64, 0xEEEEEEEEEEEEEEEE), std.mem.readInt(u64, g_mem[0x100 + 48 ..][0..8], .little));
     try testing.expect(logHas("GetSystemInfo"));
 
     // GlobalMemoryStatusEx: Total=128МБ, TRUE
