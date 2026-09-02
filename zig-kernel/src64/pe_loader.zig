@@ -262,6 +262,81 @@ pub fn loadImage(
     };
 }
 
+// ============================================================================
+// v0.17.0 (CDD №8): Base Relocations (.reloc / ASLR / DYNAMIC_BASE)
+// ============================================================================
+// Образы с ImageBase < 4ГБ (7za.exe: 0x400000) не проходят validateImageBase
+// (identity-map ядра 0–4ГБ) — грузим по ВЫСОКОМУ базису и правим абсолютные
+// 64-битные указатели таблицей .reloc. Формат: последовательность блоков
+// { u32 page_rva, u32 block_size, u16 entries[] }; entry = (type<<12)|offset;
+// type 10 = IMAGE_REL_BASED_DIR64 — *(u64*)(page_rva+offset) += delta.
+// ============================================================================
+
+/// Типы записей таблицы релокаций (winnt.h).
+pub const IMAGE_REL_BASED_ABSOLUTE: u16 = 0; // паддинг (пропуск)
+pub const IMAGE_REL_BASED_DIR64: u16 = 10; // 64-битный абсолютный указатель
+
+/// Статистика применения релокаций (лог ядра + юнит-тесты).
+pub const RelocStats = struct {
+    applied: u64 = 0, // DIR64-фикспов применено
+    skipped_type: u64 = 0, // неподдержанные типы (HIGHLOW/HIGHADJ…)
+    skipped_bounds: u64 = 0, // фикспы за пределами SizeOfImage
+    delta: i64 = 0, // фактический_базис − предпочтённый
+};
+
+/// Применить таблицу базовых релокаций DIR64 к ЗАГРУЖЕННОМУ образу
+/// (секции уже скопированы в backing по RVA; таблица .reloc читается
+/// из самого backing — её RVA из data-директории №5).
+/// base_va — фактический адрес загрузки; preferred — ImageBase из PE.
+/// Идемпотентно при delta == 0 (загружен по предпочтённому базису).
+pub fn applyRelocations(
+    image: *const pe.Pe,
+    backing: [*]u8,
+    base_va: u64,
+    preferred: u64,
+) RelocStats {
+    var stats = RelocStats{
+        .delta = @as(i64, @bitCast(base_va)) -% @as(i64, @bitCast(preferred)),
+    };
+    if (stats.delta == 0) return stats;
+
+    const dir = image.dataDirectory(pe.DIR_BASERELOC);
+    if (dir.virtual_address == 0 or dir.size == 0) return stats; // таблицы нет — нечего править
+
+    const soi: u64 = image.sizeOfImage();
+    const end: u64 = @as(u64, dir.virtual_address) + dir.size;
+    if (end > soi) return stats; // битая директория — молча отказ
+
+    var off: u64 = dir.virtual_address;
+    while (off + 8 <= end) {
+        const page_rva = std.mem.readInt(u32, backing[off..][0..4], .little);
+        const block_size = std.mem.readInt(u32, backing[off..][4..8], .little);
+        if (block_size < 8 or off + block_size > end) break; // битый блок — стоп
+        const n: u32 = (block_size - 8) / 2;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const e = std.mem.readInt(u16, backing[off + 8 + i * 2 ..][0..2], .little);
+            const typ: u16 = e >> 12;
+            if (typ == IMAGE_REL_BASED_ABSOLUTE) continue; // паддинг
+            if (typ != IMAGE_REL_BASED_DIR64) {
+                stats.skipped_type += 1;
+                continue;
+            }
+            const fix_rva: u64 = @as(u64, page_rva) + (e & 0xFFF);
+            if (fix_rva + 8 > soi) {
+                stats.skipped_bounds += 1;
+                continue; // виниграммная таблица не должна так делать — но не падаем
+            }
+            const old = std.mem.readInt(u64, backing[fix_rva..][0..8], .little);
+            const fixed = old +% @as(u64, @bitCast(stats.delta));
+            std.mem.writeInt(u64, backing[fix_rva..][0..8], fixed, .little);
+            stats.applied += 1;
+        }
+        off += block_size;
+    }
+    return stats;
+}
+
 // ─── Чистые инициализаторы структур Win64 (тестируемые) ────────────────────
 
 fn writeQ(page: []u8, off: u16, val: u64) void {
@@ -347,10 +422,22 @@ pub fn buildUserContext(
     image_base_va: u64,
     cmdline: []const u8,
 ) LoadError!UserContext {
-    // Стек: RW+NX, страницы обнулены; фейковый return-address=0 на top-8
+    // Стек: RW+NX, страницы обнулены.
     const stack_bytes = layout.stack_pages * PAGE_SIZE;
     const stack = try mapRegion(ops, pml4, layout.stack_top - stack_bytes, stack_bytes, PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE);
-    std.mem.writeInt(u64, stack.backing[stack.size - 8 ..][0..8], 0, .little); // stray ret → VA 0 → #PF → видимый CDD-крах
+
+    // v0.17.0 (CDD №8): начальный RSP = top − 0x108.
+    //   ① Win64 ABI: на входе функции RSP ≡ 8 (mod 16) — как после call,
+    //     вытолкнувшего 8-байтный адрес возврата (0x108 % 16 == 8).
+    //   ② «Тень вызвавшего»: entry-код Win64-бинарников (MSVC CRT
+    //     mainCRTStartup, entry 7-Zip) пишет в caller shadow space
+    //     [rsp+8..rsp+0x28] ВЫШЕ входного RSP. С top−8 записи [rsp+0x18]
+    //     попадали на top+0x10 — ЗА границей стека (#PF). headroom 0x100
+    //     над RSP = 256Б «фрейма вызвавшего» внутри стека.
+    //   ③ Фейковый return-address=0 в [RSP] — stray ret → VA 0 → #PF →
+    //     видимый CDD-крах (не немой уход в мусор).
+    const stack_rsp = layout.stack_top - 0x108;
+    std.mem.writeInt(u64, stack.backing[stack.size - 0x108 ..][0..8], 0, .little); // stray ret → VA 0 → #PF → видимый CDD-крах
 
     // TEB / PEB / params / TLS — по странице (TLS-страница остаётся нулевой)
     const teb = try mapRegion(ops, pml4, layout.teb_va, PAGE_SIZE, PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE);
@@ -365,7 +452,7 @@ pub fn buildUserContext(
 
     return UserContext{
         .stack_top = layout.stack_top,
-        .stack_rsp = layout.stack_top - 8,
+        .stack_rsp = stack_rsp,
         .teb_va = layout.teb_va,
         .peb_va = layout.peb_va,
         .params_va = layout.params_va,
@@ -632,7 +719,9 @@ test "buildUserContext: стек, TEB-страницы, cmdline, фейковы�
     const img = try loadImage(fp.ops(), 0x1000, &image, layout.image_base);
     const ctx = try buildUserContext(fp.ops(), 0x1000, layout, img.base_va, "curl.exe");
 
-    try testing.expectEqual(layout.stack_top - 8, ctx.stack_rsp);
+    // v0.17.0 (CDD №8): RSP = top−0x108 — ABI ≡8 (mod 16) + 256Б тени вызвавшего
+    try testing.expectEqual(layout.stack_top - 0x108, ctx.stack_rsp);
+    try testing.expectEqual(@as(u64, 0x22_0000_0000 - 0x108) % 16, @as(u64, 8)); // Win64 ABI: entry RSP ≡ 8 (mod 16)
     try testing.expectEqual(layout.teb_va, ctx.teb_va);
 
     // TEB-страница в фейковой физ-памяти: Self указывает на свой VA
@@ -654,10 +743,153 @@ test "buildUserContext: стек, TEB-страницы, cmdline, фейковы�
     try testing.expect(stack_map.flags & PTE_WRITABLE != 0);
     try testing.expect(stack_map.flags & PTE_NO_EXECUTE != 0);
     const stack_mem = fp.mem[@intCast(stack_map.pa)..][0..4096];
-    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, stack_mem[4096 - 8 ..][0..8], .little));
+    // v0.17.0 (CDD №8): фейковый ret=0 в [RSP] (top−0x108), а не в top−8
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, stack_mem[4096 - 0x108 ..][0..8], .little));
 
     // TLS-страница нулевая
     const tls_map = findMap(fp, layout.tls_va).?;
     const tls_mem = fp.mem[@intCast(tls_map.pa)..][0..4096];
     try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, tls_mem[0..][0..8], .little));
+}
+
+// ============================================================================
+// v0.17.0 (CDD №8): тесты движка базовых релокаций (.reloc / DYNAMIC_BASE)
+// ============================================================================
+
+/// Подсчёт DIR64-записей таблицы .reloc по ФАЙЛОВЫМ данным (эталон для тестов).
+fn countDir64InFile(image: *const pe.Pe) u64 {
+    const dir = image.dataDirectory(pe.DIR_BASERELOC);
+    if (dir.virtual_address == 0 or dir.size == 0) return 0;
+    const data = image.data;
+    const start = image.rvaToOffset(dir.virtual_address) orelse return 0;
+    var file_off: u64 = start;
+    const end = start + dir.size;
+    var total: u64 = 0;
+    while (file_off + 8 <= end) {
+        const block_size = std.mem.readInt(u32, data[@intCast(file_off + 4)..][0..4], .little);
+        if (block_size < 8 or file_off + block_size > end) break;
+        const n = (block_size - 8) / 2;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const e = std.mem.readInt(u16, data[@intCast(file_off + 8 + i * 2)..][0..2], .little);
+            if ((e >> 12) == IMAGE_REL_BASED_DIR64) total += 1;
+        }
+        file_off += block_size;
+    }
+    return total;
+}
+
+test "cdd8-reloc: 7za.exe x64 — 2258 DIR64 применены, значения = файл + delta" {
+    const data = try loadFixture("testdata/7za.exe");
+    defer testing.allocator.free(data);
+    const image = try pe.Pe.parse(data);
+
+    // 7za.exe: ImageBase=0x400000 (ниже identity 4ГБ!) — грузим высоко.
+    const preferred = image.imageBase();
+    const base: u64 = 0x140000000;
+    try testing.expect(preferred == 0x400000);
+    try testing.expect(!validateImageBase(preferred, image.sizeOfImage()));
+    try testing.expect(validateImageBase(base, image.sizeOfImage()));
+
+    const fp = try fakeSetup(64 << 20);
+    defer fakeTeardown(fp);
+    const img = try loadImage(fp.ops(), 0xDEAD000, &image, base);
+
+    // До релокаций: абсолютный указатель в образе указывает на СТАРЫЙ базис.
+    const stats = applyRelocations(&image, img.backing, base, preferred);
+    try testing.expectEqual(countDir64InFile(&image), stats.applied);
+    try testing.expectEqual(@as(u64, 2258), stats.applied);
+    try testing.expectEqual(@as(u64, 0), stats.skipped_type);
+    try testing.expectEqual(@as(u64, 0), stats.skipped_bounds);
+    try testing.expectEqual(@as(i64, 0x140000000 - 0x400000), stats.delta);
+
+    // Выборочная сверка 3 фикспов: backing[fix_rva] == file[fix_rva] + delta.
+    const dir = image.dataDirectory(pe.DIR_BASERELOC);
+    var checked: usize = 0;
+    var file_off: u64 = (image.rvaToOffset(dir.virtual_address) orelse return error.BadRelocDir);
+    const end = file_off + dir.size;
+    outer: while (file_off + 8 <= end) {
+        const page_rva = std.mem.readInt(u32, data[@intCast(file_off)..][0..4], .little);
+        const block_size = std.mem.readInt(u32, data[@intCast(file_off + 4)..][0..4], .little);
+        if (block_size < 8 or file_off + block_size > end) break;
+        const n = (block_size - 8) / 2;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const e = std.mem.readInt(u16, data[@intCast(file_off + 8 + i * 2)..][0..2], .little);
+            if ((e >> 12) != IMAGE_REL_BASED_DIR64) continue;
+            const fix_rva: u64 = @as(u64, page_rva) + (e & 0xFFF);
+            const file_val = std.mem.readInt(u64, data[@intCast(image.rvaToOffset(@intCast(fix_rva)) orelse continue)..][0..8], .little);
+            const mem_val = std.mem.readInt(u64, img.backing[fix_rva..][0..8], .little);
+            try testing.expectEqual(file_val +% @as(u64, @bitCast(stats.delta)), mem_val);
+            checked += 1;
+            if (checked == 3) break :outer;
+        }
+        file_off += block_size;
+    }
+    try testing.expect(checked == 3);
+}
+
+test "cdd8-reloc: curl.exe — таблица DYNAMIC_BASE применяется при сдвиге базиса" {
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try pe.Pe.parse(data);
+
+    // curl.exe грузится по предпочтённому 0x140000000 обычно; сдвинем базис —
+    // активируем .reloc, как это делает Windows ASLR.
+    const preferred = image.imageBase();
+    const base: u64 = preferred + 0x1000000; // +16МБ
+    try testing.expect(base != preferred);
+
+    const fp = try fakeSetup(96 << 20);
+    defer fakeTeardown(fp);
+    const img = try loadImage(fp.ops(), 0xDEAD000, &image, base);
+
+    const stats = applyRelocations(&image, img.backing, base, preferred);
+    try testing.expectEqual(countDir64InFile(&image), stats.applied);
+    try testing.expect(stats.applied > 9000); // curl.exe: ~10.9K DIR64-фикспов
+    try testing.expectEqual(@as(u64, 0), stats.skipped_type);
+    try testing.expectEqual(@as(u64, 0), stats.skipped_bounds);
+
+    // Дельта ноль — идемпотентность (загружен по предпочтённому базису).
+    const stats0 = applyRelocations(&image, img.backing, preferred, preferred);
+    try testing.expectEqual(@as(u64, 0), stats0.applied);
+}
+
+test "cdd8-reloc: синтетика — ABSOLUTE-паддинг пропускается, битые границы не роняют ядро" {
+    // Ручная мини-таблица (копируется в backing поверх .reloc 7za):
+    // блок 1 { page_rva=0x1000, size=8+3*2=14 }:
+    //   entry1 = (0<<12)|0x00 — ABSOLUTE (паддинг — пропуск)
+    //   entry2 = (3<<12)|0x10 — HIGHLOW (неподдержанный тип → skipped_type)
+    //   entry3 = (10<<12)|0x20 — DIR64 на RVA 0x1020 (валидный)
+    // блок 2 { page_rva=0x200000, size=10 }: entry = (10<<12)|0xF00
+    //   → RVA 0x200F00 — за SizeOfImage 7za (~0x137000) → skipped_bounds
+    var buf = [_]u8{0} ** 0x20;
+    std.mem.writeInt(u32, buf[0x00..][0..4], 0x1000, .little);
+    std.mem.writeInt(u32, buf[0x04..][0..4], 14, .little);
+    std.mem.writeInt(u16, buf[0x08..][0..2], (0 << 12) | 0x00, .little);
+    std.mem.writeInt(u16, buf[0x0A..][0..2], (3 << 12) | 0x10, .little);
+    std.mem.writeInt(u16, buf[0x0C..][0..2], (10 << 12) | 0x20, .little);
+    std.mem.writeInt(u32, buf[0x0E..][0..4], 0x200000, .little);
+    std.mem.writeInt(u32, buf[0x12..][0..4], 10, .little);
+    std.mem.writeInt(u16, buf[0x16..][0..2], (10 << 12) | 0xF00, .little);
+
+    const data = try loadFixture("testdata/7za.exe");
+    defer testing.allocator.free(data);
+    const image = try pe.Pe.parse(data);
+    const fp = try fakeSetup(64 << 20);
+    defer fakeTeardown(fp);
+    const img = try loadImage(fp.ops(), 0xDEAD000, &image, 0x140000000);
+
+    // Подменяем .reloc-область backing нашей синтетической таблицей.
+    const dir = image.dataDirectory(pe.DIR_BASERELOC);
+    @memcpy(img.backing[dir.virtual_address..][0..0x20], buf[0..0x20]);
+    // Цель фикспа — RVA 0x1020 (внутри .text 7za): кладём «старый базис».
+    std.mem.writeInt(u64, img.backing[0x1020..][0..8], 0x400000, .little);
+
+    const stats = applyRelocations(&image, img.backing, 0x140000000, 0x400000);
+    try testing.expectEqual(@as(u64, 1), stats.applied); // только валидный DIR64
+    try testing.expectEqual(@as(u64, 1), stats.skipped_type); // HIGHLOW
+    try testing.expectEqual(@as(u64, 1), stats.skipped_bounds); // за SOI — НЕ падение
+    // Цель исправлена: 0x400000 + (0x140000000 − 0x400000) = 0x140000000
+    try testing.expectEqual(@as(u64, 0x140000000), std.mem.readInt(u64, img.backing[0x1020..][0..8], .little));
 }

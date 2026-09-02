@@ -14,6 +14,9 @@ pub var bio_entropy_sink: ?*const fn (u64) void = null; // Bio pool (keystroke i
 /// APIC-таймера (retрансмиты/keep-alive/ACKи при молчащем Ring 3).
 /// Обнуляется до NULL; main64 вешает virtio_net.pollRx после init драйвера.
 pub var net_irq_sink: ?*const fn () void = null;
+/// v0.17.0 (CDD №8): virtio-blk IRQ (вектор 49) — пробуждение ждущих запросов
+/// (поллинг в waitForCompletion остаётся как fallback — IRQ ускоряет обмен).
+pub var blk_irq_sink: ?*const fn () callconv(.C) void = null;
 
 // Simple spinlock for protecting shared resources (e.g. serial output)
 pub var serial_lock: u32 = 0;
@@ -397,7 +400,7 @@ pub const IDT = struct {
         for (0..num_entries) |i| {
             const ptr_arr: [*]const u64 = @ptrFromInt(table_start);
             const handler: u64 = ptr_arr[i];
-            if (handler > 0x100000 and i < 49) {
+            if (handler > 0x100000 and i < 50) { // v0.17.0 (CDD №8): 50 = векторы 0..49 (49 = virtio-blk IRQ)
                 const dpl: u8 = if (i == 3) 3 else 0;
                 // v0.7.0: Use IST1 for Double Fault (vector 8)
                 const ist: u3 = if (i == 8) 1 else 0;
@@ -551,6 +554,13 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
             handleKeyboard(frame);
         },
         36 => handleSerial(frame),
+        49 => {
+            // v0.17.0 (CDD №8): virtio-blk — IO-APIC GSI диска маршрутизирован
+            // сюда (virtio_blk.zig). APIC EOI уже отправлен выше (вектор ≥ 48).
+            if (blk_irq_sink) |bsink| {
+                bsink();
+            }
+        },
         else => {}, // Unknown interrupt — ignore for now
     }
     

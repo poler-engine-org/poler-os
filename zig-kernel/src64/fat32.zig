@@ -41,32 +41,39 @@ const ATTR_LFN: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID
 // FAT32 BPB
 // ============================================================================
 
+// ⚠ v0.17.0 (CDD №8): ВСЕ поля дисковых структур — align(1)!
+// extern struct без align(1) кладёт bytes_per_sector (u16) на смещение 12
+// (после 11 байт jmp+oem Zig вставляет 1 байт паддинга для выравнивания),
+// а на диске BPB хранит его на смещении 11 → ВСЕ поля читались со сдвигом
+// на 1 (latent-баг: в E2E v0.10–v0.16 диск не подключался — FAT32-драйвер
+// был покрыт тестами, где структура строилась тем же Zig-лайаутом).
+// Тот же стиль, что pe.zig (IMAGE_STRUCT @alignOf==1 — фикс v0.9.0).
 pub const Bpb = extern struct {
     jmp_boot: [3]u8,
     oem_name: [8]u8,
-    bytes_per_sector: u16,
+    bytes_per_sector: u16 align(1),
     sectors_per_cluster: u8,
-    reserved_sectors: u16,
+    reserved_sectors: u16 align(1),
     num_fats: u8,
-    root_entry_count: u16,
-    total_sectors_16: u16,
+    root_entry_count: u16 align(1),
+    total_sectors_16: u16 align(1),
     media_type: u8,
-    fat_size_16: u16,
-    sectors_per_track: u16,
-    num_heads: u16,
-    hidden_sectors: u32,
-    total_sectors_32: u32,
-    fat_size_32: u32,
-    ext_flags: u16,
-    fs_version: u16,
-    root_cluster: u32,
-    fs_info_sector: u16,
-    backup_boot_sector: u16,
+    fat_size_16: u16 align(1),
+    sectors_per_track: u16 align(1),
+    num_heads: u16 align(1),
+    hidden_sectors: u32 align(1),
+    total_sectors_32: u32 align(1),
+    fat_size_32: u32 align(1),
+    ext_flags: u16 align(1),
+    fs_version: u16 align(1),
+    root_cluster: u32 align(1),
+    fs_info_sector: u16 align(1),
+    backup_boot_sector: u16 align(1),
     reserved: [12]u8,
     drive_number: u8,
     reserved1: u8,
     boot_sig: u8,
-    volume_id: u32,
+    volume_id: u32 align(1),
     volume_label: [11]u8,
     fs_type: [8]u8,
 };
@@ -77,25 +84,25 @@ pub const DirEntry = extern struct {
     attr: u8,
     nt_reserved: u8,
     creation_time_tenth: u8,
-    creation_time: u16,
-    creation_date: u16,
-    last_access_date: u16,
-    first_cluster_hi: u16,
-    last_write_time: u16,
-    last_write_date: u16,
-    first_cluster_lo: u16,
-    file_size: u32,
+    creation_time: u16 align(1),
+    creation_date: u16 align(1),
+    last_access_date: u16 align(1),
+    first_cluster_hi: u16 align(1),
+    last_write_time: u16 align(1),
+    last_write_date: u16 align(1),
+    first_cluster_lo: u16 align(1),
+    file_size: u32 align(1),
 };
 
 pub const LfnEntry = extern struct {
     seq: u8,
-    name1: [5]u16,
+    name1: [5]u16 align(1),
     attr: u8,
     type: u8,
     checksum: u8,
-    name2: [6]u16,
-    first_cluster: u16,
-    name3: [2]u16,
+    name2: [6]u16 align(1),
+    first_cluster: u16 align(1),
+    name3: [2]u16 align(1),
 };
 
 pub const File = struct {
@@ -718,26 +725,17 @@ pub const Fat32Fs = struct {
                         entry_name_len = shortNameToAscii(&entry.name, &entry.ext, &entry_name);
                     }
 
-                    // Case-insensitive comparison
-                    if (entry_name_len == target_name.len) {
-                        var match = true;
-                        for (0..target_name.len) |i| {
-                            const a = toLower(entry_name[i]);
-                            const b = toLower(target_name[i]);
-                            if (a != b) { match = false; break; }
-                        }
-
-                        if (match) {
-                            return DirEntryInfo{
-                                .name = entry_name,
-                                .name_len = entry_name_len,
-                                .is_directory = (entry.attr & ATTR_DIRECTORY) != 0,
-                                .is_read_only = (entry.attr & ATTR_READ_ONLY) != 0,
-                                .is_hidden = (entry.attr & ATTR_HIDDEN) != 0,
-                                .file_size = entry.file_size,
-                                .first_cluster = (@as(u32, entry.first_cluster_hi) << 16) | entry.first_cluster_lo,
-                            };
-                        }
+                    // v0.17.0 (CDD №8): прямой + 8.3-fallback матчинг (entryNameMatches)
+                    if (self.entryNameMatches(entry, entry_name[0..entry_name_len], target_name, lfn_len)) {
+                        return DirEntryInfo{
+                            .name = entry_name,
+                            .name_len = entry_name_len,
+                            .is_directory = (entry.attr & ATTR_DIRECTORY) != 0,
+                            .is_read_only = (entry.attr & ATTR_READ_ONLY) != 0,
+                            .is_hidden = (entry.attr & ATTR_HIDDEN) != 0,
+                            .file_size = entry.file_size,
+                            .first_cluster = (@as(u32, entry.first_cluster_hi) << 16) | entry.first_cluster_lo,
+                        };
                     }
 
                     lfn_len = 0;
@@ -754,6 +752,31 @@ pub const Fat32Fs = struct {
 
     fn toLower(ch: u8) u8 {
         return if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+    }
+
+    /// v0.17.0 (CDD №8): матчинг имени записи каталога — два пути.
+    /// ① Прямой: LFN-имя или short-as-ascii, посимвольно case-insensitive.
+    /// ② 8.3-fallback: entry без LFN (создан НАМИ — createFile пишет только
+    /// short-name entry: «index.html» хранится как «INDEX.HTM»). Без этого
+    /// open после create давал мисматч длины имени → файл «не находился».
+    fn entryNameMatches(self: *Fat32Fs, entry: *const DirEntry, entry_name: []const u8, target_name: []const u8, lfn_len: usize) bool {
+        if (entry_name.len == target_name.len) {
+            var match = true;
+            for (0..target_name.len) |i| {
+                if (toLower(entry_name[i]) != toLower(target_name[i])) { match = false; break; }
+            }
+            if (match) return true;
+        }
+        if (lfn_len == 0) {
+            var sn: [11]u8 = undefined;
+            self.filenameToShortName(target_name, sn[0..8], sn[8..11]);
+            for (0..11) |i| {
+                const a = if (i < 8) entry.name[i] else entry.ext[i - 8];
+                if (toLower(a) != toLower(sn[i])) return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     /// Get the directory cluster for a parent path.
@@ -821,33 +844,24 @@ pub const Fat32Fs = struct {
                         entry_name_len = shortNameToAscii(&entry.name, &entry.ext, &entry_name);
                     }
 
-                    // Case-insensitive comparison
-                    if (entry_name_len == target_name.len) {
-                        var match = true;
-                        for (0..target_name.len) |i| {
-                            const a = toLower(entry_name[i]);
-                            const b = toLower(target_name[i]);
-                            if (a != b) { match = false; break; }
-                        }
+                    // v0.17.0 (CDD №8): прямой + 8.3-fallback матчинг (entryNameMatches)
+                    if (self.entryNameMatches(entry, entry_name[0..entry_name_len], target_name, lfn_len)) {
+                        const first_cluster = (@as(u32, entry.first_cluster_hi) << 16) | entry.first_cluster_lo;
+                        var file_name: [256]u8 = undefined;
+                        @memcpy(file_name[0..entry_name_len], entry_name[0..entry_name_len]);
+                        file_name[entry_name_len] = 0;
 
-                        if (match) {
-                            const first_cluster = (@as(u32, entry.first_cluster_hi) << 16) | entry.first_cluster_lo;
-                            var file_name: [256]u8 = undefined;
-                            @memcpy(file_name[0..entry_name_len], entry_name[0..entry_name_len]);
-                            file_name[entry_name_len] = 0;
-
-                            return File{
-                                .first_cluster = first_cluster,
-                                .current_cluster = if (first_cluster >= 2) first_cluster else 0,
-                                .file_size = entry.file_size,
-                                .position = 0,
-                                .is_valid = true,
-                                .is_directory = (entry.attr & ATTR_DIRECTORY) != 0,
-                                .dir_cluster = dir_cluster,
-                                .name = file_name,
-                                .name_len = entry_name_len,
-                            };
-                        }
+                        return File{
+                            .first_cluster = first_cluster,
+                            .current_cluster = if (first_cluster >= 2) first_cluster else 0,
+                            .file_size = entry.file_size,
+                            .position = 0,
+                            .is_valid = true,
+                            .is_directory = (entry.attr & ATTR_DIRECTORY) != 0,
+                            .dir_cluster = dir_cluster,
+                            .name = file_name,
+                            .name_len = entry_name_len,
+                        };
                     }
 
                     lfn_len = 0;
@@ -975,6 +989,73 @@ pub const Fat32Fs = struct {
         }
 
         return bytes_written;
+    }
+
+    /// v0.17.0 (CDD №8): усечь/расширить файл — базис _chsize_s / SetEndOfFile.
+    /// Расширение: цепочка кластеров дозаполняется (кластеры приходят
+    /// обнулёнными — «дыры» читаются как нули, как в Windows).
+    /// Усечение: хвостовые кластеры освобождаются в FAT, хвост данных
+    /// последнего кластера обнуляется. Dir-entry обновляется (баг
+    /// ext-индекса в updateDirEntry закрыт — теперь размер реально пишется).
+    pub fn setFileSize(self: *Fat32Fs, file: *File, new_size: u32) bool {
+        if (!file.is_valid) return false;
+        if (virtio_blk.isReadOnly()) return false;
+        if (new_size == file.file_size) return true;
+
+        if (new_size > file.file_size) {
+            // ── Расширение: выделить кластеры под новый размер ──
+            const total_clusters = (new_size + self.cluster_size - 1) / self.cluster_size;
+            var cluster_idx: u32 = 0;
+            while (cluster_idx < total_clusters) : (cluster_idx += 1) {
+                if (file.first_cluster < 2) {
+                    const c = self.allocCluster(null) orelse return false;
+                    self.zeroCluster(c);
+                    file.first_cluster = c;
+                    file.current_cluster = c;
+                } else if (self.getClusterAt(file.first_cluster, cluster_idx) == null) {
+                    // Достроить цепочку с конца
+                    var last = file.first_cluster;
+                    while (self.getNextCluster(last)) |nx| last = nx;
+                    const c = self.allocCluster(last) orelse return false;
+                    self.zeroCluster(c);
+                }
+            }
+        } else {
+            // ── Усечение: обрезать цепочку ──
+            const keep_clusters: u32 = if (new_size == 0) 0 else (new_size + self.cluster_size - 1) / self.cluster_size;
+            if (file.first_cluster >= 2) {
+                if (keep_clusters == 0) {
+                    self.freeClusterChain(file.first_cluster);
+                    file.first_cluster = 0;
+                    file.current_cluster = 0;
+                } else {
+                    var c = file.first_cluster;
+                    var idx: u32 = 1;
+                    while (idx < keep_clusters) : (idx += 1) {
+                        c = self.getNextCluster(c) orelse break;
+                    }
+                    if (self.getNextCluster(c)) |tail| {
+                        self.freeClusterChain(tail);
+                        _ = self.setFatEntry(c, FAT32_EOF);
+                        self.flushFatCache();
+                    }
+                    // Обнулить хвост данных последнего оставшегося кластера
+                    const tail_off = new_size % self.cluster_size;
+                    if (tail_off != 0) {
+                        const sector = tail_off / self.bytes_per_sector;
+                        const byte_off = tail_off % self.bytes_per_sector;
+                        if (self.readClusterSector(c, @intCast(sector))) {
+                            @memcpy(self.write_buf[0..512], self.io_buf[0..512]);
+                            @memset(self.write_buf[byte_off..][0 .. 512 - byte_off], 0);
+                            _ = self.writeClusterSector(c, @intCast(sector), self.write_buf);
+                        }
+                    }
+                }
+            }
+            if (file.position > new_size) file.position = new_size;
+        }
+        file.file_size = new_size;
+        return self.updateDirEntry(file);
     }
 
     /// Create a new empty file in the specified directory.
@@ -1308,19 +1389,21 @@ pub const Fat32Fs = struct {
                     if ((entry.attr & ATTR_VOLUME_ID) != 0 and (entry.attr & ATTR_DIRECTORY) == 0) continue;
 
                     // Check if this entry matches our file
+                    // v0.17.0 (CDD №8) ФИКС ЛАТЕНТНОГО БАГА: было
+                    //   entry.name[0..8][if (i < 8) i else i - 8]
+                    // — для i∈8..11 читалось entry.name[0..3] вместо entry.ext[i-8]
+                    // → мисматч у КАЖДОГО файла с расширением → размер файла
+                    // НИКОГДА не сохранялся в dir-entry → после записи cat
+                    // видел пустой файл (deleteFile сравнивал правильно!).
                     var short_name: [11]u8 = undefined;
                     self.filenameToShortName(file.name[0..file.name_len], short_name[0..8], short_name[8..11]);
 
                     var match = true;
                     for (0..11) |i| {
-                        if (entry.name[0..8][if (i < 8) i else i - 8] != short_name[i]) {
-                            // Compare case-insensitively for short names
-                            const a = entry.name[0..8][if (i < 8) i else i - 8];
-                            const b = short_name[i];
-                            if (toLower(a) != toLower(b)) {
-                                match = false;
-                                break;
-                            }
+                        const a = if (i < 8) entry.name[i] else entry.ext[i - 8];
+                        if (toLower(a) != toLower(short_name[i])) {
+                            match = false;
+                            break;
                         }
                     }
 

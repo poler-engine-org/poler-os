@@ -960,6 +960,12 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         } else {
             puts("[FAT32] No FAT32 filesystem found on virtio-blk\n");
         }
+        // v0.17.0 (CDD №8): IRQ-уведомления блочного устройства (вектор 49,
+        // IO-APIC GSI). Без гейта IDT на 49 доставка прерывания = #GP —
+        // латентный баг с момента появления virtio_blk (диск в E2E не
+        // подключался до этого цикла). Sink пробуждает ждущие запросы.
+        hal.blk_irq_sink = virtio_blk.handleIrq;
+        puts("[VBLK] IRQ v49 wired (IO-APIC GSI -> IDT gate, CDD №8)\n");
     } else {
         puts("[VIRTIO-BLK] No virtio-blk device found (expected with -drive)\n");
     }
