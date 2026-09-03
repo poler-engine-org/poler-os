@@ -304,6 +304,17 @@ fn kNetTcpClose(slot: i64) void {
 /// (каскад гарантированно на СВОЁМ kstack — asm-вход по владельцу);
 /// current_task_id в окнах паркинга рассинхронизирован — будильник
 /// «не той» задаче = потерянный wake (флаки-потеря тредов резолвера).
+/// v0.18.1 (CDD №9, residual-fix): ПЕР-ТАСК РЕЗЮМ-КАДР В .BSS. Корень
+/// residual v0.18.0-RC: tasks[owner].rsp после эпилога оставался на
+/// СТАРОМ hlt-ISR-кадре ВГЛУБИ каскада — следующий syscall-каскад той
+/// же задачи затирал его (DNS-буферы/строки) → frameContentValid падал
+/// каждый тик → 50 пропусков → FRAME-GUARD убивал тред резолвера →
+/// curl-HTTP не завершался. ЛЕЧЕНИЕ: (1) при входе — пока каскад ЖИВ
+/// на топе kstack — снимаем полный InterruptFrame в .bss-слот
+/// sched_resume.syscall_frame_tab[owner] (там его не затирают никогда);
+/// (2) в эпилоге указатель tasks[owner].rsp (+ тень) направляем на слот —
+/// резюм-точка «после syscall» валидна ВСЕГДА; счётчик пропусков
+/// обнуляется (тред не отсекается по таймауту накопленных пропусков).
 fn kSleepTask(ms: u64) void {
     if (ms == 0) return;
     const capped: u64 = @min(ms, 60_000);
@@ -317,6 +328,13 @@ fn kSleepTask(ms: u64) void {
     // ВХОДОМ этой же транзакции атомарно (IF=0) — авторитетный признак
     // (SP-эвристика врала в InitOnce-бисекте). Будильник — ВЛАДЕЛЬЦУ.
     const owner = scheduler.syscallStackOwner(my_rsp);
+
+    // v0.18.1: резюм-кадр в .bss — каскад ещё жив на топе kstack владельца
+    // (мы НИЖЕ него в Zig-цепочке; над RSP никто не пишет). Слот иммунен
+    // к будущим каскадам — указатель задачи больше не «мусореет».
+    if (owner < scheduler.MAX_TASKS) {
+        scheduler.snapshotResumeFrame(owner, my_rsp);
+    }
 
     // Будильник планировщику: слайс паркованной не давать
     if (owner < scheduler.MAX_TASKS) {
@@ -348,6 +366,11 @@ fn kSleepTask(ms: u64) void {
     // будильник снят (или снимется при следующем dispatch)
     if (owner < scheduler.MAX_TASKS) {
         scheduler.setTaskSleepFor(owner, 0);
+        // v0.18.1 (residual-fix): резюм-указатель — на .bss-слот. Окно
+        // «sysretq → первый тик» закрыто валидным кадром; тень и счётчик
+        // пропусков FRAME-GUARD реанимированы. Флаг=1 — тики гвардятся,
+        // запись атомарна относительно диспетчеризации.
+        scheduler.installResumeFrame(owner);
     } else if (scheduler.current_task_id < scheduler.task_count) {
         scheduler.tasks[scheduler.current_task_id].wake_tick = 0;
     }
@@ -455,7 +478,16 @@ fn kMapUser(va: u64, bytes: u64) bool {
     var i: u64 = 0;
     while (i < pages) : (i += 1) {
         const pa = pmm.allocContiguousZeroed(1) orelse return false;
-        vmm.mapPageInPML4(c.pml4, va + i * PAGE_SIZE, pa, vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE) catch return false;
+        // v0.18.1 (multi-process): RE-MAP поверх мёртвого процесса — heap-
+        // регион (0x30…) в общей цепочке PML4[0] несёт маппинги ЗАВЕРШИВ-
+        // ШЕГОСЯ процесса (эмпирика pe-run8: второй peload — kmalloc →
+        // AlreadyMapped → 0 → __p__fmode NULL → curl #PF[0]). Снимаем
+        // старый маппинг (таблицы-опустевшие освобождаются) и ставим новый.
+        if (vmm.mapPageInPML4(c.pml4, va + i * PAGE_SIZE, pa, vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE)) |_| {} else |e| {
+            if (e != vmm.VmmError.AlreadyMapped) return false;
+            vmm.unmapPageInPML4(c.pml4, va + i * PAGE_SIZE) catch return false;
+            vmm.mapPageInPML4(c.pml4, va + i * PAGE_SIZE, pa, vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE) catch return false;
+        }
     }
     return true;
 }

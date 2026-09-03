@@ -292,6 +292,9 @@ pub fn mapPageInPML4(target_pml4_phys: u64, virt: u64, phys: u64, flags: u64) !v
     // Set the actual page table entry
     const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
     if (pt[pt_idx] & PTE_PRESENT != 0) {
+        // v0.18.1: коллизия = маппинг МЁРТВОГО процесса в общей цепочке
+        // PML4[0] (createUserPML4 копирует kernel-записи; cleanup процессов
+        // нет). Ловят вызывающие ops (loader/CRT): unmap старого + ретрай.
         return VmmError.AlreadyMapped;
     }
     pt[pt_idx] = phys | flags | PTE_PRESENT;

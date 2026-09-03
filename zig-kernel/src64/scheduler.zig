@@ -19,6 +19,7 @@
 // ============================================================================
 
 const hal = @import("hal.zig");
+const sres = @import("sched_resume.zig"); // v0.18.1: пер-таск резюм-кадры (.bss)
 
 pub const MAX_TASKS = 8;
 
@@ -56,8 +57,8 @@ pub const Task = struct {
     // pe→win32→стабы + литерал ctx) упирался в дно kstack[1] и ЗАТИРАЛ
     // НУЛЯМИ header НИЖЕЛЕЖАЩЕЙ tasks[1] (id/rsp → 0) → каскад
     // task-state-расхождений и kernel-panic @ptrFromInt (E2E-цикл №4).
-    // 32КБ × MAX_TASKS=8 = 256КБ .bss (Zig-Debug каскады PE-моста глубоки).
-    kernel_stack: [32768]u8 align(16), // Ring 0 stack (32KB)
+    // v0.18.1: 128КБ × 8 = 1МБ .bss (identity 4ГБ + user-PML4-копия — покрыто).
+    kernel_stack: [131072]u8 align(16), // Ring 0 stack (128КБ — v0.18.1: DEBUG-кадр win32_crt.dispatch ≈ 57КБ — все локали гигантского if-else живут в одном кадре; 32КБ переполнялся на 25КБ в kstack СОСЕДА — ЭТО был исходный корень cks-гонки v0.17-v0.18.0)
     cr3: u64, // Per-process PML4 physical address (0 = use kernel CR3)
     user_stack_top: u64, // Top of user stack (virtual address, for reference/cleanup)
     // v0.15.0 (CDD №6): сон задачи — планировщик пропускает до wake_tick
@@ -99,6 +100,10 @@ pub export var linux_arg6: u64 = 0;
 /// v0.18.0 (CDD №9, бисект-инструментация): трассировка тика/диспетчера/
 /// syscall-входа — ловим ПЕРВЫЙ десинк cks/TSS/owner вживую.
 pub var dbg_sched_trace: bool = false;
+
+/// v0.18.1 (бисект): [E]-трейс входа syscall (ОТДЕЛЬНЫЙ от dbg1 — спами-
+/// тообразный; включается командой dbg2).
+pub var dbg_entry_trace: bool = false;
 
 /// v0.18.0 (CDD №9, бисект): kstack-топ задачи (для сверки cks в syscall-входе).
 pub fn taskKstackTop(id: usize) u64 {
@@ -502,8 +507,15 @@ pub fn threadHandleDead(handle: u64) bool {
 /// v0.13.0-fix: структурная валидность кадра задачи — rsp обязан указывать
 /// в ЕЁ СОбственный kernel_stack (idle — бут-стек [stack_bottom, stack_top)
 /// = [0x108000, 0x10C000), см. linker64.ld).
+/// v0.18.1-fix (CDD №9 residual): .bss-слот резюм-кадра задачи
+/// (sched_resume.syscall_frame_tab[id]) — ВАЛИДНЫЙ адрес кадра: кадр в .bss
+/// иммунен к затиранию каскадами на kstack (residual v0.18.0-RC: указатель
+/// после kSleepTask-эпилога висел вглуби каскада → мусор по слотам →
+/// FRAME-GUARD убивал живые треды резолвера curl после 50 пропусков).
 fn taskRspValid(id: usize, rsp: u64) bool {
     if (rsp == 0 or rsp & 7 != 0) return false;
+    // v0.18.1: пер-таск резюм-кадр в .bss — whitelist для диспетчеризации
+    if (id != 0 and id < MAX_TASKS and rsp == sres.frameSlot(id)) return true;
     if (id == 0) {
         // idle/boot: кадры на главном бут-стеке линкера
         return rsp >= 0x108000 and rsp < 0x10C000;
@@ -513,25 +525,38 @@ fn taskRspValid(id: usize, rsp: u64) bool {
     return rsp >= base and rsp < base + tasks[id].kernel_stack.len;
 }
 
-/// v0.17.0 (CDD №8): валидность СОДЕРЖИМОГО кадра (InterruptFrame на kstack
-/// задачи). Многопоточный 7-Zip вскрыл: УКАЗАТЕЛЬ tasks[].rsp корректен
-/// (SELF-HEAL), но СОДЕРЖИМОЕ кадра перезаписано чужим syscall-кадром
-/// (гонка syscall-exit — то же v0.12/v0.16-семейство, теперь 4 треда ×
-/// syscalls). Свитч на мусорный кадр = #GP(RIP=heap, CS=0) в ядре → HALT.
-/// Guard: CS обязан быть 0x23/0x1B (user) или 0x08/0x10 (kernel), user-RIP
-/// в canonical-user. Мусор → задача УБИВАЕТСЯ — ядро живёт (CDD-честно).
-fn frameContentValid(rsp: u64) bool {
-    if (rsp == 0) return false;
-    // [rsp+136]=rip, [rsp+144]=cs, [rsp+160]=rsp, [rsp+168]=ss (isr64.S)
-    const cs = @as(*volatile u64, @ptrFromInt(rsp + 144)).*;
-    if (cs == 0x08 or cs == 0x10) return true; // kernel-задача (shell/idle)
-    if (cs != 0x23 and cs != 0x1B) return false; // мусорный CS
-    const rip = @as(*volatile u64, @ptrFromInt(rsp + 136)).*;
-    if (rip < 0x10000 or rip >= 0x0000_8000_0000_0000) return false;
-    const usp = @as(*volatile u64, @ptrFromInt(rsp + 160)).*;
-    if (usp < 0x10000 or usp >= 0x0000_8000_0000_0000) return false;
-    return true;
+/// v0.17.0 (CDD №8): валидность СОДЕРЖИМОГО кадра (InterruptFrame).
+/// v0.18.1: ПЕРЕНЕСЕНО в чистый модуль sched_resume.zig (нативные тесты);
+/// alias сохраняет все точки вызова в scheduler.zig без правок.
+const frameContentValid = sres.frameContentValid;
+
+/// v0.18.1 (CDD №9, residual-fix): снапшот резюм-кадра задачи из ЖИВОГО
+/// syscall-каскада (вызывается kSleepTask ДО парковки — каскад ещё на
+/// kstack-топе владельца). Слот .bss переживает любые каскады: указатель
+/// tasks[owner].rsp остаётся валидным ВСЕГДА (см. sched_resume.zig).
+pub fn snapshotResumeFrame(owner: usize, ur: u64) void {
+    if (owner == 0 or owner >= MAX_TASKS) return;
+    sres.snapshotSyscallFrame(owner, taskKstackTop(owner), ur);
 }
+
+/// v0.18.1 (CDD №9, residual-fix): направить резюм-указатель задачи на
+/// .bss-слот (эпилог kSleepTask, ПОСЛЕ снятия будильника). Кадр — точка
+/// «после syscall» (сон завершён): диспетчеризация из него корректна;
+/// невалидные окна «sysretq → первый тик» закрыты. Попутно реанимируем
+/// теневую копию (FRAME-HEAL) и ОБНУЛЯЕМ счётчик пропусков FRAME-GUARD —
+/// тред резолвера больше не отсекается по накопленным пропускам (семан-
+/// тика «50 подряд» вместо «50 суммарно» — счётчик живого кадра честно
+/// сбрасывается).
+pub fn installResumeFrame(owner: usize) void {
+    if (owner == 0 or owner >= MAX_TASKS) return;
+    const slot = sres.frameSlot(owner);
+    if (slot == 0) return;
+    tasks[owner].rsp = slot;
+    shadow_rsp[owner] = slot;
+    bad_frame_drops[owner] = 0; // живой кадр — пропуск-таймаут не копится
+}
+
+
 
 /// v0.13.0-fix: заполнить низ kstack задачи паттерном (детектор overflow).
 fn fillCanary(task: *Task) void {
@@ -691,6 +716,18 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
             if (taskRspValid(next_id, tasks[next_id].rsp)) {
                 if (frameContentValid(tasks[next_id].rsp)) {
                     found = true;
+                    // v0.18.1 (бисект): диспетчеризация из .bss-слота — редкое
+                    // событие (парковка без сохранённого hlt-кадра); трассируем.
+                    if (tasks[next_id].rsp == sres.frameSlot(next_id)) {
+                        hal.Serial.puts("[SCHED] RESUME-SLOT: task ");
+                        hal.Serial.putDecimal(next_id);
+                        hal.Serial.puts("\n");
+                    }
+                    // v0.18.1-fix: живой кадр — счётчик пропусков FRAME-GUARD
+                    // обнуляется. Прежде «50 суммарных» пропусков копились
+                    // сквозь валидные окна (flapping) и убивали живой тред
+                    // резолвера curl — теперь честные «50 ПОДРЯД».
+                    bad_frame_drops[next_id] = 0;
                     break;
                 }
                 // v0.17.0-fix (CDD №8 p5+): СНАЧАЛА ТЕНЬ. Кадр-мусор = чаще
@@ -702,6 +739,7 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
                     and frameContentValid(shadow_rsp[next_id]))
                 {
                     tasks[next_id].rsp = shadow_rsp[next_id];
+                    bad_frame_drops[next_id] = 0; // v0.18.1: тень жива — пропуски прощены
                     hal.Serial.puts("[SCHED] FRAME-HEAL: task ");
                     hal.Serial.putDecimal(next_id);
                     hal.Serial.puts(" кадр восстановлен из тени (0x");

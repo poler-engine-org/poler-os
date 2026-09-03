@@ -646,6 +646,21 @@ fn handleException(frame: *InterruptFrame) void {
     Serial.putHex(frame.rsp);
     Serial.puts("\nSS: ");
     Serial.putHex(frame.ss);
+    // v0.18.1-бисект: RDI (скрытый контекст error-return-trace — Zig
+    // передаёт его регистром; дикая запись returnError = порча корня) +
+    // RDI-структура {index, addresses, capacity} + мини-дамп вокруг.
+    Serial.puts("\nRDI: ");
+    Serial.putHex(frame.rdi);
+    if (!from_user and frame.rdi > 0x10000 and frame.rdi < 0x800000) {
+        const ctx: *volatile [3]u64 = @ptrFromInt(frame.rdi);
+        Serial.puts(" ctx: [idx=0x");
+        Serial.putHex(ctx[0]);
+        Serial.puts(" ptr=0x");
+        Serial.putHex(ctx[1]);
+        Serial.puts(" cap=0x");
+        Serial.putHex(ctx[2]);
+        Serial.puts("]");
+    }
     // v0.13.0-fix (диагностика CDD №4): дамп стека юзера — ret-адрес укажет
     // ВЫЗЫВАЮЩЕГО функции NULL-вызова (RIP=0: call reg с reg=0).
     if (from_user and frame.rsp > 0x1000) {
@@ -1345,7 +1360,19 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
     // от топа — каскад уходит вглубь от cks-топа).
     {
         const sched = @import("scheduler.zig");
-        if (sched.dbg_sched_trace) {
+        if (sched.dbg_entry_trace) {
+            // v0.18.1-бисект: [E]-трейс — RSP НА ВХОДЕ обработчика (после
+            // asm-каскада): сверка с kSleepTask-цепочкой ([RESUME] chain)
+            // вычисляет ФАКТИЧЕСКУЮ глубину Zig-каскада (подозрение на
+            // 58КБ — переполнение 32КБ kstack).
+            const esp: u64 = asm volatile ("movq %%rsp, %[v]"
+                : [v] "=r" (-> u64)
+            );
+            Serial.puts("[E] num=");
+            Serial.putDecimal(syscall_num);
+            Serial.puts(" sp=0x");
+            Serial.putHex(esp);
+            Serial.puts("\n");
             const my_top = sched.taskKstackTop(sched.current_task_id);
             if (sched.current_task_id != 0 and sched.current_kernel_stack != my_top) {
                 Serial.puts("[SYN!] syscall-вход: cur=");

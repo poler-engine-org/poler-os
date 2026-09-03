@@ -762,6 +762,26 @@ fn pufBootInit() void {
 export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(.C) void {
     const have_mb2 = multiboot_magic == 0x36D76289;
 
+    // 0a. v0.18.1 (CRITICAL, CDD №9 residual): занулить первую физическую
+    // страницу (реально-режимный BIOS IVT + BDA). Zig-механизм error-return
+    // (builtin.returnError) при отсутствии trace-контекста читает поля по
+    // адресу NULL = физ.0: мусор IVT (классика F000:FF53) превращался в
+    // «index/буфер трассы» → неканоническая запись → #GP при ЛЮБОМ
+    // error-return в kernel-цепочке (эмпирика pe-run8: второй peload,
+    // mapPageInPML4.AlreadyMapped — пойман vmmMapUser-ретраем, но сам
+    // возврат ошибки убивал ядро). С нулевой страницей: index=0 < cap=0
+    // → запись в буфер пропускается, ошибка штатно возвращается catch'у.
+    // IVT/BDA после ухода из реального режима не читает никто (клавиатура
+    // — порты 0x60/0x64, AP-трамплин — 0x8000, VGA-буфер — 0xB8000).
+    // (Zig запрещает указатель на адрес 0 — чистим через rep stosb.)
+    asm volatile (
+        \\xor %%eax, %%eax
+        \\xor %%rdi, %%rdi
+        \\mov $4096, %%ecx
+        \\rep stosb
+        ::: "rax", "rcx", "rdi", "memory"
+    );
+
     // 0. Detect and Initialize Framebuffer if available from Multiboot2
     // (только при mb2-загрузке: при PVH info-указатель равен 0)
     if (have_mb2) {
@@ -1157,6 +1177,11 @@ fn execute_command(cmd: []const u8) void {
     if (eq(cmd, "dbg0")) {
         scheduler.dbg_sched_trace = false;
         sys_print("[CDD9] sched-trace OFF\n");
+        return;
+    }
+    if (eq(cmd, "dbg2")) {
+        scheduler.dbg_entry_trace = true;
+        sys_print("[CDD9] entry-trace ON\n");
         return;
     }
     if (eq(cmd, "help")) {
@@ -1663,8 +1688,25 @@ fn pmmAllocContig(count: u64) ?u64 {
     return pmm.allocContiguousZeroed(count);
 }
 fn vmmMapUser(pml4: u64, va: u64, pa: u64, flags: u64) bool {
-    vmm.mapPageInPML4(pml4, va, pa, flags) catch return false;
-    return true;
+    // v0.18.1 (multi-process): RE-MAP поверх мёртвого процесса. User-образы
+    // (image 0x140000000+, стек 0x21…, TEB/PEB 0x21…, heap 0x30…) живут в
+    // ОБЩЕЙ цепочке PML4[0] (createUserPML4 копирует kernel-записи) — мап-
+    // пинги ЗАВЕРШИВШЕГОСЯ процесса остаются в общих таблицах (cleanup
+    // процесса в v0.18.0 нет) — второй peload ловил AlreadyMapped на тех
+    // же VA (эмпирика pe-run8: virt=0x140000000, old=маппинг 7za →
+    // ошибка → дикая запись error-return → CPU EXCEPTION). Лечение:
+    // снять СТАРЫЙ маппинг (unmapPageInPML4 освобождает опустевшие
+    // таблицы) и замапить страницу НОВОГО процесса. Старые физ-страницы
+    // образа мёртвого процесса остаются в PMM занятыми (документировано
+    // в AGENT_STATE: process-exit-cleanup — v0.19).
+    if (vmm.mapPageInPML4(pml4, va, pa, flags)) |_| {
+        return true;
+    } else |e| {
+        if (e != vmm.VmmError.AlreadyMapped) return false;
+        if (!vmmUnmapUser(pml4, va)) return false;
+        vmm.mapPageInPML4(pml4, va, pa, flags) catch return false;
+        return true;
+    }
 }
 fn vmmUnmapUser(pml4: u64, va: u64) bool {
     vmm.unmapPageInPML4(pml4, va) catch return false;
