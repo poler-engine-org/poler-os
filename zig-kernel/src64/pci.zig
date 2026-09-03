@@ -42,7 +42,9 @@ pub fn pciRead16(bus: u8, slot: u8, func: u8, offset: u8) u16 {
 
 pub fn pciRead8(bus: u8, slot: u8, func: u8, offset: u8) u8 {
     const val = pciRead32(bus, slot, func, offset);
-    return @truncate(val >> (8 * (@as(u32, offset) & 3)));
+    // v0.19.0 (CDD №10): latent-баг — сдвиг u32-литералом; u5 для u32-шины
+    const shift: u5 = @intCast(8 * (@as(u32, offset) & 3));
+    return @truncate(val >> shift);
 }
 
 pub fn pciWrite16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) void {

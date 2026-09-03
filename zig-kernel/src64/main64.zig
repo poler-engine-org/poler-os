@@ -33,6 +33,8 @@ const win32 = @import("win32_stubs.zig");
 const pe_loader = @import("pe_loader.zig");
 const win32_api = @import("win32_api.zig");
 const linux_syscalls = @import("linux_syscalls.zig");
+const drm_kms = @import("drm_kms.zig");
+const virtio_gpu = @import("virtio_gpu.zig");
 const win32_crt = @import("win32_crt.zig");
 
 
@@ -1012,6 +1014,11 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         puts("[VNET] No virtio-net device (expected without -netdev)\n");
     }
 
+    // 9c. (v0.19.0, CDD №10 p1) DRM-KMS: VirtIO-GPU probe + linear-fb +
+    //     PAT→WC. Экран = файл: /dev/fb0 (fbdev) + /dev/dri/card0 (DRM) —
+    //     dumb-KMS поверх фреймбуфера бут-лоадера (GRUB/VBE) или VirtIO-GPU.
+    drmBootInit();
+
     // 8.7. Initialize and parse Initrd/CPIO modules
     // mb2: модуль из тега (GRUB ISO-загрузка); PVH: modlist[0] из
     // hvm_start_info (уже разобран в parsePvhStartInfo).
@@ -1207,6 +1214,8 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  peinfo <f> - Analyze PE/COFF executable from initrd (headers, sections, imports)\n");
         sys_print("  pestubs <f> - Generate Win32 stub table for PE executable (CDD: log+int3)\n");
         sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (e.g. peload curl.exe -k https://example.com)\n");
+        sys_print("  drm       - DRM/KMS статус: скан-аут, dumb-буферы, flips (CDD #10)\n");
+        sys_print("  drmtest   - DRM self-test: create→map→addfb→flip→destroy + тест-паттерн (E2E)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
@@ -1248,6 +1257,10 @@ fn execute_command(cmd: []const u8) void {
         cmd_ifconfig();
     } else if (eq(cmd, "netstat")) {
         cmd_netstat();
+    } else if (eq(cmd, "drm")) {
+        cmd_drm();
+    } else if (eq(cmd, "drmtest")) {
+        cmd_drmtest();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -1900,6 +1913,318 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         .a5 = scheduler.linux_arg5,
         .a6 = scheduler.linux_arg6,
     });
+}
+
+// ─── v0.19.0 (CDD №10 p1): DRM-KMS runtime — «Всё есть файл» ──────────────
+//
+// Экран = /dev/fb0 + /dev/dri/card0. Скрипт CachyOS-юзерспейса (Mesa/
+// Gamescope/Wayland — шаги 4-5) поднимается над этими файлами:
+// ioctl из drm_kms.zig (UAPI-совместимые номера), mmap видеопамяти WC.
+//
+// Источник скан-аута: (а) линейный фреймбуфер бут-лоадера (GRUB-multiboot2
+// VBE — -vga std / ISO-загрузка); (б) VirtIO-GPU probe (modern 0x1050) —
+// PCI-capability-карта для vring-драйвера следующих волн.
+
+/// Глобальное DRM-состояние ядра (dumb-KMS: 1 CRTC/энкодер/коннектор).
+var drm_state: drm_kms.DrmState = .{};
+/// Probe-результат VirtIO-GPU (null = устройства нет; норма для -vga std).
+var gpu_probe: ?virtio_gpu.GpuProbe = null;
+/// Capability-карта probe (common/notify/device cfg для vring-волн).
+var gpu_caps: [virtio_gpu.MAX_CAPS]virtio_gpu.VirtioCap = [_]virtio_gpu.VirtioCap{.{}} ** virtio_gpu.MAX_CAPS;
+var gpu_caps_n: usize = 0;
+
+/// PCI-читатель для virtio_gpu.probe (инъекция pci.zig).
+fn kernelPciRead8(bus: u8, slot: u8, func: u8, off: u8) u8 {
+    return pci.pciRead8(bus, slot, func, off);
+}
+fn kernelPciRead16(bus: u8, slot: u8, func: u8, off: u8) u16 {
+    return pci.pciRead16(bus, slot, func, off);
+}
+fn kernelPciRead32(bus: u8, slot: u8, func: u8, off: u8) u32 {
+    return pci.pciRead32(bus, slot, func, off);
+}
+fn kernelPciCfg() virtio_gpu.PciCfg {
+    return .{ .read8 = kernelPciRead8, .read16 = kernelPciRead16, .read32 = kernelPciRead32 };
+}
+
+/// Бут-инициализация DRM (шаг 9c): PAT→WC (PWT-бит = Write-Combining после
+/// Linux-раскладки MSR 0x277), probe VirtIO-GPU, регистрация linear-fb.
+fn drmBootInit() void {
+    // (1) PAT: PA1/PA5 → WC. Фреймбуфер мапится юзерспейсу с PWT-битом —
+    // burst-записи пикселей без writeback-инвалидации cacheline'ов (FPS).
+    hal.writeMsr(0x277, drm_kms.PAT_LINUX_WC);
+    puts("[DRM] PAT programmed: WC on PWT (MSR 0x277, Linux layout)\n");
+
+    // (2) VirtIO-GPU probe (QEMU -device virtio-gpu-pci): modern 0x1050.
+    gpu_probe = virtio_gpu.probe(kernelPciCfg());
+    if (gpu_probe) |g| {
+        gpu_caps_n = virtio_gpu.parseCaps(kernelPciCfg(), g, &gpu_caps);
+        puts("[VIRTIO-GPU] PCI ");
+        putHex(g.bus);
+        puts(":");
+        putHex(g.slot);
+        puts(" dev=0x");
+        putHex(g.device_id);
+        puts(" modern, caps=");
+        putDecimal(@intCast(gpu_caps_n));
+        puts(" (common/notify/device cfg for vring waves)\n");
+        // 2D-скан-аут VirtIO-GPU: геометрию даст GET_DISPLAY_INFO через
+        // vring (следующие волны); пока регистрируем display-режим с
+        // дефолтом QEMU (1024x768) — probe подтверждён, вывод через fb.
+        drm_kms.initVirtioGpu(&drm_state, .{
+            .phys = 0,
+            .width = 1024,
+            .height = 768,
+            .pitch = 4096,
+            .bpp = 32,
+        });
+    } else {
+        puts("[VIRTIO-GPU] no device (expected with -vga std)\n");
+    }
+
+    // (3) Linear framebuffer от бут-лоадера: авторитетная геометрия скан-аута
+    //     (перекрывает дефолт probe — скан-аут уже показывается физически).
+    if (framebuffer.is_available()) {
+        drm_kms.initLinearFb(&drm_state, .{
+            .phys = framebuffer.getAddr(),
+            .width = framebuffer.getWidth(),
+            .height = framebuffer.getHeight(),
+            .pitch = framebuffer.getPitch(),
+            .bpp = framebuffer.getBpp(),
+        });
+        puts("[DRM] linear-fb scanout: ");
+        putDecimal(framebuffer.getWidth());
+        puts("x");
+        putDecimal(framebuffer.getHeight());
+        puts("x");
+        putDecimal(framebuffer.getBpp());
+        puts(" @0x");
+        putHex(framebuffer.getAddr());
+        puts("\n");
+    } else if (drm_state.mode == .inactive) {
+        puts("[DRM] no scanout source (PVH headless): dumb-KMS armed, /dev on demand\n");
+    }
+    puts("[DRM] /dev/fb0 + /dev/dri/card0 registered (dumb-KMS, CDD #10)\n");
+}
+
+/// Kernel-side DrmOps для drmtest: «user»-аргументы живут в identity-буфере
+/// .bss (валидация по диапазону буфера; copy_in/out — прямые).
+var drmtest_buf: [256]u8 align(16) = .{0} ** 256;
+
+fn drmtestValidate(va: u64, len: u64, want_write: bool) bool {
+    _ = want_write;
+    if (len > drmtest_buf.len) return false;
+    const base: u64 = @intFromPtr(&drmtest_buf);
+    return va >= base and va + len <= base + drmtest_buf.len;
+}
+fn drmtestCopyIn(dst: []u8, src_va: u64) bool {
+    if (!drmtestValidate(src_va, dst.len, false)) return false;
+    const p: [*]const u8 = @ptrFromInt(src_va);
+    @memcpy(dst, p[0..dst.len]);
+    return true;
+}
+fn drmtestCopyOut(dst_va: u64, src: []const u8) bool {
+    if (!drmtestValidate(dst_va, src.len, true)) return false;
+    const p: [*]u8 = @ptrFromInt(dst_va);
+    @memcpy(p[0..src.len], src);
+    return true;
+}
+fn drmAllocPages(pages: u64) ?u64 {
+    return pmm.allocContiguousZeroed(@intCast(pages));
+}
+fn drmFreePages(phys: u64, pages: u64) void {
+    pmm.freeContiguousPages(phys, @intCast(pages));
+}
+fn kernelDrmOps() drm_kms.DrmOps {
+    return .{
+        .validate = drmtestValidate,
+        .copy_in = drmtestCopyIn,
+        .copy_out = drmtestCopyOut,
+        .alloc_pages = drmAllocPages,
+        .free_pages = drmFreePages,
+    };
+}
+
+/// mmap линейного фреймбуфера в user-PML4 c WC (PWT): страницы VRAM,
+/// MAP_SHARED-семантика (запись пикселя = вывод на экран). Вызывается
+/// Linux-mmap-слоем (шаг 3) для fd=/dev/fb0.
+fn drmMapLinearFbUser(pml4: u64, va: u64, len: u64) bool {
+    if (drm_state.mode != .linear_fb) return false;
+    const pages = (len + vmm.PAGE_SIZE - 1) / vmm.PAGE_SIZE;
+    // PTE: WC = PWT (PAT PA1 после репрограммирования) + USER + RW + NX
+    const pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE | drm_kms.PTE_WC;
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        const pa = drm_state.geom.phys + i * vmm.PAGE_SIZE;
+        vmm.mapPageInPML4(pml4, va + i * vmm.PAGE_SIZE, pa, pte) catch return false;
+    }
+    return true;
+}
+
+/// cmd_drm: статус DRM/KMS для шелла и E2E.
+fn cmd_drm() void {
+    sys_print("[DRM] mode=");
+    const m = switch (drm_state.mode) {
+        .inactive => "inactive",
+        .linear_fb => "linear-fb (bootloader scanout)",
+        .virtio_gpu => "virtio-gpu (probe armed)",
+    };
+    sys_print(m);
+    sys_print("\n");
+    if (drm_state.mode != .inactive) {
+        sys_print("[DRM] scanout ");
+        putDecimal(drm_state.geom.width);
+        sys_print("x");
+        putDecimal(drm_state.geom.height);
+        sys_print("x");
+        putDecimal(drm_state.geom.bpp);
+        sys_print(" pitch=");
+        putDecimal(drm_state.geom.pitch);
+        sys_print(" vram=0x");
+        putHex(drm_state.geom.phys);
+        sys_print("\n");
+    }
+    if (gpu_probe != null) {
+        sys_print("[DRM] virtio-gpu probe OK, caps=");
+        putDecimal(@intCast(gpu_caps_n));
+        sys_print(" /dev/dri/card0 + /dev/dri/renderD128\n");
+    } else {
+        sys_print("[DRM] no virtio-gpu (display via -vga std / fb0)\n");
+    }
+    var dumb_n: u32 = 0;
+    for (&drm_state.dumb) |*b| {
+        if (b.used) dumb_n += 1;
+    }
+    sys_print("[DRM] dumb buffers: ");
+    putDecimal(dumb_n);
+    sys_print("/8, page flips: ");
+    putDecimal(drm_state.flips);
+    sys_print(", caps: VERSION/GET_CAP/GETRESOURCES/GETCRTC/GETCONNECTOR/CREATE_DUMB/MAP_DUMB/ADDFB/PAGE_FLIP\n");
+}
+
+/// cmd_drmtest: E2E-самотест DRM (шаг 5): полный жизненный цикл dumb-буфера
+/// + тест-паттерн + fbdev-запросы. Маркеры [DRMTEST] ловит e2e-харнесс.
+fn cmd_drmtest() void {
+    const ops = kernelDrmOps();
+    const va: u64 = @intFromPtr(&drmtest_buf);
+    sys_print("[DRMTEST] begin: ioctl ABI + dumb lifecycle + pattern\n");
+
+    // 1. VERSION (двухфазный протокол libdrm — как в юнит-тестах)
+    var v: drm_kms.DrmVersion = .{};
+    @memcpy(drmtest_buf[0..@sizeOf(drm_kms.DrmVersion)], std.mem.asBytes(&v));
+    if (drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_VERSION, va) != 0) {
+        sys_print("[DRMTEST] FAIL: VERSION\n");
+        return;
+    }
+    sys_print("[DRMTEST] VERSION ok: poler-drm 1.19.0\n");
+
+    // 2. GETRESOURCES: 1 CRTC/энкодер/коннектор
+    var r: drm_kms.CardRes = .{};
+    r.count_crtcs = 1;
+    r.count_encoders = 1;
+    r.count_connectors = 1;
+    @memcpy(drmtest_buf[0..@sizeOf(drm_kms.CardRes)], std.mem.asBytes(&r));
+    if (drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_MODE_GETRESOURCES, va) != 0) {
+        sys_print("[DRMTEST] FAIL: GETRESOURCES\n");
+        return;
+    }
+    sys_print("[DRMTEST] GETRESOURCES ok: 1 crtc + 1 encoder + 1 connector\n");
+
+    // 3. CREATE_DUMB 256x128 → MAP_DUMB → ADDFB → PAGE_FLIP x2 → pattern
+    var d: drm_kms.CreateDumb = .{ .width = 256, .height = 128, .bpp = 32 };
+    @memcpy(drmtest_buf[0..@sizeOf(drm_kms.CreateDumb)], std.mem.asBytes(&d));
+    if (drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_MODE_CREATE_DUMB, va) != 0) {
+        sys_print("[DRMTEST] FAIL: CREATE_DUMB\n");
+        return;
+    }
+    const gv: *const drm_kms.CreateDumb = @ptrCast(@alignCast(&drmtest_buf));
+    const handle = gv.handle;
+    sys_print("[DRMTEST] CREATE_DUMB ok: handle=");
+    putDecimal(handle);
+    sys_print(" pitch=");
+    putDecimal(gv.pitch);
+    sys_print(" size=");
+    putDecimal(gv.size);
+    sys_print("\n");
+
+    var m: drm_kms.MapDumb = .{ .handle = handle };
+    @memcpy(drmtest_buf[0..@sizeOf(drm_kms.MapDumb)], std.mem.asBytes(&m));
+    if (drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_MODE_MAP_DUMB, va) != 0) {
+        sys_print("[DRMTEST] FAIL: MAP_DUMB\n");
+        return;
+    }
+    const gm: *const drm_kms.MapDumb = @ptrCast(@alignCast(&drmtest_buf));
+    const buf = drm_kms.lookupAperture(&drm_state, gm.offset) orelse {
+        sys_print("[DRMTEST] FAIL: aperture lookup\n");
+        return;
+    };
+    sys_print("[DRMTEST] MAP_DUMB ok: aperture offset=0x");
+    putHex(gm.offset);
+    sys_print("\n");
+
+    // 4. Тест-паттерн: диагональные полосы в backing-страницы dumb-буфера
+    //    (identity-VA PMM-страниц) + контрольное чтение — «рендер кадра».
+    const pixels: [*]u32 = @ptrFromInt(buf.phys);
+    const w = buf.width;
+    const h = buf.height;
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const stripe: u32 = ((x / 16) + (y / 16)) % 2;
+            pixels[y * (buf.pitch / 4) + x] = if (stripe != 0) 0x34C7_5B12 else 0x1207_1120;
+        }
+    }
+    const probe_px = pixels[(h / 2) * (buf.pitch / 4) + (w / 2)];
+    if ((probe_px != 0x34C7_5B12) and (probe_px != 0x1207_1120)) {
+        sys_print("[DRMTEST] FAIL: pattern readback\n");
+        return;
+    }
+    sys_print("[DRMTEST] pattern ok: 256x128 stripes written+readback\n");
+
+    // 5. ADDFB → PAGE_FLIP x2 → SETCRTC
+    var f: drm_kms.FbCmd = .{ .handle = handle, .width = buf.width, .height = buf.height, .pitch = buf.pitch, .bpp = 32 };
+    @memcpy(drmtest_buf[0..@sizeOf(drm_kms.FbCmd)], std.mem.asBytes(&f));
+    if (drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_MODE_ADDFB, va) != 0) {
+        sys_print("[DRMTEST] FAIL: ADDFB\n");
+        return;
+    }
+    const gf: *const drm_kms.FbCmd = @ptrCast(@alignCast(&drmtest_buf));
+    const fb_id = gf.fb_id;
+    sys_print("[DRMTEST] ADDFB ok: fb_id=");
+    putDecimal(fb_id);
+    sys_print("\n");
+
+    var p: drm_kms.PageFlip = .{ .crtc_id = drm_kms.kmsIds()[0], .fb_id = fb_id };
+    @memcpy(drmtest_buf[0..@sizeOf(drm_kms.PageFlip)], std.mem.asBytes(&p));
+    _ = drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_MODE_PAGE_FLIP, va);
+    _ = drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_MODE_PAGE_FLIP, va);
+    if (drm_state.flips < 2) {
+        sys_print("[DRMTEST] FAIL: PAGE_FLIP\n");
+        return;
+    }
+    sys_print("[DRMTEST] PAGE_FLIP ok: flips=");
+    putDecimal(drm_state.flips);
+    sys_print("\n");
+
+    // 6. fbdev-фасад /dev/fb0: VSCREENINFO из геометрии скан-аута
+    if (drm_state.mode != .inactive) {
+        if (drm_kms.fbIoctl(&drm_state, ops, drm_kms.FBIOGET_VSCREENINFO, va) != 0) {
+            sys_print("[DRMTEST] FAIL: FBIOGET_VSCREENINFO\n");
+            return;
+        }
+        sys_print("[DRMTEST] fb0 VSCREENINFO ok\n");
+    }
+
+    // 7. DESTROY_DUMB (free_pages → PMM)
+    var dd: drm_kms.DestroyDumb = .{ .handle = handle };
+    @memcpy(drmtest_buf[0..@sizeOf(drm_kms.DestroyDumb)], std.mem.asBytes(&dd));
+    if (drm_kms.drmIoctl(&drm_state, ops, drm_kms.DRM_IOCTL_MODE_DESTROY_DUMB, va) != 0) {
+        sys_print("[DRMTEST] FAIL: DESTROY_DUMB\n");
+        return;
+    }
+    sys_print("[DRMTEST] DESTROY_DUMB ok (PMM pages freed)\n");
+    sys_print("[DRMTEST] ALL PASS\n");
 }
 
 /// v0.11.0 (CDD №2): калибровка TSC для QueryPerformanceFrequency —

@@ -253,6 +253,24 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
+    // 64-bit DRM/KMS tests (v0.19.0, CDD №10 p1): UAPI-совместимость ioctl-
+    // номеров/раскладок (якоря libdrm), dumb-буферный жизненный цикл,
+    // fbdev, апертура mmap, WC/PAT-семантика — DrmOps-инъекция
+    const drm_kms_tests = b.addTest(.{
+        .root_source_file = b.path("src64/drm_kms.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
+    // 64-bit VirtIO-GPU tests (v0.19.0, CDD №10 p1): PCI-probe (modern/
+    // legacy), virtio-1.0 capability-парсинг (гостильные листы), 2D-команды
+    // байт-в-байт — PciCfg-инъекция с fake конфиг-пространством
+    const virtio_gpu_tests = b.addTest(.{
+        .root_source_file = b.path("src64/virtio_gpu.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
     const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
@@ -266,6 +284,8 @@ pub fn build(b: *std.Build) void {
     const run_virtio_net_tests = b.addRunArtifact(virtio_net_tests);
     const run_linux_syscalls_tests = b.addRunArtifact(linux_syscalls_tests);
     const run_sched_resume_tests = b.addRunArtifact(sched_resume_tests);
+    const run_drm_kms_tests = b.addRunArtifact(drm_kms_tests);
+    const run_virtio_gpu_tests = b.addRunArtifact(virtio_gpu_tests);
 
     const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader + Win32/CRT core + Enrollment-Gate)");
     test_step.dependOn(&run_poler_core32_tests.step);
@@ -280,6 +300,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_virtio_net_tests.step);
     test_step.dependOn(&run_linux_syscalls_tests.step);
     test_step.dependOn(&run_sched_resume_tests.step);
+    test_step.dependOn(&run_drm_kms_tests.step);
+    test_step.dependOn(&run_virtio_gpu_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{
