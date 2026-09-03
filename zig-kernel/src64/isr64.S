@@ -435,6 +435,13 @@ isr_stub_table:
 .extern ucl_rflags
 .extern linux_arg5             // v0.18.0 (CDD №9): user R8 — 5-й аргумент Linux-syscall
 .extern linux_arg6             // v0.18.0 (CDD №9): user R9 — 6-й аргумент Linux-syscall
+// v0.18.0 (CDD №9): PER-TASK SYSCALL STATE — вход по ВЛАДЕЛЬЦУ user-RSP
+.extern kstack_lo_tab          // [MAX_TASKS]u64 — низ kstack задачи
+.extern kstack_hi_tab          // [MAX_TASKS]u64 — верх kstack (сюда спускаемся)
+.extern ustack_hi_tab          // [MAX_TASKS]u64 — верх user-стека (0 = нет)
+.extern ustack_lo_tab          // [MAX_TASKS]u64 — низ user-стека
+.extern syscall_num_tmp        // времяянка user RAX на время скана
+.extern rbx_tmp                // времяянка user RBX на время скана
 
 .global syscall_entry
 syscall_entry:
@@ -449,15 +456,64 @@ syscall_entry:
     movq %r8, linux_arg5(%rip)
     movq %r9, linux_arg6(%rip)
 
-    // v0.17.0 (CDD №8 p7-ship): вход по cks (как v0.16). Уроки p6: TSS.rsp0-
-    // вход давал ДЕТЕРМИНИРОВАННЫЙ Ring-3 краш «call 0x200000283B» в CB-мосте
-    // (3/3 прогона) — регресс, отклонён. Защита от десинхронов осталась в
-    // scheduler.zig: SAVE-GUARD/SAVE-REROUTE + FRAME-HEAL + heap IF-фикс +
-    // kill виновника по kstack. Полный фикс = per-task syscall state —
-    // v0.18-бэклог (так и запланировано в p4).
+    // ════════════════════════════════════════════════════════════════
+    //  v0.18.0 (CDD №9): PER-TASK SYSCALL STATE — вход по ВЛАДЕЛЬЦУ.
+    //
+    //  КОРЕНЬ cks-гонки (эмпирика [T]/[S]-трейса): в окнах паркинга
+    //  (kSleepTask hlt) cks/current_task_id РАССИНХРОНИЗИРОВАНЫ с реаль-
+    //  ным исполнителем: следующий syscall входил ПО cks НА ЧУЖОЙ kstack
+    //  → Zig-каскад (DNS-буферы, ASCII-строки) ЗАТИРАЛ замороженные кад-
+    //  ры владельца → FRAME-GUARD «кадр мусорен» → каскадный kill жилых
+    //  тредов резолвера.
+    //
+    //  РЕШЕНИЕ: каскад задачи — ТОЛЬКО НА СВОЁМ kstack. Владелец опреде-
+    //  ляется ПО USER-RSP (АТОМАРНО: IF=0 от SYSCALL/SFMASK):
+    //    1) kernel-задача: syscall из Ring 0 — RSP уже внутри ЕЁ kstack;
+    //    2) user-задача/тред: RSP внутри ЕЁ уникального user-стека
+    //       (главный 0x22_0000_0000±, треды — VHEAP-выделения: не пере-
+    //       секаются; колбэк-стек InitOnce-моста — вне таблиц → честный
+    //       cks-fallback: колбэк исполняется ТОЛЬКО при cur=владельце).
+    //  Сканируем 8 слотов; промах → cks (легаси-поведение v0.17).
+    //  Затираемые на время скана: RAX, RBX → времяянки .bss (восстановим).
+    // ════════════════════════════════════════════════════════════════
+    movq %rax, syscall_num_tmp(%rip)
+    movq %rbx, rbx_tmp(%rip)
+    xorl %eax, %eax                      // i = 0
+.owner_scan:
+    cmpq $8, %rax
+    jae .owner_fallback
+    // 1) kernel-задача: user_rsp ∈ [kstack_lo_i, kstack_hi_i) ?
+    movq kstack_lo_tab(,%rax,8), %rbx
+    cmpq user_rsp(%rip), %rbx            // kstack_lo > user_rsp? → мимо
+    ja .try_user_stack
+    movq kstack_hi_tab(,%rax,8), %rbx
+    cmpq user_rsp(%rip), %rbx            // kstack_hi > user_rsp? → HIT
+    ja .owner_found
+    // 2) user-задача: user_rsp ∈ [ustack_lo_i, ustack_hi_i) ?
+.try_user_stack:
+    movq ustack_hi_tab(,%rax,8), %rbx
+    testq %rbx, %rbx
+    jz .owner_next                       // 0 = слот без user-стека
+    cmpq user_rsp(%rip), %rbx            // ustack_hi > user_rsp?
+    jbe .owner_next
+    movq ustack_lo_tab(,%rax,8), %rbx
+    cmpq %rbx, user_rsp(%rip)            // user_rsp >= ustack_lo? → HIT
+    jae .owner_found
+.owner_next:
+    incq %rax
+    jmp .owner_scan
+.owner_found:
+    movq kstack_hi_tab(,%rax,8), %rsp    // СВОЙ kstack-топ (атомарно, IF=0)
+    jmp .owner_done
+.owner_fallback:
+    // Промах (колбэк-стек моста / мусорный RSP) — легаси cks: колбэк
+    // InitOnce исполняется только при cur=владельце → cks корректен.
     movq current_kernel_stack(%rip), %rsp
+.owner_done:
+    movq rbx_tmp(%rip), %rbx             // восстановить user RBX
+    movq syscall_num_tmp(%rip), %rax     // восстановить user RAX (номер)
 
-    // Now we are on the kernel stack!
+    // Теперь мы на СВОЁМ стеке задачи!
     // Push user RIP (RCX) and user RFLAGS (R11)
     pushq %rcx
     pushq %r11

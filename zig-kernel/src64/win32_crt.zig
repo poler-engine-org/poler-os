@@ -114,7 +114,7 @@ pub const Ops = struct {
     /// Ядро: запись exit-адреса в user-стек + scheduler.createUserThreadTask
     /// (та же PML4 — общее адресное пространство). Возврат — хэндл 0x1000+.
     /// Тест: фейк (записывает параметры, возвращает фиксированный хэндл).
-    create_thread: *const fn (start: u64, param: u64, stack_top: u64, exit_va: u64) u64,
+    create_thread: *const fn (start: u64, param: u64, stack_lo: u64, stack_top: u64, exit_va: u64) u64,
     /// v0.12.0: ExitThread/возврат из ThreadProc — убить ТЕКУЩУЮ задачу
     /// (планировщик пометит Killed; hlt до вытеснения).
     exit_task: *const fn () void,
@@ -191,7 +191,7 @@ fn denyLaunch(_: u64, _: u64, _: u64, _: u64) bool {
 fn nullStackArg(_: u64) u64 {
     return 0;
 }
-fn denyCreateThread(_: u64, _: u64, _: u64, _: u64) u64 {
+fn denyCreateThread(_: u64, _: u64, _: u64, _: u64, _: u64) u64 {
     return 0;
 }
 fn noopExitTask() void {}
@@ -4095,7 +4095,7 @@ fn kCreateThread(disp: *win32.Dispatcher, stack_size: u64, start: u64, param: u6
     if (exit_va == 0) return 0; // без exit-пути тред запускать нельзя
     // 16-байтовое выравнивание верха + [rsp]=exit (имитация call-кадра)
     const stack_top = stack + want;
-    const handle = ops.create_thread(start, param, stack_top, exit_va);
+    const handle = ops.create_thread(start, param, stack, stack_top, exit_va);
     if (handle == 0) {
         setLastError(8);
         return 0;
@@ -6701,15 +6701,17 @@ var t_thread_calls: usize = 0;
 var t_thread_start: u64 = 0;
 var t_thread_param: u64 = 0;
 var t_thread_stack_top: u64 = 0;
+var t_thread_stack_lo: u64 = 0;
 var t_thread_exit_va: u64 = 0;
 var t_exit_task_calls: usize = 0;
 var t_signaled_handle: u64 = 0;
 
-fn tCreateThread(start: u64, param: u64, stack_top: u64, exit_va: u64) u64 {
+fn tCreateThread(start: u64, param: u64, stack_lo: u64, stack_top: u64, exit_va: u64) u64 {
     t_thread_calls += 1;
     t_thread_start = start;
     t_thread_param = param;
     t_thread_stack_top = stack_top;
+    t_thread_stack_lo = stack_lo;
     t_thread_exit_va = exit_va;
     return 0x1003; // фиксированный «хэндл треда» (task 3)
 }

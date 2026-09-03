@@ -300,6 +300,10 @@ fn kNetTcpClose(slot: i64) void {
 /// (паркованная пропускается по wake_tick), CPU спит. Перед возвратом
 /// восстанавливаем СВОЙ user_rsp (его мог затереть syscall чужой задачи)
 /// и флаг транзакции — asm-exit сделает sysretq на НАШ стек.
+/// v0.18.0 (CDD №9): будильник и снятие — ВЛАДЕЛЬЦУ ФИЗИЧЕСКОГО СТЕКА
+/// (каскад гарантированно на СВОЁМ kstack — asm-вход по владельцу);
+/// current_task_id в окнах паркинга рассинхронизирован — будильник
+/// «не той» задаче = потерянный wake (флаки-потеря тредов резолвера).
 fn kSleepTask(ms: u64) void {
     if (ms == 0) return;
     const capped: u64 = @min(ms, 60_000);
@@ -309,15 +313,17 @@ fn kSleepTask(ms: u64) void {
     // поднят — чужие syscall его затереть не могли)
     const my_rsp = scheduler.user_rsp;
 
-    // v0.17.0-fix (CDD №8 p5-lite): ресинк cks перед парковкой УДАЛЁН —
-    // при рассинхронизированном current он ИНЖЕКТИРОВАЛ чужой kstack-топ
-    // (каскад cross-stack). cks пишет только schedule() (диспетчеризация);
-    // хвост нашего syscall-кадра выходит через RSP (pop'ы asm-exit) —
-    // значение cks на исход кадра не влияет.
-    _ = scheduler;
+    // Владелец транзакции = syscallStackOwner(user_rsp) — ur записан
+    // ВХОДОМ этой же транзакции атомарно (IF=0) — авторитетный признак
+    // (SP-эвристика врала в InitOnce-бисекте). Будильник — ВЛАДЕЛЬЦУ.
+    const owner = scheduler.syscallStackOwner(my_rsp);
 
     // Будильник планировщику: слайс паркованной не давать
-    scheduler.setTaskSleep(capped);
+    if (owner < scheduler.MAX_TASKS) {
+        scheduler.setTaskSleepFor(owner, capped);
+    } else {
+        scheduler.setTaskSleep(capped); // fallback — вне стеков (защитный)
+    }
 
     // Отпускаем транзакцию — атомарно под cli (тика между cli и sti нет)
     hal.cli();
@@ -340,7 +346,9 @@ fn kSleepTask(ms: u64) void {
     scheduler.in_win32_syscall = 1;
     hal.sti();
     // будильник снят (или снимется при следующем dispatch)
-    if (scheduler.current_task_id < scheduler.task_count) {
+    if (owner < scheduler.MAX_TASKS) {
+        scheduler.setTaskSleepFor(owner, 0);
+    } else if (scheduler.current_task_id < scheduler.task_count) {
         scheduler.tasks[scheduler.current_task_id].wake_tick = 0;
     }
 }
@@ -350,13 +358,16 @@ fn kSleepTask(ms: u64) void {
 /// CreateThread-примитив: запись exit-адреса в user-стек (CR3 = PML4
 /// процесса — syscall-контекст!) + scheduler.createUserThreadTask.
 /// Хэндл = THREAD_HANDLE_BASE(0x1000) + task_id.
-fn kCreateThreadOp(start: u64, param: u64, stack_top: u64, exit_va: u64) u64 {
+/// v0.18.0 (CDD №9): регистрируем границы тредового user-стека в таблицах
+/// asm-владельца (isr64.S: syscall-каскад треда — ТОЛЬКО на ЕГО kstack).
+fn kCreateThreadOp(start: u64, param: u64, stack_lo: u64, stack_top: u64, exit_va: u64) u64 {
     const c = (crt.ctx orelse return 0);
     // [rsp] = exit-адрес: имитация call-кадра ThreadProc
     const sp: *volatile u64 = @ptrFromInt(stack_top - 8);
     sp.* = exit_va;
     // верх стека 16-выровнен → RSP = stack_top-8 даёт entry RSP ≡ 8 (mod 16)
     const id = scheduler.createUserThreadTask(start, c.pml4, stack_top - 8, param) catch return 0;
+    scheduler.registerUserStack(id, stack_lo, stack_top); // CDD №9: владелец по RSP
     return scheduler.THREAD_HANDLE_BASE + id;
 }
 
@@ -525,6 +536,11 @@ const CallbackState = struct {
     resume_r13: u64,
     resume_r14: u64,
     resume_r15: u64,
+    /// v0.18.0 (CDD №9): сохранённый ustack-слот владельца до запуска моста
+    /// (восстанавливается в callbackDone — поддержка вложенных InitOnce:
+    /// каждый колбэк-стек регистрируется на время своей транзакции).
+    saved_ustack_lo: u64 = 0,
+    saved_ustack_hi: u64 = 0,
 };
 
 /// Стек транзакций (v0.12.0-fix): curl может запустить InitOnce ВНУТРИ
@@ -593,6 +609,9 @@ fn kLaunchCallback(init_once: u64, init_fn: u64, parameter: u64, context: u64) b
     //    НЕ user-стек задачи: колбэк-фрейм не должен затереть кадр стаба.
     //    Каждой транзакции — СВОЙ стек (возврат внутрь внешнего колбэка
     //    продолжается на его собственном стеке).
+    //    v0.18.0 (CDD №9): регистрируем регион в ustack-таблицах ВЛАДЕЛЬЦА
+    //    (asm syscall-вход определит колбэк-сисколы как ЕГО — каскад на
+    //    ЕГО kstack; снятие региона — в callbackDone).
     const stack = crt.kmalloc(0x4000);
     if (stack == 0) {
         cb_depth -= 1;
@@ -600,6 +619,20 @@ fn kLaunchCallback(init_once: u64, init_fn: u64, parameter: u64, context: u64) b
         return false;
     }
     ucl_rsp = (stack + 0x4000) & ~@as(u64, 15);
+
+    // Владелец транзакции = физический владелец текущего каскада (с CDD №9
+    // — гарантированно СВОЙ kstack); сохранить его ustack-слот и
+    // перерегистрировать на колбэк-стек этой транзакции.
+    // v0.18.0-fix: владелец по user_rsp-глобалу (записан атомарным входом
+    // ИМЕННО этой транзакции) — SP-эвристика врала в InitOnce-бисекте.
+    {
+        const owner = scheduler.syscallStackOwner(scheduler.user_rsp);
+        if (owner < scheduler.MAX_TASKS) {
+            cb_stack[cb_depth - 1].saved_ustack_lo = scheduler.ustack_lo_tab[owner];
+            cb_stack[cb_depth - 1].saved_ustack_hi = scheduler.ustack_hi_tab[owner];
+            scheduler.registerUserStack(owner, stack, stack + 0x4000);
+        }
+    }
 
     // 3. Mailbox моста: identity-запись в стаб-регион (CPL=0, активный CR3).
     //    mailbox_off кратен 8, база региона page-aligned → выравнивание ок.
@@ -648,11 +681,13 @@ pub fn callbackDone(cookie: u64, result: u64) u64 {
 
     // Перезапись кадра asm-возврата (слоты [top-64..top)) — под cli:
     // между записью и pop'ами в isr64.S не должно быть прерываний.
-    // v0.17.0 (CDD №8 p7-ship): возврат к cks — единый источник с входом
-    // (урок p6: рассогласование источников вход/колбэк = детерминированный
-    // Ring-3 краш в CB-мосте).
+    // v0.18.0 (CDD №9): топ = kstack ВЛАДЕЛЬЦА КАСКАДА этой транзакции
+    // (не глобальный cks: в окнах паркинга он рассинхронизирован).
+    // Владелец — по user_rsp-глобалу (записан атомарным входом ЭТОГО
+    // syscall'а №7 — ur = CB-стек транзакции → владелец гарантирован).
     hal.cli();
-    const top = scheduler.current_kernel_stack;
+    const owner = scheduler.syscallStackOwner(scheduler.user_rsp);
+    const top = if (owner < scheduler.MAX_TASKS) scheduler.taskKstackTop(owner) else scheduler.current_kernel_stack;
     const f: *volatile [8]u64 = @ptrFromInt(top - 64);
     f[0] = st.resume_r15;
     f[1] = st.resume_r14;
@@ -669,6 +704,20 @@ pub fn callbackDone(cookie: u64, result: u64) u64 {
     cb_depth -= 1;
     // ⚠ ucl_pending НЕ трогаем: после запуска колбэка флаг чист
     // (.ucl_launch сбрасывает), asm-путь syscall #7 идёт по обычным pop'ам.
+
+    // v0.18.0 (CDD №9): восстановить ustack-слот владельца (колбэк-регион
+    // этой транзакции больше не нужен — вложенный InitOnce вернёт слот
+    // внешнего колбэка, листовой — исходный стек треда/задачи).
+    {
+        const owner_done = scheduler.syscallStackOwner(scheduler.user_rsp);
+        if (owner_done < scheduler.MAX_TASKS) {
+            scheduler.registerUserStack(
+                owner_done,
+                cb_stack[cb_depth].saved_ustack_lo,
+                cb_stack[cb_depth].saved_ustack_hi,
+            );
+        }
+    }
 
     hal.Serial.puts("[CB] InitOnce: колбэк завершён, ret=");
     hal.Serial.putHex(result);

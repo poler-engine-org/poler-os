@@ -80,6 +80,8 @@ var warned_tasks: [MAX_TASKS]usize = .{0} ** MAX_TASKS;
 var warned_n: usize = 0;
 // v0.16.0-fix (CDD №7, SELF-HEAL): теневые валидные rsp (см. schedule)
 pub var shadow_rsp: [MAX_TASKS]u64 = .{0} ** MAX_TASKS;
+// v0.18.0 (CDD №9): счётчики подряд-мусорных кадров (FRAME-GUARD-паллиатив)
+var bad_frame_drops: [MAX_TASKS]u32 = .{0} ** MAX_TASKS;
 // v0.17.0-fix (CDD №8 p7): дедуп SAVE-REROUTE-печати (анти-спам 100Гц)
 var last_reroute_key: u64 = 0;
 
@@ -93,6 +95,96 @@ pub export var current_kernel_stack: u64 = 0;
 /// SYSCALL — атомарно). Читает hal.zig для Linux-маршрутизации.
 pub export var linux_arg5: u64 = 0;
 pub export var linux_arg6: u64 = 0;
+
+/// v0.18.0 (CDD №9, бисект-инструментация): трассировка тика/диспетчера/
+/// syscall-входа — ловим ПЕРВЫЙ десинк cks/TSS/owner вживую.
+pub var dbg_sched_trace: bool = false;
+
+/// v0.18.0 (CDD №9, бисект): kstack-топ задачи (для сверки cks в syscall-входе).
+pub fn taskKstackTop(id: usize) u64 {
+    if (id >= task_count) return 0;
+    return @intFromPtr(&tasks[id].kernel_stack) + tasks[id].kernel_stack.len;
+}
+
+/// v0.18.0 (CDD №9): физический ВЛАДЕЛЕЦ стека по RSP — задача, чей kstack
+/// (или бут-стек для task 0) накрывает адрес. Это АВТОРИТЕТНЫЙ признак
+/// «кто исполняется» — не зависит от current_task_id (который рассин-
+/// хронизируется в окнах паркинга). Возврат 255 = вне всех стеков.
+pub fn stackOwner(rsp: u64) usize {
+    // idle/boot-стек линкера [0x108000, 0x10C000)
+    if (rsp >= 0x108000 and rsp < 0x10C000) return 0;
+    var i: usize = 1;
+    while (i < task_count) : (i += 1) {
+        const base: u64 = @intFromPtr(&tasks[i].kernel_stack);
+        if (rsp >= base and rsp < base + tasks[i].kernel_stack.len) return i;
+    }
+    return 255;
+}
+
+// ─── v0.18.0 (CDD №9): PER-TASK SYSCALL STATE — таблицы владельца ──────────
+//
+// КОРЕНЬ cks-гонки (эмпирика [T]/[S]-трейса, QEMU 11): в окнах паркинга
+// (kSleepTask hlt) current_task_id/cks РАССИНХРОНИЗИРОВАНЫ с задачей, чей
+// syscall активен: следующий syscall входил по cks на ЧУЖОЙ kstack, и
+// Zig-каскад (DNS-буферы, строки) ЗАТИРАЛ замороженные кадры владельца
+// стека (FRAME-GUARD «кадр мусорен: ASCII/heap-указатели» — это содержимое
+// ЧУЖОГО каскада). АРХИТЕКТУРНОЕ ЗАКРЫТИЕ: syscall-вход выбирает kstack ПО
+// ВЛАДЕЛЬЦУ user-RSP (стеки тредов/задач УНИКАЛЬНЫ), а не по глобальному
+// cks. isr64.S.scan-цикл читает эти таблицы (IF=0 от SYSCALL — атомарно):
+//   1) kernel-задача: RSP уже внутри её kstack (syscall из Ring 0);
+//   2) user-задача: RSP внутри ЕЁ пользовательского стека (уникален на
+//      задачу/тред: главный 0x22_0000_0000±, треды из VHEAP-региона).
+// Заполняются при создании задач (createTask/createUserTask/
+// createUserThreadTask) и при выделении тредового стека (win32_api).
+
+/// Низ kstack задачи (границы для asm-скана владельца).
+pub export var kstack_lo_tab: [MAX_TASKS]u64 = .{0} ** MAX_TASKS;
+/// Верх kstack задачи (asm: movq kstack_hi_tab(,%rax,8), %rsp).
+pub export var kstack_hi_tab: [MAX_TASKS]u64 = .{0} ** MAX_TASKS;
+/// Верх USER-стека задачи (0 = нет: kernel-задача/вакантный слот).
+pub export var ustack_hi_tab: [MAX_TASKS]u64 = .{0} ** MAX_TASKS;
+/// Низ USER-стека задачи (стек растёт вниз: lo ≤ user_rsp < hi).
+pub export var ustack_lo_tab: [MAX_TASKS]u64 = .{0} ** MAX_TASKS;
+
+/// Регистрация kstack-границ задачи в asm-таблицах (вызывается при создании).
+fn registerKstack(id: usize) void {
+    if (id >= MAX_TASKS) return;
+    const base: u64 = @intFromPtr(&tasks[id].kernel_stack);
+    kstack_lo_tab[id] = base;
+    kstack_hi_tab[id] = base + tasks[id].kernel_stack.len;
+}
+
+/// Регистрация user-стека задачи (главный стек при createUserTask;
+/// тредовый — при createUserThreadTask: win32_api допишет точные границы).
+pub fn registerUserStack(id: usize, lo: u64, hi: u64) void {
+    if (id >= MAX_TASKS) return;
+    ustack_lo_tab[id] = lo;
+    ustack_hi_tab[id] = hi;
+}
+
+/// v0.18.0 (CDD №9): владелец syscall-транзакции ПО USER-RSP — ЗЕРКАЛО
+/// asm-скана isr64.S В ZIG. user_rsp-глобал записан ВХОДОМ ЭТОЙ ЖЕ
+/// транзакции при IF=0 (атомарно, до переключения стека) — НЕ МОЖЕТ
+/// ВРАТЬ (в отличие от SP внутри каскада: эмпирика InitOnce-бисекта —
+/// kLaunchCallback, позванный из каскада, видел SP на ЧУЖОМ kstack).
+/// Возврат 255 = вне всех диапазонов (мусорный ur / CB-стек до моста).
+pub fn syscallStackOwner(ur: u64) usize {
+    var i: usize = 0;
+    while (i < MAX_TASKS) : (i += 1) {
+        // kernel-задача: syscall из Ring 0 — ur внутри её kstack
+        if (ur >= kstack_lo_tab[i] and ur < kstack_hi_tab[i] and kstack_hi_tab[i] != 0) return i;
+        // user-задача/тред/колбэк-транзакция: ur внутри зарегистрированного региона
+        if (ustack_hi_tab[i] != 0 and ur >= ustack_lo_tab[i] and ur < ustack_hi_tab[i]) return i;
+    }
+    // idle/boot-стек (kernelMain сисколы шелла ДО создания задач)
+    if (ur >= 0x108000 and ur < 0x10C000) return 0;
+    return 255;
+}
+
+/// v0.18.0 (CDD №9): времяянки asm-скана владельца (isr64.S): user RAX/RBX
+/// сохраняются ДО цикла и восстанавливаются после выбора стека (IF=0).
+pub export var syscall_num_tmp: u64 = 0;
+pub export var rbx_tmp: u64 = 0;
 
 /// v0.18.0 (CDD №9): ABI текущей Ring-3 задачи — для syscall-маршрутизации
 /// (hal.zig): linux → linux_syscalls.dispatch (RAX-ABI), иначе Win32 #6/#7.
@@ -150,6 +242,11 @@ pub fn init() void {
     // Set initial kernel stack top (corresponds to stack_top in linker64.ld)
     current_kernel_stack = 0x10b000;
 
+    // v0.18.0 (CDD №9): таблицы владельца для asm syscall-входа: idle
+    // (task 0) живёт на бут-стеке линкера [0x108000, 0x10C000).
+    kstack_lo_tab[0] = 0x108000;
+    kstack_hi_tab[0] = 0x10C000;
+
     // Register exit callback — HAL calls this on syscall exit(4)
     // Breaks circular dependency hal.zig ↔ scheduler.zig via function pointer.
     hal.exitCallback = exitCurrentTask;
@@ -171,14 +268,20 @@ pub fn exitCurrentTask() callconv(.C) void {
     // транзакции — сбросить флаг, иначе таймер не сможет вытеснить задачу
     // (schedule видит in_win32_syscall=1 и не переключает — deadlock).
     in_win32_syscall = 0;
-    if (current_task_id == 0) {
+    // v0.18.0 (CDD №9): kill ИСПОЛНИТЕЛЯ = владельца транзакции по
+    // user_rsp (записан атомарным входом ЭТОГО syscall'а — не врёт).
+    // Убийство «по cur» при рассинкронизированном current_task_id
+    // убивало ЖИВУЮ задачу и оставляло зомби-исполнителя.
+    const owner = syscallStackOwner(user_rsp);
+    const victim = if (owner != 255) owner else current_task_id;
+    if (victim == 0) {
         hal.Serial.puts("[SCHED] ERROR: Cannot kill idle task!\n");
         return;
     }
     hal.Serial.puts("[SCHED] Exiting task ");
-    hal.Serial.putHex(current_task_id);
+    hal.Serial.putHex(victim);
     hal.Serial.puts("\n");
-    tasks[current_task_id].state = .Killed;
+    tasks[victim].state = .Killed;
 }
 
 /// Mark a task as Killed. The idle task (id 0) CANNOT be killed —
@@ -242,7 +345,7 @@ pub fn createTask(entry_point: u64) !usize {
     // Save stack pointer to task control block
     task.rsp = @intFromPtr(frame_ptr);
     fillCanary(task);
-    fillCanary(task);
+    registerKstack(id);
 
     hal.Serial.puts("[SCHED] Created kernel task ");
     hal.Serial.putHex(id);
@@ -317,6 +420,7 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
     // Save stack pointer to task control block
     task.rsp = @intFromPtr(frame_ptr);
     fillCanary(task);
+    registerKstack(id);
 
     hal.Serial.puts("[SCHED] Created user task ");
     hal.Serial.putHex(id);
@@ -369,6 +473,7 @@ pub fn createUserThreadTask(entry_point: u64, user_cr3: u64, thread_rsp: u64, pa
 
     task.rsp = @intFromPtr(frame_ptr);
     fillCanary(task);
+    registerKstack(id);
 
     hal.Serial.puts("[SCHED] Created user THREAD ");
     hal.Serial.putDecimal(id);
@@ -543,11 +648,22 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
         }
     }
     if (save_id != 0 and taskRspValid(save_id, current_rsp)) {
-        tasks[save_id].rsp = current_rsp;
-        // v0.16.0-fix (CDD №7, SELF-HEAL): теневой слепок валидного rsp —
-        // кадр на СОБСТВЕННОМ kstack (портился только УКАЗАТЕЛЬ — теневая
-        // копия полностью реанимирует тред).
-        if (save_id != 0) shadow_rsp[save_id] = current_rsp;
+        // v0.18.0 (CDD №9): КОНТЕНТ-ВАЛИДАЦИЯ ПЕРЕД ЗАПИСЬЮ. Эмпирика
+        // бисекта: точки-вглубь-Zig-каскада попадали в tasks[].rsp (кадр
+        // «мусорен» по слотам CS/RIP → ложный FRAME-GUARD-kill живого
+        // резолвера). Невалидный по содержимому кадр НЕ сохраняем —
+        // остаётся прежний (замороженный, валидный) указатель задачи.
+        if (frameContentValid(current_rsp)) {
+            tasks[save_id].rsp = current_rsp;
+            // v0.16.0-fix (CDD №7, SELF-HEAL): теневой слепок валидного rsp —
+            // кадр на СОБСТВЕННОМ kstack (портился только УКАЗАТЕЛЬ — теневая
+            // копия полностью реанимирует тред).
+            if (save_id != 0) shadow_rsp[save_id] = current_rsp;
+        } else if (shadow_rsp[save_id] == 0) {
+            // тени нет и контент мусорен — деградация до v0.17-поведения
+            // (сохраняем структурно-валидный указатель: лучше, чем потерять)
+            tasks[save_id].rsp = current_rsp;
+        }
     }
     if (tasks[current_task_id].state == .Running) {
         tasks[current_task_id].state = .Ready;
@@ -595,16 +711,27 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
                     break;
                 }
                 // v0.17.0 (CDD №8): указатель корректен, СОДЕРЖИМОЕ кадра —
-                // мусор (гонка syscall-exit многопоточного 7-Zip). Убиваем
-                // задачу — ядро и шелл живут (CDD-честная граница).
-                tasks[next_id].state = .Killed;
-                hal.Serial.puts("[SCHED] FRAME-GUARD: task ");
-                hal.Serial.putDecimal(next_id);
-                hal.Serial.puts(" убита (кадр мусорен: CS=0x");
-                hal.Serial.putHex(@as(*volatile u64, @ptrFromInt(tasks[next_id].rsp + 144)).*);
-                hal.Serial.puts(" RIP=0x");
-                hal.Serial.putHex(@as(*volatile u64, @ptrFromInt(tasks[next_id].rsp + 136)).*);
-                hal.Serial.puts(") — ядро живёт\n");
+                // мусор. v0.18.0 (CDD №9): НЕ убиваем сразу — ПРОПУСК с
+                // лимитом: старый hlt-ISR-кадр мог быть перезаписан СЛЕДУЮЩИМ
+                // каскадом этой же задачи (эмпирика бисекта: tasks[].rsp
+                // указывает вглубь собственного каскада задачи, пока она
+                // паркуется/исполняется) — ближайший валидный SAVE
+                // (kSleepTask-цикл) реанимирует указатель. 50 тиков
+                // (0.5с) без валидного кадра → честный kill (анти-livelock).
+                bad_frame_drops[next_id] += 1;
+                if (bad_frame_drops[next_id] >= 50) {
+                    tasks[next_id].state = .Killed;
+                    bad_frame_drops[next_id] = 0;
+                    hal.Serial.puts("[SCHED] FRAME-GUARD: task ");
+                    hal.Serial.putDecimal(next_id);
+                    hal.Serial.puts(" убита (кадр мусорен 50 тиков: CS=0x");
+                    hal.Serial.putHex(@as(*volatile u64, @ptrFromInt(tasks[next_id].rsp + 144)).*);
+                    hal.Serial.puts(" RIP=0x");
+                    hal.Serial.putHex(@as(*volatile u64, @ptrFromInt(tasks[next_id].rsp + 136)).*);
+                    hal.Serial.puts(" rsp_ptr=0x");
+                    hal.Serial.putHex(tasks[next_id].rsp);
+                    hal.Serial.puts(") — ядро живёт\n");
+                }
                 continue;
             }
             if (bad_rsp == 0) {
@@ -735,11 +862,19 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
 /// потолок 60с (диагностический таймаут livelock-охоты).
 pub fn setTaskSleep(ms: u64) void {
     if (current_task_id >= task_count) return;
+    setTaskSleepFor(current_task_id, ms);
+}
+
+/// v0.18.0 (CDD №9): будильник КОНКРЕТНОЙ задаче — владелец физического
+/// стека каскада (не current_task_id: в окнах паркинга он рассинхронизи-
+/// рован — будильник «не той» задаче = потерянный wake + чужой слайс).
+pub fn setTaskSleepFor(id: usize, ms: u64) void {
+    if (id >= task_count) return;
     if (ms == 0) {
-        tasks[current_task_id].wake_tick = 0;
+        tasks[id].wake_tick = 0;
         return;
     }
     const capped: u64 = @min(ms, 60_000);
     const ticks = (capped + 9) / 10; // округление вверх: Sleep(1) ≥ 1 тик
-    tasks[current_task_id].wake_tick = hal.tick_count + ticks;
+    tasks[id].wake_tick = hal.tick_count + ticks;
 }

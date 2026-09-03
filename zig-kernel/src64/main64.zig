@@ -1148,6 +1148,17 @@ fn sys_clear_screen() void {
 }
 
 fn execute_command(cmd: []const u8) void {
+    // v0.18.0 (CDD №9, бисект): трассировка планировщика/десинков вкл/выкл
+    if (eq(cmd, "dbg1")) {
+        scheduler.dbg_sched_trace = true;
+        sys_print("[CDD9] sched-trace ON\n");
+        return;
+    }
+    if (eq(cmd, "dbg0")) {
+        scheduler.dbg_sched_trace = false;
+        sys_print("[CDD9] sched-trace OFF\n");
+        return;
+    }
     if (eq(cmd, "help")) {
         sys_print("Available commands:\n");
         sys_print("  help      - Show this help menu\n");
@@ -2680,6 +2691,14 @@ fn cmd_peload(args: []const u8) void {
         sys_print("\n");
         return;
     };
+    // v0.18.0 (CDD №9): регистрируем главный user-стек задачи в таблицах
+    // asm-владельца (isr64.S: syscall-каскад — ТОЛЬКО на СВОЁМ kstack).
+    // Границы = замапленный регион [stack_top - pages*4K, stack_top).
+    scheduler.registerUserStack(
+        task_id,
+        layout.stack_top - layout.stack_pages * 4096,
+        layout.stack_top,
+    );
     sys_print("[PE] Ring 3 task #");
     printDec(task_id);
     sys_print(" created — waiting for first CDD int3 log\n");

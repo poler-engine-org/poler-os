@@ -533,6 +533,25 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                 // 10-й тик) — RTX-бэкофф 200мс/KA 1с дыхают с запасом, а
                 // 100-Гц pollRx под TCG отъедал CPU у Ring-3 крипты (сервер
                 // успевал FIN до нашего Finished — bad decrypt-подобный обрыв).
+                // v0.18.0 (CDD №9, бисект-инструментация): вход тика —
+                // сверка кадра против cur/TSS/cks (внутри cli, до nsink).
+                // Ловим «кадр на чужом стеке при cur=X» вживую.
+                {
+                    const sched = @import("scheduler.zig");
+                    if (sched.dbg_sched_trace) {
+                        Serial.puts("[T] f=0x");
+                        Serial.putHex(@intFromPtr(frame));
+                        Serial.puts(" cur=");
+                        Serial.putDecimal(sched.current_task_id);
+                        Serial.puts(" tss=0x");
+                        Serial.putHex(tss_rsp0_mirror);
+                        Serial.puts(" cks=0x");
+                        Serial.putHex(sched.current_kernel_stack);
+                        Serial.puts(" fl=");
+                        Serial.putDecimal(sched.in_win32_syscall);
+                        Serial.puts("\n");
+                    }
+                }
                 cli();
                 if (net_irq_sink) |nsink| {
                     if (tick_count % 10 == 0) nsink();
@@ -1318,6 +1337,46 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
     // user R8/R9 колбэк читает сам из scheduler.linux_arg5/6 (asm-вход).
     // Win32-задачи не заходят сюда — АБИ решается ДО легаси-свича
     // (Linux SYS_write=1 коллидит с легаси-вектором «print» №1).
+    // БИСЕКТ-ИНСТРУМЕНТАЦИЯ: сверка cks против kstack-топа ТЕКУЩЕЙ задачи —
+    // вход syscall по несвежему cks = спрей каскада Zig на ЧУЖОЙ kstack
+    // (гипотеза корня cks-гонки; лог только при dbg_sched_trace).
+    // v2: ГЛАВНОЕ — физический владелец стека каскада (по RСП вызова):
+    // чей kstack реально занял syscall-каскад (± небольшой допуск вниз
+    // от топа — каскад уходит вглубь от cks-топа).
+    {
+        const sched = @import("scheduler.zig");
+        if (sched.dbg_sched_trace) {
+            const my_top = sched.taskKstackTop(sched.current_task_id);
+            if (sched.current_task_id != 0 and sched.current_kernel_stack != my_top) {
+                Serial.puts("[SYN!] syscall-вход: cur=");
+                Serial.putDecimal(sched.current_task_id);
+                Serial.puts(" cks=0x");
+                Serial.putHex(sched.current_kernel_stack);
+                Serial.puts(" СВОЙ_топ=0x");
+                Serial.putHex(my_top);
+                Serial.puts(" num=");
+                Serial.putDecimal(syscall_num);
+                Serial.puts("\n");
+            }
+            // [S]-трейс: каскад лёг на kstack какой задачи (call-автор по RSP)?
+            // Используем RSP вызывающего кадра (asm уже спустил 8 слов + ret):
+            const sp: u64 = asm volatile ("movq %%rsp, %[v]"
+                : [v] "=r" (-> u64)
+            );
+            const owner = sched.stackOwner(sp);
+            if (owner != sched.current_task_id) {
+                Serial.puts("[S!] чужой-стек: cur=");
+                Serial.putDecimal(sched.current_task_id);
+                Serial.puts(" каскад на kstack=");
+                Serial.putDecimal(owner);
+                Serial.puts(" num=");
+                Serial.putDecimal(syscall_num);
+                Serial.puts(" sp=0x");
+                Serial.putHex(sp);
+                Serial.puts("\n");
+            }
+        }
+    }
     if (taskAbiLinuxCallback) |is_linux| {
         if (is_linux()) {
             if (linuxSyscallCallback) |cb| {
