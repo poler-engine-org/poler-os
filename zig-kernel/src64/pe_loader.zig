@@ -104,6 +104,14 @@ pub const LoaderOps = struct {
     /// Указатель ЗАПИСИ на физ. страницу: ядро — identity (pa == VA),
     /// нативные тесты — база фейкового буфера + смещение.
     page_ptr: *const fn (pa: u64) [*]u8,
+    /// v0.18.0 (CDD №9 hardening): снять маппинг va в целевом PML4
+    /// (PMM-rollback при сбоях загрузки — анти-утечка физпамяти).
+    /// false → записи не было (идемпотентно, ошибки не было).
+    unmap_user: *const fn (pml4: u64, va: u64) bool,
+    /// v0.18.0 (CDD №9 hardening): освободить contiguous-блок PMM
+    /// (base_pa из alloc_contig, тот же count) — только на путях ОТКАЗА
+    /// до передачи региона владельцу. Успешные маппинги не освобождаются.
+    free_contig: *const fn (base_pa: u64, count: u64) void,
 };
 
 pub const LoadError = error{
@@ -166,6 +174,8 @@ pub const Region = struct {
 };
 
 /// Выделить + замаппить регион с ЕДИНЫМИ флагами (стек, стабы, TEB…).
+/// v0.18.0 (CDD №9): при сбое маппинга — полный откат (unmap уже
+/// замапленных страниц + free_contig) — PMM не течёт на битых образах.
 pub fn mapRegion(
     ops: LoaderOps,
     pml4: u64,
@@ -180,6 +190,13 @@ pub fn mapRegion(
     var i: u64 = 0;
     while (i < n) : (i += 1) {
         if (!ops.map_user(pml4, va + i * PAGE_SIZE, base_pa + i * PAGE_SIZE, flags)) {
+            // ROLLBACK: снимаем уже поставленные маппинги [0, i) и
+            // возвращаем блок PMM (v0.17: утечка при сбое посреди образа)
+            var j: u64 = 0;
+            while (j < i) : (j += 1) {
+                _ = ops.unmap_user(pml4, va + j * PAGE_SIZE);
+            }
+            ops.free_contig(base_pa, n);
             return LoadError.MapFailed;
         }
     }
@@ -206,6 +223,10 @@ pub const LoadedImage = struct {
 
 /// Полный маппинг PE-образа в user-пространство задачи.
 /// image: результат pe.Pe.parse(file). base_va: предпочтённый ImageBase.
+/// v0.18.0 (CDD №9 hardening): ВСЕ пути ошибок после alloc_contig делают
+/// полный откат — unmap замапленных страниц [0, i) + free_contig блока
+/// (v0.17: повреждённый PE с секцией вне образа/конфликтом VA оставлял
+/// выделенные страницы PMM занятыми навсегда — утечка физпамяти).
 pub fn loadImage(
     ops: LoaderOps,
     pml4: u64,
@@ -221,9 +242,22 @@ pub fn loadImage(
     const backing: [*]u8 = ops.page_ptr(base_pa);
     // alloc_contig контракт: страницы ОБНУЛЕНЫ (BSS/щели чисты по построению)
 
+    // v0.18.0 (CDD №9): единый откат — снять mapped замаппингов [0, mapped)
+    // + free_contig блока. Для ошибок ДО маппинг-цикла mapped = 0.
+    const rollback = struct {
+        fn call(o: LoaderOps, p: u64, va: u64, mapped: u64, pa: u64, pages: u64, e: LoadError) LoadError!LoadedImage {
+            var j: u64 = 0;
+            while (j < mapped) : (j += 1) {
+                _ = o.unmap_user(p, va + j * PAGE_SIZE);
+            }
+            o.free_contig(pa, pages);
+            return e;
+        }
+    }.call;
+
     // 1. Заголовки (DOS + NT + таблица секций) — побайтовая копия
     const hdr_len = @min(@as(usize, image.sizeOfHeaders()), file.len);
-    if (hdr_len > soi) return LoadError.BadHeaders;
+    if (hdr_len > soi) return rollback(ops, pml4, base_va, 0, base_pa, n, LoadError.BadHeaders);
     @memcpy(backing[0..hdr_len], file[0..hdr_len]);
 
     // 2. Секции: RawData → по VirtualAddress (RVA)
@@ -231,11 +265,11 @@ pub fn loadImage(
         if (sec.size_of_raw_data == 0) continue; // чистый BSS — уже нули
         const dst: u64 = sec.virtual_address;
         if (dst + @as(u64, sec.size_of_raw_data) > soi) {
-            return LoadError.SectionOverflow;
+            return rollback(ops, pml4, base_va, 0, base_pa, n, LoadError.SectionOverflow);
         }
         const src: u64 = sec.pointer_to_raw_data;
         if (src + @as(u64, sec.size_of_raw_data) > file.len) {
-            return LoadError.BadHeaders;
+            return rollback(ops, pml4, base_va, 0, base_pa, n, LoadError.BadHeaders);
         }
         @memcpy(
             backing[dst..][0..sec.size_of_raw_data],
@@ -248,7 +282,7 @@ pub fn loadImage(
     while (i < n) : (i += 1) {
         const flags = pageFlagsAt(image, i * PAGE_SIZE);
         if (!ops.map_user(pml4, base_va + i * PAGE_SIZE, base_pa + i * PAGE_SIZE, flags)) {
-            return LoadError.MapFailed;
+            return rollback(ops, pml4, base_va, i, base_pa, n, LoadError.MapFailed);
         }
     }
 
@@ -477,12 +511,22 @@ fn loadFixture(comptime name: []const u8) ![]u8 {
 }
 
 /// Фейковое «физическое» пространство: bump-аллокатор + логер маппингов.
+/// v0.18.0 (CDD №9): + unmapUser (удаление MapRec по VA) + freeContig
+/// (откат курсора для хвостовой выделечки + счётчик свободождённых страниц)
+/// + инъекция сбоя маппинга fail_map_after (rollback-тесты).
 const FakePhys = struct {
     const MapRec = struct { va: u64, pa: u64, flags: u64 };
 
     mem: []u8,
     cursor: u64, // байтовый курсор (кратно 4096)
     maps: std.ArrayList(MapRec),
+    /// v0.18.0: инъекция сбоя — mapUser вернёт false, когда число уже
+    /// успешных маппингов достигнет порога (null = не сбивать).
+    fail_map_after: ?u64 = null,
+    /// v0.18.0: статистика rollback-путей (assert'ы тестов).
+    freed_calls: u64 = 0,
+    freed_pages: u64 = 0,
+    unmapped: u64 = 0,
 
     fn init(size: u64) !FakePhys {
         return .{
@@ -508,15 +552,46 @@ const FakePhys = struct {
     fn mapUser(self: *FakePhys, pml4: u64, va: u64, pa: u64, flags: u64) bool {
         if (va % PAGE_SIZE != 0 or pa % PAGE_SIZE != 0) return false;
         if (pa + PAGE_SIZE > self.mem.len) return false;
+        // v0.18.0: инъекция сбоя маппинга для rollback-тестов
+        if (self.fail_map_after) |thr| {
+            if (self.maps.items.len >= thr) return false;
+        }
         self.maps.append(.{ .va = va, .pa = pa, .flags = flags }) catch return false;
         _ = pml4;
         return true;
+    }
+    /// v0.18.0: снять маппинг по VA (первое вхождение) — зеркало VMM.
+    fn unmapUser(self: *FakePhys, pml4: u64, va: u64) bool {
+        for (self.maps.items, 0..) |m, idx| {
+            if (m.va == va) {
+                _ = self.maps.orderedRemove(idx);
+                self.unmapped += 1;
+                _ = pml4;
+                return true;
+            }
+        }
+        return false;
+    }
+    /// v0.18.0: free contiguous-блока. Хвостовой блок (top-of-bump) реально
+    /// возвращает память (курсор назад) — как PMM freeContiguousPages;
+    /// нет хвостовой — считаем_pages для assert'ов (реальный PMM умеет
+    /// оба случая, тестам достаточно инварианта «free вызван с теми же
+    /// base/count, что и alloc»).
+    fn freeContig(self: *FakePhys, base_pa: u64, count: u64) void {
+        const bytes = count * PAGE_SIZE;
+        if (base_pa + bytes == self.cursor) {
+            self.cursor = base_pa; // полный возврат хвоста bump-аллокатору
+        }
+        self.freed_calls += 1;
+        self.freed_pages += count;
     }
     fn ops(_: *FakePhys) LoaderOps {
         return .{
             .alloc_contig = allocContigClosure,
             .map_user = mapUserClosure,
             .page_ptr = pagePtrClosure,
+            .unmap_user = unmapUserClosure,
+            .free_contig = freeContigClosure,
         };
     }
     const allocContigClosure = struct {
@@ -532,6 +607,16 @@ const FakePhys = struct {
     const pagePtrClosure = struct {
         fn call(pa: u64) [*]u8 {
             return global_fake.?.mem.ptr + pa;
+        }
+    }.call;
+    const unmapUserClosure = struct {
+        fn call(pml4: u64, va: u64) bool {
+            return global_fake.?.unmapUser(pml4, va);
+        }
+    }.call;
+    const freeContigClosure = struct {
+        fn call(base_pa: u64, count: u64) void {
+            global_fake.?.freeContig(base_pa, count);
         }
     }.call;
 };
@@ -892,4 +977,94 @@ test "cdd8-reloc: синтетика — ABSOLUTE-паддинг пропуск�
     try testing.expectEqual(@as(u64, 1), stats.skipped_bounds); // за SOI — НЕ падение
     // Цель исправлена: 0x400000 + (0x140000000 − 0x400000) = 0x140000000
     try testing.expectEqual(@as(u64, 0x140000000), std.mem.readInt(u64, img.backing[0x1020..][0..8], .little));
+}
+
+// ============================================================================
+//  v0.18.0 (CDD №9 hardening): PMM-rollback при сбоях маппинга PE
+// ============================================================================
+
+test "rollback: mapRegion при сбое маппинга — unmap + free, PMM не течёт" {
+    const fp = try fakeSetup(16 << 20);
+    defer fakeTeardown(fp);
+    const cursor_before = fp.cursor;
+
+    // Сбой на 3-й странице 5-страничного региона
+    fp.fail_map_after = 2;
+    const r = mapRegion(fp.ops(), 0xDEAD000, 0x40000000, 5 * PAGE_SIZE, PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE);
+    try testing.expectError(LoadError.MapFailed, r);
+
+    // Инварианты отката: все частичные маппинги сняты, блок освобождён
+    try testing.expectEqual(@as(u64, 2), fp.unmapped);
+    try testing.expectEqual(@as(u64, 1), fp.freed_calls);
+    try testing.expectEqual(@as(u64, 5), fp.freed_pages);
+    try testing.expectEqual(@as(usize, 0), fp.maps.items.len);
+    // Хвостовой bump-блок реально возвращён: курсор на месте
+    try testing.expectEqual(cursor_before, fp.cursor);
+}
+
+test "rollback: loadImage при сбое маппинга посреди образа — полный откат" {
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try pe.Pe.parse(data);
+    const fp = try fakeSetup(64 << 20);
+    defer fakeTeardown(fp);
+    const cursor_before = fp.cursor;
+    const n = pageCount(image.sizeOfImage());
+
+    // Сбой на 4-й странице образа (curl.exe ~1.5МБ = сотни страниц)
+    fp.fail_map_after = 3;
+    const r = loadImage(fp.ops(), 0xDEAD000, &image, 0x140000000);
+    try testing.expectError(LoadError.MapFailed, r);
+
+    // 3 замапленных страницы сняты, весь блок образа освобождён
+    try testing.expectEqual(@as(u64, 3), fp.unmapped);
+    try testing.expectEqual(@as(u64, 1), fp.freed_calls);
+    try testing.expectEqual(n, fp.freed_pages);
+    try testing.expectEqual(@as(usize, 0), fp.maps.items.len);
+    try testing.expectEqual(cursor_before, fp.cursor); // bump-хвост возвращён
+}
+
+test "rollback: битый PE (SectionOverflow) — блок PMM освобождён" {
+    // Собираем битый образ в памяти: валидные заголовки + секция ВНЕ
+    // SizeOfImage → loadImage обязан откатить выделенный блок.
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try pe.Pe.parse(data);
+
+    // Мутируем копию секции .text: virtual_address за пределы образа.
+    // pe.Pe парсит поверх того же буфера — берём мутабельную копию данных.
+    var bad = data;
+    const text = image.sectionByName(".text").?;
+    const sec_hdr_off = @intFromPtr(text) - @intFromPtr(image.data.ptr);
+    std.mem.writeInt(u32, bad[sec_hdr_off + 12..][0..4], 0x7F000000, .little); // VA за SOI
+
+    const bad_image = try pe.Pe.parse(bad);
+    const fp = try fakeSetup(64 << 20);
+    defer fakeTeardown(fp);
+    const cursor_before = fp.cursor;
+
+    const r = loadImage(fp.ops(), 0xDEAD000, &bad_image, 0x140000000);
+    try testing.expectError(LoadError.SectionOverflow, r);
+
+    // Откат без маппингов (ошибка до цикла) — но блок PMM освобождён
+    try testing.expectEqual(@as(u64, 0), fp.unmapped);
+    try testing.expectEqual(@as(u64, 1), fp.freed_calls);
+    try testing.expectEqual(pageCount(image.sizeOfImage()), fp.freed_pages);
+    try testing.expectEqual(cursor_before, fp.cursor);
+}
+
+test "rollback: успешная загрузка НЕ трогает free-путь (нулевые счётчики)" {
+    const data = try loadFixture("testdata/curl.exe");
+    defer testing.allocator.free(data);
+    const image = try pe.Pe.parse(data);
+    const fp = try fakeSetup(64 << 20);
+    defer fakeTeardown(fp);
+
+    _ = try loadImage(fp.ops(), 0xDEAD000, &image, 0x140000000);
+
+    // Happy path: ни unmap, ни free — регион живёт у владельца
+    try testing.expectEqual(@as(u64, 0), fp.freed_calls);
+    try testing.expectEqual(@as(u64, 0), fp.freed_pages);
+    try testing.expectEqual(@as(u64, 0), fp.unmapped);
+    try testing.expect(fp.maps.items.len > 0);
 }

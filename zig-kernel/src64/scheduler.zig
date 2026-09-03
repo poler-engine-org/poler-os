@@ -38,6 +38,15 @@ pub const TaskPrivilege = enum(u2) {
     User = 3,
 };
 
+/// v0.18.0 (CDD №9): ABI пользовательского бинарника задачи. Win32 (PE)
+/// задачи ходят через фиксированные syscall-вектора #6/#7 (вход — трамплин
+/// win32_stubs); Linux (ELF) задачи — через стандартный Linux x86_64 RAX-ABI
+/// (номер в RAX, аргументы RDI/RSI/RDX/R10/R8/R9 — маршрутизация в hal).
+pub const TaskAbi = enum {
+    win32,
+    linux,
+};
+
 pub const Task = struct {
     id: usize,
     state: TaskState,
@@ -58,6 +67,8 @@ pub const Task = struct {
     // опаздывал за серверный TLS-таймаут (~10с) → FIN → bad decrypt-подобные
     // провалы. Парковка: сискол мгновенно возвращается, wake откладывается.
     wake_tick: u64 = 0,
+    /// v0.18.0 (CDD №9): syscall-ABI задачи (маршрутизация в hal.zig).
+    abi: TaskAbi = .win32,
 };
 
 pub var tasks: [MAX_TASKS]Task = undefined;
@@ -75,6 +86,22 @@ var last_reroute_key: u64 = 0;
 // Exported variables for assembly syscall_entry
 pub export var user_rsp: u64 = 0;
 pub export var current_kernel_stack: u64 = 0;
+
+/// v0.18.0 (CDD №9): 5/6-й аргументы Linux-syscall (user R8/R9). isr64.S
+/// сохраняет их в САМОМ начале syscall_entry — ДО затирания R8 номером
+/// (Win32-путь эти значения не читает — аддитивная запись, IF=0 от
+/// SYSCALL — атомарно). Читает hal.zig для Linux-маршрутизации.
+pub export var linux_arg5: u64 = 0;
+pub export var linux_arg6: u64 = 0;
+
+/// v0.18.0 (CDD №9): ABI текущей Ring-3 задачи — для syscall-маршрутизации
+/// (hal.zig): linux → linux_syscalls.dispatch (RAX-ABI), иначе Win32 #6/#7.
+/// Read-only эвристика: рассинк current_task_id не паникует — худший случай
+/// неверный маршрутиз (=-ENOSYS), а не kernel-halt (инвариант CDD №9).
+pub fn ownerAbiIsLinux() callconv(.C) bool {
+    if (current_task_id >= MAX_TASKS) return false;
+    return tasks[current_task_id].abi == .linux;
+}
 
 
 /// v0.12.0 (CDD №3): снапшот syscall-кадра активной задачи. isr64.S (путь

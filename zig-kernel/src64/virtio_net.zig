@@ -734,6 +734,24 @@ fn setupQueue(idx: u16, out_phys: *u64, out_desc: *u64, out_avail: *u64, out_use
     hal.Serial.puts(")\n");
 }
 
+/// v0.18.0 (CDD №9 hardening): чистая валидация элемента used-ring (DMA =
+/// ВРАЖДЕБНЫЙ вход). Возвращает индекс буфера (0..8) и безопасную длину
+/// кадра, либо null — и тогда буфер НЕ переиспользуется и НЕ ре-постится.
+pub fn validateRxElem(elem_id: u32, elem_len: u32) ?struct { k: u16, safe_len: usize } {
+    // 1) elem.id маскируется до 10 бит, но rx_bufs имеет всего 8 записей:
+    //    k >= 8 → OOB-индексация rx_bufs[k]/rx_posted[k] в postRxBuffer.
+    const k: u16 = @intCast(elem_id & 0x3FF);
+    if (k >= 8) return null;
+    // 2) Пустышки/мусор: 10Б virtio-hdr + минимум Ethernet-заголовок.
+    if (elem_len <= VNET_HDR_LEN + ETH_HDR_LEN) return null;
+    // 3) elem.len не ограничен (u32 от устройства): срез по frame_len мог
+    //    выйти за 4096Б физстраницу RX-буфера → OOB-чтение/парсинг чужой
+    //    памяти. safe_len жёстко зажат остатком страницы.
+    const frame_len: usize = @intCast(elem_len - VNET_HDR_LEN);
+    const safe_len: usize = @min(frame_len, 4096 - VNET_HDR_LEN);
+    return .{ .k = k, .safe_len = safe_len };
+}
+
 /// Пост RX-буфера k: WRITE-дескриптор + avail-ring запись + notify.
 /// ⚠ VirtIO-net legacy: кадр в буфере начинается с 10Б виртуального
 /// заголовка (flags/gso/csum) — данные Ethernet-кадра с buf+10!
@@ -849,17 +867,22 @@ pub fn pollRx() void {
         const elem = usedRingPtr(vn.rx_used)[vn.rx_last_used % QUEUE_SIZE];
         vn.rx_last_used +%= 1;
         const k: u16 = @intCast(elem.id & 0x3FF);
-        // ⚠ legacy: elem.len = 10Б hdr + кадр — Ethernet начинается с +10
-        if (k < 8 and elem.len > VNET_HDR_LEN + ETH_HDR_LEN) {
-            const frame_len: usize = @intCast(elem.len - VNET_HDR_LEN);
-            vn.rx_frames += 1; // v0.15.0: статистика
-            vn.rx_bytes += frame_len;
-            const buf: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(vn.rx_bufs[k])));
-            handleFrame(buf[VNET_HDR_LEN .. VNET_HDR_LEN + frame_len]);
-            handled_any = true;
+        // v0.18.0 (CDD №9 hardening): вся валидация DMA-элемента — в
+        // validateRxElem (тестируемая чистая функция). Битой id/длина →
+        // null: буфер не индексируется и НЕ ре-постится (ре-пост
+        // postRxBuffer(k) теперь строго внутри валидного k < 8 — раньше
+        // он стоял ВНЕ проверки и OOB-писал rx_bufs[k]/дескриптор).
+        if (k < 8) {
+            if (validateRxElem(elem.id, elem.len)) |ve| {
+                vn.rx_frames += 1; // v0.15.0: статистика
+                vn.rx_bytes += ve.safe_len;
+                const buf: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(vn.rx_bufs[ve.k])));
+                handleFrame(buf[VNET_HDR_LEN .. VNET_HDR_LEN + ve.safe_len]);
+                handled_any = true;
+            }
+            // ре-пост буфера — строго под проверкой k < 8
+            postRxBuffer(k);
         }
-        // ре-пост буфера
-        postRxBuffer(k);
     }
     if (handled_any) {
         // отложенные ACKи: по одному на соединение (после цикла приёма)
@@ -2057,4 +2080,43 @@ test "net: rtx-бэкофф — экспоненциальный рост с п�
     try testing.expectEqual(@as(u32, 40), rto2);
     rto2 = @min(rto2 * 2, RTO_MAX_TICKS);
     try testing.expectEqual(@as(u32, 80), rto2);
+}
+
+// ============================================================================
+//  v0.18.0 (CDD №9 hardening): RX-bounds против враждебного DMA
+// ============================================================================
+
+test "net: RX-bounds — битый elem.id (k >= 8) отбрасывается без ре-поста" {
+    // rx_bufs/rx_posted имеют 8 записей; elem.id маскируется до 10 бит.
+    // k=8..1023 → validateRxElem = null → буфер НЕ индексируется и НЕ
+    // ре-постится (v0.17: postRxBuffer(k) стоял ВНЕ проверки → OOB).
+    try testing.expect(validateRxElem(8, 1600) == null);
+    try testing.expect(validateRxElem(64, 1600) == null);
+    try testing.expect(validateRxElem(1023, 0xFFFF_FFFF) == null);
+    // Граничный валидный индекс 7 — проходит
+    try testing.expect(validateRxElem(7, 1600) != null);
+    try testing.expectEqual(@as(u16, 7), validateRxElem(7, 1600).?.k);
+    // Пустышки (len <= 10Б hdr + 14Б ETH) — кадра нет, ре-пост валидного k
+    try testing.expect(validateRxElem(0, 0) == null);
+    try testing.expect(validateRxElem(0, 24) == null);
+    try testing.expect(validateRxElem(3, VNET_HDR_LEN + ETH_HDR_LEN) == null);
+}
+
+test "net: RX-bounds — safe_len зажат остатком 4096Б физстраницы" {
+    // elem.len от устройства не ограничен: враждебный DMA может вернуть
+    // 0xFFFFFFFF — срез по frame_len вышел бы за RX-страницу. safe_len
+    // жёстко ограничен 4096 - VNET_HDR_LEN.
+    const huge = validateRxElem(0, 0xFFFF_FFFF).?;
+    try testing.expectEqual(@as(usize, 4096 - VNET_HDR_LEN), huge.safe_len);
+    try testing.expectEqual(@as(u16, 0), huge.k);
+    // Честный маленький кадр проходит как есть (len = hdr + 100Б данных)
+    const small = validateRxElem(2, @intCast(VNET_HDR_LEN + 100)).?;
+    try testing.expectEqual(@as(usize, 100), small.safe_len);
+    try testing.expectEqual(@as(u16, 2), small.k);
+    // Ровно страница: 10Б hdr + 4086Б данных — не обрезается
+    const exact = validateRxElem(5, @intCast(VNET_HDR_LEN + (4096 - VNET_HDR_LEN))).?;
+    try testing.expectEqual(@as(usize, 4096 - VNET_HDR_LEN), exact.safe_len);
+    // Стандартный MTU-кадр не задевается харденингом
+    const mtu = validateRxElem(1, @intCast(VNET_HDR_LEN + 1500)).?;
+    try testing.expectEqual(@as(usize, 1500), mtu.safe_len);
 }

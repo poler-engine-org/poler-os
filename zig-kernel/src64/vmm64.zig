@@ -299,6 +299,49 @@ pub fn mapPageInPML4(target_pml4_phys: u64, virt: u64, phys: u64, flags: u64) !v
     // No invlpg needed — this PML4 is not the active CR3 yet
 }
 
+/// v0.18.0 (CDD №9 hardening): снять маппинг страницы в УКАЗАННОМ PML4
+/// (зеркало mapPageInPML4 — для PMM-rollback при сбоях загрузки PE).
+/// Освобождает опустевшие промежуточные таблицы (PT→PD→PDPT) обратно в
+/// PMM — иначе rollback образа утекал бы страницами таблиц страниц.
+/// Invlpg не нужен: target-PML4 не активный CR3 (задача ещё не запущена).
+pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!void {
+    if (virt % PAGE_SIZE != 0) return VmmError.InvalidAddress;
+
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pt_idx = (virt >> 12) & 0x1FF;
+
+    const pml4: [*]volatile u64 = @ptrFromInt(target_pml4_phys);
+    if (pml4[pml4_idx] & PTE_PRESENT == 0) return;
+    const pdpt_phys = pml4[pml4_idx] & 0x000FFFFFFFFFF000;
+
+    const pdpt: [*]volatile u64 = @ptrFromInt(pdpt_phys);
+    if (pdpt[pdpt_idx] & PTE_PRESENT == 0) return;
+    const pd_phys = pdpt[pdpt_idx] & 0x000FFFFFFFFFF000;
+
+    const pd: [*]volatile u64 = @ptrFromInt(pd_phys);
+    if (pd[pd_idx] & PTE_PRESENT == 0) return;
+    const pt_phys = pd[pd_idx] & 0x000FFFFFFFFFF000;
+
+    const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
+    pt[pt_idx] = 0;
+
+    // Освобождение опустевших таблиц снизу вверх (как unmapPage)
+    if (isTableEmpty(pt_phys)) {
+        pmm.freePage(pt_phys);
+        pd[pd_idx] = 0;
+        if (isTableEmpty(pd_phys)) {
+            pmm.freePage(pd_phys);
+            pdpt[pdpt_idx] = 0;
+            if (isTableEmpty(pdpt_phys)) {
+                pmm.freePage(pdpt_phys);
+                pml4[pml4_idx] = 0;
+            }
+        }
+    }
+}
+
 // ─── v0.11.0 (CDD-цикл №2): валидация user-указателей из ядра ──────────────
 
 /// Identity-чтение 64-бит из физ. адреса (0-4ГБ — диапазон identity-маппинга

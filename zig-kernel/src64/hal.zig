@@ -1312,6 +1312,20 @@ pub fn initSyscalls(handler_addr: u64) void {
 pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
     // arg3/arg4/arg5 — позиционные rdx/rcx/r9: для syscall №6 это Win64-аргументы
 
+    // v0.18.0 (CDD №9): Linux POSIX-слой. Если текущая задача — Linux-ABI
+    // (ELF/Starnix), ВСЕ syscall'ы идут по Linux x86_64 конвенции: номер в
+    // RAX (syscall_num), аргументы RDI/RSI/RDX/R10 (позиционные arg1-4);
+    // user R8/R9 колбэк читает сам из scheduler.linux_arg5/6 (asm-вход).
+    // Win32-задачи не заходят сюда — АБИ решается ДО легаси-свича
+    // (Linux SYS_write=1 коллидит с легаси-вектором «print» №1).
+    if (taskAbiLinuxCallback) |is_linux| {
+        if (is_linux()) {
+            if (linuxSyscallCallback) |cb| {
+                return cb(syscall_num, arg1, arg2, arg3, arg4);
+            }
+        }
+    }
+
     // Re-enable interrupts — syscall clears IF via SFMASK, but we need
     // timer interrupts to fire for preemptive scheduling. IF will be
     // restored from R11 on sysretq anyway.
@@ -1418,6 +1432,13 @@ pub var win32SyscallCallback: ?*const fn (entry_id: u64, a1: u64, a2: u64, a3: u
 // v0.12.0 (CDD №3): syscall #7 — trampoline Win64-колбэка (InitOnce) отчитался:
 // (cookie, результат). Возврат попадает в RAX восстановленного исходного syscall'а.
 pub var win32CbDoneCallback: ?*const fn (cookie: u64, result: u64) u64 = null;
+
+/// v0.18.0 (CDD №9): Linux POSIX RAX-ABI маршрутизация. Linux-задачи
+/// (ELF, Starnix-модель) шлют номер syscall в RAX: hal решает АБИ ДО
+/// легаси-свич (Linux SYS_write=1 коллидит с легаси-вектором «print»).
+/// Регистрируется из main64 (разрывает цикл hal↔main64/scheduler).
+pub var taskAbiLinuxCallback: ?*const fn () callconv(.C) bool = null;
+pub var linuxSyscallCallback: ?*const fn (num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 = null;
 
 // int3 CDD callback — registered by main64. Вызывается из handleException
 // для вектора 3 (#BP) ПЕРВЫМ: если адрес принадлежит стабу win32_stubs,

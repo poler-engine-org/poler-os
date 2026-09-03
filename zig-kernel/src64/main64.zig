@@ -32,6 +32,7 @@ const pe = @import("pe.zig");
 const win32 = @import("win32_stubs.zig");
 const pe_loader = @import("pe_loader.zig");
 const win32_api = @import("win32_api.zig");
+const linux_syscalls = @import("linux_syscalls.zig");
 const win32_crt = @import("win32_crt.zig");
 
 
@@ -343,10 +344,10 @@ fn print_banner() void {
     vga_setcolor(0x0B); // Cyan
     puts(
         \\╔══════════════════════════════════════════════════════╗
-        \\║           POLER-OS v0.17.0 (64-bit)                ║
+        \\║           POLER-OS v0.18.0 (64-bit)                ║
         \\║          Semantic Runtime Architecture              ║
         \\║                                                      ║
-        \\║   Zig Kernel · VirtIO-BLK · FAT32 RW · POLER Core  ║
+        \\║  Zig Kernel · VirtIO-BLK/NET · Linux POSIX (CDD №9) ║
         \\╚══════════════════════════════════════════════════════╝
         \\
     );
@@ -1032,6 +1033,10 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
 
+    // v0.18.0 (CDD №9): протокольная бут-печать цикла — свидетельствует в
+    // serial-логе, что образ собран с волной харденинга + Linux POSIX-слоем.
+    puts("[CDD9] v0.18.0: RX-bounds · validateRange ceiling · PMM rollback · Linux POSIX\n");
+
     puts("\nNext steps: Memory Manager (PMM/VMM) → Process Service → Intent Layer\n");
     puts("Timer: APIC periodic, tick count will increment in idle loop\n");
 
@@ -1050,6 +1055,10 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 8.58 (v0.12.0, CDD №3): syscall #7 — trampoline Win64-колбэка
     // (InitOnceExecuteOnce) отчитывается о завершении.
     hal.win32CbDoneCallback = &win32_api.callbackDone;
+    // 8.58b (v0.18.0, CDD №9): Linux POSIX-фундамент — маршрутизация RAX-ABI
+    // (Linux SYS_write=1 коллидит с легаси-вектором №1 — АБИ решаем до свича).
+    hal.taskAbiLinuxCallback = &scheduler.ownerAbiIsLinux;
+    hal.linuxSyscallCallback = &linuxSyscallEntry;
 
     // 8.6. Initialize Scheduler & Preemptive Multitasking
     scheduler.init();
@@ -1087,7 +1096,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.17.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.18.0 Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
@@ -1637,12 +1646,21 @@ const pe_env = [_]win32_crt.EnvEntry{
 
 /// LoaderOps-проводка kernel: PMM (обнулённые contiguous) + VMM user-маппинг +
 /// identity-указатели на физ. страницы (kernel VA == phys).
+/// v0.18.0 (CDD №9): + unmap_user (vmm.unmapPageInPML4) + free_contig
+/// (pmm.freeContiguousPages) — откат при сбоях маппинга PE-образа.
 fn pmmAllocContig(count: u64) ?u64 {
     return pmm.allocContiguousZeroed(count);
 }
 fn vmmMapUser(pml4: u64, va: u64, pa: u64, flags: u64) bool {
     vmm.mapPageInPML4(pml4, va, pa, flags) catch return false;
     return true;
+}
+fn vmmUnmapUser(pml4: u64, va: u64) bool {
+    vmm.unmapPageInPML4(pml4, va) catch return false;
+    return true;
+}
+fn pmmFreeContig(base_pa: u64, count: u64) void {
+    pmm.freeContiguousPages(base_pa, count);
 }
 fn identityPagePtr(pa: u64) [*]u8 {
     return @ptrFromInt(pa);
@@ -1652,7 +1670,183 @@ fn kernelLoaderOps() pe_loader.LoaderOps {
         .alloc_contig = pmmAllocContig,
         .map_user = vmmMapUser,
         .page_ptr = identityPagePtr,
+        .unmap_user = vmmUnmapUser,
+        .free_contig = pmmFreeContig,
     };
+}
+
+// ─── v0.18.0 (CDD №9): Linux POSIX-слой — kernel-runtime (LinuxOps) ────────
+
+/// Регион mmap для Linux-задач: 16ГБ, вне Win32-планировки (image 5ГБ,
+/// стабы 8ГБ, TEB/PEB 0x21…, стек 0x22…, heap 0x30…). Бюджет — 1ГБ.
+const PAGE_SIZE = vmm.PAGE_SIZE;
+const LINUX_MMAP_BASE: u64 = 0x40_0000_0000;
+const LINUX_MMAP_BUDGET: u64 = 0x4000_0000;
+var linux_mmap_cursor: u64 = LINUX_MMAP_BASE;
+const LINUX_MAX_VALIDATE: u64 = 64 * 1024 * 1024; // зеркало MAX_VALIDATE_LEN win32
+
+/// PML4 текущей Ring-3 задачи (ABI-независимо — работает и для будущих ELF).
+/// 0 = нет активного user-контекста (валидация откажет — безопасно).
+fn linuxTaskPml4() u64 {
+    const tid = scheduler.current_task_id;
+    if (tid >= scheduler.MAX_TASKS) return 0;
+    return scheduler.tasks[tid].cr3;
+}
+
+/// Валидация user-VA по PML4 текущей задачи: та же дисциплина, что
+/// win32_api.validateRange (v0.18.0 hardening): NULL-страница, u64-перенос
+/// va+len, канонический user-потолок, USER-бит каждого листа, W-бит.
+fn linuxValidate(va: u64, len: u64, want_write: bool) bool {
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return false;
+    if (len == 0) return true;
+    if (len > LINUX_MAX_VALIDATE) return false;
+    if (va < 0x1000) return false;
+    const sum = @addWithOverflow(va, len);
+    if (sum[1] != 0) return false;
+    if (sum[0] > linux_syscalls.USER_VA_CEILING) return false;
+    var off: u64 = 0;
+    while (off < len) {
+        const p = va + off;
+        const leaf = vmm.userLeafFlags(pml4, p) orelse return false;
+        if (leaf & vmm.PTE_USER == 0) return false;
+        if (want_write and (leaf & vmm.PTE_WRITABLE == 0)) return false;
+        off += PAGE_SIZE - (p & (PAGE_SIZE - 1));
+    }
+    return true;
+}
+
+/// Ядро → user: запись БАЙТОВ (uname). Вызывается ПОСЛЕ валидации слоем;
+/// CR3 задачи активен (syscall-транзакция) — прямой доступ по VA.
+fn linuxCopyOut(dst_va: u64, src: []const u8) bool {
+    if (src.len == 0) return true;
+    if (!linuxValidate(dst_va, src.len, true)) return false;
+    const p: [*]u8 = @ptrFromInt(dst_va);
+    @memcpy(p[0..src.len], src);
+    return true;
+}
+
+/// User C-строка → kernel slice (openat). Постраничная валидация по мере
+/// скана: пересечение границы страницы в НЕмапнутую зону — отказ EFAULT,
+/// а НЕ #PF в ядре (инвариант CDD №9: ноль паник от враждебного ввода).
+fn linuxCopyInStr(src_va: u64, max_len: u64) ?[]const u8 {
+    var n: u64 = 0;
+    while (n < max_len) {
+        const va = src_va + n;
+        // до конца текущей страницы (или max_len)
+        const in_page = PAGE_SIZE - (va % PAGE_SIZE);
+        const chunk = @min(in_page, max_len - n);
+        if (!linuxValidate(va, chunk, false)) return null;
+        const base: [*]const u8 = @ptrFromInt(va);
+        var i: u64 = 0;
+        while (i < chunk) : (i += 1) {
+            if (base[i] == 0) {
+                const start: [*]const u8 = @ptrFromInt(src_va);
+                return start[0..@intCast(n + i)];
+            }
+        }
+        n += chunk;
+    }
+    return null; // терминатора в границах max_len нет
+}
+
+/// write(fd, buf, count): фундамент — stdout/stderr → Serial-консоль ОС
+/// (зеркало kWriteConsole Win32-слоя). Linux fd-таблица — v0.19 (VFS-мост).
+fn linuxFdWrite(fd: i64, va: u64, count: u64) i64 {
+    if (fd != 1 and fd != 2) return -linux_syscalls.EBADF;
+    // буфер уже валидирован syscall-слоем; CR3 задачи активен
+    const p: [*]const u8 = @ptrFromInt(va);
+    hal.Serial.puts(p[0..@intCast(count)]);
+    return @intCast(count);
+}
+
+/// read(fd, buf, count): фундамент — stdin-моста ещё нет, честный -EBADF.
+fn linuxFdRead(fd: i64, va: u64, count: u64) i64 {
+    _ = fd;
+    _ = va;
+    _ = count;
+    return -linux_syscalls.EBADF;
+}
+
+/// openat(dirfd, path, flags): VFS-мост (FAT32) — v0.19; фундамент: -ENOENT.
+fn linuxFdOpenat(dirfd: i64, path: []const u8, flags: u64) i64 {
+    _ = dirfd;
+    _ = path;
+    _ = flags;
+    return -linux_syscalls.ENOENT;
+}
+
+/// mmap(hint, len, prot, flags): MAP_ANONYMOUS|PRIVATE — PMM-страницы в
+/// PML4 текущей задачи (RW+USER+NX; PROT_EXEC снимает NX). Сбой посреди
+/// маппинга — ОТКАТ (unmap + free) — та же дисциплина, что pe_loader.
+fn linuxDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
+    _ = hint;
+    _ = flags; // MAP_FIXED не поддержан фундаментом — ядро размещает само
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return -linux_syscalls.EFAULT;
+    if (len > LINUX_MMAP_BUDGET) return -linux_syscalls.ENOMEM;
+    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (linux_mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
+        return -linux_syscalls.ENOMEM;
+    const va = linux_mmap_cursor;
+    var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
+    if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        const pa = pmm.allocContiguousZeroed(1) orelse return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
+        vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, pa, pte) catch {
+            pmm.freeContiguousPages(pa, 1);
+            return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
+        };
+    }
+    linux_mmap_cursor += pages * PAGE_SIZE;
+    return @intCast(va);
+}
+
+fn linuxMmapRollback(pml4: u64, va: u64, mapped: u64, ret: i64) i64 {
+    var j: u64 = 0;
+    while (j < mapped) : (j += 1) {
+        vmm.unmapPageInPML4(pml4, va + j * PAGE_SIZE) catch {};
+    }
+    return ret;
+}
+
+/// exit(status): завершение текущей задачи — тот же путь, что syscall #4
+/// (kill + невозврат; планировщик больше не диспетчеризирует задачу).
+fn linuxDoExit(code: u64) void {
+    hal.Serial.puts("[LINUX] exit(");
+    hal.Serial.putDecimal(code);
+    hal.Serial.puts(") — killing user process\n");
+    scheduler.exitCurrentTask();
+    while (true) {
+        asm volatile ("pause");
+    }
+}
+
+fn kernelLinuxOps() linux_syscalls.LinuxOps {
+    return .{
+        .validate = linuxValidate,
+        .copy_out = linuxCopyOut,
+        .copy_in_str = linuxCopyInStr,
+        .fd_write = linuxFdWrite,
+        .fd_read = linuxFdRead,
+        .fd_openat = linuxFdOpenat,
+        .do_mmap = linuxDoMmap,
+        .do_exit = linuxDoExit,
+    };
+}
+
+/// hal.linuxSyscallCallback: Linux x86_64 RAX-ABI. Аргументы №5/№6 (user
+/// R8/R9) читаем из scheduler-глобалов (asm-вход сохранил ДО затирания).
+fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
+    return linux_syscalls.dispatch(kernelLinuxOps(), num, .{
+        .a1 = a1,
+        .a2 = a2,
+        .a3 = a3,
+        .a4 = a4,
+        .a5 = scheduler.linux_arg5,
+        .a6 = scheduler.linux_arg6,
+    });
 }
 
 /// v0.11.0 (CDD №2): калибровка TSC для QueryPerformanceFrequency —

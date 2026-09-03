@@ -233,6 +233,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
+    // 64-bit Linux POSIX syscall-layer tests (v0.18.0, CDD №9): syscall-
+    // таблица x86_64, errno-ABI, uname/utsname, валидация враждебных
+    // user-VA (EFAULT-инвариант: ноль паник) — LinuxOps-инъекция
+    const linux_syscalls_tests = b.addTest(.{
+        .root_source_file = b.path("src64/linux_syscalls.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
     const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
@@ -244,6 +253,7 @@ pub fn build(b: *std.Build) void {
     const run_win32_crt_tests = b.addRunArtifact(win32_crt_tests);
     const run_enroll_gate_tests = b.addRunArtifact(enroll_gate_tests);
     const run_virtio_net_tests = b.addRunArtifact(virtio_net_tests);
+    const run_linux_syscalls_tests = b.addRunArtifact(linux_syscalls_tests);
 
     const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader + Win32/CRT core + Enrollment-Gate)");
     test_step.dependOn(&run_poler_core32_tests.step);
@@ -256,6 +266,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_win32_crt_tests.step);
     test_step.dependOn(&run_enroll_gate_tests.step);
     test_step.dependOn(&run_virtio_net_tests.step);
+    test_step.dependOn(&run_linux_syscalls_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{

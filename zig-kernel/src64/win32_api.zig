@@ -398,11 +398,22 @@ pub fn syscallDispatch(entry_id: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
 /// Walk таблиц PML4 процесса: каждая страница диапазона обязана быть present
 /// и USER (иначе это не память приложения — kernel-VA/подделка → отказ).
 /// Постраничная гранулярность: диапазон может пересекать границы страниц.
-fn validateRange(va: u64, len: u64, want_write: bool) bool {
+/// v0.18.0 (CDD №9 hardening): во-первых, проверка переполнения сложения
+/// `va + len` через @addWithOverflow (враждебный Ring-3 мог передать
+/// va=0x7FFF_FFFF_FFFF, len=0x1000 → перенос в kernel-половину и walk
+/// по kernel-VA); во-вторых, канонический потолок юзерспейса x86_64:
+/// конец диапазона обязан укладываться в 0x0000_7FFF_FFFF_FFFF (иначе
+/// sysretq/iretq на такой RIP/RSP = #GP в Ring 3 сразу на выходе).
+pub fn validateRange(va: u64, len: u64, want_write: bool) bool {
     const c = (crt.ctx orelse return false);
     if (len == 0) return true;
     if (len > MAX_VALIDATE_LEN) return false;
     if (va < 0x1000) return false; // NULL-страница — не бывает user-данных
+    // 1) va + len без переноса (u64-переполнение — отказ до walk)
+    const sum_ov = @addWithOverflow(va, len);
+    if (sum_ov[1] != 0) return false;
+    // 2) канонический user-потолок: sum <= 0x0000_7FFF_FFFF_FFFF
+    if (sum_ov[0] > 0x0000_7FFF_FFFF_FFFF) return false;
 
     var off: u64 = 0;
     while (off < len) {

@@ -433,11 +433,21 @@ isr_stub_table:
 .extern ucl_rsp
 .extern ucl_rip
 .extern ucl_rflags
+.extern linux_arg5             // v0.18.0 (CDD №9): user R8 — 5-й аргумент Linux-syscall
+.extern linux_arg6             // v0.18.0 (CDD №9): user R9 — 6-й аргумент Linux-syscall
 
 .global syscall_entry
 syscall_entry:
     // Save user RSP to user_rsp
     movq %rsp, user_rsp(%rip)
+
+    // v0.18.0 (CDD №9, Linux POSIX-фундамент): сохранить user R8/R9 —
+    // аргументы №5/№6 Linux x86_64 ABI — ДО затирания R8 номером syscall
+    // ниже. АДДИТИВНО: Win32-путь эти значения не читает (R8 перезаписы-
+    // вается movq %rax,%r8, R9 в Win64-конвенции — caller-saved/мусор),
+    // стек и транзакция НЕ затрагиваются, IF=0 от SYSCALL — атомарно.
+    movq %r8, linux_arg5(%rip)
+    movq %r9, linux_arg6(%rip)
 
     // v0.17.0 (CDD №8 p7-ship): вход по cks (как v0.16). Уроки p6: TSS.rsp0-
     // вход давал ДЕТЕРМИНИРОВАННЫЙ Ring-3 краш «call 0x200000283B» в CB-мосте
