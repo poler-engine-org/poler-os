@@ -21,7 +21,8 @@ import threading
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-KERNEL = os.path.join(REPO, "zig-kernel", "zig-out", "bin", "poler-os64")
+KERNEL = os.environ.get("POLER_KERNEL") or os.path.join(
+    REPO, "zig-kernel", "zig-out", "bin", "poler-os64")
 QEMU = os.path.join(REPO, "qemu-portable", "qemu-portable.sh")
 TESTDATA = os.path.join(REPO, "zig-kernel", "testdata")
 
@@ -174,7 +175,9 @@ class VM:
             "-initrd", self.initrd_path,
             "-display", "none",
             "-no-reboot",
-            "-chardev", "socket,id=ser0,path=%s,server=on,wait=off" % self.ser_sock_path,
+            # wait=on: QEMU ждёт ПОДКЛЮЧЕНИЕ сокета ДО запуска ВМ — serial-лог
+            # с первого байта (ранний бут: PMM/VMM/PCI/VBLK/FAT32 не теряется)
+            "-chardev", "socket,id=ser0,path=%s,server=on,wait=on" % self.ser_sock_path,
             "-serial", "chardev:ser0",
             "-monitor", "unix:%s,server,nowait" % self.mon_sock_path,
             "-netdev", "user,id=n0",
@@ -194,7 +197,7 @@ class VM:
                 self._ser = s
                 break
             except (FileNotFoundError, ConnectionRefusedError):
-                time.sleep(0.2)
+                time.sleep(0.05)
         if self._ser is None:
             raise RuntimeError("serial socket не подключился")
         self._ser.setblocking(False)
