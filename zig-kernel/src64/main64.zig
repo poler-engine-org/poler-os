@@ -35,6 +35,7 @@ const win32_api = @import("win32_api.zig");
 const linux_syscalls = @import("linux_syscalls.zig");
 const drm_kms = @import("drm_kms.zig");
 const virtio_gpu = @import("virtio_gpu.zig");
+const evdev = @import("evdev.zig");
 const win32_crt = @import("win32_crt.zig");
 
 
@@ -1019,6 +1020,15 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     //     dumb-KMS поверх фреймбуфера бут-лоадера (GRUB/VBE) или VirtIO-GPU.
     drmBootInit();
 
+    // 9d. (v0.19.0, CDD №10 p2) Evdev: /dev/input/event0,1 + PS/2 мышь.
+    //     Ввод = файл: поток struct input_event (24Б), IRQ12 → вектор 44.
+    hal.initInputEvdev();
+    if (hal.initPs2Mouse()) {
+        puts("[PS2-MOUSE] enabled: 3-byte protocol, IRQ12 -> v44 (IO-APIC)\n");
+    } else {
+        puts("[PS2-MOUSE] not detected (headless QEMU — safe, IRQ12 idle)\n");
+    }
+
     // 8.7. Initialize and parse Initrd/CPIO modules
     // mb2: модуль из тега (GRUB ISO-загрузка); PVH: modlist[0] из
     // hvm_start_info (уже разобран в parsePvhStartInfo).
@@ -1216,6 +1226,8 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (e.g. peload curl.exe -k https://example.com)\n");
         sys_print("  drm       - DRM/KMS статус: скан-аут, dumb-буферы, flips (CDD #10)\n");
         sys_print("  drmtest   - DRM self-test: create→map→addfb→flip→destroy + тест-паттерн (E2E)\n");
+        sys_print("  input     - Evdev статус: /dev/input/event0,1 (очереди, дропы)\n");
+        sys_print("  inputtest - Evdev self-test: живые клавиши + синт. мышь (E2E)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
@@ -1261,6 +1273,10 @@ fn execute_command(cmd: []const u8) void {
         cmd_drm();
     } else if (eq(cmd, "drmtest")) {
         cmd_drmtest();
+    } else if (eq(cmd, "input")) {
+        cmd_input();
+    } else if (eq(cmd, "inputtest")) {
+        cmd_inputtest();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -2225,6 +2241,128 @@ fn cmd_drmtest() void {
     }
     sys_print("[DRMTEST] DESTROY_DUMB ok (PMM pages freed)\n");
     sys_print("[DRMTEST] ALL PASS\n");
+}
+
+// ─── v0.19.0 (CDD №10 p2): Evdev — команды input/inputtest ─────────────────
+
+/// cmd_input: статус устройств /dev/input/event0,1.
+fn cmd_input() void {
+    sys_print("[INPUT] /dev/input/event0 (kbd): pending=");
+    putDecimal(hal.evdev_kbd.pending());
+    sys_print(" delivered=");
+    putDecimal(hal.evdev_kbd.delivered);
+    sys_print(" dropped=");
+    putDecimal(hal.evdev_kbd.dropped);
+    sys_print("\n[INPUT] /dev/input/event1 (mouse): pending=");
+    putDecimal(hal.evdev_mouse.pending());
+    sys_print(" delivered=");
+    putDecimal(hal.evdev_mouse.delivered);
+    sys_print(" dropped=");
+    putDecimal(hal.evdev_mouse.dropped);
+    sys_print("\n");
+}
+
+/// cmd_inputtest: E2E-самотест evdev: ЖИВЫЕ клавиатурные события (набор
+/// самой команды уже сгенерировал их через PS/2-IRQ) + синтетическая мышь.
+fn cmd_inputtest() void {
+    sys_print("[INPUTTEST] begin: live keys + synthetic mouse\n");
+
+    // 1. Живые события: набор «inputtest» прошёл через handleKeyboard →
+    //    evdev_kbd. Очередь НЕ пуста.
+    const kbd_pending = hal.evdev_kbd.pending();
+    if (kbd_pending == 0) {
+        sys_print("[INPUTTEST] FAIL: kbd queue empty (no live events)\n");
+        return;
+    }
+    sys_print("[INPUTTEST] kbd queue: ");
+    putDecimal(@intCast(kbd_pending));
+    sys_print(" live events (PS/2 -> IRQ1 -> evdev)\n");
+
+    // 2. Дренаж всей очереди: валидация структуры (EV_KEY/EV_SYN, коды 1..57
+    //    или 103..108, value 0/1) + поиск букв «inputtest».
+    var events: [evdev.QUEUE_LEN]evdev.InputEvent = undefined;
+    const n = hal.evdev_kbd.drain(&events);
+    var saw_t = false;
+    var saw_e = false;
+    var malformed: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const ev = events[i];
+        switch (ev.type_) {
+            evdev.EV_KEY => {
+                const ok_code = (ev.code >= 1 and ev.code <= 57) or (ev.code >= 103 and ev.code <= 108);
+                const ok_val = ev.value == 0 or ev.value == 1;
+                if (!ok_code or !ok_val) malformed += 1;
+                if (ev.value == 1 and ev.code == 20) saw_t = true; // KEY_T
+                if (ev.value == 1 and ev.code == 18) saw_e = true; // KEY_E
+            },
+            evdev.EV_SYN => {
+                if (ev.code != 0 or ev.value != 0) malformed += 1;
+            },
+            else => malformed += 1,
+        }
+    }
+    if (malformed != 0) {
+        sys_print("[INPUTTEST] FAIL: malformed events: ");
+        putDecimal(@intCast(malformed));
+        sys_print("\n");
+        return;
+    }
+    sys_print("[INPUTTEST] drained+validated: ");
+    putDecimal(@intCast(n));
+    sys_print(" events, structure OK");
+    if (saw_t and saw_e) {
+        sys_print(", letters 't'/'e' seen (inputtest typed)");
+    }
+    sys_print("\n");
+
+    // 3. Пустая очередь + O_NONBLOCK → -EAGAIN (семантика read(2)).
+    //    ЖИВАЯ клавиатура дельтовая: release последней клавиши (Enter —
+    //    «запустившей» эту команду) приходит асинхронно ~35мс ПОСЛЕ press,
+    //    когда команда уже исполняется. Окно утихания 12 тиков (120мс) +
+    //    повторный дренаж — иначе честный EWAIT-тест гоняется с IRQ.
+    {
+        const t0 = hal.tick_count;
+        while (hal.tick_count < t0 + 12) {
+            asm volatile ("pause");
+        }
+        var discard: [evdev.QUEUE_LEN]evdev.InputEvent = undefined;
+        _ = hal.evdev_kbd.drain(&discard);
+    }
+    var rbuf: [evdev.EVENT_SIZE * 4]u8 = undefined;
+    if (hal.evdev_kbd.readBytes(&rbuf, true) != -linux_syscalls.EAGAIN) {
+        sys_print("[INPUTTEST] FAIL: EAGAIN on empty kbd\n");
+        return;
+    }
+    sys_print("[INPUTTEST] empty queue + O_NONBLOCK -> -EAGAIN ok\n");
+
+    // 4. Синтетическая мышь: REL_X/REL_Y/BTN_LEFT + SYN → чтение обратно
+    hal.evdev_mouse.pushRel(evdev.REL_X, 7);
+    hal.evdev_mouse.pushRel(evdev.REL_Y, -3);
+    hal.evdev_mouse.pushKey(evdev.BTN_LEFT, 1);
+    hal.evdev_mouse.pushSyn();
+    var mbuf: [evdev.EVENT_SIZE * 4]u8 = undefined;
+    const mbytes = hal.evdev_mouse.readBytes(&mbuf, false);
+    if (mbytes != 4 * evdev.EVENT_SIZE) {
+        sys_print("[INPUTTEST] FAIL: mouse read bytes=");
+        putDecimal(@intCast(mbytes));
+        sys_print("\n");
+        return;
+    }
+    // REL_X=7 — первое событие: value @20
+    const dx = std.mem.readInt(i32, mbuf[20..24], .little);
+    const dy = std.mem.readInt(i32, mbuf[evdev.EVENT_SIZE + 20 ..][0..4], .little);
+    if (dx != 7 or dy != -3) {
+        sys_print("[INPUTTEST] FAIL: mouse deltas dx=");
+        putDecimal(@intCast(dx));
+        sys_print(" dy=");
+        putDecimal(@intCast(dy));
+        sys_print("\n");
+        return;
+    }
+    sys_print("[INPUTTEST] synthetic mouse: REL_X=7 REL_Y=-3 BTN_LEFT roundtrip ok\n");
+
+    sys_print("[INPUTTEST] ALL PASS\n");
 }
 
 /// v0.11.0 (CDD №2): калибровка TSC для QueryPerformanceFrequency —

@@ -584,6 +584,10 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
             }
             handleKeyboard(frame);
         },
+        44 => {
+            // v0.19.0 (CDD №10 p2): PS/2 мышь (IO-APIC GSI 12 → сюда).
+            handleMouse();
+        },
         36 => handleSerial(frame),
         49 => {
             // v0.17.0 (CDD №8): virtio-blk — IO-APIC GSI диска маршрутизирован
@@ -758,9 +762,36 @@ fn handleKeyboard(frame: *InterruptFrame) void {
     // keyboard (not mouse AUX) data.
     const status = inb(0x64);
     if ((status & 0x01) == 0) return; // OBF clear — nothing to read
-    if ((status & 0x20) != 0) return; // AUX bit — mouse byte, skip
+    // v0.19.0 (CDD №10 p2): AUX-байт (мышь) — потребляем мышиным путём ПРЯМО
+    // (устойчивость: если IRQ12 не доставлен, мышиный байт не блокирует OBF
+    // и не глушит клавиатуру).
+    if ((status & 0x20) != 0) {
+        handleMouse();
+        return;
+    }
 
     const scan = inb(0x60);
+
+    // v0.19.0 (CDD №10 p2): evdev /dev/input/event0 — КАЖДЫЙ сканкод
+    // становится input_event (нажатие/отпускание/E0-расширенные). Прерывание
+    // = interrupt gate (IF=0) — атомарность push'а гарантирована.
+    {
+        const released = (scan & 0x80) != 0;
+        const base = scan & 0x7F;
+        if (kbd_extended) {
+            const code = evdev.set1ExtToKeyCode(base);
+            if (code != 0) {
+                evdev_kbd.pushKey(code, if (released) 0 else 1);
+                evdev_kbd.pushSyn();
+            }
+        } else {
+            const code = evdev.set1ToKeyCode(base);
+            if (code != 0) {
+                evdev_kbd.pushKey(code, if (released) 0 else 1);
+                evdev_kbd.pushSyn();
+            }
+        }
+    }
 
     // Debug: raw scancode на serial — ТОЛЬКО нажатия (bit7=release):
     // release-коды (0x9C от sendkey ret) печатались ВНУТРИ строк шелла
@@ -813,6 +844,135 @@ fn handleKeyboard(frame: *InterruptFrame) void {
             kbd_push(ch);
         }
     }
+}
+
+// ============================================================================
+// v0.19.0 (CDD №10 p2): Evdev — /dev/input/event0 (kbd) + /dev/input/event1 (mouse)
+// ============================================================================
+const evdev = @import("evdev.zig");
+
+/// Устройства-синглтоны evdev (push из IRQ, read — через Linux-fd слой шага 3).
+pub var evdev_kbd: evdev.Evdev = .{};
+pub var evdev_mouse: evdev.Evdev = .{};
+var mouse_btn_prev: u3 = 0;
+var mouse_pkt: [3]u8 = .{0} ** 3;
+var mouse_pkt_n: usize = 0;
+
+pub fn initInputEvdev() void {
+    evdev.initKeyboard(&evdev_kbd);
+    evdev.initMouse(&evdev_mouse);
+    Serial.puts("[EVDEV] /dev/input/event0 (PS/2 kbd) + /dev/input/event1 (PS/2 mouse)\n");
+}
+
+/// Ожидание OBF с таймаутом (спин — бут-контекст, TCG).
+fn waitObf() bool {
+    var spins: u32 = 0;
+    while (spins < 10_000_000) : (spins += 1) {
+        if ((inb(0x64) & 0x01) != 0) return true;
+        asm volatile ("pause");
+    }
+    return false;
+}
+
+/// Входной буфер 8042 пуст (контроллер ГОТОВ принять команду) — ОБЯЗАТЕЛЬНО
+/// перед КАЖДОЙ записью в 0x64/0x60, иначе команда теряется (эмпирика
+/// drm-smoke: потерянный 0xD4-префикс отправил 0xF6 КЛАВИАТУРЕ → reset).
+fn waitIbf() void {
+    var spins: u32 = 0;
+    while (spins < 10_000_000) : (spins += 1) {
+        if ((inb(0x64) & 0x02) == 0) return;
+        asm volatile ("pause");
+    }
+}
+
+/// Слить выходной буфер (устаревшие байты) — до 64.
+fn flushObf() void {
+    var n: usize = 0;
+    while (n < 64) : (n += 1) {
+        if ((inb(0x64) & 0x01) == 0) return;
+        _ = inb(0x60);
+    }
+}
+
+/// Сохранение IF (cli-окно для атомарных 8042-транзакций).
+fn irqSave() u64 {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; popq %[f]"
+        : [f] "=r" (flags)
+        ::
+        "memory");
+    cli();
+    return flags;
+}
+fn irqRestore(flags: u64) void {
+    if (flags & 0x200 != 0) sti(); // IF был включён — восстанавливаем
+}
+
+/// Команда aux-устройству (0xD4 + 0x60), ждём ACK 0xFA.
+fn auxCmd(cmd: u8) bool {
+    waitIbf();
+    outb(0x64, 0xD4);
+    waitIbf();
+    outb(0x60, cmd);
+    if (!waitObf()) return false;
+    const ack = inb(0x60);
+    return ack == 0xFA;
+}
+
+/// PS/2 мышь: включить aux-порт, IRQ12 в конфиге 8042, defaults + streaming.
+/// false = устройства нет (безопасно — IRQ12 не маршрутизируется).
+///
+/// АТОМАРНОСТЬ (критично, урок drm-smoke-гонки): ответ контроллера на
+/// «read config» (0x20) выглядит как клавиатурный байт (OBF без AUX-бита)
+/// → IRQ1/handleKeyboard КРАЛ его из-под waitObf → cfg читался из мусора
+/// → запись конфига ПОТЕРЯЛА бит6 (Set2→Set1 translation) → клавиатура
+/// сыпала Set2-сырцом («dxx» вместо «drm»). Лечение: cli-окно на всю
+/// последовательность + flushObf + waitIbf перед КАЖДОЙ записью + бит6
+/// принудительно сохраняется (ядро ожидает Set1-translation).
+pub fn initPs2Mouse() bool {
+    const flags = irqSave();
+    defer irqRestore(flags);
+
+    // 1. Enable auxiliary device (0xA8)
+    waitIbf();
+    outb(0x64, 0xA8);
+    // 2. Controller config: IRQ12 (bit1) + IRQ1 (bit0) вкл, часы вкл
+    //    (bit4/5 сняты), translation (bit6) — сохранён и принудительно 1.
+    flushObf(); // устаревших байтов нет — ответ 0x20 будет чистым
+    waitIbf();
+    outb(0x64, 0x20); // read config byte
+    if (!waitObf()) return false;
+    const cfg = inb(0x60);
+    waitIbf();
+    outb(0x64, 0x60); // write config byte
+    waitIbf();
+    outb(0x60, (cfg | 0x03) & ~@as(u8, 0x30) | 0x40);
+    // 3. Set defaults (0xF6) — 3-байтный протокол, 100 отсчётов/с
+    if (!auxCmd(0xF6)) return false;
+    // 4. Enable streaming (0xF4)
+    if (!auxCmd(0xF4)) return false;
+    return true;
+}
+
+/// Обработчик мышиных байтов (IRQ12 → вектор 44; и хвост-путь из IRQ1):
+/// 3-байтный пакет (byte0.bit3 = 1 — синхронизация потока) → evdev.
+pub fn handleMouse() void {
+    const status = inb(0x64);
+    if ((status & 0x01) == 0) return;
+    if ((status & 0x20) == 0) return; // не AUX — не наш байт
+    const b = inb(0x60);
+    // resync: первый байт пакета обязан иметь bit3=1 — иначе пропускаем
+    if (mouse_pkt_n == 0 and (b & 0x08) == 0) {
+        evdev_mouse.dropped += 1;
+        return;
+    }
+    mouse_pkt[mouse_pkt_n] = b;
+    mouse_pkt_n += 1;
+    if (mouse_pkt_n < 3) return;
+    mouse_pkt_n = 0;
+    const md = evdev.parseMousePacket(mouse_pkt[0], mouse_pkt[1], mouse_pkt[2]);
+    evdev.mousePacketToEvents(&evdev_mouse, md, mouse_btn_prev);
+    mouse_btn_prev = evdev.buttonsOf(md);
 }
 
 fn handleSerial(frame: *InterruptFrame) void {
@@ -1017,6 +1177,11 @@ pub const IOAPIC = struct {
         write(0x12, 33);
         write(0x13, 0);
         Serial.puts("[IOAPIC] Keyboard redirection configured (IRQ1 -> Vector 33)\n");
+        // v0.19.0 (CDD №10 p2): мышь — IRQ12 (GSI 12) → вектор 44.
+        // Редирект-таблица: IRQ n → рег-ры 0x10+2n (low) / 0x11+2n (high).
+        write(0x28, 44);
+        write(0x29, 0);
+        Serial.puts("[IOAPIC] Mouse redirection configured (IRQ12 -> Vector 44)\n");
     }
 };
 

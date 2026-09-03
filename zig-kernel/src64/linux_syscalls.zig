@@ -36,12 +36,14 @@ pub const SYS_openat: u64 = 257;
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EBADF: i64 = 9;
+pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EFAULT: i64 = 14;
 pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
 pub const ENODEV: i64 = 19;
 pub const EINVAL: i64 = 22;
+pub const ENOTTY: i64 = 25;
 pub const ENOSYS: i64 = 38;
 
 /// Кодирование ошибки в RAX: Linux возвращает -errno (u64-биткаст).
