@@ -1228,6 +1228,7 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  drmtest   - DRM self-test: create→map→addfb→flip→destroy + тест-паттерн (E2E)\n");
         sys_print("  input     - Evdev статус: /dev/input/event0,1 (очереди, дропы)\n");
         sys_print("  inputtest - Evdev self-test: живые клавиши + синт. мышь (E2E)\n");
+        sys_print("  ldevtest  - Linux POSIX-слой self-test: open/ioctl/poll/epoll/futex (E2E)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
@@ -1277,6 +1278,8 @@ fn execute_command(cmd: []const u8) void {
         cmd_input();
     } else if (eq(cmd, "inputtest")) {
         cmd_inputtest();
+    } else if (eq(cmd, "ldevtest")) {
+        cmd_ldevtest();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -1818,7 +1821,7 @@ fn linuxCopyInStr(src_va: u64, max_len: u64) ?[]const u8 {
         // до конца текущей страницы (или max_len)
         const in_page = PAGE_SIZE - (va % PAGE_SIZE);
         const chunk = @min(in_page, max_len - n);
-        if (!linuxValidate(va, chunk, false)) return null;
+        if (!linux_user_io.validate(va, chunk, false)) return null;
         const base: [*]const u8 = @ptrFromInt(va);
         var i: u64 = 0;
         while (i < chunk) : (i += 1) {
@@ -1832,30 +1835,158 @@ fn linuxCopyInStr(src_va: u64, max_len: u64) ?[]const u8 {
     return null; // терминатора в границах max_len нет
 }
 
-/// write(fd, buf, count): фундамент — stdout/stderr → Serial-консоль ОС
-/// (зеркало kWriteConsole Win32-слоя). Linux fd-таблица — v0.19 (VFS-мост).
-fn linuxFdWrite(fd: i64, va: u64, count: u64) i64 {
-    if (fd != 1 and fd != 2) return -linux_syscalls.EBADF;
+/// write(fd, buf, count): консоль — Serial ОС (зеркало kWriteConsole
+/// Win32-слоя). Семантический слой уже проверил fd = консоль.
+fn linuxDevWrite(va: u64, count: u64) i64 {
     // буфер уже валидирован syscall-слоем; CR3 задачи активен
     const p: [*]const u8 = @ptrFromInt(va);
     hal.Serial.puts(p[0..@intCast(count)]);
     return @intCast(count);
 }
 
-/// read(fd, buf, count): фундамент — stdin-моста ещё нет, честный -EBADF.
-fn linuxFdRead(fd: i64, va: u64, count: u64) i64 {
-    _ = fd;
-    _ = va;
-    _ = count;
-    return -linux_syscalls.EBADF;
+/// read(fd, buf, count): устройства ввода — ПОТОК input_event (24Б) прямо
+/// в user-буфер (CR3 задачи активен; readBytes пишет напрямую по VA).
+fn linuxDevRead(kind: linux_syscalls.FdKind, va: u64, count: u64, nonblock: bool) i64 {
+    const p: [*]u8 = @ptrFromInt(va);
+    const buf = p[0..@intCast(count)];
+    switch (kind) {
+        .input_event0 => return hal.evdev_kbd.readBytes(buf, nonblock),
+        .input_event1 => return hal.evdev_mouse.readBytes(buf, nonblock),
+        else => return -linux_syscalls.EIO,
+    }
 }
 
-/// openat(dirfd, path, flags): VFS-мост (FAT32) — v0.19; фундамент: -ENOENT.
-fn linuxFdOpenat(dirfd: i64, path: []const u8, flags: u64) i64 {
-    _ = dirfd;
-    _ = path;
-    _ = flags;
-    return -linux_syscalls.ENOENT;
+// ─── v0.19.0 (CDD №10 p3): user-IO-контекст (переключаемый) ────────────────
+//
+// Боевой режим: валидация по PML4 активной Ring-3 задачи (linuxValidate).
+// Режим ldevtest: валидация по .bss-тестовому буферу (ядро-самотест без
+// Ring-3 ELF-задачи: kernel-страницы без USER-бита PML4-валидацию не
+// проходят — самотест работает через буфер-«песочницу»).
+
+const LinuxUserIo = struct {
+    validate: *const fn (va: u64, len: u64, want_write: bool) bool,
+    copy_in: *const fn (dst: []u8, src_va: u64) bool,
+    copy_out: *const fn (dst_va: u64, src: []const u8) bool,
+};
+
+var linux_user_io: LinuxUserIo = .{
+    .validate = linuxValidate,
+    .copy_in = linuxCopyIn,
+    .copy_out = linuxCopyOut,
+};
+
+/// Индирекция user-IO (переключаемая): kernelLinuxOps захватывает ЭТИ
+/// обёртки, чтобы переключение linux_user_io действовало и на семантический
+/// слой (validate/copy), а не только на dev-мосты.
+fn linuxUserIoValidate(va: u64, len: u64, want_write: bool) bool {
+    return linux_user_io.validate(va, len, want_write);
+}
+fn linuxUserIoCopyIn(dst: []u8, src_va: u64) bool {
+    return linux_user_io.copy_in(dst, src_va);
+}
+fn linuxUserIoCopyOut(dst_va: u64, src: []const u8) bool {
+    return linux_user_io.copy_out(dst_va, src);
+}
+
+/// User → ядро: копия БАЙТОВ (контр-направление linuxCopyOut).
+fn linuxCopyIn(dst: []u8, src_va: u64) bool {
+    if (dst.len == 0) return true;
+    if (!linuxValidate(src_va, dst.len, false)) return false;
+    const p: [*]const u8 = @ptrFromInt(src_va);
+    @memcpy(dst, p[0..dst.len]);
+    return true;
+}
+
+/// ioctl-мост: DRM/fb0 → drm_kms (UAPI-номера), evdev → evdev.ioctlEvdev.
+fn linuxDevIoctl(kind: linux_syscalls.FdKind, cmd: u32, arg: u64) i64 {
+    switch (kind) {
+        .fb0 => return drm_kms.fbIoctl(&drm_state, kernelDrmUserOps(), cmd, arg),
+        .dri_card0 => return drm_kms.drmIoctl(&drm_state, kernelDrmUserOps(), cmd, arg),
+        .input_event0, .input_event1 => {
+            // размер из IOC-бита cmd (≤ 1КБ); копируем в ядро-буфер,
+            // зовём evdev-обработчик, копируем назад
+            const size: usize = @intCast(@min((cmd >> 16) & 0x3FFF, @as(u32, @intCast(linux_ioctl_buf.len))));
+            if (size == 0 or !linux_user_io.copy_in(linux_ioctl_buf[0..size], arg))
+                return -linux_syscalls.EFAULT;
+            const dev: *evdev.Evdev = if (kind == .input_event0) &hal.evdev_kbd else &hal.evdev_mouse;
+            const r = evdev.ioctlEvdev(dev, cmd, linux_ioctl_buf[0..size]);
+            if (r < 0) return r;
+            if (!linux_user_io.copy_out(arg, linux_ioctl_buf[0..size])) return -linux_syscalls.EFAULT;
+            return r;
+        },
+        else => return -linux_syscalls.ENOTTY,
+    }
+}
+
+/// Буфер ioctl-копирования (evdev-команды ≤ 304Б + запас).
+var linux_ioctl_buf: [512]u8 align(16) = .{0} ** 512;
+
+/// DrmOps на user-IO-контексте: копии через переключаемый linux_user_io.
+fn kernelDrmUserOps() drm_kms.DrmOps {
+    return .{
+        .validate = linux_user_io.validate,
+        .copy_in = linux_user_io.copy_in,
+        .copy_out = linux_user_io.copy_out,
+        .alloc_pages = drmAllocPages,
+        .free_pages = drmFreePages,
+    };
+}
+
+/// Готовность устройств: POLLIN для input-очередей, POLLOUT для остального.
+fn linuxDevReady(kind: linux_syscalls.FdKind) u32 {
+    switch (kind) {
+        .input_event0 => return if (hal.evdev_kbd.pending() > 0) linux_syscalls.EPOLLIN else 0,
+        .input_event1 => return if (hal.evdev_mouse.pending() > 0) linux_syscalls.EPOLLIN else 0,
+        else => return linux_syscalls.EPOLLOUT,
+    }
+}
+
+/// mmap устройства: fb0 (linear-fb WC) / card0 (dumb-апертура). Требует
+/// АКТИВНОЙ Ring-3 задачи (её PML4); в shell-контексте — честный -ENODEV.
+fn linuxDevMmap(kind: linux_syscalls.FdKind, off: u64, len: u64, prot: u64) i64 {
+    _ = prot; // WC-бит для fb (видеопамять); NX для dumb (данные)
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return -linux_syscalls.ENODEV; // нет user-задачи
+    if (len > LINUX_MMAP_BUDGET) return -linux_syscalls.ENOMEM;
+    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (linux_mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
+        return -linux_syscalls.ENOMEM;
+    const va = linux_mmap_cursor;
+    switch (kind) {
+        .fb0 => {
+            if (off != 0) return -linux_syscalls.ENODEV; // только весь fb
+            if (!drmMapLinearFbUser(pml4, va, len)) return -linux_syscalls.ENOMEM;
+        },
+        .dri_card0 => {
+            // offset из MAP_DUMB (апертура) → dumb-буфер → физ. страницы
+            const buf = drm_kms.lookupAperture(&drm_state, off) orelse return -linux_syscalls.ENODEV;
+            if (buf.pages < pages) return -linux_syscalls.EINVAL; // Запрошено больше буфера
+            var i: u64 = 0;
+            while (i < pages) : (i += 1) {
+                const pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE;
+                vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, buf.phys + i * PAGE_SIZE, pte) catch {
+                    return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
+                };
+            }
+        },
+        else => return -linux_syscalls.ENODEV,
+    }
+    linux_mmap_cursor += pages * PAGE_SIZE;
+    return @intCast(va);
+}
+
+/// munmap(va, len): снятие страниц в PML4 задачи. Физ. страницы НЕ
+/// освобождаются (реестра маппингов нет — process-exit-cleanup = бэклог
+/// v0.20, уже в AGENT_STATE next_task).
+fn linuxDoMunmap(va: u64, len: u64) i64 {
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return 0; // нечего снимать
+    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+    }
+    return 0;
 }
 
 /// mmap(hint, len, prot, flags): MAP_ANONYMOUS|PRIVATE — PMM-страницы в
@@ -1905,23 +2036,73 @@ fn linuxDoExit(code: u64) void {
     }
 }
 
+/// exit_group: v0.19 — процесс = единственная задача (потоки прибудут с
+/// ELF-загрузчиком); путь идентичен exit.
+fn linuxDoExitGroup(code: u64) void {
+    hal.Serial.puts("[LINUX] exit_group(");
+    hal.Serial.putDecimal(code);
+    hal.Serial.puts(")\n");
+    linuxDoExit(code);
+}
+
+/// clone: ПОТОКИ ждут ELF-загрузчик (child-return-механика резюм-кадров —
+/// волна реальных Linux-процессов). Семантика/валидация — в слое, готово.
+fn linuxDoClone(flags: u64, stack: u64, tls: u64) i64 {
+    _ = flags;
+    _ = stack;
+    _ = tls;
+    hal.Serial.puts("[LINUX] clone: threads arrive with ELF-loader wave (semantic layer ready)\n");
+    return -linux_syscalls.ENOSYS;
+}
+
+/// futex-WAIT: слово уже сверено слоем; парковка — 1 тик (10мс) кооперативно
+/// (спин-фьютекс: glibc-мьютексы работают, честная блокировка — с потоками).
+fn linuxFutexPark(uaddr: u64, timeout_ms: u64, infinite: bool) i64 {
+    _ = uaddr;
+    const t0 = hal.tick_count;
+    const ticks = if (infinite) @as(u64, 1) else (timeout_ms + 9) / 10;
+    while (hal.tick_count < t0 + ticks) {
+        asm volatile ("pause");
+    }
+    return 0; // «разбужен» (или таймаут-модель: см. тесты слоя)
+}
+
+/// futex-WAKE: реестра парковок нет (потоки = ELF-волна) → 0 разбуженных.
+fn linuxFutexWake(uaddr: u64, n: u32) u32 {
+    _ = uaddr;
+    _ = n;
+    return 0;
+}
+
+/// fd-таблица Linux-процессов (v0.19: глобальная на слой — ELF-загрузчик
+/// размножит на задачу; контракты семантического слоя уже пер-таблиценные).
+var linux_fds: linux_syscalls.FdTable = linux_syscalls.FdTable.init();
+
 fn kernelLinuxOps() linux_syscalls.LinuxOps {
     return .{
-        .validate = linuxValidate,
-        .copy_out = linuxCopyOut,
+        .validate = linuxUserIoValidate,
+        .copy_out = linuxUserIoCopyOut,
+        .copy_in = linuxUserIoCopyIn,
         .copy_in_str = linuxCopyInStr,
-        .fd_write = linuxFdWrite,
-        .fd_read = linuxFdRead,
-        .fd_openat = linuxFdOpenat,
+        .dev_write = linuxDevWrite,
+        .dev_read = linuxDevRead,
+        .dev_ioctl = linuxDevIoctl,
+        .dev_ready = linuxDevReady,
+        .dev_mmap = linuxDevMmap,
         .do_mmap = linuxDoMmap,
+        .do_munmap = linuxDoMunmap,
         .do_exit = linuxDoExit,
+        .do_exit_group = linuxDoExitGroup,
+        .do_clone = linuxDoClone,
+        .futex_park = linuxFutexPark,
+        .futex_wake = linuxFutexWake,
     };
 }
 
 /// hal.linuxSyscallCallback: Linux x86_64 RAX-ABI. Аргументы №5/№6 (user
 /// R8/R9) читаем из scheduler-глобалов (asm-вход сохранил ДО затирания).
 fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
-    return linux_syscalls.dispatch(kernelLinuxOps(), num, .{
+    return linux_syscalls.dispatch(kernelLinuxOps(), &linux_fds, num, .{
         .a1 = a1,
         .a2 = a2,
         .a3 = a3,
@@ -2363,6 +2544,269 @@ fn cmd_inputtest() void {
     sys_print("[INPUTTEST] synthetic mouse: REL_X=7 REL_Y=-3 BTN_LEFT roundtrip ok\n");
 
     sys_print("[INPUTTEST] ALL PASS\n");
+}
+
+// ─── v0.19.0 (CDD №10 p3): ldevtest — самотест Linux device-слоя ───────────
+
+/// Песочница «user»-памяти для ядра-самотеста: .bss-буфер СТРАНИЧНОГО
+/// размера (copy_in_str сканирует страничными чанками до 4096Б — буфер
+/// меньше страницы отверг бы валидацию чанка; kernel-страницы без USER-бита
+/// не проходят PML4-валидацию — самотест переключает user-IO).
+var ldev_buf: [8192]u8 align(4096) = .{0} ** 8192;
+
+fn ldevValidate(va: u64, len: u64, want_write: bool) bool {
+    _ = want_write;
+    if (len > ldev_buf.len) return false;
+    const base: u64 = @intFromPtr(&ldev_buf);
+    return va >= base and va + len <= base + ldev_buf.len;
+}
+fn ldevCopyIn(dst: []u8, src_va: u64) bool {
+    if (!ldevValidate(src_va, dst.len, false)) return false;
+    const p: [*]const u8 = @ptrFromInt(src_va);
+    @memcpy(dst, p[0..dst.len]);
+    return true;
+}
+fn ldevCopyOut(dst_va: u64, src: []const u8) bool {
+    if (!ldevValidate(dst_va, src.len, true)) return false;
+    const p: [*]u8 = @ptrFromInt(dst_va);
+    @memcpy(p[0..src.len], src);
+    return true;
+}
+
+/// cmd_ldevtest: E2E-самотест Linux-POSIX графического слоя: openat → ioctl
+/// (DRM VERSION/CREATE_DUMB/MAP_DUMB/ADDFB/PAGE_FLIP) → read event0 (ЖИВЫЕ
+/// input_event!) → poll/epoll → futex → close. Маркеры [LDEVTEST] для e2e.
+fn cmd_ldevtest() void {
+    const L = linux_syscalls;
+    const ops = kernelLinuxOps();
+    const fds = &linux_fds;
+    const buf_va: u64 = @intFromPtr(&ldev_buf);
+
+    // переключаем user-IO на песочницу (CR3-путь остаётся для Ring-3)
+    const saved_io = linux_user_io;
+    linux_user_io = .{ .validate = ldevValidate, .copy_in = ldevCopyIn, .copy_out = ldevCopyOut };
+    defer linux_user_io = saved_io;
+
+    sys_print("[LDEVTEST] begin: open/ioctl/read/poll/epoll/futex/close\n");
+
+    // 1. write(1, …) — консоль через fd-таблицу
+    @memcpy(ldev_buf[0..5], "POLER");
+    const w = L.sysWrite(ops, fds, 1, buf_va, 5);
+    if (w != 5) {
+        sys_print("[LDEVTEST] FAIL: console write\n");
+        return;
+    }
+
+    // 2. openat("/dev/dri/card0") → fd
+    const path1 = buf_va + 0x100;
+    @memcpy(ldev_buf[0x100..0x10E], "/dev/dri/card0");
+    ldev_buf[0x10E] = 0;
+    const card_r: i64 = @bitCast(L.sysOpenat(ops, fds, L.AT_FDCWD, path1, 0, 0));
+    if (card_r < 3) {
+        sys_print("[LDEVTEST] FAIL: openat card0 (errno=");
+        putDecimal(@intCast(-card_r));
+        sys_print(")\n");
+        return;
+    }
+    const card: i64 = card_r;
+    sys_print("[LDEVTEST] openat /dev/dri/card0 -> fd ");
+    putDecimal(@intCast(card));
+    sys_print("\n");
+
+    // 3. ioctl VERSION (двухфазный протокол libdrm)
+    @memset(ldev_buf[0..64], 0);
+    if (L.sysIoctl(ops, fds, @intCast(card), drm_kms.DRM_IOCTL_VERSION, buf_va) != 0) {
+        sys_print("[LDEVTEST] FAIL: DRM VERSION\n");
+        return;
+    }
+    sys_print("[LDEVTEST] ioctl DRM_IOCTL_VERSION ok (poler-drm)\n");
+
+    // 4. CREATE_DUMB 64x64 → MAP_DUMB → ADDFB → PAGE_FLIP
+    var d: drm_kms.CreateDumb = .{ .width = 64, .height = 64, .bpp = 32 };
+    @memcpy(ldev_buf[0..@sizeOf(drm_kms.CreateDumb)], std.mem.asBytes(&d));
+    if (L.sysIoctl(ops, fds, @intCast(card), drm_kms.DRM_IOCTL_MODE_CREATE_DUMB, buf_va) != 0) {
+        sys_print("[LDEVTEST] FAIL: CREATE_DUMB\n");
+        return;
+    }
+    const gd: *const drm_kms.CreateDumb = @ptrCast(@alignCast(&ldev_buf));
+    const handle = gd.handle;
+    sys_print("[LDEVTEST] CREATE_DUMB ok: handle=");
+    putDecimal(handle);
+    sys_print("\n");
+
+    var m: drm_kms.MapDumb = .{ .handle = handle };
+    @memcpy(ldev_buf[0..@sizeOf(drm_kms.MapDumb)], std.mem.asBytes(&m));
+    if (L.sysIoctl(ops, fds, @intCast(card), drm_kms.DRM_IOCTL_MODE_MAP_DUMB, buf_va) != 0) {
+        sys_print("[LDEVTEST] FAIL: MAP_DUMB\n");
+        return;
+    }
+    const gm: *const drm_kms.MapDumb = @ptrCast(@alignCast(&ldev_buf));
+    const aperture = gm.offset;
+    sys_print("[LDEVTEST] MAP_DUMB ok: aperture=0x");
+    putHex(aperture);
+    sys_print("\n");
+
+    var f: drm_kms.FbCmd = .{ .handle = handle, .width = 64, .height = 64, .pitch = 256, .bpp = 32 };
+    @memcpy(ldev_buf[0..@sizeOf(drm_kms.FbCmd)], std.mem.asBytes(&f));
+    if (L.sysIoctl(ops, fds, @intCast(card), drm_kms.DRM_IOCTL_MODE_ADDFB, buf_va) != 0) {
+        sys_print("[LDEVTEST] FAIL: ADDFB\n");
+        return;
+    }
+    const gf: *const drm_kms.FbCmd = @ptrCast(@alignCast(&ldev_buf));
+    const fb_id = gf.fb_id;
+    var p: drm_kms.PageFlip = .{ .crtc_id = drm_kms.kmsIds()[0], .fb_id = fb_id };
+    @memcpy(ldev_buf[0..@sizeOf(drm_kms.PageFlip)], std.mem.asBytes(&p));
+    if (L.sysIoctl(ops, fds, @intCast(card), drm_kms.DRM_IOCTL_MODE_PAGE_FLIP, buf_va) != 0) {
+        sys_print("[LDEVTEST] FAIL: PAGE_FLIP\n");
+        return;
+    }
+    sys_print("[LDEVTEST] ADDFB + PAGE_FLIP ok\n");
+
+    // 5. mmap устройства в shell-контексте → честный -ENODEV (нет Ring-3
+    //    задачи; runtime-путь mapPageInPML4 активируется ELF-процессом)
+    const mm = L.sysMmap(ops, fds, 0, 4096, L.PROT_READ | L.PROT_WRITE, L.MAP_SHARED, @intCast(card), aperture);
+    if (mm != @as(u64, @bitCast(@as(i64, -L.ENODEV)))) {
+        sys_print("[LDEVTEST] FAIL: dev mmap expected ENODEV, got 0x");
+        putHex(mm);
+        sys_print("\n");
+        return;
+    }
+    sys_print("[LDEVTEST] dev mmap -> -ENODEV in shell ctx (Ring-3 path ready)\n");
+
+    // 6. openat("/dev/input/event0") + EVIOCGVERSION
+    const path2 = buf_va + 0x140;
+    @memcpy(ldev_buf[0x140..0x151], "/dev/input/event0");
+    ldev_buf[0x151] = 0;
+    const kfd_r: i64 = @bitCast(L.sysOpenat(ops, fds, L.AT_FDCWD, path2, 0, 0));
+    if (kfd_r < 4) {
+        sys_print("[LDEVTEST] FAIL: openat event0\n");
+        return;
+    }
+    const kfd: i64 = kfd_r;
+    @memset(ldev_buf[0..16], 0);
+    if (L.sysIoctl(ops, fds, @intCast(kfd), evdev.EVIOCGVERSION, buf_va) != 0) {
+        sys_print("[LDEVTEST] FAIL: EVIOCGVERSION\n");
+        return;
+    }
+    const evver = std.mem.readInt(i32, ldev_buf[0..4], .little);
+    if (evver != evdev.EV_VERSION) {
+        sys_print("[LDEVTEST] FAIL: evdev version readback\n");
+        return;
+    }
+    sys_print("[LDEVTEST] openat /dev/input/event0 + EVIOCGVERSION ok (1.0.1)\n");
+
+    // 7. read(event0): ЖИВЫЕ input_event'ы (набор команды их сгенерил);
+    //    fcntl O_NONBLOCK → дренаж до пустоты → -EAGAIN (release Enter
+    //    приходит асинхронно ~35мс ПОСЛЕ press — окно утихания как inputtest)
+    var live_events: u64 = 0;
+    const rb = L.sysRead(ops, fds, @intCast(kfd), buf_va, 24 * 4);
+    if (rb > 0) live_events = rb / 24;
+    if (L.sysFcntl(ops, fds, @intCast(kfd), L.F_SETFL, L.O_NONBLOCK) != 0) {
+        sys_print("[LDEVTEST] FAIL: fcntl F_SETFL\n");
+        return;
+    }
+    {
+        const t0 = hal.tick_count;
+        while (hal.tick_count < t0 + 12) {
+            asm volatile ("pause");
+        }
+        // дренаж до пустоты (живые события продолжают капать)
+        var guard: u32 = 0;
+        while (guard < 64) : (guard += 1) {
+            const dd = L.sysRead(ops, fds, @intCast(kfd), buf_va, 24 * 4);
+            if (dd == 0) break;
+            if (dd == @as(u64, @bitCast(@as(i64, -L.EAGAIN)))) break;
+            if (dd > 0) {
+                live_events += dd / 24;
+            } else break;
+        }
+    }
+    const again = L.sysRead(ops, fds, @intCast(kfd), buf_va, 24);
+    if (live_events > 0 and again != @as(u64, @bitCast(@as(i64, -L.EAGAIN)))) {
+        sys_print("[LDEVTEST] FAIL: EAGAIN after drain (got 0x");
+        putHex(again);
+        sys_print(")\n");
+        return;
+    }
+    sys_print("[LDEVTEST] read(event0): ");
+    putDecimal(@intCast(live_events));
+    sys_print(" live events, O_NONBLOCK drain -> -EAGAIN\n");
+
+    // 8. poll: card0 (POLLOUT) + event0 (POLLIN после дренажа — пусто)
+    var pfds = [_]L.PollFd{
+        .{ .fd = @intCast(card), .events = L.POLLOUT },
+        .{ .fd = @intCast(kfd), .events = L.POLLIN },
+    };
+    @memcpy(ldev_buf[0x200 .. 0x200 + 16], std.mem.sliceAsBytes(pfds[0..2]));
+    const pn = L.sysPoll(ops, fds, buf_va + 0x200, 2, 0);
+    if (pn < 1) {
+        sys_print("[LDEVTEST] FAIL: poll count\n");
+        return;
+    }
+    const pr: [*]const L.PollFd = @ptrCast(@alignCast(&ldev_buf[0x200]));
+    if (pr[0].revents & L.POLLOUT == 0) {
+        sys_print("[LDEVTEST] FAIL: poll card0 POLLOUT\n");
+        return;
+    }
+    sys_print("[LDEVTEST] poll ok: card0 POLLOUT ready\n");
+
+    // 9. epoll-троица: create → ctl ADD event0 → wait
+    const epfd_r: i64 = @bitCast(L.sysEpollCreate1(ops, fds, 0));
+    if (epfd_r < 5) {
+        sys_print("[LDEVTEST] FAIL: epoll_create1\n");
+        return;
+    }
+    const epfd: i64 = epfd_r;
+    var evb: [12]u8 = .{0} ** 12;
+    std.mem.writeInt(u32, evb[0..4], L.EPOLLIN, .little);
+    std.mem.writeInt(u64, evb[4..12], 0xCAFE, .little);
+    @memcpy(ldev_buf[0x300..0x30C], &evb);
+    if (L.sysEpollCtl(ops, fds, @intCast(epfd), L.EPOLL_CTL_ADD, @intCast(kfd), buf_va + 0x300) != 0) {
+        sys_print("[LDEVTEST] FAIL: epoll_ctl ADD\n");
+        return;
+    }
+    const en = L.sysEpollWait(ops, fds, @intCast(epfd), buf_va + 0x340, 4, 0);
+    if (en > 0) {
+        // если после дренажа нажатие Enter-release пришло — валидно
+        const eevents = std.mem.readInt(u32, ldev_buf[0x340..0x344], .little);
+        if (eevents & L.EPOLLIN == 0) {
+            sys_print("[LDEVTEST] FAIL: epoll event mask\n");
+            return;
+        }
+    }
+    sys_print("[LDEVTEST] epoll create+ctl+wait ok (");
+    putDecimal(@intCast(en));
+    sys_print(" events)\n");
+
+    // 10. futex: слово 7 в «user», WAIT(7) → парковка 1 тик → 0;
+    //     WAIT(8) → -EAGAIN (слово не совпало); WAKE → 0
+    const futex_va = buf_va + 0x380;
+    std.mem.writeInt(u32, ldev_buf[0x380..0x384], 7, .little);
+    if (L.sysFutex(ops, futex_va, L.FUTEX_WAIT | L.FUTEX_PRIVATE_FLAG, 7, 0) != 0) {
+        sys_print("[LDEVTEST] FAIL: futex WAIT matched\n");
+        return;
+    }
+    if (L.sysFutex(ops, futex_va, L.FUTEX_WAIT, 8, 0) != @as(u64, @bitCast(@as(i64, -L.EAGAIN)))) {
+        sys_print("[LDEVTEST] FAIL: futex WAIT mismatch EAGAIN\n");
+        return;
+    }
+    _ = L.sysFutex(ops, futex_va, L.FUTEX_WAKE, 1, 0);
+    sys_print("[LDEVTEST] futex WAIT/WAKE/EAGAIN semantics ok\n");
+
+    // 11. close всего + повторный close → EBADF
+    if (L.sysClose(ops, fds, @intCast(kfd)) != 0 or
+        L.sysClose(ops, fds, @intCast(epfd)) != 0 or
+        L.sysClose(ops, fds, @intCast(card)) != 0)
+    {
+        sys_print("[LDEVTEST] FAIL: close\n");
+        return;
+    }
+    if (L.sysClose(ops, fds, @intCast(card)) != @as(u64, @bitCast(@as(i64, -L.EBADF)))) {
+        sys_print("[LDEVTEST] FAIL: double close EBADF\n");
+        return;
+    }
+    sys_print("[LDEVTEST] close lifecycle ok\n");
+    sys_print("[LDEVTEST] ALL PASS\n");
 }
 
 /// v0.11.0 (CDD №2): калибровка TSC для QueryPerformanceFrequency —
