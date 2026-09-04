@@ -36,6 +36,7 @@ const linux_syscalls = @import("linux_syscalls.zig");
 const drm_kms = @import("drm_kms.zig");
 const virtio_gpu = @import("virtio_gpu.zig");
 const evdev = @import("evdev.zig");
+const vfs = @import("vfs.zig");
 const win32_crt = @import("win32_crt.zig");
 
 
@@ -1058,7 +1059,12 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         // v0.16.0 (CDD №7): VFS-мост Ring 3 — файлы initrd (curl.exe, 
         // cacert.pem) доступны PE-процессу через CreateFileA/fopen (RO-VFS)
         win32_api.initrd_archive = arch;
+        // v0.19.0 (CDD №10 p4): VFS Live-режима — initrd-RO (USB-контент) +
+        // tmpfs-оверлей (/tmp — запись в RAM): openat/read/write fd-слоем
+        vfsInit();
     } else {
+        // initrd нет — VFS всё равно поднимаем (tmpfs + devfs живут без него)
+        vfsInit();
         puts("[INITRD] No initrd modules loaded by bootloader.\n");
     }
 
@@ -2078,6 +2084,135 @@ fn linuxFutexWake(uaddr: u64, n: u32) u32 {
 /// размножит на задачу; контракты семантического слоя уже пер-таблиценные).
 var linux_fds: linux_syscalls.FdTable = linux_syscalls.FdTable.init();
 
+// ─── v0.19.0 (CDD №10 p4): VFS Live-режима (initrd-RO + tmpfs-RAM) ─────────
+
+/// Реестр открытых файлов VFS (file_id ↔ узел).
+const LinuxFile = struct {
+    used: bool = false,
+    kind: linux_syscalls.FdKind = .free,
+    tmp: ?*vfs.TmpFile = null, // для tmpfs_file
+    initrd_data: ?[]const u8 = null, // для initrd_file
+};
+var linux_files: [linux_syscalls.MAX_FILE_ID]LinuxFile = [_]LinuxFile{.{}} ** linux_syscalls.MAX_FILE_ID;
+
+fn vfsAlloc(n: usize) ?[*]u8 {
+    return heap.kmalloc(n);
+}
+fn vfsFree(ptr: [*]u8, n: usize) void {
+    _ = n; // heap64.kfree без размера (фраг-хип со своей меткой)
+    heap.kfree(ptr);
+}
+fn vfsInitrdFind(name: []const u8) ?[]const u8 {
+    return initrdFindFile(name);
+}
+fn kernelVfsOps() vfs.VfsOps {
+    return .{ .alloc = vfsAlloc, .free = vfsFree, .initrd_find = vfsInitrdFind };
+}
+/// Глобальный VFS Live-режима: /dev (устройства) + initrd-RO + /tmp (RAM).
+var kernel_vfs: vfs.Vfs = undefined;
+var kernel_vfs_ready = false;
+
+fn vfsInit() void {
+    kernel_vfs = vfs.Vfs.init(kernelVfsOps());
+    kernel_vfs_ready = true;
+    puts("[VFS] Live-mode VFS: /dev (devfs) + initrd (RO) + /tmp (tmpfs RAM overlay)\n");
+}
+
+/// open_file: VFS-резолв пути (normalizePath + overlay) → file_id.
+fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind) i64 {
+    if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    const write_mode = (flags & linux_syscalls.O_ACCMODE) != linux_syscalls.O_RDONLY;
+    const node = kernel_vfs.resolve(path, write_mode) catch |e| switch (e) {
+        vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
+        vfs.VfsError.ReadOnly => return -linux_syscalls.EPERM, // запись вне /tmp
+        vfs.VfsError.NoSpace => return -linux_syscalls.ENOMEM,
+        vfs.VfsError.TooManyFiles => return -linux_syscalls.ENOMEM,
+        vfs.VfsError.NameTooLong => return -linux_syscalls.EINVAL,
+        vfs.VfsError.BadPath => return -linux_syscalls.EINVAL,
+    };
+    // слот в реестре
+    var slot: ?usize = null;
+    for (&linux_files, 0..) |*f, i| {
+        if (!f.used) {
+            slot = i;
+            break;
+        }
+    }
+    const s = slot orelse return -linux_syscalls.EMFILE;
+    switch (node.kind) {
+        .tmpfs_file => {
+            linux_files[s] = .{ .used = true, .kind = .tmpfs_file, .tmp = node.tmp };
+            out_kind.* = .tmpfs_file;
+        },
+        .initrd_file => {
+            linux_files[s] = .{ .used = true, .kind = .initrd_file, .initrd_data = node.initrd_data };
+            out_kind.* = .initrd_file;
+        },
+        .dev => return -linux_syscalls.EINVAL, // /dev — уже разложено dev-резолвом слоя
+    }
+    return @intCast(s);
+}
+
+/// file_read: tmpfs (RAM) или initrd (USB-RO) → user-VA (валидация слоем).
+fn linuxFileRead(id: u32, off: u64, va: u64, count: u64) i64 {
+    if (id >= linux_files.len or !linux_files[id].used) return -linux_syscalls.EBADF;
+    const f = &linux_files[id];
+    if (f.kind == .tmpfs_file) {
+        const t = f.tmp orelse return -linux_syscalls.EIO;
+        var n: usize = 0;
+        // постраничная запись в user-VA (CR3 задачи активен; буфер валидирован)
+        var remain: u64 = count;
+        var o = off;
+        while (remain > 0 and n < count) {
+            var chunk_buf: [512]u8 = undefined;
+            const c: u64 = @min(remain, chunk_buf.len);
+            const got = kernel_vfs.tmp.read(t, o, chunk_buf[0..@intCast(c)]);
+            if (got == 0) break; // EOF
+            const p: [*]u8 = @ptrFromInt(va + n);
+            @memcpy(p[0..got], chunk_buf[0..got]);
+            n += got;
+            o += got;
+            remain -= got;
+        }
+        return @intCast(n);
+    }
+    // initrd-RO
+    const data = f.initrd_data orelse return -linux_syscalls.EIO;
+    if (off >= data.len) return 0; // EOF
+    const avail: u64 = @intCast(data.len - @as(usize, @intCast(off)));
+    const n: u64 = @min(count, avail);
+    const p: [*]u8 = @ptrFromInt(va);
+    const src: [*]const u8 = data.ptr + @as(usize, @intCast(off));
+    @memcpy(p[0..@intCast(n)], src[0..@intCast(n)]);
+    return @intCast(n);
+}
+
+/// file_write: только tmpfs (RAM — Live-модель «запись в RAM, чтение с USB»).
+fn linuxFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
+    if (id >= linux_files.len or !linux_files[id].used) return -linux_syscalls.EBADF;
+    const f = &linux_files[id];
+    if (f.kind != .tmpfs_file) return -linux_syscalls.EBADF;
+    const t = f.tmp orelse return -linux_syscalls.EIO;
+    // читаем user-VA чанками (валидация уже сделана слоем)
+    var n: u64 = 0;
+    var remain: u64 = count;
+    var o = off;
+    const p: [*]const u8 = @ptrFromInt(va);
+    while (remain > 0) {
+        var chunk_buf: [512]u8 = undefined;
+        const c: u64 = @min(remain, chunk_buf.len);
+        @memcpy(chunk_buf[0..@intCast(c)], p[@intCast(n)..][0..@intCast(c)]);
+        const got = kernel_vfs.tmp.write(t, o, chunk_buf[0..@intCast(c)]) catch |e| switch (e) {
+            vfs.VfsError.NoSpace => return if (n == 0) -linux_syscalls.ENOMEM else @as(i64, @intCast(n)),
+            else => return -linux_syscalls.EIO,
+        };
+        n += got;
+        o += got;
+        remain -= got;
+    }
+    return @intCast(n);
+}
+
 fn kernelLinuxOps() linux_syscalls.LinuxOps {
     return .{
         .validate = linuxUserIoValidate,
@@ -2096,6 +2231,9 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .do_clone = linuxDoClone,
         .futex_park = linuxFutexPark,
         .futex_wake = linuxFutexWake,
+        .open_file = linuxOpenFile,
+        .file_read = linuxFileRead,
+        .file_write = linuxFileWrite,
     };
 }
 
@@ -2805,7 +2943,61 @@ fn cmd_ldevtest() void {
         sys_print("[LDEVTEST] FAIL: double close EBADF\n");
         return;
     }
+    // 12. VFS Live-режима: initrd-RO (чтение с «USB») + tmpfs (запись в RAM)
+    //     — оверлей «запись в RAM, чтение с USB» (CDD №10 p4)
     sys_print("[LDEVTEST] close lifecycle ok\n");
+    {
+        // initrd-файл: открытие + чтение контента (путь АБСОЛЮТНЫЙ — VFS)
+        const ipath = buf_va + 0x400;
+        @memcpy(ldev_buf[0x400..0x40B], "/README.txt"); // 11 символов
+        ldev_buf[0x40B] = 0;
+        const ifd_r: i64 = @bitCast(L.sysOpenat(ops, fds, L.AT_FDCWD, ipath, 0, 0));
+        if (ifd_r < 3) {
+            sys_print("[LDEVTEST] FAIL: openat initrd README.txt\n");
+            return;
+        }
+        @memset(ldev_buf[0x500..0x540], 0);
+        const irn = L.sysRead(ops, fds, ifd_r, buf_va + 0x500, 32);
+        if (irn == 0) {
+            sys_print("[LDEVTEST] FAIL: initrd read EOF\n");
+            return;
+        }
+        // запись в initrd → -EBADF (RO)
+        if (L.sysWrite(ops, fds, ifd_r, buf_va, 3) != @as(u64, @bitCast(@as(i64, -L.EBADF)))) {
+            sys_print("[LDEVTEST] FAIL: initrd write must EBADF\n");
+            return;
+        }
+        _ = L.sysClose(ops, fds, ifd_r);
+        sys_print("[LDEVTEST] initrd-RO: open+read (USB), write->EBADF ok\n");
+
+        // tmpfs: создание записью, чтение — RAM roundtrip
+        const tpath = buf_va + 0x420;
+        @memcpy(ldev_buf[0x420..0x431], "/tmp/live-session"); // 17 символов
+        ldev_buf[0x431] = 0;
+        const tfd_r: i64 = @bitCast(L.sysOpenat(ops, fds, L.AT_FDCWD, tpath, L.O_RDWR, 0));
+        if (tfd_r < 3) {
+            sys_print("[LDEVTEST] FAIL: openat tmpfs\n");
+            return;
+        }
+        @memcpy(ldev_buf[0x600..0x60C], "RAM-WRITE!**"); // 12 символов
+        const twn = L.sysWrite(ops, fds, tfd_r, buf_va + 0x600, 10);
+        if (twn != 10) {
+            sys_print("[LDEVTEST] FAIL: tmpfs write\n");
+            return;
+        }
+        // чтение через ПОВТОРНОЕ открытие (offset 0)
+        const tfd2_r: i64 = @bitCast(L.sysOpenat(ops, fds, L.AT_FDCWD, tpath, L.O_RDONLY, 0));
+        @memset(ldev_buf[0x640..0x660], 0);
+        const trn = L.sysRead(ops, fds, tfd2_r, buf_va + 0x640, 16);
+        if (trn != 10 or !std.mem.eql(u8, ldev_buf[0x640..0x64A], "RAM-WRITE!")) {
+            sys_print("[LDEVTEST] FAIL: tmpfs read roundtrip\n");
+            return;
+        }
+        _ = L.sysClose(ops, fds, tfd_r);
+        _ = L.sysClose(ops, fds, tfd2_r);
+        sys_print("[LDEVTEST] tmpfs-RAM: create+write+read roundtrip ok\n");
+    }
+
     sys_print("[LDEVTEST] ALL PASS\n");
 }
 

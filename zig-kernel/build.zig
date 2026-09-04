@@ -280,6 +280,14 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
+    // 64-bit VFS tests (v0.19.0, CDD №10 p4): нормализация путей, tmpfs
+    // CRUD + лимиты, overlay-резолв (dev/RO-initrd/RW-tmpfs) — VfsOps-инъекция
+    const vfs_tests = b.addTest(.{
+        .root_source_file = b.path("src64/vfs.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
     const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
@@ -296,6 +304,7 @@ pub fn build(b: *std.Build) void {
     const run_drm_kms_tests = b.addRunArtifact(drm_kms_tests);
     const run_virtio_gpu_tests = b.addRunArtifact(virtio_gpu_tests);
     const run_evdev_tests = b.addRunArtifact(evdev_tests);
+    const run_vfs_tests = b.addRunArtifact(vfs_tests);
 
     const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader + Win32/CRT core + Enrollment-Gate)");
     test_step.dependOn(&run_poler_core32_tests.step);
@@ -313,6 +322,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_drm_kms_tests.step);
     test_step.dependOn(&run_virtio_gpu_tests.step);
     test_step.dependOn(&run_evdev_tests.step);
+    test_step.dependOn(&run_vfs_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{

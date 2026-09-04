@@ -215,7 +215,13 @@ pub const FdKind = enum {
     input_event0,
     input_event1,
     epoll,
+    /// Файл initrd (RO — Live-USB: чтение с USB).
+    initrd_file,
+    /// Файл tmpfs (RW — Live-USB: запись в RAM).
+    tmpfs_file,
 };
+
+pub const MAX_FILE_ID: u32 = 16; // реестр открытых файлов runtime
 
 /// Один наблюдаемый fd в epoll-инстансе.
 pub const EpollWatch = struct {
@@ -230,12 +236,21 @@ pub const MAX_WATCHES: usize = 12;
 pub const FdEntry = struct {
     kind: FdKind = .free,
     nonblock: bool = false,
+    /// Файловый дескриптор: идентификатор в реестре runtime (VFS).
+    file_id: u32 = 0,
+    /// Текущее смещение чтения/записи (Linux: последовательный I/O,
+    /// lseek — вне фундамента v0.19).
+    file_off: u64 = 0,
     // epoll-инстанс: список наблюдений
     watches: [MAX_WATCHES]EpollWatch = [_]EpollWatch{.{}} ** MAX_WATCHES,
     watch_count: usize = 0,
 
     pub fn used(self: *const FdEntry) bool {
         return self.kind != .free;
+    }
+
+    pub fn isFile(self: *const FdEntry) bool {
+        return self.kind == .initrd_file or self.kind == .tmpfs_file;
     }
 };
 
@@ -322,6 +337,14 @@ pub const LinuxOps = struct {
     futex_park: *const fn (uaddr: u64, timeout_ms: u64, infinite: bool) i64,
     /// futex-WAKE: число разбуженных.
     futex_wake: *const fn (uaddr: u64, n: u32) u32,
+    /// open_file: открыть файл VFS (initrd-RO/tmpfs-RW) по пути.
+    /// Возвращает файл-id ≥ 0 или -errno; kind возвращает через out_kind.
+    open_file: *const fn (path: []const u8, flags: u64, out_kind: *FdKind) i64,
+    /// file_read: чтение файла по id+offset в user-VA (валидация уже
+    /// сделана слоем). Возвращает байты или -errno.
+    file_read: *const fn (id: u32, off: u64, va: u64, count: u64) i64,
+    /// file_write: запись в файл (tmpfs) из user-VA.
+    file_write: *const fn (id: u32, off: u64, va: u64, count: u64) i64,
 };
 
 // ─── Аргументы syscall (единая структура для dispatch) ─────────────────────
@@ -341,7 +364,16 @@ pub const Args = struct {
 pub fn sysWrite(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64) u64 {
     if (count == 0) return 0;
     const e = fds.get(fd_i) orelse return err(EBADF);
-    if (e.kind != .console_out) return err(EBADF); // файлы/устройства: RO
+    // tmpfs-файл: RW (Live-USB — «запись в RAM»)
+    if (e.kind == .tmpfs_file) {
+        // ядро ЧИТАЕТ user-буфер: want_write=false
+        if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
+        const r = ops.file_write(e.file_id, e.file_off, buf_va, count);
+        if (r < 0) return @bitCast(r);
+        e.file_off += @intCast(r);
+        return @intCast(r);
+    }
+    if (e.kind != .console_out) return err(EBADF); // initrd: RO; файлы — только tmpfs
     // ядро ЧИТАЕТ user-буфер: want_write=false
     if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
     const r = ops.dev_write(buf_va, count);
@@ -361,6 +393,14 @@ pub fn sysRead(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64)
             if (r < 0) return @bitCast(r);
             return @intCast(r);
         },
+        .initrd_file, .tmpfs_file => {
+            // файл VFS: последовательное чтение (offset ведёт слой)
+            if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
+            const r = ops.file_read(e.file_id, e.file_off, buf_va, count);
+            if (r < 0) return @bitCast(r);
+            e.file_off += @intCast(r);
+            return @intCast(r);
+        },
         else => return err(EBADF), // консоль: входного пути нет (stdin)
     }
 }
@@ -378,7 +418,15 @@ pub fn sysOpenat(ops: LinuxOps, fds: *FdTable, dirfd_i: i64, path_va: u64, flags
                 if (fd < 0) return @bitCast(fd);
                 return @intCast(fd);
             }
-            return err(ENOENT); // файловый VFS-мост — вне фундамента v0.19
+            // VFS-файл (initrd-RO / tmpfs-RW — Live-USB overlay)
+            var kind: FdKind = .free;
+            const file_id = ops.open_file(path, flags, &kind);
+            if (file_id < 0) return @bitCast(file_id);
+            const fd = fds.allocFd(kind, (flags & O_NONBLOCK) != 0);
+            if (fd < 0) return @bitCast(fd);
+            fds.entries[@intCast(fd)].file_id = @intCast(file_id);
+            fds.entries[@intCast(fd)].file_off = 0;
+            return @intCast(fd);
         }
     }
     return err(EFAULT);
@@ -540,6 +588,8 @@ pub fn sysPoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, timeout: i6
                 if (mask & EPOLLERR != 0) rdy |= POLLERR;
             },
             .epoll => rdy = POLLOUT, // epoll-инстанс «готов» (wait-able)
+            .initrd_file => rdy = POLLIN, // RO-файл: читаем
+            .tmpfs_file => rdy = POLLIN | POLLOUT, // RAM-файл: RW
             .free => unreachable,
         }
         p.revents = p.events & rdy;
@@ -634,6 +684,8 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
         switch (e.kind) {
             .console_out, .fb0, .dri_card0, .epoll => rdy = EPOLLOUT,
             .input_event0, .input_event1 => rdy = ops.dev_ready(e.kind),
+            .initrd_file => rdy = EPOLLIN,
+            .tmpfs_file => rdy = EPOLLIN | EPOLLOUT,
             .free => unreachable,
         }
         const combined = w.events & (rdy | EPOLLERR | EPOLLHUP);
@@ -902,6 +954,84 @@ fn fakeFutexWake(uaddr: u64, n: u32) u32 {
     return @min(n, 2); // «разбудили» двоих (тест-модель)
 }
 
+/// Fake-реестр файлов VFS: 4 слота (tmpfs RW / initrd RO); ПОВТОРНОЕ
+/// открытие того же пути возвращает ТОТ ЖЕ файл (как настоящий VFS).
+const FakeFile = struct {
+    used: bool = false,
+    kind: FdKind = .free,
+    name: [64]u8 = .{0} ** 64,
+    name_len: usize = 0,
+    data: [128]u8 = .{0} ** 128,
+    size: usize = 0,
+};
+var g_files: [4]FakeFile = [_]FakeFile{.{}} ** 4;
+
+fn fakeOpenFile(path: []const u8, flags: u64, out_kind: *FdKind) i64 {
+    _ = flags;
+    const e = g_env.?;
+    e.open_path = path;
+    // повторное открытие → тот же файл (offset-состояние у fd-слоя своё)
+    for (&g_files, 0..) |*f, i| {
+        if (f.used and std.mem.eql(u8, f.name[0..f.name_len], path)) {
+            out_kind.* = f.kind;
+            return @intCast(i);
+        }
+    }
+    var slot: ?usize = null;
+    for (&g_files, 0..) |*f, i| {
+        if (!f.used) {
+            slot = i;
+            break;
+        }
+    }
+    const s = slot orelse return -EMFILE;
+    if (path.len > 64) return -EINVAL;
+    g_files[s].used = true;
+    if (std.mem.startsWith(u8, path, "/tmp/")) {
+        g_files[s].kind = .tmpfs_file;
+        out_kind.* = .tmpfs_file;
+    } else if (std.mem.eql(u8, path, "/etc/hostname")) {
+        g_files[s].kind = .initrd_file;
+        const content = "poler-live-host";
+        @memcpy(g_files[s].data[0..content.len], content);
+        g_files[s].size = content.len;
+        out_kind.* = .initrd_file;
+    } else if (std.mem.eql(u8, path, "/usr/bin/gamescope") or std.mem.eql(u8, path, "/README.txt")) {
+        g_files[s].kind = .initrd_file;
+        const content = "BINARY-PLACEHOLDER";
+        @memcpy(g_files[s].data[0..content.len], content);
+        g_files[s].size = content.len;
+        out_kind.* = .initrd_file;
+    } else {
+        g_files[s].used = false;
+        return -ENOENT;
+    }
+    @memcpy(g_files[s].name[0..path.len], path);
+    g_files[s].name_len = path.len;
+    return @intCast(s);
+}
+fn fakeFileRead(id: u32, off: u64, va: u64, count: u64) i64 {
+    if (id >= g_files.len or !g_files[id].used) return -EBADF;
+    const f = &g_files[id];
+    if (off >= f.size) return 0; // EOF
+    const n = @min(@as(usize, @intCast(count)), f.size - @as(usize, @intCast(off)));
+    if (!fakeCopyOut(va, f.data[@intCast(off)..][0..n])) return -EFAULT;
+    return @intCast(n);
+}
+fn fakeFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
+    if (id >= g_files.len or !g_files[id].used) return -EBADF;
+    const f = &g_files[id];
+    if (f.kind != .tmpfs_file) return -EBADF; // initrd: RO
+    const n: usize = @intCast(@min(count, 128));
+    var tmp: [128]u8 = undefined;
+    if (!fakeCopyIn(tmp[0..n], va)) return -EFAULT;
+    const end = @as(usize, @intCast(off)) + n;
+    if (end > 128) return -ENOMEM;
+    @memcpy(f.data[@intCast(off)..end], tmp[0..n]);
+    if (end > f.size) f.size = end;
+    return @intCast(n);
+}
+
 fn fakeOps() LinuxOps {
     return .{
         .validate = fakeValidate,
@@ -920,6 +1050,9 @@ fn fakeOps() LinuxOps {
         .do_clone = fakeDoClone,
         .futex_park = fakeFutexPark,
         .futex_wake = fakeFutexWake,
+        .open_file = fakeOpenFile,
+        .file_read = fakeFileRead,
+        .file_write = fakeFileWrite,
     };
 }
 
@@ -928,6 +1061,7 @@ fn envSetup() !*FakeEnv {
     e.* = try FakeEnv.init();
     @memset(e.mem, 0);
     g_env = e;
+    g_files = [_]FakeFile{.{}} ** 4; // чистый реестр файлов на каждый тест
     return e;
 }
 fn envTeardown(e: *FakeEnv) void {
@@ -1088,8 +1222,9 @@ test "linux: sys_openat — AT_FDCWD, путь существует/нет; пу
     try testing.expectEqual(@as(u64, 5), sysOpenat(ops, &fds, AT_FDCWD, path3, O_NONBLOCK, 0));
     try testing.expect(fds.entries[5].nonblock);
 
-    // Обычный файл → -ENOENT (VFS-мост вне фундамента)
-    const path4 = putStr(e, 0xC0, "/etc/hostname");
+    // Обычный файл БЕЗ VFS-записи (initrd-слой не монтирован в тесте) →
+    // VFS-мост вернёт -ENOENT — используем заведомо отсутствующий путь
+    const path4 = putStr(e, 0xC0, "/var/log/nothing");
     try testing.expectEqual(err(ENOENT), sysOpenat(ops, &fds, AT_FDCWD, path4, 0, 0));
 
     // Пустой путь → -EINVAL
@@ -1460,4 +1595,82 @@ test "linux: UAPI-якоря волны — pollfd 8Б, epoll_event 12Б (packed
     try testing.expectEqual(@as(u64, 0x800), O_NONBLOCK); // 0o4000
     try testing.expectEqual(@as(u64, 128), FUTEX_PRIVATE_FLAG);
     try testing.expectEqual(@as(u64, 0x10000), CLONE_THREAD);
+}
+
+// ─── Тесты: VFS-файлы (Live-USB overlay — CDD №10 p4) ──────────────────────
+
+test "linux: openat /tmp-файл → write → read roundtrip + смещение" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    const buf_va = FakeEnv.USER_BASE;
+
+    // открыли tmpfs-файл (создаётся открытием — O_CREAT-стиль);
+    // путь — в отдалённом буфере (записи теста идут по offset 0)
+    const path = putStr(e, 0x100, "/tmp/session.conf");
+    const fd = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDWR, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    try testing.expectEqual(FdKind.tmpfs_file, fds.entries[3].kind);
+
+    // write «POLER» + «-LIVE» — offset движется
+    @memcpy(e.vaPtr(buf_va).?[0..5], "POLER");
+    try testing.expectEqual(@as(u64, 5), sysWrite(ops, &fds, 3, buf_va, 5));
+    @memcpy(e.vaPtr(buf_va).?[0..5], "-LIVE");
+    try testing.expectEqual(@as(u64, 5), sysWrite(ops, &fds, 3, buf_va, 5));
+    try testing.expectEqual(@as(u64, 10), fds.entries[3].file_off);
+
+    // переоткрытие НЕ разделяет offset (новый file_id — новое состояние)
+    const fd2 = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDWR, 0);
+    try testing.expectEqual(@as(u64, 4), fd2);
+    try testing.expectEqual(@as(u64, 0), fds.entries[4].file_off);
+
+    // полное содержимое — через ВТОРОЕ открытие (его offset = 0);
+    // чистим ТОЛЬКО читаемый буфер (путь живёт в 0x100)
+    @memset(e.vaPtr(buf_va).?[0..64], 0);
+    try testing.expectEqual(@as(u64, 10), sysRead(ops, &fds, 4, buf_va, 64));
+    try testing.expectEqualStrings("POLER-LIVE", e.vaPtr(buf_va).?[0..10]);
+    // fd4 дошёл до конца → EOF (0)
+    try testing.expectEqual(@as(u64, 0), sysRead(ops, &fds, 4, buf_va, 64));
+    // fd3 тоже в конце (offset = 10 после записей)
+    try testing.expectEqual(@as(u64, 0), sysRead(ops, &fds, 3, buf_va, 64));
+    // частичное чтение со смещением — третье открытие
+    const fd5 = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDWR, 0);
+    try testing.expectEqual(@as(u64, 5), fd5);
+    try testing.expectEqual(@as(u64, 4), sysRead(ops, &fds, 5, buf_va, 4));
+    try testing.expectEqualStrings("POL", e.vaPtr(buf_va).?[0..3]);
+}
+
+test "linux: initrd-файл — RO-чтение с «USB»; запись → -EBADF" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    const buf_va = FakeEnv.USER_BASE;
+
+    const path = putStr(e, 0, "/etc/hostname");
+    const fd = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDONLY, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    try testing.expectEqual(FdKind.initrd_file, fds.entries[3].kind);
+
+    // чтение RO-файла (initrd-CPIO контент)
+    try testing.expectEqual(@as(u64, 15), sysRead(ops, &fds, 3, buf_va, 64));
+    try testing.expectEqualStrings("poler-live-host", e.vaPtr(buf_va).?[0..15]);
+
+    // ЗАПИСЬ в initrd → -EBADF (RO-fd: Linux-семантика)
+    @memcpy(e.vaPtr(buf_va).?[0..3], "XYZ");
+    try testing.expectEqual(err(EBADF), sysWrite(ops, &fds, 3, buf_va, 3));
+
+    // несуществующий файл → -ENOENT
+    const p404 = putStr(e, 0x40, "/var/log/nope");
+    try testing.expectEqual(err(ENOENT), sysOpenat(ops, &fds, AT_FDCWD, p404, 0, 0));
+
+    // poll: initrd-файл читаем (POLLIN), tmpfs — RW
+    var pfds = [_]PollFd{.{ .fd = 3, .events = POLLIN | POLLOUT }};
+    const pva = FakeEnv.USER_BASE + 0x200;
+    @memcpy(e.vaPtr(pva).?[0..8], std.mem.sliceAsBytes(pfds[0..1]));
+    _ = sysPoll(ops, &fds, pva, 1, 0);
+    const out: *const PollFd = @ptrCast(@alignCast(e.vaPtr(pva).?));
+    try testing.expectEqual(POLLIN, out.revents & POLLIN);
+    try testing.expectEqual(@as(i16, 0), out.revents & POLLOUT); // RO — писать нельзя
 }

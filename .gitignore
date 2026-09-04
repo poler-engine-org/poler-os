@@ -4,3 +4,4 @@ zig-kernel/zig-out/
 zig-kernel/.zig-cache/
 *.iso
 disk.img
+build/
