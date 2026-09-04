@@ -24,6 +24,8 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 KERNEL = os.environ.get("POLER_KERNEL") or os.path.join(
     REPO, "zig-kernel", "zig-out", "bin", "poler-os64")
 QEMU = os.path.join(REPO, "qemu-portable", "qemu-portable.sh")
+# Полный QEMU (virtio-gpu): qemu-full/qemu-full.sh (setup: setup-qemu-full.sh)
+QEMU_FULL = os.path.join(REPO, "qemu-full", "qemu-full.sh")
 TESTDATA = os.path.join(REPO, "zig-kernel", "testdata")
 
 
@@ -140,8 +142,10 @@ _SHIFT_KEYMAP = {
 
 class VM:
     def __init__(self, name, initrd, disk=None, mem="256M", timeout=180,
-                 extra_args=None, workdir=None):
+                 extra_args=None, workdir=None, qemu=None, display=None):
         self.name = name
+        self._qemu = qemu or QEMU
+        self._display = display
         self.workdir = workdir or os.path.join("/tmp", "poler-e2e-" + name)
         os.makedirs(self.workdir, exist_ok=True)
         self.initrd_path = os.path.join(self.workdir, "initrd.cpio")
@@ -169,11 +173,12 @@ class VM:
             if os.path.exists(p):
                 os.unlink(p)
         cmd = [
-            QEMU,
+            self._qemu,
             "-kernel", KERNEL,
             "-m", self.mem_size,
             "-initrd", self.initrd_path,
-            "-display", "none",
+            # display=None → без -display (например, -vnc :0 задаёт свой)
+            *([] if self._display is None else ["-display", self._display]),
             "-no-reboot",
             # wait=on: QEMU ждёт ПОДКЛЮЧЕНИЕ сокета ДО запуска ВМ — serial-лог
             # с первого байта (ранний бут: PMM/VMM/PCI/VBLK/FAT32 не теряется)

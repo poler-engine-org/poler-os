@@ -1237,6 +1237,7 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  inputtest - Evdev self-test: живые клавиши + синт. мышь (E2E)\n");
         sys_print("  ldevtest  - Linux POSIX-слой self-test: open/ioctl/poll/epoll/futex (E2E)\n");
         sys_print("  elfload   - ELF-процесс Linux-ABI: PT_LOAD+стек argc/argv/auxv → Ring 3\n");
+        sys_print("  gputest   - VirtIO-GPU vring скан-аут: паттерн НА ЭКРАН (CDD #11 p2, E2E)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
@@ -1294,6 +1295,8 @@ fn execute_command(cmd: []const u8) void {
         cmd_elfload("");
     } else if (eq(cmd, "elftest")) {
         cmd_elfload("elftest");
+    } else if (eq(cmd, "gputest")) {
+        cmd_gputest();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -2739,6 +2742,9 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
 var drm_state: drm_kms.DrmState = .{};
 /// Probe-результат VirtIO-GPU (null = устройства нет; норма для -vga std).
 var gpu_probe: ?virtio_gpu.GpuProbe = null;
+/// v0.20.0 (CDD №11 p2): vring-состояние + MMIO-конфиг (caps → BAR+offset).
+var gpu_vring: virtio_gpu.VringState = .{};
+var gpu_vring_cfg: ?virtio_gpu.VringConfig = null;
 /// Capability-карта probe (common/notify/device cfg для vring-волн).
 var gpu_caps: [virtio_gpu.MAX_CAPS]virtio_gpu.VirtioCap = [_]virtio_gpu.VirtioCap{.{}} ** virtio_gpu.MAX_CAPS;
 var gpu_caps_n: usize = 0;
@@ -2777,17 +2783,46 @@ fn drmBootInit() void {
         putHex(g.device_id);
         puts(" modern, caps=");
         putDecimal(@intCast(gpu_caps_n));
-        puts(" (common/notify/device cfg for vring waves)\n");
-        // 2D-скан-аут VirtIO-GPU: геометрию даст GET_DISPLAY_INFO через
-        // vring (следующие волны); пока регистрируем display-режим с
-        // дефолтом QEMU (1024x768) — probe подтверждён, вывод через fb.
-        drm_kms.initVirtioGpu(&drm_state, .{
-            .phys = 0,
-            .width = 1024,
-            .height = 768,
-            .pitch = 4096,
-            .bpp = 32,
-        });
+        puts("\n");
+
+        // v0.20.0 (CDD №11 p2): VRING — caps → MMIO-базисы → init →
+        // GET_DISPLAY_INFO → геометрия РЕАЛЬНОГО скан-аута
+        gpuVringSetup(g);
+
+        if (gpu_vring_cfg != null) {
+            if (virtio_gpu.getDisplayInfo(gpu_vring_cfg.?, &gpu_vring)) |pm| {
+                puts("[VIRTIO-GPU] GET_DISPLAY_INFO: scanout ");
+                putDecimal(pm.r.w);
+                puts("x");
+                putDecimal(pm.r.h);
+                puts(" enabled — vring roundtrip OK\n");
+                drm_kms.initVirtioGpu(&drm_state, .{
+                    .phys = 0,
+                    .width = pm.r.w,
+                    .height = pm.r.h,
+                    .pitch = pm.r.w * 4,
+                    .bpp = 32,
+                });
+            } else {
+                puts("[VIRTIO-GPU] GET_DISPLAY_INFO timeout/нет scanout — дефолт 1024x768\n");
+                drm_kms.initVirtioGpu(&drm_state, .{
+                    .phys = 0,
+                    .width = 1024,
+                    .height = 768,
+                    .pitch = 4096,
+                    .bpp = 32,
+                });
+            }
+        } else {
+            puts("[VIRTIO-GPU] caps без common/notify — vring недоступен\n");
+            drm_kms.initVirtioGpu(&drm_state, .{
+                .phys = 0,
+                .width = 1024,
+                .height = 768,
+                .pitch = 4096,
+                .bpp = 32,
+            });
+        }
     } else {
         puts("[VIRTIO-GPU] no device (expected with -vga std)\n");
     }
@@ -2869,6 +2904,235 @@ fn drmMapLinearFbUser(pml4: u64, va: u64, len: u64) bool {
         vmm.mapPageInPML4(pml4, va + i * vmm.PAGE_SIZE, pa, pte) catch return false;
     }
     return true;
+}
+
+/// v0.20.0 (CDD №11 p2): caps → MMIO-базисы (BAR+cap.offset) + vring-init.
+/// Общий/notify-регионы — PCI MMIO < 4ГБ (identity-маппинг ядра).
+fn gpuVringSetup(g: virtio_gpu.GpuProbe) void {
+    var common_base: u64 = 0;
+    var notify_base: u64 = 0;
+    var notify_mult: u32 = 0;
+    for (gpu_caps[0..gpu_caps_n]) |cap| {
+        const bar_addr = g.barAddr(@intCast(cap.bar % 6));
+        if (bar_addr == 0) continue;
+        switch (cap.cfg_type) {
+            virtio_gpu.VIRTIO_PCI_CAP_COMMON_CFG => common_base = bar_addr + cap.offset,
+            virtio_gpu.VIRTIO_PCI_CAP_NOTIFY_CFG => {
+                notify_base = bar_addr + cap.offset;
+                notify_mult = cap.notify_off_multiplier;
+            },
+            else => {},
+        }
+    }
+    if (common_base == 0 or notify_base == 0) {
+        puts("[VIRTIO-GPU] vring: нет common/notify cap — скан-аут недоступен\n");
+        return;
+    }
+    gpu_vring_cfg = .{
+        .common = .{ .base = common_base },
+        .notify = .{ .base = notify_base },
+        .notify_off_multiplier = notify_mult,
+        .alloc_page = gpuVringAllocPage,
+        .tick = gpuVringTick,
+    };
+    const vr_cfg = gpu_vring_cfg.?;
+    const r = virtio_gpu.vringInit(vr_cfg, &gpu_vring);
+    if (r == virtio_gpu.VRING_OK) {
+        vr_cfg.common.w16(virtio_gpu.CCFG_OFF_QUEUE_SELECT, virtio_gpu.CTRL_QUEUE_IDX);
+        const n_off = vr_cfg.common.r16(virtio_gpu.CCFG_OFF_QUEUE_NOTIFY_OFF);
+        puts("[VIRTIO-GPU] vring INIT OK: ctrl-queue ");
+        putDecimal(@intCast(gpu_vring.qsize));
+        puts(" desc, DRIVER_OK, common=0x");
+        putHex(common_base);
+        puts(" notify=0x");
+        putHex(notify_base);
+        puts(" mult=");
+        putDecimal(notify_mult);
+        puts(" n_off=");
+        putDecimal(n_off);
+        puts("\n");
+    } else {
+        puts("[VIRTIO-GPU] vring init FAIL code=");
+        putDecimal(@intCast(-r));
+        puts("\n");
+        gpu_vring_cfg = null;
+    }
+}
+
+/// PMM-страница под vring (4К-выровнена — обязательное требование spec).
+fn gpuVringAllocPage() ?u64 {
+    return pmm.allocContiguousZeroed(1);
+}
+
+/// poll-тик: ~1мс реального времени (TSC-дедлайн; QEMU TCG обрабатывает
+/// virtqueue в MMIO-обработчике notify, но под нагрузкой — десятки мс).
+fn gpuVringTick() bool {
+    // мягкая задержка ~мс-масштаба (2М pause); эмпирика QEMU-10 qemu64:
+    // TSC-RDMSR зацикливался — планировочные тики живут, TSC нет
+    var i: u32 = 0;
+    while (i < 2_000_000) : (i += 1) {
+        asm volatile ("pause");
+    }
+    return true;
+}
+
+/// cmd_gputest: E2E-самотест VRING-скан-аута (CDD №11 p2):
+/// dumb-буфер с тест-паттерном → CREATE_2D/ATTACH/TRANSFER/SET_SCANOUT/
+/// FLUSH через virtqueue → РЕАЛЬНЫЙ вывод кадра на дисплей QEMU.
+/// Маркеры [GPUTEST] ловит e2e (gpu-scanout: screendump → пиксели).
+fn cmd_gputest() void {
+    if (gpu_probe == null or gpu_vring_cfg == null) {
+        sys_print("[GPUTEST] FAIL: virtio-gpu/vring отсутствует (-device virtio-gpu-pci)\n");
+        return;
+    }
+    const cfg = gpu_vring_cfg.?;
+    sys_print("[GPUTEST] begin: vring 2D-конвейер скан-аута\n");
+
+    const w = drm_state.geom.width;
+    const h = drm_state.geom.height;
+    if (w == 0 or h == 0) {
+        sys_print("[GPUTEST] FAIL: геометрия скан-аута неизвестна\n");
+        return;
+    }
+
+    // 1. Dumb-буфер w×h (contiguous-физблок PMM)
+    const bytes = @as(u64, w) * h * 4;
+    const pages = (bytes + 4095) / 4096;
+    const buf_phys = pmm.allocContiguousZeroed(@intCast(pages)) orelse {
+        sys_print("[GPUTEST] FAIL: PMMContiguous\n");
+        return;
+    };
+
+    // 2. Тест-паттерн: диагональные полосы B8G8R8X8 (DRM XRGB8888-эквивалент)
+    const pixels: [*]volatile u32 = @ptrFromInt(buf_phys);
+    const pitch_u32 = w;
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const stripe: u32 = ((x / 64) + (y / 64)) % 2;
+            pixels[@as(u32, y) * pitch_u32 + x] = if (stripe != 0)
+                0x34C7_5B12 // [B=0x12, G=0x5B, R=0xC7, X]
+            else
+                0x1207_1120; // [B=0x20, G=0x11, R=0x07, X]
+        }
+    }
+    sys_print("[GPUTEST] pattern ");
+    putDecimal(w);
+    sys_print("x");
+    putDecimal(h);
+    sys_print(" (stripes 64px)\n");
+
+    // 3. VRING 2D-конвейер: ресурс 1 → экран (покроково — диагностика стадий)
+    const stages = [_]struct { name: []const u8 }{
+        .{ .name = "CREATE_2D" },
+        .{ .name = "ATTACH" },
+        .{ .name = "TRANSFER" },
+        .{ .name = "SET_SCANOUT" },
+        .{ .name = "FLUSH" },
+    };
+    // STEP 1: RESOURCE_CREATE_2D
+    var create = virtio_gpu.cmdResourceCreate2d(1, w, h);
+    var hdr = virtio_gpu.submitCmd(cfg, &gpu_vring, &create, @sizeOf(virtio_gpu.ResourceCreate2d)) orelse {
+        sys_print("[GPUTEST] FAIL: CREATE_2D timeout\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    };
+    if (hdr.type_ != virtio_gpu.RESP_OK_NODATA) {
+        sys_print("[GPUTEST] FAIL: CREATE_2D resp=0x");
+        putHex(hdr.type_);
+        sys_print("\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    }
+    sys_print("[GPUTEST] stage 1/5 CREATE_2D ok\n");
+    // STEP 2: ATTACH_BACKING (INLINE mem-entry — UAPI: 32Б заголовок +
+    // 16Б записи в ОДНОМ буфере команды; отдельные данные → 0x1200)
+    var attach_buf: [64]u8 align(8) = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, attach_buf[0..4], virtio_gpu.CMD_RESOURCE_ATTACH_BACKING, .little);
+    std.mem.writeInt(u32, attach_buf[24..28], 1, .little); // resource_id
+    std.mem.writeInt(u32, attach_buf[28..32], 1, .little); // nr_entries
+    std.mem.writeInt(u64, attach_buf[32..40], buf_phys, .little); // entry.addr
+    std.mem.writeInt(u32, attach_buf[40..44], @truncate(bytes), .little); // entry.length
+    hdr = virtio_gpu.submitCmd(cfg, &gpu_vring, &attach_buf, 48) orelse {
+        sys_print("[GPUTEST] FAIL: ATTACH timeout\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    };
+    if (hdr.type_ != virtio_gpu.RESP_OK_NODATA) {
+        sys_print("[GPUTEST] FAIL: ATTACH resp=0x");
+        putHex(hdr.type_);
+        sys_print("\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    }
+    sys_print("[GPUTEST] stage 2/5 ATTACH_BACKING ok\n");
+    // STEP 3: TRANSFER_TO_HOST_2D
+    var transfer = virtio_gpu.TransferToHost2d{
+        .hdr = .{ .type_ = virtio_gpu.CMD_TRANSFER_TO_HOST_2D },
+        .w = w,
+        .h = h,
+        .resource_id = 1,
+    };
+    hdr = virtio_gpu.submitCmd(cfg, &gpu_vring, &transfer, @sizeOf(virtio_gpu.TransferToHost2d)) orelse {
+        sys_print("[GPUTEST] FAIL: TRANSFER timeout\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    };
+    if (hdr.type_ != virtio_gpu.RESP_OK_NODATA) {
+        sys_print("[GPUTEST] FAIL: TRANSFER resp=0x");
+        putHex(hdr.type_);
+        sys_print("\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    }
+    sys_print("[GPUTEST] stage 3/5 TRANSFER_TO_HOST_2D ok\n");
+    // STEP 4: SET_SCANOUT
+    var scanout_cmd = virtio_gpu.SetScanout{
+        .hdr = .{ .type_ = virtio_gpu.CMD_SET_SCANOUT },
+        .w = w,
+        .h = h,
+        .scanout_id = 0,
+        .resource_id = 1,
+    };
+    hdr = virtio_gpu.submitCmd(cfg, &gpu_vring, &scanout_cmd, @sizeOf(virtio_gpu.SetScanout)) orelse {
+        sys_print("[GPUTEST] FAIL: SET_SCANOUT timeout\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    };
+    if (hdr.type_ != virtio_gpu.RESP_OK_NODATA) {
+        sys_print("[GPUTEST] FAIL: SET_SCANOUT resp=0x");
+        putHex(hdr.type_);
+        sys_print("\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    }
+    sys_print("[GPUTEST] stage 4/5 SET_SCANOUT ok\n");
+    // STEP 5: RESOURCE_FLUSH
+    var flush_cmd = virtio_gpu.ResourceFlush{
+        .hdr = .{ .type_ = virtio_gpu.CMD_RESOURCE_FLUSH },
+        .w = w,
+        .h = h,
+    };
+    hdr = virtio_gpu.submitCmd(cfg, &gpu_vring, &flush_cmd, @sizeOf(virtio_gpu.ResourceFlush)) orelse {
+        sys_print("[GPUTEST] FAIL: FLUSH timeout\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    };
+    if (hdr.type_ != virtio_gpu.RESP_OK_NODATA) {
+        sys_print("[GPUTEST] FAIL: FLUSH resp=0x");
+        putHex(hdr.type_);
+        sys_print("\n");
+        pmm.freeContiguousPages(buf_phys, @intCast(pages));
+        return;
+    }
+    sys_print("[GPUTEST] stage 5/5 RESOURCE_FLUSH ok — КАДР НА ЭКРАНЕ\n");
+    _ = stages;
+    sys_print("[GPUTEST] CREATE_2D + ATTACH + TRANSFER + SET_SCANOUT + FLUSH ok\n");
+    sys_print("[GPUTEST] кадр НА ЭКРАНЕ (screendump верифицирует пиксели)\n");
+
+    // ресурс не освобождаем (scanout живёт); физблок — владение ресурса
+    sys_print("[GPUTEST] ALL PASS\n");
 }
 
 /// cmd_drm: статус DRM/KMS для шелла и E2E.

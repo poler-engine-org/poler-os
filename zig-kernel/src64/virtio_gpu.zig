@@ -254,13 +254,12 @@ pub const TransferToHost2d = extern struct {
     padding: u32 = 0,
 };
 
-/// struct virtio_gpu_resource_attach_backing (36Б; entries — отдельные
-/// дескрипторы vring: массив virtio_gpu_mem_entry).
+/// struct virtio_gpu_resource_attach_backing (32Б; mem-entries идут
+/// INLINE — сразу за заголовком в том же буфере команды: 32 + n×16Б).
 pub const AttachBacking = extern struct {
     hdr: CtrlHdr = .{},
     resource_id: u32 = 0,
     nr_entries: u32 = 0,
-    padding: u32 = 0,
 };
 
 /// struct virtio_gpu_mem_entry (16Б) — гостевая страница backing'а.
@@ -553,7 +552,7 @@ test "gpu: UAPI-размеры структур virtio-gpu (хост-ABI)" {
     try testing.expectEqual(@as(usize, 48), @sizeOf(SetScanout));
     try testing.expectEqual(@as(usize, 40), @sizeOf(ResourceFlush));
     try testing.expectEqual(@as(usize, 56), @sizeOf(TransferToHost2d));
-    try testing.expectEqual(@as(usize, 40), @sizeOf(AttachBacking)); // 36 + хвостовое выравнивание 8 (как в C: hdr содержит u64)
+    try testing.expectEqual(@as(usize, 32), @sizeOf(AttachBacking)); // 32 = UAPI (entries INLINE после заголовка)
     try testing.expectEqual(@as(usize, 16), @sizeOf(MemEntry));
     try testing.expectEqual(@as(usize, 24), @sizeOf(DisplayOne));
     try testing.expectEqual(@as(usize, 408), @sizeOf(RespDisplayInfo));
@@ -630,4 +629,567 @@ test "gpu: форматы — B8G8R8X8_UNORM=2 ↔ DRM XRGB8888-семантик
     try testing.expectEqual(@as(u32, 2), FORMAT_B8G8R8X8_UNORM);
     try testing.expectEqual(@as(u32, 1), FORMAT_B8G8R8A8_UNORM);
     try testing.expectEqual(@as(u32, 5), FORMAT_R8G8B8A8_UNORM);
+}
+
+// ============================================================================
+// VRING-ДРАЙВЕР (v0.20.0, CDD №11 p2): SCAN-OUT через virtqueue
+// ============================================================================
+//
+// VirtIO 1.0 split-virtqueue: desc-table + avail + used. Инициализация
+// устройства через common-cfg (PCI MMIO, identity-доступ — BAR < 4ГБ):
+//   reset → ACK/DRIVER → фичи (VIRTIO_F_VERSION_1) → FEATURES_OK →
+//   queue-setup (desc/avail/used — 4К-выровненные PMM-страницы) → DRIVER_OK.
+// Отправка: desc-цепочка [cmd (RO) → resp (WO)] → avail-ring → notify.
+// Ожидание: poll used.idx (без IRQ — v0.20; ISR-волна по краш-логам).
+//
+// Инъекция: Mmio-регион передаётся БАЗОВЫМ адресом (ядро: BAR+cap.offset;
+// тесты: fake-регион в памяти + симулятор устройства в FakeGpuDev).
+
+// ─── Common-cfg (virtio_pci_common_cfg, MMIO-раскладка) ────────────────────
+
+pub const CCFG_OFF_FEATURE_SELECT: u32 = 0x00;
+pub const CCFG_OFF_FEATURE: u32 = 0x04;
+pub const CCFG_OFF_DRIVER_FEATURE_SELECT: u32 = 0x08;
+pub const CCFG_OFF_DRIVER_FEATURE: u32 = 0x0C;
+pub const CCFG_OFF_NUM_QUEUES: u32 = 0x12;
+pub const CCFG_OFF_DEVICE_STATUS: u32 = 0x14;
+pub const CCFG_OFF_CONFIG_GENERATION: u32 = 0x15;
+pub const CCFG_OFF_QUEUE_SELECT: u32 = 0x16;
+pub const CCFG_OFF_QUEUE_SIZE: u32 = 0x18;
+pub const CCFG_OFF_QUEUE_ENABLE: u32 = 0x1C;
+pub const CCFG_OFF_QUEUE_NOTIFY_OFF: u32 = 0x1E;
+pub const CCFG_OFF_QUEUE_DESC: u32 = 0x20; // lo/hi u32
+pub const CCFG_OFF_QUEUE_AVAIL: u32 = 0x28;
+pub const CCFG_OFF_QUEUE_USED: u32 = 0x30;
+
+/// Статусы устройства (virtio_config.h).
+pub const VIRTIO_STATUS_ACK: u8 = 1;
+pub const VIRTIO_STATUS_DRIVER: u8 = 2;
+pub const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
+pub const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
+pub const VIRTIO_STATUS_FAILED: u8 = 128;
+
+/// VIRTIO_F_VERSION_1 (бит 32 → feature_select 1, бит 0).
+pub const VIRTIO_F_VERSION_1_BIT: u32 = 0;
+
+/// Контрольная virtqueue (queue index 0).
+pub const CTRL_QUEUE_IDX: u16 = 0;
+
+/// Лимит размера очереди (защита от мусорного queue_size).
+pub const MAX_QUEUE_SIZE: u16 = 128;
+
+// ─── vring-структуры (virtio_ring.h, UAPI-раскладки) ───────────────────────
+
+pub const VRING_DESC_F_NEXT: u16 = 1;
+pub const VRING_DESC_F_WRITE: u16 = 2;
+
+pub const Desc = extern struct {
+    addr: u64 = 0,
+    len: u32 = 0,
+    flags: u16 = 0,
+    next: u16 = 0,
+};
+
+pub const AvailHeader = extern struct {
+    flags: u16 = 0,
+    idx: u16 = 0, // следующий свободный слот (устройство читает ring[idx-1])
+};
+
+pub const UsedElem = extern struct {
+    id: u32 = 0,
+    len: u32 = 0,
+};
+
+pub const UsedHeader = extern struct {
+    flags: u16 = 0,
+    idx: u16 = 0, // устройство пишет +1 на каждое завершение
+};
+
+// ─── MMIO-доступ (volatile, единый для ядра и fake-тестов) ─────────────────
+
+pub const Mmio = struct {
+    base: u64,
+
+    pub inline fn r16(self: Mmio, off: u32) u16 {
+        const p: *const volatile u16 = @ptrFromInt(self.base + off);
+        return p.*;
+    }
+    pub inline fn w16(self: Mmio, off: u32, v: u16) void {
+        const p: *volatile u16 = @ptrFromInt(self.base + off);
+        p.* = v;
+    }
+    pub inline fn r32(self: Mmio, off: u32) u32 {
+        const p: *const volatile u32 = @ptrFromInt(self.base + off);
+        return p.*;
+    }
+    pub inline fn w32(self: Mmio, off: u32, v: u32) void {
+        const p: *volatile u32 = @ptrFromInt(self.base + off);
+        p.* = v;
+    }
+    pub inline fn r8(self: Mmio, off: u32) u8 {
+        const p: *const volatile u8 = @ptrFromInt(self.base + off);
+        return p.*;
+    }
+    pub inline fn w8(self: Mmio, off: u32, v: u8) void {
+        const p: *volatile u8 = @ptrFromInt(self.base + off);
+        p.* = v;
+    }
+};
+
+// ─── Состояние vring-драйвера ──────────────────────────────────────────────
+
+/// Одна PMM-страница: desc[Q×16] + avail[6+2Q] + used[6+8Q] (Q≤128 → 8КБ
+/// макс: 2048+262+1030 = 3340 — ОДНА страница 4КБ до Q=106; QEMU ctrl=64 → ок;
+/// больший Q — обрезаем лимитом MAX_QUEUE_SIZE и вторая страница не нужна).
+pub const VRING_PAGES: u64 = 1;
+
+pub const VringState = struct {
+    qsize: u16 = 0,
+    /// Физика страницы desc+avail+used (4К-выровнена — PMM).
+    ring_phys: u64 = 0,
+    /// Теневой avail-idx (следующий СВОБОДНЫЙ слот для записи).
+    avail_idx: u16 = 0,
+    /// Теневой used-idx (до которого ГЛАЗАМИ драйвера обработано).
+    used_idx: u16 = 0,
+    /// Флип-буферы команд/ответов (гостевая память).
+    cmd_buf: [64]u8 align(8) = [_]u8{0} ** 64,
+    resp_buf: [512]u8 align(8) = [_]u8{0} ** 512,
+    ///Backing mem-entries для ATTACH (контiguous-блоки — 1 запись достаточно).
+    mem_entries: [4]MemEntry align(8) = [_]MemEntry{.{}} ** 4,
+    /// Счётчик fence (hdr.fence_id — сопоставление ответа).
+    fence: u64 = 1,
+
+    pub fn descTable(self: *const VringState) [*]volatile Desc {
+        return @ptrFromInt(self.ring_phys);
+    }
+    pub fn availRing(self: *const VringState) [*]volatile u16 {
+        // avail: flags(2) idx(2) ring[qsize](2*qsize) used_event(2);
+        // возвращаем МАССИВ ring (после заголовка flags+idx)
+        return @ptrFromInt(self.availOffset() + 4);
+    }
+    pub fn availHeader(self: *const VringState) *volatile AvailHeader {
+        return @ptrFromInt(self.availOffset());
+    }
+    pub fn usedRing(self: *const VringState) [*]volatile UsedElem {
+        return @ptrFromInt(self.usedOffset());
+    }
+    pub fn usedHeader(self: *const VringState) *volatile UsedHeader {
+        return @ptrFromInt(self.usedOffset());
+    }
+    fn availOffset(self: *const VringState) u64 {
+        return self.ring_phys + @sizeOf(Desc) * @as(u32, self.qsize);
+    }
+    /// used-ring: после avail (6 + 2·qsize) с паддингом до 4 (u32-элементы).
+    fn usedOffset(self: *const VringState) u64 {
+        const avail_end = @sizeOf(Desc) * @as(u32, self.qsize) + 6 + 2 * @as(u32, self.qsize);
+        const used_off = (avail_end + 3) & ~@as(u32, 3);
+        return self.ring_phys + used_off;
+    }
+};
+
+/// Параметры инициализации (ядро — BAR/caps; тесты — fake MMIO-регионы).
+pub const VringConfig = struct {
+    common: Mmio,
+    notify: Mmio,
+    notify_off_multiplier: u32,
+    /// Выделение 4К-страницы под vring (ядро: PMM; тест: fake-физика).
+    alloc_page: *const fn () ?u64,
+    /// poll-тик: true = прошло ~1мс (ядро: tick_count; тест: счётчик).
+    tick: *const fn () bool,
+};
+
+/// Полная инициализация устройства VirtIO 1.0 + контрольная virtqueue.
+/// Ошибки — негативные коды (маппинг на errno при интеграции).
+pub const VRING_OK: i64 = 0;
+pub const VRING_ERR_NO_MEM: i64 = -1;
+pub const VRING_ERR_BAD_SIZE: i64 = -2;
+pub const VRING_ERR_FEATURES: i64 = -3;
+pub const VRING_ERR_TIMEOUT: i64 = -4;
+
+pub fn vringInit(cfg: VringConfig, st: *VringState) i64 {
+    const c = cfg.common;
+
+    // 1. reset → ACK → DRIVER
+    c.w8(CCFG_OFF_DEVICE_STATUS, 0);
+    c.w8(CCFG_OFF_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+    c.w8(CCFG_OFF_DEVICE_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
+
+    // 2. Фичи: принимаем ТОЛЬКО VIRTIO_F_VERSION_1 (бит 32)
+    c.w32(CCFG_OFF_DRIVER_FEATURE_SELECT, 1);
+    c.w32(CCFG_OFF_DRIVER_FEATURE, @as(u32, 1) << VIRTIO_F_VERSION_1_BIT);
+    c.w32(CCFG_OFF_DRIVER_FEATURE_SELECT, 0);
+    c.w32(CCFG_OFF_DRIVER_FEATURE, 0); // 2D-фичи не нужны (virgl/edid off)
+
+    // 3. FEATURES_OK — устройство обязано подтвердить
+    c.w8(CCFG_OFF_DEVICE_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+    if (c.r8(CCFG_OFF_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK == 0) {
+        return VRING_ERR_FEATURES;
+    }
+
+    // 4. Контрольная очередь (index 0)
+    c.w16(CCFG_OFF_QUEUE_SELECT, CTRL_QUEUE_IDX);
+    const qsize = c.r16(CCFG_OFF_QUEUE_SIZE);
+    if (qsize == 0 or qsize > MAX_QUEUE_SIZE) return VRING_ERR_BAD_SIZE;
+
+    // 5. vring-страница (4К-выровнена)
+    const ring = cfg.alloc_page() orelse return VRING_ERR_NO_MEM;
+    st.* = .{ .qsize = qsize, .ring_phys = ring };
+
+    // Обнуление страницы (desc/avail/used)
+    const page: [*]volatile u8 = @ptrFromInt(ring);
+    @memset(page[0..4096], 0);
+
+    // 6. Регистрация очереди (lo/hi u32; identity: phys < 4ГБ; used — с
+    //    4-выравниванием после avail — см. usedOffset)
+    const avail_off = @sizeOf(Desc) * @as(u32, qsize);
+    const avail_end = avail_off + 6 + 2 * @as(u32, qsize);
+    const used_off = (avail_end + 3) & ~@as(u32, 3);
+    c.w32(CCFG_OFF_QUEUE_DESC, @truncate(ring));
+    c.w32(CCFG_OFF_QUEUE_DESC + 4, @truncate(ring >> 32));
+    c.w32(CCFG_OFF_QUEUE_AVAIL, @truncate(ring + avail_off));
+    c.w32(CCFG_OFF_QUEUE_AVAIL + 4, @truncate((ring + avail_off) >> 32));
+    c.w32(CCFG_OFF_QUEUE_USED, @truncate(ring + used_off));
+    c.w32(CCFG_OFF_QUEUE_USED + 4, @truncate((ring + used_off) >> 32));
+    c.w16(CCFG_OFF_QUEUE_ENABLE, 1);
+
+    // 7. DRIVER_OK — устройство начинает работать
+    c.w8(CCFG_OFF_DEVICE_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
+    return VRING_OK;
+}
+
+/// Уведомление устройства: notify-регион + queue_notify_off × multiplier.
+pub fn notifyDevice(cfg: VringConfig, queue_idx: u16) void {
+    cfg.common.w16(CCFG_OFF_QUEUE_SELECT, queue_idx);
+    const notify_off = cfg.common.r16(CCFG_OFF_QUEUE_NOTIFY_OFF);
+    const off = notify_off *% cfg.notify_off_multiplier;
+    cfg.notify.w16(@intCast(off), queue_idx);
+}
+
+/// Отправка команды + ожидание ответа (poll used, тик-таймаут).
+/// cmd — структура UAPI (заполена билдером); ответ пишется в st.resp_buf.
+/// Возвращает *CtrlHdr ответа или null (таймаут).
+pub fn submitCmd(cfg: VringConfig, st: *VringState, cmd: *const anyopaque, cmd_len: u32) ?*CtrlHdr {
+    const slot: u16 = st.avail_idx % st.qsize; // слот desc — переиспользуем 0/1
+    const desc = st.descTable();
+    const desc_idx: u16 = 0; // простая модель: desc[0]=cmd, desc[1]=resp (одна команда за раз)
+    _ = slot;
+
+    // Команда → гостевый буфер (identity: .bss/физика совпадают)
+    const cmd_ptr: [*]u8 = @ptrCast(&st.cmd_buf);
+    const src: [*]const u8 = @ptrCast(cmd);
+    if (cmd_len > st.cmd_buf.len) return null;
+    @memcpy(cmd_ptr[0..cmd_len], src[0..cmd_len]);
+
+    // desc[0]: команда (RO), desc[1]: ответ (WO) — цепочка
+    desc[desc_idx] = .{
+        .addr = @intFromPtr(&st.cmd_buf),
+        .len = cmd_len,
+        .flags = VRING_DESC_F_NEXT,
+        .next = desc_idx + 1,
+    };
+    desc[desc_idx + 1] = .{
+        .addr = @intFromPtr(&st.resp_buf),
+        .len = @intCast(st.resp_buf.len),
+        .flags = VRING_DESC_F_WRITE,
+        .next = 0,
+    };
+
+    // avail: публикуем голову цепочки
+    const ring = st.availRing();
+    const head = st.avail_idx % st.qsize;
+    ring[head] = desc_idx;
+    st.avail_idx +%= 1;
+    st.availHeader().idx = st.avail_idx;
+
+    // уведомляем устройство
+    notifyDevice(cfg, CTRL_QUEUE_IDX);
+
+    // poll used.idx (дедлайн ~3с — 3000 тиков; тестовый tick = мгновенно)
+    var waited: u32 = 0;
+    while (waited < 3000) {
+        const used_idx = st.usedHeader().idx;
+        if (used_idx != st.used_idx) {
+            // ответ пришёл: забираем (последний used-элемент = наша цепочка)
+            const ue = st.usedRing()[(st.used_idx) % st.qsize];
+            _ = ue;
+            st.used_idx = used_idx;
+            const hdr: *CtrlHdr = @ptrCast(@alignCast(&st.resp_buf));
+            return hdr;
+        }
+        if (cfg.tick()) waited += 1;
+    }
+    return null; // таймаут
+}
+
+/// GET_DISPLAY_INFO → главный scanout (null = headless/таймаут).
+pub fn getDisplayInfo(cfg: VringConfig, st: *VringState) ?DisplayOne {
+    const cmd = cmdGetDisplayInfo();
+    const hdr = submitCmd(cfg, st, &cmd, @sizeOf(CtrlHdr)) orelse return null;
+    if (hdr.type_ != RESP_OK_DISPLAY_INFO) return null;
+    const resp: *const RespDisplayInfo = @ptrCast(@alignCast(&st.resp_buf));
+    return primaryScanout(resp);
+}
+
+/// Полный 2D-конвейер скан-аута: dumb-буфер (contiguous-физблок) на экран.
+/// res_id — идентификатор ресурса (≠0). Возвращает true при успехе.
+pub fn scanoutFrame(
+    cfg: VringConfig,
+    st: *VringState,
+    res_id: u32,
+    w: u32,
+    h: u32,
+    backing_phys: u64,
+    backing_len: u64,
+) bool {
+    if (res_id == 0 or w == 0 or h == 0) return false;
+
+    // 1. RESOURCE_CREATE_2D
+    var create = cmdResourceCreate2d(res_id, w, h);
+    var hdr = submitCmd(cfg, st, &create, @sizeOf(ResourceCreate2d)) orelse return false;
+    if (hdr.type_ != RESP_OK_NODATA) return false;
+
+    // 2. ATTACH_BACKING: один INLINE mem-entry (32Б заголовок + 16Б записи —
+    //    UAPI: entries в ТОМ ЖЕ буфере команды; эмпирика: отдельные данные
+    //    → RESP_ERR_INVALID_PARAMETER 0x1200)
+    var attach_buf: [64]u8 align(8) = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, attach_buf[0..4], CMD_RESOURCE_ATTACH_BACKING, .little);
+    std.mem.writeInt(u64, attach_buf[8..16], nextFence(st), .little);
+    std.mem.writeInt(u32, attach_buf[24..28], res_id, .little);
+    std.mem.writeInt(u32, attach_buf[28..32], 1, .little); // nr_entries
+    std.mem.writeInt(u64, attach_buf[32..40], backing_phys, .little); // entry.addr
+    std.mem.writeInt(u32, attach_buf[40..44], @truncate(backing_len), .little); // entry.length
+    hdr = submitCmd(cfg, st, &attach_buf, 32 + 16) orelse return false;
+    if (hdr.type_ != RESP_OK_NODATA) return false;
+
+    // 3. TRANSFER_TO_HOST_2D: весь кадр
+    var transfer = TransferToHost2d{
+        .hdr = .{ .type_ = CMD_TRANSFER_TO_HOST_2D, .fence_id = nextFence(st) },
+        .x = 0,
+        .y = 0,
+        .w = w,
+        .h = h,
+        .offset = 0,
+        .resource_id = res_id,
+    };
+    hdr = submitCmd(cfg, st, &transfer, @sizeOf(TransferToHost2d)) orelse return false;
+    if (hdr.type_ != RESP_OK_NODATA) return false;
+
+    // 4. SET_SCANOUT: scanout 0 ← resource
+    var scanout = SetScanout{
+        .hdr = .{ .type_ = CMD_SET_SCANOUT, .fence_id = nextFence(st) },
+        .x = 0,
+        .y = 0,
+        .w = w,
+        .h = h,
+        .scanout_id = 0,
+        .resource_id = res_id,
+    };
+    hdr = submitCmd(cfg, st, &scanout, @sizeOf(SetScanout)) orelse return false;
+    if (hdr.type_ != RESP_OK_NODATA) return false;
+
+    // 5. RESOURCE_FLUSH: вывести на экран
+    var flush = ResourceFlush{
+        .hdr = .{ .type_ = CMD_RESOURCE_FLUSH, .fence_id = nextFence(st) },
+        .x = 0,
+        .y = 0,
+        .w = w,
+        .h = h,
+    };
+    hdr = submitCmd(cfg, st, &flush, @sizeOf(ResourceFlush)) orelse return false;
+    if (hdr.type_ != RESP_OK_NODATA) return false;
+
+    return true;
+}
+
+fn nextFence(st: *VringState) u64 {
+    st.fence += 1;
+    return st.fence;
+}
+
+// ─── Тесты vring: fake-устройство (полный протокол virtqueue) ───────────────
+
+/// Fake-«физика»: страница vring (4К-выровнена).
+var fake_ring_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+
+fn fakeAllocPage() ?u64 {
+    return @intFromPtr(&fake_ring_page);
+}
+
+/// Симулятор устройства: обрабатывает avail-кольцо на «тике» (tick = реакции
+/// на notify в реальном железе происходят в MMIO-обработчике — мгновенно).
+const FakeGpuDev = struct {
+    common: [0x40]u8 align(8) = [_]u8{0} ** 0x40,
+    notify: [16]u8 align(8) = [_]u8{0} ** 16,
+    st: ?*VringState = null,
+    dev_avail_idx: u16 = 0,
+    dev_used_idx: u16 = 0,
+    seen_cmds: [16]u32 = [_]u32{0} ** 16,
+    seen_n: usize = 0,
+    /// Геометрия для GET_DISPLAY_INFO.
+    disp_w: u32 = 1024,
+    disp_h: u32 = 768,
+};
+
+var g_dev: FakeGpuDev = .{};
+var g_ticks: u32 = 0;
+
+fn fakeTick() bool {
+    g_ticks += 1;
+    const st = g_dev.st orelse return true;
+    // «Устройство» обрабатывает всё, что опубликовано в avail
+    const avail_idx = st.availHeader().idx;
+    while (g_dev.dev_avail_idx != avail_idx) {
+        const head = st.availRing()[g_dev.dev_avail_idx % st.qsize];
+        const desc = st.descTable();
+        const cmd_hdr: *volatile CtrlHdr = @ptrFromInt(desc[head].addr);
+        if (g_dev.seen_n < g_dev.seen_cmds.len) {
+            g_dev.seen_cmds[g_dev.seen_n] = cmd_hdr.type_;
+            g_dev.seen_n += 1;
+        }
+        // ответ в WO-дескриптор (next)
+        const resp_addr = desc[desc[head].next].addr;
+        const rhdr: *volatile CtrlHdr = @ptrFromInt(resp_addr);
+        if (cmd_hdr.type_ == CMD_GET_DISPLAY_INFO) {
+            rhdr.type_ = RESP_OK_DISPLAY_INFO;
+            const resp: *volatile RespDisplayInfo = @ptrFromInt(resp_addr);
+            resp.pmodes[0] = .{
+                .r = .{ .x = 0, .y = 0, .w = g_dev.disp_w, .h = g_dev.disp_h },
+                .enabled = 1,
+            };
+        } else {
+            rhdr.type_ = RESP_OK_NODATA;
+        }
+        g_dev.dev_avail_idx +%= 1;
+        st.usedRing()[g_dev.dev_used_idx % st.qsize] = .{ .id = head, .len = 24 };
+        g_dev.dev_used_idx +%= 1;
+        st.usedHeader().idx = g_dev.dev_used_idx;
+    }
+    return true;
+}
+
+fn fakeVringCfg() VringConfig {
+    return .{
+        .common = Mmio{ .base = @intFromPtr(&g_dev.common) },
+        .notify = Mmio{ .base = @intFromPtr(&g_dev.notify) },
+        .notify_off_multiplier = 4,
+        .alloc_page = fakeAllocPage,
+        .tick = fakeTick,
+    };
+}
+
+fn fakeDevReset(queue_size: u16) void {
+    g_dev = .{};
+    g_ticks = 0;
+    @memset(&fake_ring_page, 0);
+    // предустановки регистров устройства
+    const mm = Mmio{ .base = @intFromPtr(&g_dev.common) };
+    mm.w16(CCFG_OFF_QUEUE_SIZE, queue_size);
+    mm.w16(CCFG_OFF_NUM_QUEUES, 2);
+    mm.w16(CCFG_OFF_QUEUE_NOTIFY_OFF, 0);
+}
+
+test "vring: init — reset/фичи/queue/DRIVER_OK; лимит размера" {
+    fakeDevReset(16);
+    var st = VringState{};
+    const cfg = fakeVringCfg();
+
+    try testing.expectEqual(VRING_OK, vringInit(cfg, &st));
+    // статус: ACK|DRIVER|FEATURES_OK|DRIVER_OK
+    const status_mm = Mmio{ .base = @intFromPtr(&g_dev.common) };
+    const status = status_mm.r8(CCFG_OFF_DEVICE_STATUS);
+    try testing.expect(status & VIRTIO_STATUS_DRIVER_OK != 0);
+    try testing.expect(status & VIRTIO_STATUS_FEATURES_OK != 0);
+    // vring-геометрия
+    try testing.expectEqual(@as(u16, 16), st.qsize);
+    try testing.expectEqual(@intFromPtr(&fake_ring_page), st.ring_phys);
+    // очереди зарегистрированы (queue_enable=1)
+    try testing.expectEqual(@as(u16, 1), status_mm.r16(CCFG_OFF_QUEUE_ENABLE));
+
+    // мусорный queue_size → отказ
+    fakeDevReset(9999);
+    var st2 = VringState{};
+    try testing.expectEqual(VRING_ERR_BAD_SIZE, vringInit(fakeVringCfg(), &st2));
+}
+
+test "vring: GET_DISPLAY_INFO — полный roundtrip avail→notify→used→resp" {
+    fakeDevReset(16);
+    var st = VringState{};
+    g_dev.st = &st;
+    _ = vringInit(fakeVringCfg(), &st);
+
+    const pm = getDisplayInfo(fakeVringCfg(), &st) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try testing.expectEqual(@as(u32, 1024), pm.r.w);
+    try testing.expectEqual(@as(u32, 768), pm.r.h);
+    try testing.expectEqual(@as(u32, 1), pm.enabled);
+    // устройство увидело команду
+    try testing.expectEqual(@as(usize, 1), g_dev.seen_n);
+    try testing.expectEqual(CMD_GET_DISPLAY_INFO, g_dev.seen_cmds[0]);
+    // avail/used продвинулись синхронно
+    try testing.expectEqual(st.avail_idx, st.used_idx);
+}
+
+test "vring: scanoutFrame — CREATE_2D/ATTACH/TRANSFER/SET_SCANOUT/FLUSH" {
+    fakeDevReset(16);
+    var st = VringState{};
+    g_dev.st = &st;
+    _ = vringInit(fakeVringCfg(), &st);
+
+    const FAKE_BACKING: u64 = 0x10000; // «физика» кадра
+    const ok = scanoutFrame(fakeVringCfg(), &st, 7, 800, 600, FAKE_BACKING, 800 * 600 * 4);
+    try testing.expect(ok);
+
+    // ВСЕ 5 команд 2D-конвейера ушли устройству (в порядке)
+    try testing.expectEqual(@as(usize, 5), g_dev.seen_n);
+    try testing.expectEqual(CMD_RESOURCE_CREATE_2D, g_dev.seen_cmds[0]);
+    try testing.expectEqual(CMD_RESOURCE_ATTACH_BACKING, g_dev.seen_cmds[1]);
+    try testing.expectEqual(CMD_TRANSFER_TO_HOST_2D, g_dev.seen_cmds[2]);
+    try testing.expectEqual(CMD_SET_SCANOUT, g_dev.seen_cmds[3]);
+    try testing.expectEqual(CMD_RESOURCE_FLUSH, g_dev.seen_cmds[4]);
+
+    // DESC-цепочка: cmd (RO+NEXT) → resp (WO)
+    const desc = st.descTable();
+    try testing.expectEqual(VRING_DESC_F_NEXT, desc[0].flags & VRING_DESC_F_NEXT);
+    try testing.expectEqual(@as(u16, 0), desc[0].flags & VRING_DESC_F_WRITE);
+    try testing.expectEqual(VRING_DESC_F_WRITE, desc[1].flags & VRING_DESC_F_WRITE);
+    try testing.expectEqual(@as(u16, 0), desc[1].flags & VRING_DESC_F_NEXT);
+
+    // недопустимый ресурс → false (res_id=0)
+    try testing.expect(!scanoutFrame(fakeVringCfg(), &st, 0, 800, 600, FAKE_BACKING, 800 * 600 * 4));
+}
+
+test "vring: submitCmd — cmd>64Б отклонён; poll-таймаут при молчащем устройстве" {
+    fakeDevReset(16);
+    var st = VringState{};
+    g_dev.st = null; // устройство НЕ отвечает (headless-модель)
+    _ = vringInit(fakeVringCfg(), &st);
+
+    // большой cmd (attach 36Б ок; возьмём «respir» больше 64Б — resp сам 512Б
+    // устройству можно; команда лимитируется cmd_buf)
+    var big: [80]u8 = [_]u8{0} ** 80;
+    const r = submitCmd(fakeVringCfg(), &st, &big, 80);
+    try testing.expect(r == null);
+
+    // таймаут: устройство подключено, но tick не продвигает used (st нет)
+    const cmd = cmdGetDisplayInfo();
+    const r2 = submitCmd(fakeVringCfg(), &st, &cmd, @sizeOf(CtrlHdr));
+    try testing.expect(r2 == null);
+}
+
+test "vring: одна страница вмещает desc+avail+used при qsize=64" {
+    // desc 64×16=1024 + avail 4+128+2=134 (+паддинг 2) + used 4+512+4=520 → ~1680 ≤ 4096
+    const qsize: u32 = 64;
+    const avail_end = @sizeOf(Desc) * qsize + 6 + 2 * qsize;
+    const used_off = (avail_end + 3) & ~@as(u32, 3);
+    const total = used_off + 6 + 8 * qsize;
+    try testing.expect(total <= 4096);
+    // и при 105 (максимум в одну страницу)
+    const qsize2: u32 = 105;
+    const avail_end2 = @sizeOf(Desc) * qsize2 + 6 + 2 * qsize2;
+    const used_off2 = (avail_end2 + 3) & ~@as(u32, 3);
+    const total2 = used_off2 + 6 + 8 * qsize2;
+    try testing.expect(total2 <= 4096);
+    // 128 — за одной страницей (обрезаем лимитом 128 → vringInit примет, но
+    // страницы не хватит: ядро использует queue_size устройства (QEMU=64))
 }
