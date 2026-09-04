@@ -667,10 +667,18 @@ fn handleException(frame: *InterruptFrame) void {
     }
     // v0.13.0-fix (диагностика CDD №4): дамп стека юзера — ret-адрес укажет
     // ВЫЗЫВАЮЩЕГО функции NULL-вызова (RIP=0: call reg с reg=0).
+    // v0.20.0-fix (CDD №11): ВАЛИДАЦИЯ страницы ПОСЛЕ user-RSP — клон-тред
+    // fault-ится на [rsp+8] ВЫШЕ региона стека (эмпирика elf-run: дампер
+    // слепо разыменовывал usp[i] → kernel-#PF внутри обработчика → halt).
+    // Проба страницы по текущим таблицам (CR3 = PML4 виновника).
     if (from_user and frame.rsp > 0x1000) {
-        const usp: *volatile [12]u64 = @ptrFromInt(frame.rsp);
+        const vmm = @import("vmm64.zig");
         var i: usize = 0;
         while (i < 12) : (i += 1) {
+            const va = frame.rsp + i * 8;
+            const leaf = vmm.userLeafFlags(readCr3() & 0x000FFFFFFFFFF000, va) orelse break;
+            if (leaf & vmm.PTE_USER == 0) break;
+            const usp: *volatile [12]u64 = @ptrFromInt(frame.rsp);
             const v = usp[i];
             if (v >= 0x140000000 and v < 0x1403C0000) {
                 Serial.puts("\n  [rsp+");
@@ -686,12 +694,19 @@ fn handleException(frame: *InterruptFrame) void {
         Serial.puts("\n[EXCEPTION] Ring 3 fault! Killing user process.\n");
         // DEBUG (CDD №8): компактный дамп при RIP=0 (урок SYSTEM_INFO-48Б)
         if (frame.rip == 0) {
-            Serial.puts("[DBG] RIP=0: [rsp]=0x");
-            const usp: *volatile u64 = @ptrFromInt(frame.rsp);
-            Serial.putHex(usp.*);
-            Serial.puts(" [rsp+8]=0x");
-            const usp2: *volatile u64 = @ptrFromInt(frame.rsp + 8);
-            Serial.putHex(usp2.*);
+            const vmm = @import("vmm64.zig");
+            const cr3 = readCr3() & 0x000FFFFFFFFFF000;
+            Serial.puts("[DBG] RIP=0: ");
+            if (vmm.userLeafFlags(cr3, frame.rsp)) |_| {
+                const usp: *volatile u64 = @ptrFromInt(frame.rsp);
+                Serial.puts("[rsp]=0x");
+                Serial.putHex(usp.*);
+                if (vmm.userLeafFlags(cr3, frame.rsp + 8)) |_| {
+                    Serial.puts(" [rsp+8]=0x");
+                    const usp2: *volatile u64 = @ptrFromInt(frame.rsp + 8);
+                    Serial.putHex(usp2.*);
+                }
+            }
             Serial.puts("\n");
         }
         // Kill the task via the exit callback (same mechanism as syscall exit).

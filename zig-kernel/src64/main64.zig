@@ -33,6 +33,7 @@ const win32 = @import("win32_stubs.zig");
 const pe_loader = @import("pe_loader.zig");
 const win32_api = @import("win32_api.zig");
 const linux_syscalls = @import("linux_syscalls.zig");
+const elf_loader = @import("elf_loader.zig");
 const drm_kms = @import("drm_kms.zig");
 const virtio_gpu = @import("virtio_gpu.zig");
 const evdev = @import("evdev.zig");
@@ -1235,6 +1236,7 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  input     - Evdev статус: /dev/input/event0,1 (очереди, дропы)\n");
         sys_print("  inputtest - Evdev self-test: живые клавиши + синт. мышь (E2E)\n");
         sys_print("  ldevtest  - Linux POSIX-слой self-test: open/ioctl/poll/epoll/futex (E2E)\n");
+        sys_print("  elfload   - ELF-процесс Linux-ABI: PT_LOAD+стек argc/argv/auxv → Ring 3\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
@@ -1286,6 +1288,12 @@ fn execute_command(cmd: []const u8) void {
         cmd_inputtest();
     } else if (eq(cmd, "ldevtest")) {
         cmd_ldevtest();
+    } else if (startsWith(cmd, "elfload ")) {
+        cmd_elfload(cmd[8..]);
+    } else if (eq(cmd, "elfload")) {
+        cmd_elfload("");
+    } else if (eq(cmd, "elftest")) {
+        cmd_elfload("elftest");
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -1773,15 +1781,26 @@ fn kernelLoaderOps() pe_loader.LoaderOps {
 const PAGE_SIZE = vmm.PAGE_SIZE;
 const LINUX_MMAP_BASE: u64 = 0x40_0000_0000;
 const LINUX_MMAP_BUDGET: u64 = 0x4000_0000;
-var linux_mmap_cursor: u64 = LINUX_MMAP_BASE;
 const LINUX_MAX_VALIDATE: u64 = 64 * 1024 * 1024; // зеркало MAX_VALIDATE_LEN win32
 
-/// PML4 текущей Ring-3 задачи (ABI-независимо — работает и для будущих ELF).
-/// 0 = нет активного user-контекста (валидация откажет — безопасно).
+/// PML4 текущей Ring-3 задачи (ABI-независимо — работает и для ELF).
+/// v0.20.0 (CDD №11): ВЛАДЕЛЕЦ-ориентированно (user_rsp → задача — атомарно
+/// IF=0; защита от parking-рассинхронов CDD №9). Shell-контекст (ldevtest):
+/// владелец не Linux-тред → честный 0 (валидация/dev_mmap откажут — так
+/// и было в v0.19 через current_task_id).
 fn linuxTaskPml4() u64 {
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        const t = &scheduler.tasks[owner];
+        if (t.privilege == .User and t.abi == .linux and t.state != .Killed) {
+            return t.cr3;
+        }
+    }
     const tid = scheduler.current_task_id;
     if (tid >= scheduler.MAX_TASKS) return 0;
-    return scheduler.tasks[tid].cr3;
+    const t = &scheduler.tasks[tid];
+    if (t.privilege == .User and t.abi == .linux) return t.cr3;
+    return 0;
 }
 
 /// Валидация user-VA по PML4 текущей задачи: та же дисциплина, что
@@ -1953,11 +1972,12 @@ fn linuxDevMmap(kind: linux_syscalls.FdKind, off: u64, len: u64, prot: u64) i64 
     _ = prot; // WC-бит для fb (видеопамять); NX для dumb (данные)
     const pml4 = linuxTaskPml4();
     if (pml4 == 0) return -linux_syscalls.ENODEV; // нет user-задачи
+    const proc = linuxProcCurrent() orelse return -linux_syscalls.ENODEV;
     if (len > LINUX_MMAP_BUDGET) return -linux_syscalls.ENOMEM;
     const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (linux_mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
+    if (proc.mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
         return -linux_syscalls.ENOMEM;
-    const va = linux_mmap_cursor;
+    const va = proc.mmap_cursor;
     switch (kind) {
         .fb0 => {
             if (off != 0) return -linux_syscalls.ENODEV; // только весь fb
@@ -1977,48 +1997,70 @@ fn linuxDevMmap(kind: linux_syscalls.FdKind, off: u64, len: u64, prot: u64) i64 
         },
         else => return -linux_syscalls.ENODEV,
     }
-    linux_mmap_cursor += pages * PAGE_SIZE;
+    // dev-регион: физику НЕ освобождаем (VRAM/dumb — владение drm_kms)
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false);
+    proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }
 
-/// munmap(va, len): снятие страниц в PML4 задачи. Физ. страницы НЕ
-/// освобождаются (реестра маппингов нет — process-exit-cleanup = бэклог
-/// v0.20, уже в AGENT_STATE next_task).
+/// munmap(va, len): снятие страниц в PML4 задачи. v0.20.0: ТОЧНЫЙ anon-регион
+/// (va+len = конец) → физблок освобождается (анти-утечка); dev-мапы и частич-
+/// ные диапазоны — только unmap (реестр-деградация документирована).
 fn linuxDoMunmap(va: u64, len: u64) i64 {
     const pml4 = linuxTaskPml4();
     if (pml4 == 0) return 0; // нечего снимать
     const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     var i: u64 = 0;
     while (i < pages) : (i += 1) {
-        vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+        _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+    }
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        const slot = linux_task_proc[owner];
+        if (slot < MAX_LINUX_PROCS) {
+            for (&linux_mmap_regions[slot]) |*r| {
+                if (r.used and r.va == va and r.anon and
+                    r.va + r.pages * PAGE_SIZE <= va + len)
+                {
+                    pmm.freeContiguousPages(r.phys, r.pages);
+                    r.used = false;
+                    break;
+                }
+            }
+        }
     }
     return 0;
 }
 
-/// mmap(hint, len, prot, flags): MAP_ANONYMOUS|PRIVATE — PMM-страницы в
-/// PML4 текущей задачи (RW+USER+NX; PROT_EXEC снимает NX). Сбой посреди
-/// маппинга — ОТКАТ (unmap + free) — та же дисциплина, что pe_loader.
+/// mmap(hint, len, prot, flags): MAP_ANONYMOUS|PRIVATE — ОДИН contiguous-нулевой
+/// блок в PML4 текущей задачи (RW+USER+NX; PROT_EXEC снимает NX) + запись в
+/// mmap-реестр (munmap-free + clone-стек-lookup). Сбой посреди маппинга —
+/// ОТКАТ (unmap + free) — та же дисциплина, что pe_loader.
 fn linuxDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
     _ = hint;
     _ = flags; // MAP_FIXED не поддержан фундаментом — ядро размещает само
     const pml4 = linuxTaskPml4();
     if (pml4 == 0) return -linux_syscalls.EFAULT;
+    const proc = linuxProcCurrent() orelse return -linux_syscalls.EFAULT;
     if (len > LINUX_MMAP_BUDGET) return -linux_syscalls.ENOMEM;
     const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (linux_mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
+    if (proc.mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
         return -linux_syscalls.ENOMEM;
-    const va = linux_mmap_cursor;
+    const va = proc.mmap_cursor;
     var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
     if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
+    // ОДИН contiguous-блок: munmap-free по реестру + clone-стек-регион
+    const base = pmm.allocContiguousZeroed(@intCast(pages)) orelse
+        return -linux_syscalls.ENOMEM;
     var i: u64 = 0;
     while (i < pages) : (i += 1) {
-        const pa = pmm.allocContiguousZeroed(1) orelse return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
-        vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, pa, pte) catch {
-            pmm.freeContiguousPages(pa, 1);
+        vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, base + i * PAGE_SIZE, pte) catch {
+            pmm.freeContiguousPages(base, pages);
             return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
         };
     }
-    linux_mmap_cursor += pages * PAGE_SIZE;
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true);
+    proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }
 
@@ -2030,59 +2072,375 @@ fn linuxMmapRollback(pml4: u64, va: u64, mapped: u64, ret: i64) i64 {
     return ret;
 }
 
-/// exit(status): завершение текущей задачи — тот же путь, что syscall #4
-/// (kill + невозврат; планировщик больше не диспетчеризирует задачу).
+/// exit(status): завершение ТЕКУЩЕЙ задачи (владелец syscall-каскада).
 fn linuxDoExit(code: u64) void {
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        linuxClearWakeTid(owner);
+    }
     hal.Serial.puts("[LINUX] exit(");
     hal.Serial.putDecimal(code);
     hal.Serial.puts(") — killing user process\n");
     scheduler.exitCurrentTask();
+    // Linux-путь держит IF=0 (SYSCALL SFMASK): pause-цикл заблокировал бы
+    // таймер навсегда (замерзание ядра — эмпирика elf-run E2E). Win32-паттерн:
+    // sti + hlt — тик вытесняет Killed-задачу, остальные живут.
+    hal.sti();
     while (true) {
-        asm volatile ("pause");
+        asm volatile ("hlt" ::: "memory");
     }
 }
 
-/// exit_group: v0.19 — процесс = единственная задача (потоки прибудут с
-/// ELF-загрузчиком); путь идентичен exit.
+/// exit_group: v0.20 — завершение ВСЕХ потоков процесса (CLONE_THREAD-группа
+/// = общий proc-слот): помечаем Killed + CLEARTID-слова (pthread_join).
 fn linuxDoExitGroup(code: u64) void {
     hal.Serial.puts("[LINUX] exit_group(");
     hal.Serial.putDecimal(code);
-    hal.Serial.puts(")\n");
+    hal.Serial.puts(") — killing process threads\n");
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        const slot = linux_task_proc[owner];
+        if (slot < MAX_LINUX_PROCS) {
+            linux_procs[slot].exit_code = code;
+            var i: usize = 0;
+            while (i < scheduler.task_count) : (i += 1) {
+                if (i != owner and linux_task_proc[i] == slot and
+                    scheduler.tasks[i].state != .Killed)
+                {
+                    linuxClearWakeTid(i);
+                    scheduler.tasks[i].state = .Killed;
+                }
+            }
+        }
+    }
     linuxDoExit(code);
 }
 
-/// clone: ПОТОКИ ждут ELF-загрузчик (child-return-механика резюм-кадров —
-/// волна реальных Linux-процессов). Семантика/валидация — в слое, готово.
-fn linuxDoClone(flags: u64, stack: u64, tls: u64) i64 {
-    _ = flags;
-    _ = stack;
-    _ = tls;
-    hal.Serial.puts("[LINUX] clone: threads arrive with ELF-loader wave (semantic layer ready)\n");
-    return -linux_syscalls.ENOSYS;
-}
-
-/// futex-WAIT: слово уже сверено слоем; парковка — 1 тик (10мс) кооперативно
-/// (спин-фьютекс: glibc-мьютексы работают, честная блокировка — с потоками).
-fn linuxFutexPark(uaddr: u64, timeout_ms: u64, infinite: bool) i64 {
-    _ = uaddr;
-    const t0 = hal.tick_count;
-    const ticks = if (infinite) @as(u64, 1) else (timeout_ms + 9) / 10;
-    while (hal.tick_count < t0 + ticks) {
-        asm volatile ("pause");
+/// CLONE_CHILD_CLEARTID-эпилог треда: обнуляем tid-слово + FUTEX_WAKE
+/// (pthread_join на этом слове просыпается). CR3 задачи активен.
+fn linuxClearWakeTid(task_id: usize) void {
+    const tid_va = linux_child_tid[task_id];
+    if (tid_va == 0) return;
+    linux_child_tid[task_id] = 0;
+    var z: [4]u8 = .{0} ** 4;
+    if (linux_user_io.copy_out(tid_va, &z)) {
+        _ = linuxFutexWake(tid_va, 1);
     }
-    return 0; // «разбужен» (или таймаут-модель: см. тесты слоя)
 }
 
-/// futex-WAKE: реестра парковок нет (потоки = ELF-волна) → 0 разбуженных.
+/// clone: НАСТОЯЩИЕ Linux-треды (CDD №11 p1). Ребёнок — задача с кадром
+/// «возврата из clone-syscall»: RAX=0, RSP=новый стек, RIP=после-syscall,
+/// callee-saved от родителя, общий CR3 (CLONE_VM). Родитель получает tid.
+fn linuxDoClone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
+    // parent_tid пишет семантический слой (SETTID); tls — в кадр ребёнка
+    // (CLONE_SETTLS: FS-base — arch_prctl-волна CDD №11 p3)
+
+    const my_rsp = scheduler.user_rsp;
+    const owner = scheduler.syscallStackOwner(my_rsp);
+    if (owner >= scheduler.MAX_TASKS) return -linux_syscalls.ESRCH;
+    const parent = &scheduler.tasks[owner];
+    if (parent.privilege != .User or parent.abi != .linux or parent.state == .Killed)
+        return -linux_syscalls.EPERM;
+    if (stack == 0 or stack > linux_syscalls.USER_VA_CEILING) return -linux_syscalls.EINVAL;
+    if (stack % 16 != 0) return -linux_syscalls.EINVAL;
+    if (linuxProcCurrent() == null) return -linux_syscalls.ESRCH;
+
+    // Кадр ребёнка из syscall_frame-снапшота (IF=0 Linux-пути — ЭТА транзакция;
+    // раскладка: [0]=r15 [1]=r14 [2]=r13 [3]=r12 [4]=rbp [5]=rbx
+    //             [6]=r11(user RFLAGS) [7]=rcx(user RIP после syscall))
+    const sf = scheduler.syscall_frame;
+    var frame: hal.InterruptFrame = std.mem.zeroes(hal.InterruptFrame);
+    frame.r15 = sf[0];
+    frame.r14 = sf[1];
+    frame.r13 = sf[2];
+    frame.r12 = sf[3];
+    frame.rbp = sf[4];
+    frame.rbx = sf[5];
+    // GPR-аргументы clone сохранены Linux-ABI (RDI/RSI/RDX/R10/R8/R9)
+    frame.rdi = flags;
+    frame.rsi = stack;
+    frame.rdx = parent_tid;
+    frame.r10 = child_tid;
+    frame.r8 = tls;
+    frame.r9 = scheduler.linux_arg6;
+    frame.rax = 0; // РЕБЁНОК: clone() возвращает 0
+    frame.rcx = sf[7];
+    frame.r11 = sf[6];
+    frame.rip = sf[7]; // возврат ПОСЛЕ syscall
+    frame.cs = 0x23;
+    frame.rflags = sf[6] | 0x200; // IF=1
+    frame.rsp = stack; // стек ребёнка (аргумент clone)
+    frame.ss = 0x1B;
+
+    const child = scheduler.createLinuxCloneTask(parent.cr3, &frame) catch
+        return -linux_syscalls.EAGAIN; // лимит задач (MAX_TASKS)
+
+    // Тред наследует ПРОЦЕСС родителя (CLONE_VM|CLONE_FILES — общие fd)
+    linux_task_proc[child] = linux_task_proc[owner];
+    // CLONE_CHILD_CLEARTID: слово tid — на exit треда (pthread_join)
+    if (flags & linux_syscalls.CLONE_CHILD_CLEARTID != 0 and child_tid != 0)
+        linux_child_tid[child] = child_tid;
+
+    // Стек ребёнка → таблицы asm-владельца (isr64.S: syscall-каскад треда —
+    // ТОЛЬКО на СВОЁМ kstack). Регион ищем в mmap-реестре процесса (стек
+    // glibc-тредов = mmap-выделение); вне реестра — окно 64КБ вниз.
+    var reg_lo = stack - 64 * 1024;
+    var reg_hi = stack;
+    for (&linux_mmap_regions[linux_task_proc[owner]]) |*r| {
+        if (r.used and stack > r.va and stack <= r.va + r.pages * PAGE_SIZE) {
+            reg_lo = r.va;
+            reg_hi = r.va + r.pages * PAGE_SIZE;
+            break;
+        }
+    }
+    scheduler.registerUserStack(child, reg_lo, reg_hi);
+
+    hal.Serial.puts("[LINUX] clone: child task ");
+    hal.Serial.putDecimal(child);
+    hal.Serial.puts(" (stack 0x");
+    hal.Serial.putHex(stack);
+    hal.Serial.puts(", flags 0x");
+    hal.Serial.putHex(flags);
+    hal.Serial.puts(")\n");
+    return @intCast(child);
+}
+
+// ─── v0.20.0 (CDD №11 p1): futex-реестр парковок (честная блокировка) ──────
+
+const FutexPark = struct {
+    active: bool = false,
+    task: usize = 0,
+    uaddr: u64 = 0,
+    woken: bool = false,
+};
+
+var futex_parks: [scheduler.MAX_TASKS]FutexPark =
+    [_]FutexPark{.{}} ** scheduler.MAX_TASKS;
+
+/// futex-WAIT: слово сверено слоем; парковка модели kSleepTask —
+/// snapshotResumeFrame + снятие транзакции + hlt до WAKE/дедлайна.
+/// WAKE из другого треда (общая VM) находит реестровую запись → woken.
+fn linuxFutexPark(uaddr: u64, timeout_ms: u64, infinite: bool) i64 {
+    const my_rsp = scheduler.user_rsp;
+    const owner = scheduler.syscallStackOwner(my_rsp);
+    if (owner >= scheduler.MAX_TASKS or
+        scheduler.tasks[owner].privilege != .User)
+    {
+        // shell-контекст (ldevtest): кооперативная модель 1 тик
+        const t0 = hal.tick_count;
+        const ticks = if (infinite) @as(u64, 1) else (timeout_ms + 9) / 10;
+        while (hal.tick_count < t0 + ticks) {
+            asm volatile ("pause");
+        }
+        return 0;
+    }
+
+    // Регистрируемся ДО выпуска транзакции: WAKE в окне word-check→park
+    // находит запись (не теряется)
+    futex_parks[owner] = .{ .active = true, .task = owner, .uaddr = uaddr, .woken = false };
+
+    // Дедлайн: finite → таймаут-тики; infinite → 60с-страховка с перепарковкой
+    var deadline = hal.tick_count + 6000;
+    if (!infinite) {
+        const ticks = (timeout_ms + 9) / 10;
+        if (ticks == 0) {
+            futex_parks[owner].active = false;
+            return -linux_syscalls.ETIMEDOUT;
+        }
+        deadline = hal.tick_count + ticks;
+    }
+
+    // Резюм-кадр + будильник (модель kSleepTask: каскад на топе kstack)
+    scheduler.snapshotResumeFrame(owner, my_rsp);
+    scheduler.setTaskSleepFor(owner, (deadline - hal.tick_count) * 10);
+
+    // Выпуск транзакции: тики диспетчируют WAKE-ника
+    hal.cli();
+    scheduler.in_win32_syscall = 0;
+    hal.sti();
+
+    // Парк: hlt до прерывания (тик 100Гц); WAKE снимает будильник → слайс
+    while (true) {
+        if (futex_parks[owner].woken) break;
+        if (hal.tick_count >= deadline) {
+            if (infinite) {
+                // перепарковка (страховка от зависшего таймера); честный
+                // glibc-цикл повторит word-check новым WAIT → EAGAIN
+                deadline = hal.tick_count + 6000;
+                scheduler.setTaskSleepFor(owner, 60_000);
+                continue;
+            }
+            break; // таймаут
+        }
+        asm volatile ("hlt" ::: "memory");
+    }
+    const was_woken = futex_parks[owner].woken;
+    futex_parks[owner].active = false;
+
+    // Эпилог транзакции (модель kSleepTask): вернуть свой user_rsp,
+    // резюм-указатель — на .bss-слот (валидный кадр «после syscall»)
+    hal.cli();
+    scheduler.user_rsp = my_rsp;
+    scheduler.in_win32_syscall = 1;
+    hal.sti();
+    scheduler.setTaskSleepFor(owner, 0);
+    scheduler.installResumeFrame(owner);
+
+    return if (was_woken) 0 else -linux_syscalls.ETIMEDOUT;
+}
+
+/// futex-WAKE: разбудить до n паркуемых на uaddr (реестр → будильник-снятие).
 fn linuxFutexWake(uaddr: u64, n: u32) u32 {
-    _ = uaddr;
-    _ = n;
-    return 0;
+    var cnt: u32 = 0;
+    for (&futex_parks) |*p| {
+        if (cnt >= n) break;
+        if (p.active and !p.woken and p.uaddr == uaddr) {
+            p.woken = true;
+            scheduler.setTaskSleepFor(p.task, 0); // будильник снять → слайс
+            cnt += 1;
+        }
+    }
+    return cnt;
 }
 
 /// fd-таблица Linux-процессов (v0.19: глобальная на слой — ELF-загрузчик
 /// размножит на задачу; контракты семантического слоя уже пер-таблиценные).
 var linux_fds: linux_syscalls.FdTable = linux_syscalls.FdTable.init();
+
+// ─── v0.20.0 (CDD №11 p1): Linux-ПРОЦЕССЫ — состояние и реестры ────────────
+//
+// Процесс = proc-слот (fd-таблица CLONE_FILES-общая, mmap-курсор, brk,
+// exit-код). Треды (clone) наследуют слот: linux_task_proc[task] → слот.
+// mmap-реестр: munmap-освобождение физики + clone-стек-lookup.
+
+const LinuxProc = struct {
+    used: bool = false,
+    fds: linux_syscalls.FdTable = linux_syscalls.FdTable.init(),
+    mmap_cursor: u64 = 0,
+    /// brk-базис (конец ELF-образа) и текущий brk (glibc-static malloc).
+    brk_base: u64 = 0,
+    brk: u64 = 0,
+    exit_code: ?u64 = null,
+};
+
+const MmapRegion = struct {
+    used: bool = false,
+    va: u64 = 0,
+    pages: u64 = 0,
+    /// Базис физблока (munmap-free; dev-мапы — 0, физику НЕ освобождаем).
+    phys: u64 = 0,
+    anon: bool = true,
+};
+
+const MAX_LINUX_PROCS: usize = 2;
+const MAX_MMAP_REGIONS: usize = 16;
+
+var linux_task_proc: [scheduler.MAX_TASKS]u8 =
+    [_]u8{255} ** scheduler.MAX_TASKS;
+var linux_procs: [MAX_LINUX_PROCS]LinuxProc = [_]LinuxProc{.{}} ** MAX_LINUX_PROCS;
+var linux_mmap_regions: [MAX_LINUX_PROCS][MAX_MMAP_REGIONS]MmapRegion =
+    [_][MAX_MMAP_REGIONS]MmapRegion{[_]MmapRegion{.{}} ** MAX_MMAP_REGIONS} ** MAX_LINUX_PROCS;
+/// CLONE_CHILD_CLEARTID-слова тредов (pthread_join).
+var linux_child_tid: [scheduler.MAX_TASKS]u64 =
+    [_]u64{0} ** scheduler.MAX_TASKS;
+
+/// Владелец текущего syscall-каскада (user_rsp → задача; атомарно IF=0).
+fn linuxOwnerTask() usize {
+    return scheduler.syscallStackOwner(scheduler.user_rsp);
+}
+
+/// Proc-слот текущей Linux-задачи (null = shell/ldevtest-контекст).
+fn linuxProcCurrent() ?*LinuxProc {
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        const t = &scheduler.tasks[owner];
+        if (t.privilege == .User and t.abi == .linux and t.state != .Killed) {
+            const slot = linux_task_proc[owner];
+            if (slot < MAX_LINUX_PROCS) return &linux_procs[slot];
+        }
+    }
+    return null;
+}
+
+/// fd-таблица текущего контекста: тред → таблица процесса; shell → глобальная.
+fn linuxFdsCurrent() *linux_syscalls.FdTable {
+    if (linuxProcCurrent()) |p| return &p.fds;
+    return &linux_fds;
+}
+
+/// Занять proc-слот для новой задачи (elfload).
+fn linuxNewProc(task_id: usize) ?usize {
+    for (&linux_procs, 0..) |*p, i| {
+        if (!p.used) {
+            p.* = .{
+                .used = true,
+                .fds = linux_syscalls.FdTable.init(),
+                .mmap_cursor = LINUX_MMAP_BASE,
+            };
+            linux_task_proc[task_id] = @intCast(i);
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Записать mmap-регион в реестр процесса.
+fn linuxRecordRegion(slot: u8, va: u64, pages: u64, phys: u64, anon: bool) void {
+    if (slot >= MAX_LINUX_PROCS) return;
+    for (&linux_mmap_regions[slot]) |*r| {
+        if (!r.used) {
+            r.* = .{ .used = true, .va = va, .pages = pages, .phys = phys, .anon = anon };
+            return;
+        }
+    }
+    // реестр полон: регион живёт без записи (munmap-free деградирует до unmap)
+    hal.Serial.puts("[LINUX] mmap registry full (16) — region untracked\n");
+}
+
+/// brk Linux-семантики: 0 → текущий; рост/спад — маппинг страниц [brk, addr);
+/// отказ (ниже базиса / нет памяти) → вернуть СТАРЫЙ brk.
+fn linuxDoBrk(addr: u64) u64 {
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return 0; // shell-контекст: brk нет
+    const proc = linuxProcCurrent() orelse return 0;
+    if (addr == 0) return proc.brk;
+    if (addr < proc.brk_base) return proc.brk; // ниже образа — отказ
+    if (addr == proc.brk) return proc.brk;
+
+    if (addr > proc.brk) {
+        // рост: страницы [brk, addr) — RW+USER+NX
+        const pages = (addr - proc.brk + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (pages > 1024) return proc.brk; // 4МБ за вызов — подозрительно
+        const base = pmm.allocContiguousZeroed(@intCast(pages)) orelse
+            return proc.brk;
+        const pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE;
+        var i: u64 = 0;
+        while (i < pages) : (i += 1) {
+            vmm.mapPageInPML4(pml4, proc.brk + i * PAGE_SIZE, base + i * PAGE_SIZE, pte) catch {
+                // откат роста
+                var j: u64 = 0;
+                while (j < i) : (j += 1) {
+                    vmm.unmapPageInPML4(pml4, proc.brk + j * PAGE_SIZE) catch {};
+                }
+                pmm.freeContiguousPages(base, pages);
+                return proc.brk;
+            };
+        }
+        linuxRecordRegion(linux_task_proc[linuxOwnerTask()], proc.brk, pages, base, true);
+        proc.brk = proc.brk + pages * PAGE_SIZE; // Linux: brk странично-гранулярный
+        return proc.brk;
+    }
+
+    // спад: unmap [addr, brk) (физику точного региона освобождаем)
+    const drop_pages = (proc.brk - addr + PAGE_SIZE - 1) / PAGE_SIZE;
+    var i: u64 = 0;
+    while (i < drop_pages) : (i += 1) {
+        _ = vmm.unmapPageInPML4(pml4, addr + i * PAGE_SIZE) catch {};
+    }
+    proc.brk = addr & ~@as(u64, PAGE_SIZE - 1);
+    return proc.brk;
+}
+
 
 // ─── v0.19.0 (CDD №10 p4): VFS Live-режима (initrd-RO + tmpfs-RAM) ─────────
 
@@ -2231,16 +2589,36 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .do_clone = linuxDoClone,
         .futex_park = linuxFutexPark,
         .futex_wake = linuxFutexWake,
+        .current_pid = linuxCurrentPid,
+        .current_tid = linuxCurrentTid,
+        .do_brk = linuxDoBrk,
         .open_file = linuxOpenFile,
         .file_read = linuxFileRead,
         .file_write = linuxFileWrite,
     };
 }
 
+/// pid: стабилен внутри процесса (группа тредов = слот): 100 + slot.
+fn linuxCurrentPid() u64 {
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        const slot = linux_task_proc[owner];
+        if (slot < MAX_LINUX_PROCS) return 100 + slot;
+    }
+    return 100; // shell-контекст
+}
+
+/// tid: id задачи-владельца syscall-каскада (NPTL: уникален на тред).
+fn linuxCurrentTid() u64 {
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) return owner;
+    return 0;
+}
+
 /// hal.linuxSyscallCallback: Linux x86_64 RAX-ABI. Аргументы №5/№6 (user
 /// R8/R9) читаем из scheduler-глобалов (asm-вход сохранил ДО затирания).
 fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
-    return linux_syscalls.dispatch(kernelLinuxOps(), &linux_fds, num, .{
+    return linux_syscalls.dispatch(kernelLinuxOps(), linuxFdsCurrent(), num, .{
         .a1 = a1,
         .a2 = a2,
         .a3 = a3,
@@ -2999,6 +3377,161 @@ fn cmd_ldevtest() void {
     }
 
     sys_print("[LDEVTEST] ALL PASS\n");
+}
+
+// ─── v0.20.0 (CDD №11 p1): elfload — запуск Linux-ABI ELF-процесса ──────────
+
+/// ElfOps-мост к PMM/vmm (те же бриджи, что pe_loader — идентичные контракты).
+fn kernelElfOps() elf_loader.ElfOps {
+    return .{
+        .alloc_contig = pmmAllocContig,
+        .map_user = vmmMapUser,
+        .page_ptr = identityPagePtr,
+        .unmap_user = vmmUnmapUser,
+        .free_contig = pmmFreeContig,
+    };
+}
+
+/// Буферы argv для процесса (shell-строка → токены ≤ 8 × 63Б).
+var elf_argv_buf: [9][64]u8 = undefined;
+
+/// AT_RANDOM-сид: TSC + тик-микс (16Б). PUF-энтропия подключается в
+/// glibc-волне (stack-canary стартует случайным).
+fn elfRandomSeed() [16]u8 {
+    const tsc = hal.readMsr(0x10);
+    var seed: [16]u8 = undefined;
+    var v = tsc ^ (hal.tick_count << 32) ^ 0x5A17_C0DE;
+    for (&seed) |*b| {
+        v = v *% 6364136223846793005 +% 1442695040888963407;
+        b.* = @truncate(v >> 33);
+    }
+    return seed;
+}
+
+/// cmd_elfload <file-in-initrd> [args…]: ПЕРВЫЙ ELF-процесс Linux-ABI.
+/// PT_LOAD → user-PML4 (PTE по p_flags), стек Linux-ABI (argc/argv/envp/
+/// auxv), Ring-3 задача с RAX-маршрутизацией + proc-слот (fd/mmap/brk).
+/// Активирует БОЕВОЙ режим: dev_mmap WC, clone-треды, futex-парковки.
+fn cmd_elfload(args: []const u8) void {
+    if (args.len == 0) {
+        sys_print("Usage: elfload <file-in-initrd> [args...]  (e.g. elfload elftest --flag)\n");
+        return;
+    }
+    var file_end = std.mem.indexOfScalar(u8, args, ' ') orelse args.len;
+    if (file_end == 0) file_end = args.len;
+    const file = args[0..file_end];
+    const rest = if (args.len > file_end) args[file_end + 1 ..] else "";
+    const data = initrdFindFile(file) orelse {
+        sys_print("File not found in initrd: ");
+        sys_print(file);
+        sys_print("\n");
+        return;
+    };
+
+    sys_print("=== ELF Load & Run (CDD #11): ");
+    sys_print(file);
+    if (rest.len > 0) {
+        sys_print(" — args: ");
+        sys_print(rest);
+    }
+    sys_print(" ===\n");
+
+    // 1. User-PML4 (kernel-маппинги копируются БЕЗ User-бита)
+    const user_pml4 = vmm.createUserPML4() catch |err| {
+        sys_print("createUserPML4 error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+
+    // 2. Образ: PT_LOAD → PML4 (ET_DYN-базис LINUX_IMAGE_BASE)
+    const ops = kernelElfOps();
+    const img = elf_loader.loadElf(ops, user_pml4, data, elf_loader.LINUX_IMAGE_BASE) catch |err| {
+        sys_print("[ELF] load error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    sys_print("[ELF] image: base=0x");
+    putHex(img.base_va);
+    sys_print(" entry=0x");
+    putHex(img.entry_va);
+    sys_print(" pages=");
+    printDec(img.pages);
+    sys_print(" brk=0x");
+    putHex(img.brk);
+    if (img.is_pie) {
+        sys_print(" (PIE)");
+    }
+    sys_print("\n");
+
+    // 3. argv: file + токены rest (≤ 9 × 63Б)
+    var argv_count: usize = 0;
+    var argv_ptrs: [9][]const u8 = undefined;
+    {
+        const n = @min(file.len, elf_argv_buf[0].len - 1);
+        @memcpy(elf_argv_buf[0][0..n], file[0..n]);
+        elf_argv_buf[0][n] = 0;
+        argv_ptrs[0] = elf_argv_buf[0][0..n];
+        argv_count = 1;
+        var it = std.mem.tokenizeScalar(u8, rest, ' ');
+        while (it.next()) |tok| {
+            if (argv_count >= elf_argv_buf.len) break;
+            const t = @min(tok.len, elf_argv_buf[argv_count].len - 1);
+            @memcpy(elf_argv_buf[argv_count][0..t], tok[0..t]);
+            elf_argv_buf[argv_count][t] = 0;
+            argv_ptrs[argv_count] = elf_argv_buf[argv_count][0..t];
+            argv_count += 1;
+        }
+    }
+    const envp = [_][]const u8{ "HOME=/root", "TERM=linux", "PATH=/usr/bin" };
+
+    // 4. Стек Linux-ABI: argc/argv/envp/auxv + AT_RANDOM
+    const stack = elf_loader.buildUserStack(
+        ops,
+        user_pml4,
+        elf_loader.LINUX_STACK_TOP,
+        elf_loader.LINUX_STACK_PAGES,
+        .{ .argv = argv_ptrs[0..argv_count], .envp = &envp, .execfn = argv_ptrs[0] },
+        img,
+        elfRandomSeed(),
+    ) catch |err| {
+        sys_print("[ELF] stack error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    sys_print("[ELF] stack: entry_rsp=0x");
+    putHex(stack.entry_rsp);
+    sys_print(" argc=");
+    printDec(argv_count);
+    sys_print("\n");
+
+    // 5. Ring-3 задача + Linux-ABI + proc-слот (fd/mmap/brk)
+    const task_id = scheduler.createUserTask(img.entry_va, user_pml4, stack.entry_rsp) catch |err| {
+        sys_print("createUserTask error: ");
+        sys_print(@errorName(err));
+        sys_print("\n");
+        return;
+    };
+    scheduler.tasks[task_id].abi = .linux;
+    // v0.18.0 (CDD №9): главный user-стек — в таблицах asm-владельца
+    scheduler.registerUserStack(
+        task_id,
+        elf_loader.LINUX_STACK_TOP - elf_loader.LINUX_STACK_PAGES * 4096,
+        elf_loader.LINUX_STACK_TOP,
+    );
+    if (linuxNewProc(task_id)) |slot| {
+        linux_procs[slot].brk_base = img.brk;
+        linux_procs[slot].brk = img.brk;
+    } else {
+        sys_print("[ELF] proc-слоты исчерпаны (2) — задача без fd-таблицы\n");
+    }
+
+    sys_print("[ELF] Ring 3 task #");
+    printDec(task_id);
+    sys_print(" created (Linux ABI) — waiting for user markers\n");
+    sys_print("[ELF] dev_mmap WC / clone / futex — боевой режим активирован\n");
 }
 
 /// v0.11.0 (CDD №2): калибровка TSC для QueryPerformanceFrequency —

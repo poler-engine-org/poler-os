@@ -36,13 +36,21 @@ pub const SYS_write: u64 = 1;
 pub const SYS_open: u64 = 2;
 pub const SYS_close: u64 = 3;
 pub const SYS_mmap: u64 = 9;
+pub const SYS_brk: u64 = 12;
 pub const SYS_munmap: u64 = 11;
 pub const SYS_ioctl: u64 = 16;
 pub const SYS_poll: u64 = 7;
 pub const SYS_clone: u64 = 56;
+pub const SYS_getpid: u64 = 39;
 pub const SYS_fcntl: u64 = 72;
 pub const SYS_exit: u64 = 60;
 pub const SYS_futex: u64 = 202;
+pub const SYS_getuid: u64 = 102;
+pub const SYS_getgid: u64 = 104;
+pub const SYS_geteuid: u64 = 107;
+pub const SYS_getegid: u64 = 108;
+pub const SYS_getppid: u64 = 110;
+pub const SYS_gettid: u64 = 186;
 pub const SYS_epoll_wait: u64 = 232;
 pub const SYS_epoll_ctl: u64 = 233;
 pub const SYS_exit_group: u64 = 231;
@@ -54,6 +62,7 @@ pub const SYS_openat: u64 = 257;
 
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
+pub const ESRCH: i64 = 3;
 pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;
 pub const EAGAIN: i64 = 11;
@@ -186,6 +195,11 @@ pub const CLONE_FS: u64 = 0x200;
 pub const CLONE_FILES: u64 = 0x400;
 pub const CLONE_SIGHAND: u64 = 0x800;
 pub const CLONE_THREAD: u64 = 0x10000;
+/// v0.20.0 (CDD №11): NPTL-контракты pthread_join
+pub const CLONE_SETTLS: u64 = 0x80000;
+pub const CLONE_PARENT_SETTID: u64 = 0x100000;
+pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+pub const CLONE_CHILD_SETTID: u64 = 0x10000000;
 
 /// Максимальная ёмкость poll-буфера фундамента (ядро копирует в статический
 /// буфер — аллокаций в syscall-пути нет). Linux-лимит RLIMIT_NOFILE больше,
@@ -331,12 +345,22 @@ pub const LinuxOps = struct {
     do_exit: *const fn (code: u64) void,
     /// exit_group(code): завершение процесса (все потоки).
     do_exit_group: *const fn (code: u64) void,
-    /// clone-поток (CLONE_VM|CLONE_THREAD): tid или -errno.
-    do_clone: *const fn (flags: u64, stack: u64, tls: u64) i64,
+    /// clone-поток (CLONE_VM|CLONE_THREAD): tid или -errno. Ядро строит
+    /// кадр ребёнка (RAX=0, RSP=stack, RIP=после-syscall) и регистрирует
+    /// его стек в таблицах asm-владельца. parent_tid/child_tid — адреса
+    /// слов SETTID-контрактов (пишет СЕМАНТИЧЕСКИЙ слой после успеха).
+    do_clone: *const fn (flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) i64,
     /// futex-WAIT: значение уже сверено; парковка. 0/EAGAIN/ETIMEDOUT.
     futex_park: *const fn (uaddr: u64, timeout_ms: u64, infinite: bool) i64,
     /// futex-WAKE: число разбуженных.
     futex_wake: *const fn (uaddr: u64, n: u32) u32,
+    /// v0.20.0 (CDD №11): PID текущего процесса (группа тредов).
+    current_pid: *const fn () u64,
+    /// v0.20.0 (CDD №11): TID текущей задачи (gettid; futex/NPTL).
+    current_tid: *const fn () u64,
+    /// v0.20.0 (CDD №11): brk(addr) — Linux-семантика (0 → текущий;
+    /// рост/спад маппинга; отказ → старый brk).
+    do_brk: *const fn (addr: u64) u64,
     /// open_file: открыть файл VFS (initrd-RO/tmpfs-RW) по пути.
     /// Возвращает файл-id ≥ 0 или -errno; kind возвращает через out_kind.
     open_file: *const fn (path: []const u8, flags: u64, out_kind: *FdKind) i64,
@@ -701,15 +725,34 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
     return n;
 }
 
-/// long clone(unsigned long flags, void *stack, ...) — ПОТОКИ v0.19:
-/// CLONE_VM|CLONE_SIGHAND|CLONE_THREAD|CLONE_FS|CLONE_FILES (POSIX-треды
-/// glibc/musl). fork (без CLONE_VM) требует copy-on-write — вне фундамента.
-pub fn sysClone(ops: LinuxOps, flags: u64, stack: u64, tls: u64) u64 {
+/// long clone(unsigned long flags, void *stack, int *parent_tid,
+///             int *child_tid, unsigned long tls) — ПОТОКИ v0.20:
+/// фактический запуск (RAX=0 у ребёнка — runtime-мост do_clone).
+/// SETTID-контракты NPTL: после успеха ядро пишет tid ребёнка в
+/// *parent_tid (CLONE_PARENT_SETTID) и/или *child_tid (CLONE_CHILD_SETTID);
+/// CLONE_CHILD_CLEARTID-слово runtime обнуляет на exit треда + FUTEX_WAKE
+/// (pthread_join). CLONE_SETTLS принимается — FS-base в arch_prctl-волне.
+pub fn sysClone(ops: LinuxOps, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) u64 {
     const need = CLONE_VM | CLONE_SIGHAND;
     if (flags & need != need) return err(EINVAL); // fork/COW — честный EINVAL
     if (flags & CLONE_SIGHAND != 0 and flags & CLONE_VM == 0) return err(EINVAL);
-    const r = ops.do_clone(flags, stack, tls);
+    // SETTID-указатели обязаны присутствовать (ядро пишет tid после успеха)
+    if (flags & CLONE_PARENT_SETTID != 0 and parent_tid == 0) return err(EINVAL);
+    if (flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 and child_tid == 0)
+        return err(EINVAL);
+    const r = ops.do_clone(flags, stack, parent_tid, child_tid, tls);
     if (r < 0) return @bitCast(r);
+    const tid: u32 = @truncate(@as(u64, @intCast(r)));
+    if (flags & CLONE_PARENT_SETTID != 0) {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, tid, .little);
+        if (!ops.copy_out(parent_tid, &b)) return err(EFAULT);
+    }
+    if (flags & CLONE_CHILD_SETTID != 0) {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, tid, .little);
+        if (!ops.copy_out(child_tid, &b)) return err(EFAULT);
+    }
     return @intCast(r);
 }
 
@@ -724,6 +767,34 @@ pub fn sysUname(ops: LinuxOps, buf_va: u64) u64 {
     if (!ops.validate(buf_va, @sizeOf(Utsname), true)) return err(EFAULT);
     if (!ops.copy_out(buf_va, std.mem.asBytes(&default_uts))) return err(EFAULT);
     return 0;
+}
+
+// ─── v0.20.0 (CDD №11 p1): идентичность процесса + brk (glibc-static волна) ─
+
+/// uid/gid нашего CachyOS-пользователя (не-root: безопасность).
+pub const KUID: u64 = 1000;
+
+/// pid_t gettid(void) — TID текущей задачи (NPTL: futex/robust-list).
+pub fn sysGettid(ops: LinuxOps) u64 {
+    return ops.current_tid();
+}
+
+/// pid_t getpid(void) — PID процесса (одинаков во всех тредах).
+pub fn sysGetpid(ops: LinuxOps) u64 {
+    return ops.current_pid();
+}
+
+/// pid_t getppid(void) — родитель = init (1).
+pub fn sysGetppid(ops: LinuxOps) u64 {
+    _ = ops;
+    return 1;
+}
+
+/// unsigned long brk(unsigned long addr) — Linux-семантика:
+///   addr=0 → текущий brk; рост/спад — runtime; отказ → старый brk.
+/// glibc-static malloc стартует с sbrk(0) (получить базис).
+pub fn sysBrk(ops: LinuxOps, addr: u64) u64 {
+    return ops.do_brk(addr);
 }
 
 /// void exit(int status) — noreturn по ABI; ядро убивает задачу.
@@ -754,7 +825,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_ioctl => return sysIoctl(ops, fds, @bitCast(args.a1), @truncate(args.a2), args.a3),
         SYS_fcntl => return sysFcntl(ops, fds, @bitCast(args.a1), args.a2, args.a3),
         SYS_poll => return sysPoll(ops, fds, args.a1, args.a2, @bitCast(args.a3)),
-        SYS_clone => return sysClone(ops, args.a1, args.a2, args.a5),
+        SYS_clone => return sysClone(ops, args.a1, args.a2, args.a3, args.a4, args.a5),
         SYS_futex => return sysFutex(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_epoll_create1 => return sysEpollCreate1(ops, fds, args.a1),
         SYS_epoll_ctl => return sysEpollCtl(ops, fds, @bitCast(args.a1), args.a2, @bitCast(args.a3), args.a4),
@@ -762,6 +833,14 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_exit => return sysExit(ops, args.a1),
         SYS_exit_group => return sysExitGroup(ops, args.a1),
         SYS_uname => return sysUname(ops, args.a1),
+        SYS_gettid => return sysGettid(ops),
+        SYS_getpid => return sysGetpid(ops),
+        SYS_getppid => return sysGetppid(ops),
+        SYS_getuid => return @intCast(KUID),
+        SYS_geteuid => return @intCast(KUID),
+        SYS_getgid => return @intCast(KUID),
+        SYS_getegid => return @intCast(KUID),
+        SYS_brk => return sysBrk(ops, args.a1),
         else => return err(ENOSYS),
     }
 }
@@ -793,6 +872,9 @@ const FakeEnv = struct {
     last_dev_mmap_off: u64 = 0,
     clone_calls: u64 = 0,
     last_clone_flags: u64 = 0,
+    brk_calls: u64 = 0,
+    last_brk_addr: u64 = 0,
+    brk_value: u64 = 0x1000,
     park_calls: u64 = 0,
     wake_calls: u64 = 0,
     last_wake_n: u32 = 0,
@@ -930,11 +1012,13 @@ fn fakeDoExit(code: u64) void {
 fn fakeDoExitGroup(code: u64) void {
     g_env.?.exit_group_code = code;
 }
-fn fakeDoClone(flags: u64, stack: u64, tls: u64) i64 {
+fn fakeDoClone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
     const e = g_env.?;
     e.clone_calls += 1;
     e.last_clone_flags = flags;
     _ = stack;
+    _ = parent_tid;
+    _ = child_tid;
     _ = tls;
     return 77; // tid ребёнка
 }
@@ -1050,10 +1134,31 @@ fn fakeOps() LinuxOps {
         .do_clone = fakeDoClone,
         .futex_park = fakeFutexPark,
         .futex_wake = fakeFutexWake,
+        .current_pid = fakeCurrentPid,
+        .current_tid = fakeCurrentTid,
+        .do_brk = fakeDoBrk,
         .open_file = fakeOpenFile,
         .file_read = fakeFileRead,
         .file_write = fakeFileWrite,
     };
+}
+
+fn fakeCurrentPid() u64 {
+    return 100; // слот-модель ядра: pid = 100 + slot
+}
+
+fn fakeCurrentTid() u64 {
+    return 77;
+}
+
+fn fakeDoBrk(addr: u64) u64 {
+    const e = g_env.?;
+    e.brk_calls += 1;
+    e.last_brk_addr = addr;
+    if (addr == 0) return e.brk_value;
+    if (addr < 0x1000) return e.brk_value; // ниже базиса — отказ
+    e.brk_value = addr;
+    return addr;
 }
 
 fn envSetup() !*FakeEnv {
@@ -1521,15 +1626,55 @@ test "linux: sys_clone — потоковые флаги; fork (без CLONE_VM)
 
     // поток: CLONE_VM|CLONE_SIGHAND|CLONE_THREAD|CLONE_FS|CLONE_FILES
     const thr = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_FS | CLONE_FILES;
-    const r = sysClone(ops, thr, 0x2000_0000_0000, 0);
+    const r = sysClone(ops, thr, 0x2000_0000_0000, 0, 0, 0);
     try testing.expectEqual(@as(u64, 77), r); // tid ребёнка
     try testing.expectEqual(@as(u64, 1), e.clone_calls);
     try testing.expectEqual(thr, e.last_clone_flags);
 
     // fork (SIGCHLD, без CLONE_VM) → -EINVAL (COW вне фундамента v0.19)
-    try testing.expectEqual(err(EINVAL), sysClone(ops, 17, 0, 0));
+    try testing.expectEqual(err(EINVAL), sysClone(ops, 17, 0, 0, 0, 0));
     // CLONE_VM без CLONE_SIGHAND → Linux требует пару → -EINVAL
-    try testing.expectEqual(err(EINVAL), sysClone(ops, CLONE_VM, 0, 0));
+    try testing.expectEqual(err(EINVAL), sysClone(ops, CLONE_VM, 0, 0, 0, 0));
+}
+
+test "linux: sys_clone SETTID — NPTL-контракты parent/child_tid" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+
+    // слова tid в «user»-памяти фейка (USER_BASE — валидная зона fakeValidate)
+    const ctid_va = FakeEnv.USER_BASE + 0x60;
+    const ptid_va = FakeEnv.USER_BASE + 0x70;
+    std.mem.writeInt(u32, e.mem[0x60..0x64], 0xDEAD, .little);
+    std.mem.writeInt(u32, e.mem[0x70..0x74], 0xBEEF, .little);
+
+    const thr = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_FS | CLONE_FILES |
+        CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+    const r = sysClone(ops, thr, 0x2000_0000_0000, ptid_va, ctid_va, 0);
+    try testing.expectEqual(@as(u64, 77), r);
+
+    // tid (77) записан в ОБА слова
+    try testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, e.mem[0x60..0x64], .little));
+    try testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, e.mem[0x70..0x74], .little));
+
+    // CLONE_PARENT_SETTID без указателя → EINVAL
+    try testing.expectEqual(err(EINVAL), sysClone(
+        ops,
+        CLONE_VM | CLONE_SIGHAND | CLONE_PARENT_SETTID,
+        0x2000_0000_0000,
+        0,
+        0,
+        0,
+    ));
+    // CLONE_CHILD_CLEARTID без указателя → EINVAL
+    try testing.expectEqual(err(EINVAL), sysClone(
+        ops,
+        CLONE_VM | CLONE_SIGHAND | CLONE_CHILD_CLEARTID,
+        0x2000_0000_0000,
+        0,
+        0,
+        0,
+    ));
 }
 
 test "linux: sys_read — event-устройства, EAGAIN/EOF-семантика; консоль → EBADF" {
@@ -1673,4 +1818,37 @@ test "linux: initrd-файл — RO-чтение с «USB»; запись → -E
     const out: *const PollFd = @ptrCast(@alignCast(e.vaPtr(pva).?));
     try testing.expectEqual(POLLIN, out.revents & POLLIN);
     try testing.expectEqual(@as(i16, 0), out.revents & POLLOUT); // RO — писать нельзя
+}
+
+test "linux: v0.20 identity/brk — gettid/getpid/getppid/uid/brk-семантика" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+    var fds = FdTable.init();
+
+    // якоря номеров (unistd_64.h)
+    try testing.expectEqual(@as(u64, 12), SYS_brk);
+    try testing.expectEqual(@as(u64, 39), SYS_getpid);
+    try testing.expectEqual(@as(u64, 102), SYS_getuid);
+    try testing.expectEqual(@as(u64, 104), SYS_getgid);
+    try testing.expectEqual(@as(u64, 107), SYS_geteuid);
+    try testing.expectEqual(@as(u64, 108), SYS_getegid);
+    try testing.expectEqual(@as(u64, 110), SYS_getppid);
+    try testing.expectEqual(@as(u64, 186), SYS_gettid);
+
+    // dispatch: identity-волна
+    try testing.expectEqual(@as(u64, 77), dispatch(ops, &fds, SYS_gettid, .{}));
+    try testing.expectEqual(@as(u64, 100), dispatch(ops, &fds, SYS_getpid, .{}));
+    try testing.expectEqual(@as(u64, 1), dispatch(ops, &fds, SYS_getppid, .{}));
+    try testing.expectEqual(@as(u64, 1000), dispatch(ops, &fds, SYS_getuid, .{}));
+    try testing.expectEqual(@as(u64, 1000), dispatch(ops, &fds, SYS_geteuid, .{}));
+    try testing.expectEqual(@as(u64, 1000), dispatch(ops, &fds, SYS_getgid, .{}));
+    try testing.expectEqual(@as(u64, 1000), dispatch(ops, &fds, SYS_getegid, .{}));
+
+    // brk: sbrk(0) → базис; рост → новый; отказ (ниже базиса) → старый
+    try testing.expectEqual(@as(u64, 0x1000), dispatch(ops, &fds, SYS_brk, .{ .a1 = 0 }));
+    try testing.expectEqual(@as(u64, 0x3000), dispatch(ops, &fds, SYS_brk, .{ .a1 = 0x3000 }));
+    try testing.expectEqual(@as(u64, 0x3000), dispatch(ops, &fds, SYS_brk, .{ .a1 = 0x800 })); // отказ
+    try testing.expectEqual(@as(u64, 3), e.brk_calls);
+    try testing.expectEqual(@as(u64, 0x3000), e.brk_value);
 }

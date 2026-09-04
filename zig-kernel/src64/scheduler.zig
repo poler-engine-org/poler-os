@@ -491,6 +491,56 @@ pub fn createUserThreadTask(entry_point: u64, user_cr3: u64, thread_rsp: u64, pa
     return id;
 }
 
+/// v0.20.0 (CDD №11, p1): Linux-тред — clone(CLONE_VM|CLONE_SIGHAND…).
+/// Задача с ГОТОВЫМ кадром «возврата из clone-syscall»:
+///   • RAX = 0 (ребёнок: clone() возвращает 0);
+///   • RSP = новый стек (аргумент clone — пишет вызывающий в frame_src);
+///   • RIP = инструкция ПОСЛЕ syscall (frame_src.rip);
+///   • callee-saved (rbx/rbp/r12-r15) наследуются от родителя;
+///   • CR3 = родительский (CLONE_VM — общее адресное пространство);
+///   • ABI = linux (RAX-маршрутизация в hal.zig).
+/// Кадр-источник строит main64.linuxDoClone из syscall_frame-снапшота
+/// (IF=0 от SYSCALL — снапшот атомарен, это ЭТА транзакция).
+pub fn createLinuxCloneTask(user_cr3: u64, frame_src: *const hal.InterruptFrame) !usize {
+    if (task_count >= MAX_TASKS) return error.OutOfTasks;
+
+    const id = task_count;
+    task_count += 1;
+
+    const task = &tasks[id];
+    task.id = id;
+    task.state = .Ready;
+    task.privilege = .User;
+    task.cr3 = user_cr3; // CLONE_VM: общий PML4 с родителем
+    task.user_stack_top = frame_src.rsp;
+    task.wake_tick = 0; // не спит при рождении
+    task.abi = .linux; // RAX-ABI Linux
+
+    const kstack_top = @intFromPtr(&task.kernel_stack) + task.kernel_stack.len;
+    const frame_ptr: *hal.InterruptFrame = @ptrFromInt(kstack_top - 176);
+    // Полная копия кадра-источника (GPR-наследие + сегменты + IF=1)
+    frame_ptr.* = frame_src.*;
+    frame_ptr.rflags |= 0x200; // IF=1: прерывания/вытеснение доступны
+    frame_ptr.vector = 48;
+    frame_ptr.error_code = 0;
+
+    task.rsp = @intFromPtr(frame_ptr);
+    fillCanary(task);
+    registerKstack(id);
+
+    hal.Serial.puts("[SCHED] Created Linux CLONE thread ");
+    hal.Serial.putDecimal(id);
+    hal.Serial.puts(" RIP=");
+    hal.Serial.putHex(frame_ptr.rip);
+    hal.Serial.puts(" RSP=");
+    hal.Serial.putHex(frame_ptr.rsp);
+    hal.Serial.puts(" RAX=");
+    hal.Serial.putHex(frame_ptr.rax);
+    hal.Serial.puts(" (shared CR3)\n");
+
+    return id;
+}
+
 /// v0.12.0: тред по хэндлу мёртв? (WaitForSingleObject на thread-handle).
 /// Хэндл = THREAD_HANDLE_BASE + task_id (см. win32_api.kCreateThreadOp).
 /// База 0x1000 — выше пулов сокетов (0x100+) и WSA-событий (0x200+),

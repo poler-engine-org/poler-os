@@ -288,6 +288,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
 
+    // 64-bit ELF loader tests (v0.20.0, CDD №11 p1): Linux-ABI ELF64 —
+    // ET_EXEC/ET_DYN-PIE, PTE-флаги по сегментам, BSS, откат при мусорных
+    // заголовках, первичный стек argc/argv/envp/auxv (glibc-раскладка)
+    const elf_loader_tests = b.addTest(.{
+        .root_source_file = b.path("src64/elf_loader.zig"),
+        .target = test_target,
+        .optimize = .Debug,
+    });
+
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);
     const run_poler_core64_tests = b.addRunArtifact(poler_core64_tests);
@@ -305,6 +314,7 @@ pub fn build(b: *std.Build) void {
     const run_virtio_gpu_tests = b.addRunArtifact(virtio_gpu_tests);
     const run_evdev_tests = b.addRunArtifact(evdev_tests);
     const run_vfs_tests = b.addRunArtifact(vfs_tests);
+    const run_elf_loader_tests = b.addRunArtifact(elf_loader_tests);
 
     const test_step = b.step("test", "Run all POLER unit tests (32-bit core + 64-bit core + RSA-OAEP + PUF + PE/COFF + Win32 stubs + PE loader + Win32/CRT core + Enrollment-Gate)");
     test_step.dependOn(&run_poler_core32_tests.step);
@@ -323,6 +333,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_virtio_gpu_tests.step);
     test_step.dependOn(&run_evdev_tests.step);
     test_step.dependOn(&run_vfs_tests.step);
+    test_step.dependOn(&run_elf_loader_tests.step);
 
     // ═══ Build ISO step ══════════════════════════════════════════════════
     const iso_cp_cmd = b.addSystemCommand(&.{
