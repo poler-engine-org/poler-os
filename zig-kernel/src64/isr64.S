@@ -593,6 +593,14 @@ syscall_entry:
     movq %rax, syscall_ret_tmp(%rip)
     popq %r9
     popq %r8
+    // v0.20.0-fix (CDD №12 p2): ВЕРНУТЬ НАСТОЯЩИЙ user R8! Выше
+    // «movq %rax,%r8» (номер syscall → 4-й Zig-аргумент) затирал R8,
+    // а pushq/popc-пара сохраняла УЖЕ ИСКАЖЁННОЕ значение: пользователь
+    // возвращался с R8 = НОМЕР SYSCALL (13=rt_sigaction → glibc писал
+    // oldact по адресу 13 → #PF CR2=0xD!). Настоящий R8 лежит в
+    // linux_arg5 (сохранён ВХОДОМ, транзакция in_win32_syscall=1 —
+    // переключений нет, клетка стабильна). Win32-пути безразличен.
+    movq linux_arg5(%rip), %r8
     popq %r10
     popq %rdx
     popq %rsi

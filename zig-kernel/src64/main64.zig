@@ -2436,7 +2436,188 @@ const LinuxProc = struct {
     execfn_len: usize = 0,
     /// TLS-база main-треда (arch_prctl SET_FS; клон-треды — своя волна).
     fs_base: u64 = 0,
+    // ─── CDD №12 p2: сигнальное состояние glibc ───────────────────────
+    /// rt_sigaction: handler по сигналу 1..64 (0 = SIG_DFL).
+    sig_handlers: [65]u64 = [_]u64{0} ** 65,
+    sig_flags: [65]u64 = [_]u64{0} ** 65,
+    sig_restorers: [65]u64 = [_]u64{0} ** 65,
+    /// rt_sigprocmask: текущая маска.
+    sig_mask: u64 = 0,
+    /// Счётчик memfd (анонимные tmpfs-файлы Wayland-shm).
+    memfd_seq: u32 = 0,
 };
+
+// ─── CDD №12 p2: каналы (pipe/eventfd/socketpair/timerfd) ─────────────────
+const MAX_CHANNELS: usize = 48;
+const ChanKind = enum { pipe, eventfd, socketpair, timerfd };
+const CHAN_BUF: usize = 1024; // FIFO pipe/socketpair (wakeup-трафик мал)
+
+const Channel = struct {
+    used: bool = false,
+    refs: u8 = 0, // pipe/socketpair=2 (оба конца), eventfd/timerfd=1
+    kind: ChanKind = .pipe,
+    buf: [CHAN_BUF]u8 = [_]u8{0} ** CHAN_BUF,
+    len: usize = 0, // FIFO: байт в буфере
+    counter: u64 = 0, // eventfd: счётчик; timerfd: экспирации
+    semaphore: bool = false, // EFD_SEMAPHORE
+    deadline_ns: u64 = 0, // timerfd: 0 = не взведён
+    interval_ns: u64 = 0,
+};
+
+var channels: [MAX_CHANNELS]Channel = [_]Channel{.{}} ** MAX_CHANNELS;
+
+fn linuxProcSlot() usize {
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        const slot = linux_task_proc[owner];
+        if (slot < MAX_LINUX_PROCS) return slot;
+    }
+    return MAX_LINUX_PROCS; // невалидный
+}
+
+fn linuxChannelCreate(kind: u32, arg: u64) i64 {
+    for (&channels, 0..) |*c, i| {
+        if (c.used) continue;
+        const k: ChanKind = switch (kind) {
+            linux_syscalls.CHAN_PIPE => .pipe,
+            linux_syscalls.CHAN_EVENTFD => .eventfd,
+            linux_syscalls.CHAN_SOCKETPAIR => .socketpair,
+            linux_syscalls.CHAN_TIMERFD => .timerfd,
+            else => return -linux_syscalls.EINVAL,
+        };
+        c.* = .{ .used = true, .refs = if (k == .pipe or k == .socketpair) 2 else 1, .kind = k };
+        if (k == .eventfd) c.counter = arg;
+        return @intCast(i);
+    }
+    return -linux_syscalls.ENFILE;
+}
+
+fn linuxChannelUnref(id: u32) void {
+    if (id >= channels.len) return;
+    if (channels[id].refs > 0) channels[id].refs -= 1;
+    if (channels[id].refs == 0) channels[id].used = false;
+}
+
+/// timerfd: ленивое продвижение экспираций (deadline прошёл → counter+1,
+/// периодический — перевзвод; одноразовый — разряжаем).
+fn channelMaybeExpire(c: *Channel) void {
+    if (c.kind != .timerfd or c.deadline_ns == 0) return;
+    const now = linuxTimeNsRaw();
+    while (now >= c.deadline_ns) {
+        c.counter +%= 1;
+        if (c.interval_ns == 0) {
+            c.deadline_ns = 0; // одноразовый — взрыв и разряд
+            break;
+        }
+        c.deadline_ns += c.interval_ns; // догоняющий перевзвод
+        if (c.counter > 1024) break; // анти-спин: после 1024 пропусков — стоп
+    }
+}
+
+fn linuxChannelRead(id: u32, va: u64, count: u64) i64 {
+    if (id >= channels.len or !channels[id].used) return -linux_syscalls.EBADF;
+    const c = &channels[id];
+    switch (c.kind) {
+        .pipe, .socketpair => {
+            if (c.len == 0) return -linux_syscalls.EAGAIN; // NB-контракт (парковок нет)
+            const n: usize = @intCast(@min(count, c.len));
+            const dst: [*]u8 = @ptrFromInt(va);
+            @memcpy(dst[0..n], c.buf[0..n]);
+            // компакция остатка
+            std.mem.copyForwards(u8, c.buf[0 .. c.len - n], c.buf[n..c.len]);
+            c.len -= n;
+            return @intCast(n);
+        },
+        .eventfd => {
+            if (count < 8) return -linux_syscalls.EINVAL;
+            if (c.counter == 0) return -linux_syscalls.EAGAIN;
+            const val: u64 = if (c.semaphore) 1 else c.counter;
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, val, .little);
+            const dst: [*]u8 = @ptrFromInt(va);
+            @memcpy(dst[0..8], &b);
+            if (c.semaphore) c.counter -= 1 else c.counter = 0;
+            return 8;
+        },
+        .timerfd => {
+            if (count < 8) return -linux_syscalls.EINVAL;
+            channelMaybeExpire(c);
+            if (c.counter == 0) return -linux_syscalls.EAGAIN;
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, c.counter, .little);
+            const dst: [*]u8 = @ptrFromInt(va);
+            @memcpy(dst[0..8], &b);
+            c.counter = 0;
+            return 8;
+        },
+    }
+}
+
+fn linuxChannelWrite(id: u32, va: u64, count: u64) i64 {
+    if (id >= channels.len or !channels[id].used) return -linux_syscalls.EBADF;
+    const c = &channels[id];
+    switch (c.kind) {
+        .pipe, .socketpair => {
+            const n: usize = @intCast(count);
+            if (c.len + n > c.buf.len) return -linux_syscalls.EAGAIN; // буфер полон
+            const s: [*]const u8 = @ptrFromInt(va);
+            @memcpy(c.buf[c.len .. c.len + n], s[0..n]);
+            c.len += n;
+            return @intCast(n);
+        },
+        .eventfd => {
+            if (count < 8) return -linux_syscalls.EINVAL;
+            var b: [8]u8 = undefined;
+            const s: [*]const u8 = @ptrFromInt(va);
+            @memcpy(&b, s[0..8]);
+            const val = std.mem.readInt(u64, &b, .little);
+            const sum = @addWithOverflow(c.counter, val);
+            if (sum[1] != 0 or c.counter + val > 0xFFFFFFFFFFFFFFFE) return -linux_syscalls.EINVAL;
+            c.counter += val;
+            return 8;
+        },
+        .timerfd => {
+            // kernel-путь timerfd_settime: 16Б [value_ns, interval_ns]
+            // (va — kernel-указатель: identity-map читается как user)
+            if (count < 16) return -linux_syscalls.EINVAL;
+            var b: [16]u8 = undefined;
+            const s: [*]const u8 = @ptrFromInt(va);
+            @memcpy(&b, s[0..16]);
+            const value = std.mem.readInt(u64, b[0..8], .little);
+            const interval = std.mem.readInt(u64, b[8..16], .little);
+            c.counter = 0;
+            c.interval_ns = interval;
+            if (value == 0) {
+                c.deadline_ns = 0; // disarm
+            } else {
+                c.deadline_ns = linuxTimeNsRaw() + value;
+            }
+            return 16;
+        },
+    }
+}
+
+fn linuxChannelReady(id: u32) u32 {
+    if (id >= channels.len or !channels[id].used) return 0;
+    const c = &channels[id];
+    switch (c.kind) {
+        .pipe => return if (c.len > 0) linux_syscalls.EPOLLIN else 0,
+        .socketpair, .eventfd => {
+            var r: u32 = linux_syscalls.EPOLLOUT;
+            if (c.kind == .eventfd and c.counter > 0) r |= linux_syscalls.EPOLLIN;
+            if (c.kind == .socketpair and c.len > 0) r |= linux_syscalls.EPOLLIN;
+            return r;
+        },
+        .timerfd => {
+            channelMaybeExpire(c);
+            return if (c.counter > 0) linux_syscalls.EPOLLIN else 0;
+        },
+    }
+}
+
+fn linuxTimeNsRaw() u64 {
+    return linuxTimeNs();
+}
 
 const MmapRegion = struct {
     used: bool = false,
@@ -3012,7 +3193,73 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .stat_by_path = linuxStatByPath,
         .readlink_path = linuxReadlinkPath,
         .release_file = linuxReleaseFile,
+        .channel_create = linuxChannelCreate,
+        .channel_read = linuxChannelRead,
+        .channel_write = linuxChannelWrite,
+        .channel_ready = linuxChannelReady,
+        .channel_unref = linuxChannelUnref,
+        .set_sigaction = linuxSetSigaction,
+        .get_sigaction = linuxGetSigaction,
+        .set_sigmask = linuxSetSigmask,
+        .memfd_create = linuxMemfdCreate,
     };
+}
+
+// ─── CDD №12 p2: сигнальные мосты (хранение per-proc) ──────────────────────
+
+fn linuxSetSigaction(sig: u32, handler: u64, flags: u64, restorer: u64) i64 {
+    if (sig == 0 or sig > 64 or sig == 9 or sig == 19) return -linux_syscalls.EINVAL;
+    const slot = linuxProcSlot();
+    if (slot >= MAX_LINUX_PROCS) return -linux_syscalls.EPERM;
+    const proc = &linux_procs[slot];
+    const old: i64 = @bitCast(proc.sig_handlers[sig]);
+    proc.sig_handlers[sig] = handler;
+    proc.sig_flags[sig] = flags;
+    proc.sig_restorers[sig] = restorer;
+    return old;
+}
+
+fn linuxGetSigaction(sig: u32) u64 {
+    const slot = linuxProcSlot();
+    if (slot >= MAX_LINUX_PROCS or sig == 0 or sig > 64) return 0;
+    return linux_procs[slot].sig_handlers[sig];
+}
+
+/// how: 0=BLOCK 1=UNBLOCK 2=SETMASK 3=QUERY; возвращает СТАРУЮ маску.
+fn linuxSetSigmask(how: u32, mask: u64) u64 {
+    const slot = linuxProcSlot();
+    if (slot >= MAX_LINUX_PROCS) return 0;
+    const proc = &linux_procs[slot];
+    const old = proc.sig_mask;
+    switch (how) {
+        0 => proc.sig_mask |= mask,
+        1 => proc.sig_mask &= ~mask,
+        2 => proc.sig_mask = mask,
+        else => {},
+    }
+    return old;
+}
+
+/// memfd: анонимный tmpfs-файл (имя .memfd-N — не резолвится путями VFS,
+/// tmpfs-префикс /tmp гарантирует RW-семантику реестра).
+fn linuxMemfdCreate() i64 {
+    const slot = linuxProcSlot();
+    if (slot >= MAX_LINUX_PROCS) return -linux_syscalls.EPERM;
+    const proc = &linux_procs[slot];
+    proc.memfd_seq +%= 1;
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "tmp/.memfd-{d}", .{proc.memfd_seq}) catch
+        return -linux_syscalls.ENOMEM;
+    // создаём tmpfs-файл напрямую (без VFS-резолва): реестр-слот
+    const f = kernel_vfs.tmp.create(name) catch return -linux_syscalls.ENOMEM;
+    // file_id: ищем слот реестра с этим TmpFile
+    for (&linux_files, 0..) |*lf, i| {
+        if (!lf.used and lf.tmp == null) {
+            lf.* = .{ .used = true, .kind = .tmpfs_file, .tmp = f };
+            return @intCast(i);
+        }
+    }
+    return -linux_syscalls.ENFILE;
 }
 
 /// pid: стабилен внутри процесса (группа тредов = слот): 100 + slot.
@@ -3048,12 +3295,19 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         .a6 = scheduler.linux_arg6,
     });
     if (linux_trace) {
+        // CDD №12 p2: 4 аргумента (sigaction-подобные вызовы требуют a3/a4)
         hal.Serial.puts("[L] ");
         hal.Serial.putDecimal(num);
         hal.Serial.puts("(0x");
         hal.Serial.putHex(a1);
         hal.Serial.puts(",0x");
         hal.Serial.putHex(a2);
+        if (num == 13 or num == 14 or num == 157 or num == 281 or num == 270 or num == 289) {
+            hal.Serial.puts(",0x");
+            hal.Serial.putHex(a3);
+            hal.Serial.puts(",0x");
+            hal.Serial.putHex(a4);
+        }
         hal.Serial.puts(") = 0x");
         hal.Serial.putHex(r);
         hal.Serial.puts("\n");
@@ -4247,10 +4501,25 @@ fn cmd_elfload(args: []const u8) void {
     if (linuxNewProc(task_id)) |slot| {
         linux_procs[slot].brk_base = img.brk;
         linux_procs[slot].brk = img.brk;
-        // execfn (readlink /proc/self/exe для glibc-static init)
-        const n = @min(file.len, linux_procs[slot].execfn_buf.len);
-        @memcpy(linux_procs[slot].execfn_buf[0..n], file[0..n]);
-        linux_procs[slot].execfn_len = n;
+        // execfn (readlink /proc/self/exe): АБСОЛЮТНЫЙ путь — glibc
+        // _dl_get_origin (dl-origin.c:41) ASSERT'ит linkval[0]=='/'
+        // (эмпирика glibc-static: «Fatal glibc error: assertion failed»).
+        // elfload hello-static → «/hello-static»; usr/bin/gamescope →
+        // «/usr/bin/gamescope» (Linux-семантика exec-пути).
+        {
+            var efn_buf: [96]u8 = undefined;
+            var efn_len: usize = 0;
+            if (file.len > 0 and file[0] != '/') {
+                efn_buf[0] = '/';
+                efn_len = 1;
+            }
+            const copy = @min(file.len, efn_buf.len - efn_len);
+            @memcpy(efn_buf[efn_len .. efn_len + copy], file[0..copy]);
+            efn_len += copy;
+            const n = @min(efn_len, linux_procs[slot].execfn_buf.len);
+            @memcpy(linux_procs[slot].execfn_buf[0..n], efn_buf[0..n]);
+            linux_procs[slot].execfn_len = n;
+        }
     } else {
         sys_print("[ELF] proc-слоты исчерпаны (2) — задача без fd-таблицы\n");
     }

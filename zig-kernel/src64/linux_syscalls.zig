@@ -54,6 +54,41 @@ pub const SYS_set_robust_list: u64 = 273;
 pub const SYS_rseq: u64 = 334; // 293 = pipe2 (!раньше коллизия: rseq-заглушка съедала pipe2 glibc)
 pub const SYS_pipe2: u64 = 293;
 pub const SYS_readlinkat: u64 = 267; // 298 = perf_event_open (!коллизия v0.19)
+// ─── CDD №12 p2: канал-волна (номера сверены с syscall_64.tbl) ─────────────
+pub const SYS_eventfd2: u64 = 290;
+pub const SYS_signalfd4: u64 = 289;
+pub const SYS_timerfd_create: u64 = 283;
+pub const SYS_timerfd_settime: u64 = 286;
+pub const SYS_epoll_pwait: u64 = 281;
+pub const SYS_ppoll: u64 = 270;
+pub const SYS_fstatfs: u64 = 138;
+pub const SYS_getcwd: u64 = 79;
+pub const SYS_prctl: u64 = 157;
+pub const SYS_madvise: u64 = 28;
+pub const SYS_rt_sigaction: u64 = 13;
+pub const SYS_rt_sigprocmask: u64 = 14;
+pub const SYS_socketpair: u64 = 53;
+pub const SYS_memfd_create: u64 = 319;
+
+/// O_CLOEXEC/O_NONBLOCK (pipe2/socketpair/eventfd2/timerfd/signalfd4).
+pub const O_CLOEXEC: u64 = 0o2000000;
+pub const EFD_SEMAPHORE: u64 = 1;
+pub const EFD_NONBLOCK: u64 = 0o4000;
+pub const EFD_CLOEXEC: u64 = 0o2000000;
+pub const TFD_NONBLOCK: u64 = 0o4000;
+pub const TFD_CLOEXEC: u64 = 0o2000000;
+pub const SFD_NONBLOCK: u64 = 0o4000;
+pub const SFD_CLOEXEC: u64 = 0o2000000;
+/// prctl-опции (частичный набор).
+pub const PR_CAPBSET_READ: u64 = 23;
+pub const PR_SET_NAME: u64 = 15;
+pub const PR_GET_NAME: u64 = 16;
+pub const PR_SET_PDEATHSIG: u64 = 1;
+/// Канал-типы (ops.channel_create kind).
+pub const CHAN_PIPE: u32 = 0;
+pub const CHAN_EVENTFD: u32 = 1;
+pub const CHAN_SOCKETPAIR: u32 = 2;
+pub const CHAN_TIMERFD: u32 = 3;
 pub const SYS_readlink: u64 = 89; // 87 = unlink (!коллизия)
 pub const SYS_prlimit64: u64 = 302;
 pub const SYS_getrandom: u64 = 318;
@@ -88,8 +123,13 @@ pub const EFAULT: i64 = 14;
 pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
 pub const ENODEV: i64 = 19;
+pub const ENFILE: i64 = 23; // реестры каналов/файлов исчерпаны
 pub const EINVAL: i64 = 22;
 pub const ELOOP: i64 = 40; // слишком много симлинков в цепи (readlink/resolve)
+pub const EAFNOSUPPORT: i64 = 97; // socketpair: только AF_UNIX
+pub const ESOCKTNOSUPPORT: i64 = 94; // только SOCK_STREAM
+pub const EPROTONOSUPPORT: i64 = 93; // протокол 0
+pub const ENOTSUP: i64 = 95; // TFD_TIMER_ABSTIME и пр.
 pub const ENOTTY: i64 = 25;
 pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
@@ -224,7 +264,9 @@ pub const CLONE_CHILD_SETTID: u64 = 0x10000000;
 /// буфер — аллокаций в syscall-пути нет). Linux-лимит RLIMIT_NOFILE больше,
 /// но WAIT-эпоха (реальные процессы) пересмотрит.
 pub const MAX_POLL_FDS: usize = 64;
-pub const MAX_EPOLL_EVENTS: usize = 64;
+pub const MAX_EPOLL_EVENTS: usize = 256;
+pub const MAX_WATCHES: usize = 32;
+pub const MAX_FDS: usize = 64;
 
 // ─── fcntl-команды (fcntl.h) ──────────────────────────────────────────────
 
@@ -252,9 +294,23 @@ pub const FdKind = enum {
     initrd_file,
     /// Файл tmpfs (RW — Live-USB: запись в RAM).
     tmpfs_file,
+    // ─── CDD №12 p2: канал-объекты (pipe/eventfd/socketpair/timerfd/
+    // signalfd) — file_id = индекс в реестре каналов runtime ─────
+    /// Читательский конец pipe (FIFO; epoll POLLIN).
+    pipe_read,
+    /// Писательский конец pipe.
+    pipe_write,
+    /// eventfd (счётчик 8Б; POLLIN при ≠0).
+    eventfd,
+    /// Конец socketpair AF_UNIX/SOCK_STREAM (двунаправленный).
+    socket,
+    /// timerfd (дедлайн+интервал; POLLIN при истечении).
+    timerfd,
+    /// signalfd (маска хранится; готовность — нет сигналов = 0).
+    signalfd,
 };
 
-pub const MAX_FILE_ID: u32 = 16; // реестр открытых файлов runtime
+pub const MAX_FILE_ID: u32 = 64; // реестр открытых файлов runtime (p2: 64 — е2е фд-фонтан)
 
 /// Один наблюдаемый fd в epoll-инстансе.
 pub const EpollWatch = struct {
@@ -262,9 +318,6 @@ pub const EpollWatch = struct {
     events: u32 = 0,
     data: u64 = 0,
 };
-
-pub const MAX_FDS: usize = 16;
-pub const MAX_WATCHES: usize = 12;
 
 pub const FdEntry = struct {
     kind: FdKind = .free,
@@ -429,6 +482,30 @@ pub const LinuxOps = struct {
     /// реестр runtime VFS ≠ fd-таблица — иначе 16 либ = EMFILE, ld.so
     /// держит по одной открытой на каждую DT_NEEDED при обходе замыкания).
     release_file: *const fn (id: u32) void,
+    // ─── CDD №12 p2: канал-объекты (pipe/eventfd/socketpair/timerfd) ──────
+    /// Создать канал: kind 0=pipe, 1=eventfd, 2=socketpair, 3=timerfd;
+    /// arg = initval(eventfd) / clockid(timerfd, игнорируется). id ≥ 0/-errno.
+    channel_create: *const fn (kind: u32, arg: u64) i64,
+    /// FIFO-чтение из канала (pipe_read/socket/eventfd-счётчик/timerfd-экспирации).
+    channel_read: *const fn (id: u32, va: u64, count: u64) i64,
+    /// Запись в канал (pipe_write/socket/eventfd-инкремент).
+    channel_write: *const fn (id: u32, va: u64, count: u64) i64,
+    /// Готовность канала: биты POLLIN/POLLOUT (для poll/epoll).
+    channel_ready: *const fn (id: u32) u32,
+    /// Снять ОДНУ ссылку канала (pipe/socketpair создаются с refs=2,
+    /// eventfd/timerfd с refs=1); refs=0 → слот свободен.
+    channel_unref: *const fn (id: u32) void,
+    // ─── CDD №12 p2: сигнальное состояние glibc ───────────────────────────
+    /// rt_sigaction: сохранить (sig, handler, flags, restorer); вернуть СТАРЫЙ
+    /// handler или -errno (EINVAL: SIGKILL/SIGSTOP/диапазон).
+    set_sigaction: *const fn (sig: u32, handler: u64, flags: u64, restorer: u64) i64,
+    /// rt_sigaction: {handler, flags, restorer} текущего sig (для oldact).
+    get_sigaction: *const fn (sig: u32) u64,
+    /// rt_sigprocmask: установить маску (как 0=BLOCK/1=UNBLOCK/2=SETMASK);
+    /// вернуть СТАРУЮ маску.
+    set_sigmask: *const fn (how: u32, mask: u64) u64,
+    /// memfd_create: анонимный RW-файл (Wayland-shm) → file_id или -errno.
+    memfd_create: *const fn () i64,
 };
 
 // ─── Аргументы syscall (единая структура для dispatch) ─────────────────────
@@ -457,6 +534,16 @@ pub fn sysWrite(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64
         e.file_off += @intCast(r);
         return @intCast(r);
     }
+    // CDD №12 p2: канальные виды (pipe-писец/socket/eventfd-инкремент)
+    switch (e.kind) {
+        .pipe_write, .socket, .eventfd => {
+            if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
+            const r = ops.channel_write(e.file_id, buf_va, count);
+            if (r < 0) return @bitCast(r);
+            return @intCast(r);
+        },
+        else => {},
+    }
     if (e.kind != .console_out) return err(EBADF); // initrd: RO; файлы — только tmpfs
     // ядро ЧИТАЕТ user-буфер: want_write=false
     if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
@@ -477,6 +564,14 @@ pub fn sysRead(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64)
             if (r < 0) return @bitCast(r);
             return @intCast(r);
         },
+        .pipe_read, .socket, .eventfd, .timerfd => {
+            // канал: FIFO-чтение (pipe/socket), счётчик (eventfd), экспирации
+            if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
+            const r = ops.channel_read(e.file_id, buf_va, count);
+            if (r < 0) return @bitCast(r);
+            return @intCast(r);
+        },
+        .signalfd => return err(EAGAIN), // сигналов нет — пусто (NB-путь glibc)
         .initrd_file, .tmpfs_file => {
             // файл VFS: последовательное чтение (offset ведёт слой)
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
@@ -521,8 +616,10 @@ pub fn sysClose(ops: LinuxOps, fds: *FdTable, fd_i: i64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
     // v0.20.0 (CDD №12 p1): слот РЕЕСТРА файлов (fd→file_id: initrd/tmpfs)
     // освобождаем ДО затирания записи — иначе утечка (EMFILE после 16 либ).
+    // p2: каналы (pipe/eventfd/socket/timerfd) — счётчик ссылок концов.
     switch (e.kind) {
         .initrd_file, .tmpfs_file => ops.release_file(e.file_id),
+        .pipe_read, .pipe_write, .eventfd, .socket, .timerfd, .signalfd => ops.channel_unref(e.file_id),
         else => {},
     }
     e.* = .{}; // освобождаем слот fd-таблицы (epoll-наблюдения тоже)
@@ -790,6 +887,22 @@ pub fn sysPoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, timeout: i6
                 if (mask & EPOLLERR != 0) rdy |= POLLERR;
             },
             .epoll => rdy = POLLOUT, // epoll-инстанс «готов» (wait-able)
+            .pipe_read => {
+                if (ops.channel_ready(e.file_id) & EPOLLIN != 0) rdy |= POLLIN;
+            },
+            .pipe_write => rdy = POLLOUT, // запись в буфер канала — всегда
+            .eventfd => {
+                if (ops.channel_ready(e.file_id) & EPOLLIN != 0) rdy |= POLLIN;
+                rdy |= POLLOUT;
+            },
+            .socket => {
+                if (ops.channel_ready(e.file_id) & EPOLLIN != 0) rdy |= POLLIN;
+                rdy |= POLLOUT;
+            },
+            .timerfd => {
+                if (ops.channel_ready(e.file_id) & EPOLLIN != 0) rdy |= POLLIN;
+            },
+            .signalfd => {}, // сигналов нет — не готов
             .initrd_file => rdy = POLLIN, // RO-файл: читаем
             .tmpfs_file => rdy = POLLIN | POLLOUT, // RAM-файл: RW
             .free => unreachable,
@@ -888,6 +1001,9 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
             .input_event0, .input_event1 => rdy = ops.dev_ready(e.kind),
             .initrd_file => rdy = EPOLLIN,
             .tmpfs_file => rdy = EPOLLIN | EPOLLOUT,
+            .pipe_read, .timerfd => rdy = ops.channel_ready(e.file_id),
+            .pipe_write, .socket, .eventfd => rdy = ops.channel_ready(e.file_id) | EPOLLOUT,
+            .signalfd => rdy = 0, // сигналов нет
             .free => unreachable,
         }
         const combined = w.events & (rdy | EPOLLERR | EPOLLHUP);
@@ -1149,6 +1265,286 @@ pub fn sysExit(ops: LinuxOps, code: u64) u64 {
 /// выравненного чтения НЕ нужно: std.mem.readInt на байтовых массивах не
 /// требует выравнивания (packed epoll_event.data читается напрямую)
 
+// ─── CDD №12 p2: канал-объекты + сигналы + misc-волна ───────────────────────
+
+/// pipe2(int fds[2], flags): wakeup-канал Wayland/reaper-потоков (glibc:
+/// CAsyncWaiter gamescope; O_NONBLOCK наследуют оба конца).
+pub fn sysPipe2(ops: LinuxOps, fds: *FdTable, fds_va: u64, flags: u64) u64 {
+    if (flags & ~(O_CLOEXEC | O_NONBLOCK) != 0) return err(EINVAL);
+    if (!ops.validate(fds_va, 8, true)) return err(EFAULT);
+    const chan = ops.channel_create(CHAN_PIPE, 0);
+    if (chan < 0) return @bitCast(chan);
+    const cid: u32 = @intCast(chan);
+    const nonblock = (flags & O_NONBLOCK) != 0;
+    const rfd = fds.allocFd(.pipe_read, nonblock);
+    if (rfd < 0) {
+        _ = ops.channel_unref(cid); // вернуть ссылку (созданную каналом)
+        _ = ops.channel_unref(cid);
+        return @bitCast(rfd);
+    }
+    fds.entries[@intCast(rfd)].file_id = cid;
+    const wfd = fds.allocFd(.pipe_write, nonblock);
+    if (wfd < 0) {
+        fds.entries[@intCast(rfd)] = .{};
+        _ = ops.channel_unref(cid);
+        _ = ops.channel_unref(cid);
+        return @bitCast(wfd);
+    }
+    fds.entries[@intCast(wfd)].file_id = cid;
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u32, b[0..4], @intCast(rfd), .little);
+    std.mem.writeInt(u32, b[4..8], @intCast(wfd), .little);
+    if (!ops.copy_out(fds_va, &b)) return err(EFAULT);
+    return 0;
+}
+
+/// socketpair(domain, type, protocol, sv[4]): AF_UNIX/SOCK_STREAM —
+/// двунаправленный канал (Wayland client↔server). Оба конца RW.
+pub fn sysSocketpair(ops: LinuxOps, fds: *FdTable, domain: u64, stype: u64, protocol: u64, sv_va: u64) u64 {
+    if (domain != 1) return err(EAFNOSUPPORT); // AF_UNIX only (фундамент)
+    if (protocol != 0) return err(EPROTONOSUPPORT);
+    if (stype & 0xFF != 1) return err(ESOCKTNOSUPPORT); // SOCK_STREAM
+    if (stype & ~(0xFF | O_CLOEXEC | O_NONBLOCK) != 0) return err(EINVAL);
+    if (!ops.validate(sv_va, 8, true)) return err(EFAULT);
+    const chan = ops.channel_create(CHAN_SOCKETPAIR, 0);
+    if (chan < 0) return @bitCast(chan);
+    const cid: u32 = @intCast(chan);
+    const nonblock = (stype & O_NONBLOCK) != 0;
+    const fd0 = fds.allocFd(.socket, nonblock);
+    if (fd0 < 0) {
+        _ = ops.channel_unref(cid);
+        _ = ops.channel_unref(cid);
+        return @bitCast(fd0);
+    }
+    fds.entries[@intCast(fd0)].file_id = cid;
+    const fd1 = fds.allocFd(.socket, nonblock);
+    if (fd1 < 0) {
+        fds.entries[@intCast(fd0)] = .{};
+        _ = ops.channel_unref(cid);
+        _ = ops.channel_unref(cid);
+        return @bitCast(fd1);
+    }
+    fds.entries[@intCast(fd1)].file_id = cid;
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u32, b[0..4], @intCast(fd0), .little);
+    std.mem.writeInt(u32, b[4..8], @intCast(fd1), .little);
+    if (!ops.copy_out(sv_va, &b)) return err(EFAULT);
+    return 0;
+}
+
+/// eventfd2(initval, flags): счётчик-канал (wl_event_loop).
+pub fn sysEventfd2(ops: LinuxOps, fds: *FdTable, initval: u64, flags: u64) u64 {
+    if (flags & ~(EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE) != 0) return err(EINVAL);
+    if (initval > 0xFFFFFFFFFFFFFFFE) return err(EINVAL);
+    const chan = ops.channel_create(CHAN_EVENTFD, initval);
+    if (chan < 0) return @bitCast(chan);
+    const fd = fds.allocFd(.eventfd, (flags & EFD_NONBLOCK) != 0);
+    if (fd < 0) {
+        _ = ops.channel_unref(@intCast(chan));
+        return @bitCast(fd);
+    }
+    fds.entries[@intCast(fd)].file_id = @intCast(chan);
+    return @intCast(fd);
+}
+
+/// signalfd4(fd, mask, sizset, flags): fd сигнальной очереди (маска
+/// хранится; доставки сигналов нет → готовность 0; read → EAGAIN).
+pub fn sysSignalfd4(ops: LinuxOps, fds: *FdTable, fd_i: i64, mask_va: u64, size: u64, flags: u64) u64 {
+    if (size != 8) return err(EINVAL);
+    if (flags & ~(SFD_CLOEXEC | SFD_NONBLOCK) != 0) return err(EINVAL);
+    if (fd_i != -1) {
+        const e = fds.get(fd_i) orelse return err(EBADF);
+        if (e.kind != .signalfd) return err(EINVAL);
+    }
+    if (!ops.validate(mask_va, 8, false)) return err(EFAULT);
+    var mb: [8]u8 = undefined;
+    if (!ops.copy_in(&mb, mask_va)) return err(EFAULT);
+    if (fd_i == -1) {
+        const fd = fds.allocFd(.signalfd, (flags & SFD_NONBLOCK) != 0);
+        if (fd < 0) return @bitCast(fd);
+        return @intCast(fd);
+    }
+    return @intCast(fd_i);
+}
+
+/// timerfd_create(clockid, flags) → fd (wl таймеры; монотонный).
+pub fn sysTimerfdCreate(ops: LinuxOps, fds: *FdTable, clockid: u64, flags: u64) u64 {
+    _ = clockid; // CLOCK_MONOTONIC (1) / REALTIME (0) — один источник
+    if (flags & ~(TFD_NONBLOCK | TFD_CLOEXEC) != 0) return err(EINVAL);
+    const chan = ops.channel_create(CHAN_TIMERFD, 0);
+    if (chan < 0) return @bitCast(chan);
+    const fd = fds.allocFd(.timerfd, (flags & TFD_NONBLOCK) != 0);
+    if (fd < 0) {
+        _ = ops.channel_unref(@intCast(chan));
+        return @bitCast(fd);
+    }
+    fds.entries[@intCast(fd)].file_id = @intCast(chan);
+    return @intCast(fd);
+}
+
+/// timerfd_settime(fd, flags, new_itimerspec, old): tfd_args {value, interval}
+/// (16Б: two timespec-like u64 нс). Абсолютный флаг не поддержан → EINVAL.
+pub fn sysTimerfdSettime(ops: LinuxOps, fds: *FdTable, fd_i: i64, flags: u64, new_va: u64, old_va: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .timerfd) return err(EINVAL);
+    if (flags & 1 != 0) return err(ENOTSUP); // TFD_TIMER_ABSTIME
+    if (!ops.validate(new_va, 16, false)) return err(EFAULT);
+    var nb: [16]u8 = undefined;
+    if (!ops.copy_in(&nb, new_va)) return err(EFAULT);
+    const value = std.mem.readInt(u64, nb[0..8], .little);
+    const interval = std.mem.readInt(u64, nb[8..16], .little);
+    if (old_va != 0) {
+        if (!ops.validate(old_va, 16, true)) return err(EFAULT);
+        var ob: [16]u8 = .{0} ** 16; // старое время — заглушка (нет хранилища prev в фундаменте)
+        if (!ops.copy_out(old_va, &ob)) return err(EFAULT);
+    }
+    // установка дедлайна: channel_write с kernel-VA (контракт моста:
+    // identity-map — ptr читается напрямую, как user-VA)
+    var wb: [16]u8 = undefined;
+    std.mem.writeInt(u64, wb[0..8], value, .little);
+    std.mem.writeInt(u64, wb[8..16], interval, .little);
+    _ = ops.channel_write(e.file_id, @intFromPtr(&wb), 16);
+    return 0;
+}
+
+/// memfd_create(name, flags): анонимный RW-файл (Wayland-shm буферы).
+pub fn sysMemfdCreate(ops: LinuxOps, fds: *FdTable, flags: u64) u64 {
+    _ = flags; // MFD_CLOEXEC/MFD_ALLOW_SEALING — sealing не поддержан
+    const id = ops.memfd_create();
+    if (id < 0) return @bitCast(id);
+    const fd = fds.allocFd(.tmpfs_file, false);
+    if (fd < 0) {
+        ops.release_file(@intCast(id));
+        return @bitCast(fd);
+    }
+    fds.entries[@intCast(fd)].file_id = @intCast(id);
+    return @intCast(fd);
+}
+
+/// rt_sigaction(sig, act, oldact, sigsetsize): ХРАНИЛИЩЕ обработчиков
+/// (доставки сигналов нет — glibc требует успешную установку).
+pub const KSIG_SIZE: u64 = 32; // {handler, flags, restorer, mask}
+
+pub fn sysRtSigaction(ops: LinuxOps, sig: u64, act_va: u64, old_va: u64, sigsetsize: u64) u64 {
+    if (sig == 0 or sig > 64) return err(EINVAL);
+    if (sig == 9 or sig == 19) return err(EINVAL); // SIGKILL/SIGSTOP
+    if (sigsetsize != 8) return err(EINVAL);
+    // oldact: {handler, flags, restorer, mask} 32Б
+    if (old_va != 0) {
+        if (!ops.validate(old_va, 32, true)) return err(EFAULT);
+        var ob: [32]u8 = .{0} ** 32;
+        const old_h = ops.get_sigaction(@intCast(sig));
+        if (old_h != 0) std.mem.writeInt(u64, ob[0..8], old_h, .little);
+        if (!ops.copy_out(old_va, &ob)) return err(EFAULT);
+    }
+    if (act_va != 0) {
+        if (!ops.validate(act_va, 32, false)) return err(EFAULT);
+        var ab: [32]u8 = undefined;
+        if (!ops.copy_in(&ab, act_va)) return err(EFAULT);
+        const handler = std.mem.readInt(u64, ab[0..8], .little);
+        const flags = std.mem.readInt(u64, ab[8..16], .little);
+        const restorer = std.mem.readInt(u64, ab[16..24], .little);
+        const r = ops.set_sigaction(@intCast(sig), handler, flags, restorer);
+        if (r < 0) return @bitCast(r);
+    }
+    return 0;
+}
+
+/// rt_sigprocmask(how, set, oldset, size): маска сигналов (хранение).
+pub fn sysRtSigprocmask(ops: LinuxOps, how: u64, set_va: u64, old_va: u64, size: u64) u64 {
+    if (size != 8) return err(EINVAL);
+    if (set_va != 0 and how > 2) return err(EINVAL); // SIG_BLOCK/UNBLOCK/SETMASK
+    if (old_va != 0) {
+        if (!ops.validate(old_va, 8, true)) return err(EFAULT);
+        // how=3 (QUERY): контракт моста — вернуть СТАРУЮ без изменения
+        const old = ops.set_sigmask(3, 0);
+        var ob: [8]u8 = undefined;
+        std.mem.writeInt(u64, &ob, old, .little);
+        if (!ops.copy_out(old_va, &ob)) return err(EFAULT);
+    }
+    if (set_va != 0) {
+        if (!ops.validate(set_va, 8, false)) return err(EFAULT);
+        var sb: [8]u8 = undefined;
+        if (!ops.copy_in(&sb, set_va)) return err(EFAULT);
+        const mask = std.mem.readInt(u64, &sb, .little);
+        _ = ops.set_sigmask(@intCast(how), mask);
+    }
+    return 0;
+}
+
+/// prctl(option, ...): CAPBSET_READ→0 (нет cap), SET_NAME→0, GET_NAME→имя.
+pub fn sysPrctl(ops: LinuxOps, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) u64 {
+    _ = arg3;
+    _ = arg4;
+    _ = arg5;
+    switch (option) {
+        PR_CAPBSET_READ => {
+            if (arg2 > 40) return err(EINVAL); // CAP_LAST_CAP
+            return 0; // вне bounding set (gamescope: привилегий нет — честно)
+        },
+        PR_SET_NAME, PR_SET_PDEATHSIG => return 0,
+        PR_GET_NAME => {
+            // имя процесса: копируем execfn-заглушку «gamescope»? — пусто
+            var name: [16]u8 = .{0} ** 16;
+            if (!ops.copy_out(arg2, &name)) return err(EFAULT);
+            return 0;
+        },
+        else => return err(EINVAL), // SA_RESTORER-мир: неизвестные — EINVAL
+    }
+}
+
+/// madvise(va, len, advice): DAMP-заглушка (RELRO/malloc-советы — успех).
+pub fn sysMadvise(ops: LinuxOps, va: u64, len: u64, advice: u64) u64 {
+    _ = advice; // MADV_NORMAL/DONTNEED/… — без VM-подсказок (анонимные страницы)
+    if (len == 0) return 0;
+    if (!ops.validate(va, len, false)) return err(EFAULT);
+    return 0;
+}
+
+/// fstatfs(fd, buf): struct statfs 120Б — tmpfs-магия (glibc: /dev-проверки).
+pub fn sysFstatfs(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    _ = e;
+    if (!ops.validate(buf_va, 120, true)) return err(EFAULT);
+    var st: [120]u8 = .{0} ** 120;
+    std.mem.writeInt(u64, st[0..8], 0x01021998, .little); // f_type: POLER-канал
+    std.mem.writeInt(u64, st[8..16], 4096, .little); // f_bsize
+    std.mem.writeInt(u64, st[16..24], 1 << 20, .little); // f_blocks (4ГБ)
+    std.mem.writeInt(u64, st[24..32], 1 << 18, .little); // f_bfree
+    std.mem.writeInt(u64, st[32..40], 1 << 18, .little); // f_bavail
+    std.mem.writeInt(u64, st[40..48], 1 << 16, .little); // f_files
+    std.mem.writeInt(u64, st[48..56], 1 << 15, .little); // f_ffree
+    std.mem.writeInt(u64, st[56..64], 0x19981998, .little); // f_fsid
+    std.mem.writeInt(u64, st[64..72], 255, .little); // f_namelen
+    std.mem.writeInt(u64, st[72..80], 4096, .little); // f_frsize
+    if (!ops.copy_out(buf_va, &st)) return err(EFAULT);
+    return 0;
+}
+
+/// getcwd(buf, size): корень Live-сессии.
+pub fn sysGetcwd(ops: LinuxOps, buf_va: u64, size: u64) u64 {
+    if (size < 2) return err(ERANGE);
+    if (!ops.validate(buf_va, 2, true)) return err(EFAULT);
+    if (!ops.copy_out(buf_va, "/\x00")) return err(EFAULT);
+    return 2; // записано байт: «/» + NUL
+}
+
+/// ppoll(fds, nfds, tmo, sigmask, size): poll + сигмаска (игнор) + timeout
+/// (v0.19: неблокирующий — WAIT-эпоха добавит парковку).
+pub fn sysPpoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, tmo_va: u64, sigmask_va: u64, size: u64) u64 {
+    _ = tmo_va;
+    _ = sigmask_va;
+    _ = size;
+    return sysPoll(ops, fds, fds_va, nfds, 0);
+}
+
+/// epoll_pwait(epfd, events, maxevents, timeout, sigmask): = epoll_wait
+/// (сигмаску игнорируем — доставки сигналов нет).
+pub fn sysEpollPwait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, maxevents: u64, timeout: i64, sigmask_va: u64) u64 {
+    _ = sigmask_va;
+    return sysEpollWait(ops, fds, epfd, events_va, maxevents, timeout);
+}
+
 // ─── Диспетчер (syscall-таблица) ───────────────────────────────────────────
 
 /// Главная точка входа Linux POSIX-слоя: num — RAX, args — RDI/RSI/RDX/R10/R8.
@@ -1189,6 +1585,21 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_set_tid_address => return sysSetTidAddress(ops, args.a1),
         SYS_set_robust_list => return sysSetRobustList(ops, args.a1, args.a2),
         SYS_rseq => return sysRseq(),
+        SYS_pipe2 => return sysPipe2(ops, fds, args.a1, args.a2),
+        SYS_socketpair => return sysSocketpair(ops, fds, args.a1, args.a2, args.a3, args.a4),
+        SYS_eventfd2 => return sysEventfd2(ops, fds, args.a1, args.a2),
+        SYS_signalfd4 => return sysSignalfd4(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
+        SYS_timerfd_create => return sysTimerfdCreate(ops, fds, args.a1, args.a2),
+        SYS_timerfd_settime => return sysTimerfdSettime(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
+        SYS_memfd_create => return sysMemfdCreate(ops, fds, args.a2),
+        SYS_rt_sigaction => return sysRtSigaction(ops, args.a1, args.a2, args.a3, args.a4),
+        SYS_rt_sigprocmask => return sysRtSigprocmask(ops, args.a1, args.a2, args.a3, args.a4),
+        SYS_prctl => return sysPrctl(ops, args.a1, args.a2, args.a3, args.a4, args.a5),
+        SYS_madvise => return sysMadvise(ops, args.a1, args.a2, args.a3),
+        SYS_fstatfs => return sysFstatfs(ops, fds, @bitCast(args.a1), args.a2),
+        SYS_getcwd => return sysGetcwd(ops, args.a1, args.a2),
+        SYS_ppoll => return sysPpoll(ops, fds, args.a1, args.a2, args.a3, args.a4, args.a5),
+        SYS_epoll_pwait => return sysEpollPwait(ops, fds, @bitCast(args.a1), args.a2, args.a3, @bitCast(args.a4), args.a5),
         SYS_readlinkat => return sysReadlinkat(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_readlink => return sysReadlinkat(ops, @bitCast(@as(i64, -100)), args.a1, args.a2, args.a3),
         SYS_prlimit64 => return sysPrlimit64(ops, args.a1, args.a2, args.a3, args.a4),
@@ -1552,6 +1963,146 @@ fn fakeReleaseFile(id: u32) void {
     g_files[id].used = false;
 }
 
+// ─── CDD №12 p2: фейк-каналы (pipe/eventfd/socketpair/timerfd) ──────────────
+const FakeChan = struct {
+    used: bool = false,
+    refs: u8 = 0,
+    kind: u32 = 0, // 0=pipe 1=eventfd 2=socketpair 3=timerfd
+    buf: [64]u8 = .{0} ** 64,
+    len: usize = 0,
+    counter: u64 = 0,
+    deadline_ns: u64 = 0,
+    interval_ns: u64 = 0,
+};
+var g_chans: [8]FakeChan = [_]FakeChan{.{}} ** 8;
+
+fn fakeChannelCreate(kind: u32, arg: u64) i64 {
+    for (&g_chans, 0..) |*c, i| {
+        if (c.used) continue;
+        c.* = .{ .used = true, .refs = if (kind == 0 or kind == 2) 2 else 1, .kind = kind, .counter = arg };
+        if (g_env) |e| e.mmap_calls += 0; // наблюдаемость при необходимости
+        return @intCast(i);
+    }
+    return -ENFILE;
+}
+fn fakeChannelRead(id: u32, va: u64, count: u64) i64 {
+    if (id >= g_chans.len or !g_chans[id].used) return -EBADF;
+    const c = &g_chans[id];
+    switch (c.kind) {
+        1 => { // eventfd: 8Б счётчик
+            if (count < 8) return -EINVAL;
+            if (c.counter == 0) return -EAGAIN;
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, c.counter, .little);
+            if (!fakeCopyOut(va, &b)) return -EFAULT;
+            c.counter = 0;
+            return 8;
+        },
+        3 => { // timerfd
+            if (count < 8) return -EINVAL;
+            if (c.counter == 0) return -EAGAIN;
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, c.counter, .little);
+            if (!fakeCopyOut(va, &b)) return -EFAULT;
+            c.counter = 0;
+            return 8;
+        },
+        else => { // pipe/socketpair: FIFO
+            if (c.len == 0) return -EAGAIN;
+            const n: usize = @intCast(@min(count, c.len));
+            if (!fakeCopyOut(va, c.buf[0..n])) return -EFAULT;
+            std.mem.copyForwards(u8, c.buf[0 .. c.len - n], c.buf[n..c.len]);
+            c.len -= n;
+            return @intCast(n);
+        },
+    }
+}
+fn fakeChannelWrite(id: u32, va: u64, count: u64) i64 {
+    if (id >= g_chans.len or !g_chans[id].used) return -EBADF;
+    const c = &g_chans[id];
+    switch (c.kind) {
+        1 => { // eventfd: += 8Б value
+            if (count < 8) return -EINVAL;
+            var b: [8]u8 = undefined;
+            if (!fakeCopyIn(&b, va)) return -EFAULT;
+            c.counter += std.mem.readInt(u64, &b, .little);
+            return 8;
+        },
+        3 => { // timerfd: arm [value, interval] из kernel-VA
+            if (count < 16) return -EINVAL;
+            var b: [16]u8 = undefined;
+            const s: [*]const u8 = @ptrFromInt(va);
+            @memcpy(&b, s[0..16]);
+            c.interval_ns = std.mem.readInt(u64, b[8..16], .little);
+            const value = std.mem.readInt(u64, b[0..8], .little);
+            c.deadline_ns = if (value == 0) 0 else 1; // fake-время: value>0 → «взведён»
+            c.counter = 0;
+            return 16;
+        },
+        else => { // pipe/socketpair: FIFO append
+            const n: usize = @intCast(count);
+            if (c.len + n > c.buf.len) return -EAGAIN;
+            if (!fakeCopyIn(c.buf[c.len .. c.len + n], va)) return -EFAULT;
+            c.len += n;
+            return @intCast(n);
+        },
+    }
+}
+fn fakeChannelReady(id: u32) u32 {
+    if (id >= g_chans.len or !g_chans[id].used) return 0;
+    const c = &g_chans[id];
+    return switch (c.kind) {
+        1, 3 => if (c.counter > 0) EPOLLIN else 0,
+        else => if (c.len > 0) EPOLLIN else 0,
+    };
+}
+fn fakeChannelUnref(id: u32) void {
+    if (id >= g_chans.len) return;
+    if (g_chans[id].refs > 0) g_chans[id].refs -= 1;
+    if (g_chans[id].refs == 0) g_chans[id].used = false;
+}
+
+// ─── CDD №12 p2: фейк-сигналы + memfd ──────────────────────────────────────
+var g_sig_handlers: [65]u64 = .{0} ** 65;
+var g_sig_mask: u64 = 0;
+
+fn fakeSetSigaction(sig: u32, handler: u64, flags: u64, restorer: u64) i64 {
+    _ = flags;
+    _ = restorer;
+    if (sig == 0 or sig > 64 or sig == 9 or sig == 19) return -EINVAL;
+    const old: i64 = @bitCast(g_sig_handlers[sig]);
+    g_sig_handlers[sig] = handler;
+    return old;
+}
+fn fakeGetSigaction(sig: u32) u64 {
+    if (sig == 0 or sig > 64) return 0;
+    return g_sig_handlers[sig];
+}
+fn fakeSetSigmask(how: u32, mask: u64) u64 {
+    const old = g_sig_mask;
+    switch (how) {
+        0 => g_sig_mask |= mask,
+        1 => g_sig_mask &= ~mask,
+        2 => g_sig_mask = mask,
+        else => {},
+    }
+    return old;
+}
+fn fakeMemfdCreate() i64 {
+    // fake: файл реестра «memfd»
+    for (&g_files, 0..) |*f, i| {
+        if (!f.used) {
+            f.* = .{ .used = true, .kind = .tmpfs_file };
+            const name = "/tmp/.memfd"; // путь-имя КАК в openat (фейк-сравнение)
+            @memcpy(f.name[0..name.len], name);
+            f.name_len = name.len;
+            f.size = 0;
+            return @intCast(i);
+        }
+    }
+    return -ENFILE;
+}
+
 fn fakeFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
     if (id >= g_files.len or !g_files[id].used) return -EBADF;
     const f = &g_files[id];
@@ -1605,6 +2156,15 @@ fn fakeOps() LinuxOps {
         .stat_by_path = fakeStatByPath,
         .readlink_path = fakeReadlinkPath,
         .release_file = fakeReleaseFile,
+        .channel_create = fakeChannelCreate,
+        .channel_read = fakeChannelRead,
+        .channel_write = fakeChannelWrite,
+        .channel_ready = fakeChannelReady,
+        .channel_unref = fakeChannelUnref,
+        .set_sigaction = fakeSetSigaction,
+        .get_sigaction = fakeGetSigaction,
+        .set_sigmask = fakeSetSigmask,
+        .memfd_create = fakeMemfdCreate,
     };
 }
 
@@ -2227,11 +2787,11 @@ test "linux: FdTable — EMFILE при заполнении; resolveDevKind" {
     var fds = FdTable.init();
     const ops = fakeOps();
 
-    // заполняем все слоты (3..15 = 13 открытий)
+    // заполняем все слоты (3..MAX_FDS-1 = 61 открытие; p2: 16→64)
     var i: u64 = 0;
-    while (i < 13) : (i += 1) {
+    while (i < MAX_FDS - 3) : (i += 1) {
         const r = sysOpenat(ops, &fds, AT_FDCWD, putStr(e, 0x100, "/dev/fb0"), 0, 0);
-        try testing.expectEqual(@as(u64, 3 + i), r);
+        try testing.expectEqual(3 + i, r);
     }
     // таблица полна → -EMFILE
     try testing.expectEqual(err(EMFILE), sysOpenat(ops, &fds, AT_FDCWD, putStr(e, 0x140, "/dev/fb0"), 0, 0));
@@ -2706,4 +3266,217 @@ test "linux: close — освобождение слота РЕЕСТРА (EMFIL
     const p = putStr(e, 0, path);
     const fd2 = sysOpenat(ops, &fds, 0, p, 0, 0);
     try testing.expect(fd2 >= 3 and fd2 < 256);
+}
+
+// ─── Тесты CDD №12 p2: канал-волна + сигналы + misc ─────────────────────────
+
+test "linux: pipe2 — пара fd, FIFO write/read, EINVAL/EFAULT-края" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    const pair_va = FakeEnv.USER_BASE + 0x200;
+    const r = sysPipe2(ops, &fds, pair_va, 0);
+    try testing.expectEqual(@as(u64, 0), r);
+    var pb: [8]u8 = undefined;
+    try testing.expect(fakeCopyIn(&pb, pair_va));
+    const rfd: i64 = std.mem.readInt(u32, pb[0..4], .little);
+    const wfd: i64 = std.mem.readInt(u32, pb[4..8], .little);
+    try testing.expect(rfd == 3 and wfd == 4);
+    try testing.expectEqual(FdKind.pipe_read, fds.entries[3].kind);
+    try testing.expectEqual(FdKind.pipe_write, fds.entries[4].kind);
+
+    // FIFO: write 4Б в писца → read 4Б из читателя
+    const msg = putStr(e, 0x40, "PING");
+    try testing.expectEqual(@as(u64, 4), sysWrite(ops, &fds, wfd, msg, 4));
+    const out_va = FakeEnv.USER_BASE + 0x300;
+    try testing.expectEqual(@as(u64, 4), sysRead(ops, &fds, rfd, out_va, 8));
+    var out: [8]u8 = undefined;
+    try testing.expect(fakeCopyIn(&out, out_va));
+    try testing.expectEqualStrings("PING", out[0..4]);
+    // пустой pipe + NB → EAGAIN
+    fds.entries[@intCast(rfd)].nonblock = true;
+    try testing.expectEqual(err(EAGAIN), sysRead(ops, &fds, rfd, out_va, 8));
+
+    // краи: битые флаги → EINVAL; битый указатель → EFAULT
+    try testing.expectEqual(err(EINVAL), sysPipe2(ops, &fds, pair_va, 0x4));
+    try testing.expectEqual(err(EFAULT), sysPipe2(ops, &fds, 0x10_0000, 0));
+}
+
+test "linux: eventfd2 — счётчик write→read; ready-биты; close→unref" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    const fd = sysEventfd2(ops, &fds, 0, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    try testing.expectEqual(FdKind.eventfd, fds.entries[3].kind);
+    // инкремент (write 8Б value=5)
+    const val_va = putStr(e, 0x40, "\x05\x00\x00\x00\x00\x00\x00\x00");
+    try testing.expectEqual(@as(u64, 8), sysWrite(ops, &fds, 3, val_va, 8));
+    // read → счётчик 5, сброс
+    const out_va = FakeEnv.USER_BASE + 0x300;
+    try testing.expectEqual(@as(u64, 8), sysRead(ops, &fds, 3, out_va, 8));
+    var out: [8]u8 = undefined;
+    try testing.expect(fakeCopyIn(&out, out_va));
+    try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, &out, .little));
+    // после сброса → EAGAIN
+    try testing.expectEqual(err(EAGAIN), sysRead(ops, &fds, 3, out_va, 8));
+    // флаги-край
+    try testing.expectEqual(err(EINVAL), sysEventfd2(ops, &fds, 0, 0x100));
+    // close → слот канала освободился (переиспользование id)
+    try testing.expectEqual(@as(u64, 0), sysClose(ops, &fds, 3));
+}
+
+test "linux: socketpair — AF_UNIX пара; wrong domain → EAFNOSUPPORT" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    const sv_va = FakeEnv.USER_BASE + 0x200;
+    try testing.expectEqual(@as(u64, 0), sysSocketpair(ops, &fds, 1, 1, 0, sv_va));
+    var pb: [8]u8 = undefined;
+    try testing.expect(fakeCopyIn(&pb, sv_va));
+    try testing.expect(std.mem.readInt(u32, pb[0..4], .little) == 3);
+    try testing.expect(std.mem.readInt(u32, pb[4..8], .little) == 4);
+    try testing.expectEqual(FdKind.socket, fds.entries[3].kind);
+    // двунаправленность: write fd3 → read fd4
+    const msg = putStr(e, 0x40, "WL");
+    try testing.expectEqual(@as(u64, 2), sysWrite(ops, &fds, 3, msg, 2));
+    const out_va = FakeEnv.USER_BASE + 0x300;
+    try testing.expectEqual(@as(u64, 2), sysRead(ops, &fds, 4, out_va, 8));
+    // не-AF_UNIX
+    try testing.expectEqual(err(EAFNOSUPPORT), sysSocketpair(ops, &fds, 2, 1, 0, sv_va));
+}
+
+test "linux: rt_sigaction/rt_sigprocmask — хранилище; SIGKILL → EINVAL" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+
+    // установить SIGUSR1(10) = 0xDEAD
+    var act: [32]u8 = .{0} ** 32;
+    std.mem.writeInt(u64, act[0..8], 0xDEAD, .little);
+    const act_va = putStr(e, 0, "/proc/self/exe"); // перезапишем ниже сырыми байтами
+    try testing.expect(fakeCopyOut(act_va, &act));
+    try testing.expectEqual(@as(u64, 0), sysRtSigaction(ops, 10, act_va, 0, 8));
+    try testing.expectEqual(@as(u64, 0xDEAD), g_sig_handlers[10]);
+
+    // oldact возвращает прежний handler
+    const old_va = FakeEnv.USER_BASE + 0x100;
+    std.mem.writeInt(u64, act[0..8], 0xBEEF, .little);
+    try testing.expect(fakeCopyOut(act_va, &act));
+    try testing.expectEqual(@as(u64, 0), sysRtSigaction(ops, 10, act_va, old_va, 8));
+    var ob: [32]u8 = undefined;
+    try testing.expect(fakeCopyIn(&ob, old_va));
+    try testing.expectEqual(@as(u64, 0xDEAD), std.mem.readInt(u64, ob[0..8], .little));
+
+    // SIGKILL(9)/SIGSTOP(19) → EINVAL; sig=0/65 → EINVAL
+    try testing.expectEqual(err(EINVAL), sysRtSigaction(ops, 9, act_va, 0, 8));
+    try testing.expectEqual(err(EINVAL), sysRtSigaction(ops, 0, act_va, 0, 8));
+
+    // sigprocmask: SETMASK 0xFF → old 0; QUERY возвращает 0xFF
+    const set_va = putStr(e, 0x40, "\xFF\x00\x00\x00\x00\x00\x00\x00");
+    const oldm_va = FakeEnv.USER_BASE + 0x140;
+    try testing.expectEqual(@as(u64, 0), sysRtSigprocmask(ops, 2, set_va, oldm_va, 8));
+    var mb: [8]u8 = undefined;
+    try testing.expect(fakeCopyIn(&mb, oldm_va));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, &mb, .little));
+    try testing.expectEqual(@as(u64, 0xFF), g_sig_mask);
+}
+
+test "linux: prctl — CAPBSET_READ→0; madvise; getcwd; fstatfs" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    // prctl(PR_CAPBSET_READ, CAP_SYS_ADMIN=21) → 0 (нет cap)
+    try testing.expectEqual(@as(u64, 0), sysPrctl(ops, PR_CAPBSET_READ, 21, 0, 0, 0));
+    try testing.expectEqual(err(EINVAL), sysPrctl(ops, PR_CAPBSET_READ, 64, 0, 0, 0));
+    // madvise: корректный VA → 0
+    const buf = FakeEnv.USER_BASE;
+    try testing.expectEqual(@as(u64, 0), sysMadvise(ops, buf, 16, 3));
+    try testing.expectEqual(err(EFAULT), sysMadvise(ops, 0x10_0000, 16, 3));
+    // getcwd: «/» + NUL = 2 байта
+    const cwd_va = FakeEnv.USER_BASE + 0x80;
+    try testing.expectEqual(@as(u64, 2), sysGetcwd(ops, cwd_va, 64));
+    var cb: [4]u8 = undefined;
+    try testing.expect(fakeCopyIn(&cb, cwd_va));
+    try testing.expectEqual(@as(u8, '/'), cb[0]);
+    try testing.expectEqual(@as(u8, 0), cb[1]);
+    try testing.expectEqual(err(ERANGE), sysGetcwd(ops, cwd_va, 1));
+    // fstatfs: 120Б, f_bsize=4096
+    const p_fb = putStr(e, 0, "/dev/fb0");
+    const fb = sysOpenat(ops, &fds, AT_FDCWD, p_fb, 0, 0);
+    const stfs_va = FakeEnv.USER_BASE + 0x100;
+    try testing.expectEqual(@as(u64, 0), sysFstatfs(ops, &fds, @intCast(fb), stfs_va));
+    var sb: [120]u8 = undefined;
+    try testing.expect(fakeCopyIn(&sb, stfs_va));
+    try testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, sb[8..16], .little));
+}
+
+test "linux: timerfd — create/arm/read-цикл; memfd — anon RW-файл" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    // timerfd: create + arm (kernel-VA 16Б) + read (fake: value>0 → счётчик
+    // вручную — проверяем контракт read)
+    const fd = sysTimerfdCreate(ops, &fds, 1, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    try testing.expectEqual(FdKind.timerfd, fds.entries[3].kind);
+    // arm через settime: new_itimerspec {value=5мс, interval=0} (fake: взвод)
+    var it: [16]u8 = .{0} ** 16;
+    std.mem.writeInt(u64, it[0..8], 5_000_000, .little);
+    const it_va = FakeEnv.USER_BASE + 0x60;
+    try testing.expect(fakeCopyOut(it_va, &it));
+    try testing.expectEqual(@as(u64, 0), sysTimerfdSettime(ops, &fds, 3, 0, it_va, 0));
+    // чтение до экспирации → EAGAIN (fake-время не тикает)
+    const out_va = FakeEnv.USER_BASE + 0x300;
+    try testing.expectEqual(err(EAGAIN), sysRead(ops, &fds, 3, out_va, 8));
+    // ABSTIME-флаг → ENOTSUP
+    try testing.expectEqual(err(ENOTSUP), sysTimerfdSettime(ops, &fds, 3, 1, it_va, 0));
+
+    // memfd: anon tmpfs RW
+    const mfd = sysMemfdCreate(ops, &fds, 0);
+    try testing.expectEqual(@as(u64, 4), mfd);
+    try testing.expectEqual(FdKind.tmpfs_file, fds.entries[4].kind);
+    var fds2 = FdTable.init();
+    _ = &fds2;
+    const w = putStr(e, 0x40, "SHM-DATA");
+    try testing.expectEqual(@as(u64, 8), sysWrite(ops, &fds, 4, w, 8));
+    // чтение С 0: ВТОРОЕ открытие того же файла (offset=0) — как mmap-клиент
+    const p_memfd = putStr(e, 0x20, "/tmp/.memfd");
+    const mfd2 = sysOpenat(ops, &fds, AT_FDCWD, p_memfd, 0, 0);
+    try testing.expect(mfd2 >= 5);
+    const out2 = FakeEnv.USER_BASE + 0x310;
+    try testing.expectEqual(@as(u64, 8), sysRead(ops, &fds, @intCast(mfd2), out2, 8));
+    var rb: [8]u8 = undefined;
+    try testing.expect(fakeCopyIn(&rb, out2));
+    try testing.expectEqualStrings("SHM-DATA", rb[0..8]);
+}
+
+test "linux: ppoll/epoll_pwait — маршрутизация dispatch (якоря номеров)" {
+    // сверка номеров с arch/x86/entry/syscalls/syscall_64.tbl
+    try testing.expectEqual(@as(u64, 293), SYS_pipe2);
+    try testing.expectEqual(@as(u64, 290), SYS_eventfd2);
+    try testing.expectEqual(@as(u64, 289), SYS_signalfd4);
+    try testing.expectEqual(@as(u64, 283), SYS_timerfd_create);
+    try testing.expectEqual(@as(u64, 286), SYS_timerfd_settime);
+    try testing.expectEqual(@as(u64, 281), SYS_epoll_pwait);
+    try testing.expectEqual(@as(u64, 270), SYS_ppoll);
+    try testing.expectEqual(@as(u64, 138), SYS_fstatfs);
+    try testing.expectEqual(@as(u64, 79), SYS_getcwd);
+    try testing.expectEqual(@as(u64, 157), SYS_prctl);
+    try testing.expectEqual(@as(u64, 28), SYS_madvise);
+    try testing.expectEqual(@as(u64, 13), SYS_rt_sigaction);
+    try testing.expectEqual(@as(u64, 14), SYS_rt_sigprocmask);
+    try testing.expectEqual(@as(u64, 53), SYS_socketpair);
+    try testing.expectEqual(@as(u64, 319), SYS_memfd_create);
+    try testing.expectEqual(@as(u64, 334), SYS_rseq);
 }

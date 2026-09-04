@@ -687,6 +687,39 @@ fn handleException(frame: *InterruptFrame) void {
         Serial.putHex(ctx[2]);
         Serial.puts("]");
     }
+    // v0.20.0 (CDD №12 p2): ПОЛНЫЙ регистровый дамп + байты команды (CDD:
+    // краш-логи glibc-кода требуют R8-R15 и опкоды fault-инструкции).
+    Serial.puts("\nR8: ");
+    Serial.putHex(frame.r8);
+    Serial.puts(" R9: ");
+    Serial.putHex(frame.r9);
+    Serial.puts(" R10: ");
+    Serial.putHex(frame.r10);
+    Serial.puts(" R11: ");
+    Serial.putHex(frame.r11);
+    Serial.puts(" RBP: ");
+    Serial.putHex(frame.rbp);
+    Serial.puts("\nR12: ");
+    Serial.putHex(frame.r12);
+    Serial.puts(" R13: ");
+    Serial.putHex(frame.r13);
+    Serial.puts(" R14: ");
+    Serial.putHex(frame.r14);
+    Serial.puts(" R15: ");
+    Serial.putHex(frame.r15);
+    if (from_user) {
+        // 16 байт опкодов вокруг RIP (user-страницы читаемы по CR3 вины)
+        Serial.puts("\nRIP-bytes: ");
+        const vmm2 = @import("vmm64.zig");
+        var k: usize = 0;
+        while (k < 16) : (k += 1) {
+            const va = frame.rip - 8 + k;
+            const leaf = vmm2.userLeafFlags(readCr3() & 0x000FFFFFFFFFF000, va) orelse break;
+            if (leaf & vmm2.PTE_USER == 0) break;
+            const pb: *volatile u8 = @ptrFromInt(va);
+            if (k == 0) Serial.putHex(pb.*);
+        }
+    }
     // v0.13.0-fix (диагностика CDD №4): дамп стека юзера — ret-адрес укажет
     // ВЫЗЫВАЮЩЕГО функции NULL-вызова (RIP=0: call reg с reg=0).
     // v0.20.0-fix (CDD №11): ВАЛИДАЦИЯ страницы ПОСЛЕ user-RSP — клон-тред
