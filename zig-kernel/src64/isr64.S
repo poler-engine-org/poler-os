@@ -441,6 +441,7 @@ isr_stub_table:
 .extern ustack_hi_tab          // [MAX_TASKS]u64 — верх user-стека (0 = нет)
 .extern ustack_lo_tab          // [MAX_TASKS]u64 — низ user-стека
 .extern syscall_num_tmp        // времяянка user RAX на время скана
+.extern syscall_ret_tmp        // v0.20.0: результат Zig-обработчика (возврат в RAX)
 .extern rbx_tmp                // времяянка user RBX на время скана
 
 .global syscall_entry
@@ -564,8 +565,39 @@ syscall_entry:
     // IF=0 от SYSCALL — запись атомарна.
     movq $1, in_win32_syscall(%rip)
 
+    // ════════════════════════════════════════════════════════════════
+    //  v0.20.0 (CDD №11, glibc-волна): СОХРАНЕНИЕ Linux-ABI регистров.
+    //
+    //  x86-64 syscall ABI: ядро возвращает пользователю с НЕИЗМЕННЫМИ
+    //  RDI/RSI/RDX/R10/R8/R9 (калечатся только RCX/R11/RAX). Zig-обработчик
+    //  (.C-конвенция) свободно калечит АРГУМЕНТНЫЕ регистры — glibc
+    //  ПОЛАГАЕТСЯ на сохранность (эмпирика: _dl_early_allocate держал
+    //  номер syscall в ESI через brk(0)→brk(new): мусор в ESI = дикий
+    //  syscall = #PF в __libc_setup_tls). Win32-код не замечал баг:
+    //  MSVC-ABI считает RCX/RDX/R8/R9 volatile.
+    //
+    //  Пуш ПОСЛЕ снапшота syscall_frame (смещения снапшота не трогаем).
+    // ════════════════════════════════════════════════════════════════
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %r10
+    pushq %r8
+    pushq %r9
+
     // Call Zig syscall handler
     call zig_syscall_handler
+
+    // Результат — в .bss времяянку (RAX обязан вернуться пользователю),
+    // затем восстановить аргументные регистры
+    movq %rax, syscall_ret_tmp(%rip)
+    popq %r9
+    popq %r8
+    popq %r10
+    popq %rdx
+    popq %rsi
+    popq %rdi
+    movq syscall_ret_tmp(%rip), %rax
 
     // v0.16.0-fix (CDD №7, застрявшие CV-треды): сброс флага транзакции
     // ПЕРЕНЕСЁН за pop'ы — раньше окно «flag=0 до sysretq» (~12 инструкций,

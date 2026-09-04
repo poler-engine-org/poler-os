@@ -2321,6 +2321,11 @@ const LinuxProc = struct {
     brk_base: u64 = 0,
     brk: u64 = 0,
     exit_code: ?u64 = null,
+    /// execfn (argv[0]) — readlink("/proc/self/exe") для glibc.
+    execfn_buf: [64]u8 = [_]u8{0} ** 64,
+    execfn_len: usize = 0,
+    /// TLS-база main-треда (arch_prctl SET_FS; клон-треды — своя волна).
+    fs_base: u64 = 0,
 };
 
 const MmapRegion = struct {
@@ -2439,6 +2444,90 @@ fn linuxDoBrk(addr: u64) u64 {
     }
     proc.brk = addr & ~@as(u64, PAGE_SIZE - 1);
     return proc.brk;
+}
+
+// ─── v0.20.0 (CDD №11 p1b): glibc-волна — runtime-мосты ─────────────────────
+
+/// mprotect(va, len, prot): обновление прав страниц [va, va+len) в PML4
+/// задачи (RELRO: RW-страницы образа → RO после загрузки glibc).
+fn linuxDoMprotect(va: u64, len: u64, prot: u64) i64 {
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return -linux_syscalls.EFAULT;
+    var want: u64 = 0;
+    if (prot & linux_syscalls.PROT_WRITE != 0) want |= vmm.PTE_WRITABLE;
+    if (prot & linux_syscalls.PROT_EXEC == 0) want |= vmm.PTE_NO_EXECUTE;
+    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        // страница не замаплена — Linux молча пропускает (PROT_NONE-зоны)
+        _ = vmm.userLeafApplyProt(pml4, va + i * PAGE_SIZE, want);
+    }
+    return 0;
+}
+
+/// arch_prctl(ARCH_SET_FS): TLS-база — MSR + per-task-таблица (диспетчер
+/// восстановит после переключения). glibc: [fs:0] = tcbhead_t.
+fn linuxArchSetFs(addr: u64) i64 {
+    const owner = linuxOwnerTask();
+    if (owner >= scheduler.MAX_TASKS) return -linux_syscalls.EPERM;
+    const t = &scheduler.tasks[owner];
+    if (t.privilege != .User or t.abi != .linux) return -linux_syscalls.EPERM;
+    scheduler.fs_base_tab[owner] = addr;
+    if (linuxProcCurrent()) |p| p.fs_base = addr;
+    hal.writeMsr(hal.MSR.FS_BASE, addr); // CR3 задачи активна — живой MSR
+    return 0;
+}
+
+fn linuxArchGetFs() u64 {
+    const owner = linuxOwnerTask();
+    if (owner >= scheduler.MAX_TASKS) return 0;
+    return scheduler.fs_base_tab[owner];
+}
+
+/// set_tid_address: cleartid-слово ТЕКУЩЕГО треда (glibc main-тред:
+/// exit → ядро пишет 0 + FUTEX_WAKE — ровно наша механика join).
+fn linuxSetTidAddress(addr: u64) u64 {
+    const owner = linuxOwnerTask();
+    if (owner >= scheduler.MAX_TASKS) return 1;
+    if (addr != 0) linux_child_tid[owner] = addr;
+    return @intCast(owner);
+}
+
+/// set_robust_list: фиксируем (futex-эпилог мёртвых владельцев — будущие
+/// волны; ядру для базового glibc достаточно 0).
+fn linuxSetRobustList(addr: u64, len: u64) i64 {
+    _ = addr;
+    _ = len;
+    return 0;
+}
+
+/// readlink("/proc/self/exe"): execfn из proc-слота (auxv AT_EXECFN-модель).
+fn linuxReadlinkSelf(buf_va: u64, bufsz: u64) i64 {
+    const proc = linuxProcCurrent() orelse return -linux_syscalls.ENOENT;
+    const n = @min(bufsz, proc.execfn_len);
+    if (n == 0) return -linux_syscalls.ENOENT;
+    if (!linux_user_io.copy_out(buf_va, proc.execfn_buf[0..@intCast(n)]))
+        return -linux_syscalls.EFAULT;
+    return @intCast(n);
+}
+
+/// getrandom: TSC+тик-микс в user-буфер (счётчик PUF-апгрейда — бэклог).
+fn linuxGetrandom(va: u64, count: u64) i64 {
+    const p: [*]u8 = @ptrFromInt(va);
+    var v = hal.readMsr(0x10) ^ (hal.tick_count << 32) ^ 0x9E37_79B9_7F4A_7C15;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        v = v *% 6364136223846793005 +% 1442695040888963407;
+        p[@intCast(i)] = @truncate(v >> 33);
+    }
+    return @intCast(count);
+}
+
+/// clock_gettime-источник: тики 10мс + TSC-доводка до наносекунд.
+fn linuxTimeNs() u64 {
+    const tsc = hal.readMsr(0x10);
+    const ns = hal.tick_count * 10_000_000 + (tsc / 3000); // TCG ~3ГГц-приближение
+    return ns;
 }
 
 
@@ -2592,6 +2681,14 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .current_pid = linuxCurrentPid,
         .current_tid = linuxCurrentTid,
         .do_brk = linuxDoBrk,
+        .do_mprotect = linuxDoMprotect,
+        .arch_set_fs = linuxArchSetFs,
+        .arch_get_fs = linuxArchGetFs,
+        .set_tid_address = linuxSetTidAddress,
+        .set_robust_list = linuxSetRobustList,
+        .readlink_self = linuxReadlinkSelf,
+        .do_getrandom = linuxGetrandom,
+        .time_ns = linuxTimeNs,
         .open_file = linuxOpenFile,
         .file_read = linuxFileRead,
         .file_write = linuxFileWrite,
@@ -3524,6 +3621,10 @@ fn cmd_elfload(args: []const u8) void {
     if (linuxNewProc(task_id)) |slot| {
         linux_procs[slot].brk_base = img.brk;
         linux_procs[slot].brk = img.brk;
+        // execfn (readlink /proc/self/exe для glibc-static init)
+        const n = @min(file.len, linux_procs[slot].execfn_buf.len);
+        @memcpy(linux_procs[slot].execfn_buf[0..n], file[0..n]);
+        linux_procs[slot].execfn_len = n;
     } else {
         sys_print("[ELF] proc-слоты исчерпаны (2) — задача без fd-таблицы\n");
     }

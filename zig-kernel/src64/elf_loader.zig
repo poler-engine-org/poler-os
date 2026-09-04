@@ -192,9 +192,16 @@ pub fn flagsToPte(p_flags: u32) u64 {
 
 // ─── Валидация заголовка ───────────────────────────────────────────────────
 
+/// Bounce-буферы парсинга: CPIO-данные НЕ обязаны быть выровнены
+/// (эмпирика glibc-static: файл 758КБ на смещении ≠ 8 — @alignCast паниковал
+/// ядро). Копируем заголовок/фантом в выровненный .bss, разбор идёт оттуда.
+var hdr_bounce: [64]u8 align(8) = [_]u8{0} ** 64;
+var ph_bounce: [56]u8 align(8) = [_]u8{0} ** 56;
+
 fn validateEhdr(data: []const u8) ElfError!*const Elf64_Ehdr {
     if (data.len < @sizeOf(Elf64_Ehdr)) return ElfError.Truncated;
-    const ehdr: *const Elf64_Ehdr = @ptrCast(@alignCast(data.ptr));
+    @memcpy(hdr_bounce[0..64], data[0..64]);
+    const ehdr: *const Elf64_Ehdr = @ptrCast(&hdr_bounce);
     if (ehdr.e_ident[0] != 0x7F or ehdr.e_ident[1] != 'E' or
         ehdr.e_ident[2] != 'L' or ehdr.e_ident[3] != 'F')
     {
@@ -252,7 +259,7 @@ pub fn loadElf(ops: ElfOps, pml4: u64, data: []const u8, dyn_base: u64) ElfError
     var seg_hi: u64 = 0;
     var i: usize = 0;
     while (i < ehdr.e_phnum) : (i += 1) {
-        const ph: *const Elf64_Phdr = phdrAt(data, ehdr, i);
+        const ph = phdrAt(data, ehdr, i);
         if (ph.p_type != PT_LOAD) continue;
         if (ph.p_memsz < ph.p_filesz) return ElfError.SegmentBounds;
         const fsum = @addWithOverflow(ph.p_offset, ph.p_filesz);
@@ -310,7 +317,7 @@ pub fn loadElf(ops: ElfOps, pml4: u64, data: []const u8, dyn_base: u64) ElfError
     // Проход 3: копия файлов + BSS
     i = 0;
     while (i < ehdr.e_phnum) : (i += 1) {
-        const ph: *const Elf64_Phdr = phdrAt(data, ehdr, i);
+        const ph = phdrAt(data, ehdr, i);
         if (ph.p_type != PT_LOAD) continue;
         const seg_va = base + ph.p_vaddr;
 
@@ -359,7 +366,7 @@ pub fn loadElf(ops: ElfOps, pml4: u64, data: []const u8, dyn_base: u64) ElfError
 fn pageOwnerPte(data: []const u8, ehdr: *const Elf64_Ehdr, base: u64, va: u64) u64 {
     var i: usize = 0;
     while (i < ehdr.e_phnum) : (i += 1) {
-        const ph: *const Elf64_Phdr = phdrAt(data, ehdr, i);
+        const ph = phdrAt(data, ehdr, i);
         if (ph.p_type != PT_LOAD) continue;
         const seg_start = base + ph.p_vaddr;
         const seg_end = seg_start + ph.p_memsz;
@@ -369,9 +376,13 @@ fn pageOwnerPte(data: []const u8, ehdr: *const Elf64_Ehdr, base: u64, va: u64) u
     return PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE;
 }
 
-fn phdrAt(data: []const u8, ehdr: *const Elf64_Ehdr, idx: usize) *const Elf64_Phdr {
+/// Фантом по индексу — ЗНАЧЕНИЕМ (копия в выровненный bounce: CPIO-данные
+/// могут лежать на невыровненном смещении — @alignCast запрещён).
+fn phdrAt(data: []const u8, ehdr: *const Elf64_Ehdr, idx: usize) Elf64_Phdr {
     const off = ehdr.e_phoff + idx * ehdr.e_phentsize;
-    return @ptrCast(@alignCast(data.ptr + off));
+    @memcpy(ph_bounce[0..56], data[@intCast(off)..][0..56]);
+    const ph: *const Elf64_Phdr = @ptrCast(&ph_bounce);
+    return ph.*;
 }
 
 // ─── Первичный стек Linux-ABI ──────────────────────────────────────────────

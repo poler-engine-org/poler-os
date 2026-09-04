@@ -39,7 +39,17 @@ pub const SYS_mmap: u64 = 9;
 pub const SYS_brk: u64 = 12;
 pub const SYS_munmap: u64 = 11;
 pub const SYS_ioctl: u64 = 16;
+pub const SYS_fstat: u64 = 5;
 pub const SYS_poll: u64 = 7;
+pub const SYS_mprotect: u64 = 10;
+pub const SYS_arch_prctl: u64 = 158;
+pub const SYS_set_tid_address: u64 = 218;
+pub const SYS_clock_gettime: u64 = 228;
+pub const SYS_set_robust_list: u64 = 273;
+pub const SYS_rseq: u64 = 293;
+pub const SYS_readlinkat: u64 = 298;
+pub const SYS_prlimit64: u64 = 302;
+pub const SYS_getrandom: u64 = 318;
 pub const SYS_clone: u64 = 56;
 pub const SYS_getpid: u64 = 39;
 pub const SYS_fcntl: u64 = 72;
@@ -361,6 +371,24 @@ pub const LinuxOps = struct {
     /// v0.20.0 (CDD №11): brk(addr) — Linux-семантика (0 → текущий;
     /// рост/спад маппинга; отказ → старый brk).
     do_brk: *const fn (addr: u64) u64,
+    /// glibc-волна (CDD №11 p1b): mprotect(va, len, prot) — обновление
+    /// прав страниц (RELRO: RW→RO после загрузки). 0 / -errno.
+    do_mprotect: *const fn (va: u64, len: u64, prot: u64) i64,
+    /// arch_prctl(ARCH_SET_FS, addr): TLS-база задачи. 0 / -errno.
+    arch_set_fs: *const fn (addr: u64) i64,
+    /// arch_prctl(ARCH_GET_FS): текущая TLS-база.
+    arch_get_fs: *const fn () u64,
+    /// set_tid_address(addr): cleartid-слово ТЕКУЩЕГО треда (exit → 0+WAKE).
+    /// Возвращает tid.
+    set_tid_address: *const fn (addr: u64) u64,
+    /// set_robust_list(addr, len): NPTL-реестр мьютексов. 0 / -errno.
+    set_robust_list: *const fn (addr: u64, len: u64) i64,
+    /// readlink("/proc/self/exe") в buf: длина или -errno (execfn из auxv).
+    readlink_self: *const fn (buf_va: u64, bufsz: u64) i64,
+    /// getrandom(va, count): энтропия в user-буфер. Байты или -errno.
+    do_getrandom: *const fn (va: u64, count: u64) i64,
+    /// clock_gettime-источник: монотонные наносекунды.
+    time_ns: *const fn () u64,
     /// open_file: открыть файл VFS (initrd-RO/tmpfs-RW) по пути.
     /// Возвращает файл-id ≥ 0 или -errno; kind возвращает через out_kind.
     open_file: *const fn (path: []const u8, flags: u64, out_kind: *FdKind) i64,
@@ -797,6 +825,143 @@ pub fn sysBrk(ops: LinuxOps, addr: u64) u64 {
     return ops.do_brk(addr);
 }
 
+// ─── glibc-волна (CDD №11 p1b): ранний init статических бинарников ─────────
+
+/// ARCH_SET_FS / ARCH_GET_FS (TLS glibc) + остальное → EINVAL.
+pub const ARCH_SET_GS: u64 = 0x1001;
+pub const ARCH_SET_FS: u64 = 0x1002;
+pub const ARCH_GET_FS: u64 = 0x1003;
+pub const ARCH_GET_GS: u64 = 0x1004;
+
+pub fn sysArchPrctl(ops: LinuxOps, code: u64, addr: u64) u64 {
+    switch (code) {
+        ARCH_SET_FS => {
+            if (addr > USER_VA_CEILING) return err(EPERM);
+            const r = ops.arch_set_fs(addr);
+            if (r < 0) return @bitCast(r);
+            return 0;
+        },
+        ARCH_GET_FS => {
+            if (!ops.validate(addr, 8, true)) return err(EFAULT);
+            const v = ops.arch_get_fs();
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, v, .little);
+            if (!ops.copy_out(addr, &b)) return err(EFAULT);
+            return 0;
+        },
+        else => return err(EINVAL), // SET_GS/GET_GS — GS занят TEB Win32-задач
+    }
+}
+
+/// set_tid_address(addr): слово, которое ядро обнуляет + FUTEX_WAKE на
+/// exit ТЕКУЩЕГО треда (main-тред glibc — pthread_join с init).
+pub fn sysSetTidAddress(ops: LinuxOps, addr: u64) u64 {
+    if (addr != 0 and !ops.validate(addr, 4, true)) return err(EFAULT);
+    return ops.set_tid_address(addr);
+}
+
+/// set_robust_list(head, len): реестр robust-мьютексов NPTL. v0.20 —
+/// фиксируем адрес (futex-эпилог владельца мёртвого треда — будущие волны).
+pub fn sysSetRobustList(ops: LinuxOps, addr: u64, len: u64) u64 {
+    if (len != 24) return err(EINVAL); // sizeof(struct robust_list_head)
+    if (!ops.validate(addr, 24, true)) return err(EFAULT);
+    return 0;
+}
+
+/// rseq: честный -ENOSYS (glibc ≥ 2.35 переключается на сигнал-модель).
+pub fn sysRseq() u64 {
+    return err(ENOSYS);
+}
+
+/// prlimit64(0, res, NULL, &rlim): RLIMIT_STACK = 8МБ (glibc: стек-модель
+/// stdio-буферов). Прочие ресурсы — EINVAL.
+pub const RLIMIT_STACK: u64 = 3;
+pub const STACK_LIMIT: u64 = 8 * 1024 * 1024;
+
+pub fn sysPrlimit64(ops: LinuxOps, pid: u64, res: u64, new_va: u64, old_va: u64) u64 {
+    if (pid != 0) return err(EPERM); // только о себе
+    if (res != RLIMIT_STACK) return err(EINVAL);
+    if (new_va != 0) return err(EPERM); // setter — не фундамент
+    if (old_va == 0) return 0;
+    if (!ops.validate(old_va, 16, true)) return err(EFAULT);
+    var b: [16]u8 = undefined;
+    std.mem.writeInt(u64, b[0..8], STACK_LIMIT, .little); // rlim_cur
+    std.mem.writeInt(u64, b[8..16], STACK_LIMIT, .little); // rlim_max
+    if (!ops.copy_out(old_va, &b)) return err(EFAULT);
+    return 0;
+}
+
+/// readlinkat(AT_FDCWD, "/proc/self/exe", buf, sz): execfn (argv[0]).
+pub fn sysReadlinkat(ops: LinuxOps, dirfd: u64, path_va: u64, buf_va: u64, bufsz: u64) u64 {
+    _ = dirfd;
+    if (bufsz == 0) return err(EINVAL);
+    if (ops.validate(path_va, 1, false)) {
+        if (ops.copy_in_str(path_va, 64)) |path| {
+            if (!std.mem.eql(u8, path, "/proc/self/exe")) return err(EINVAL);
+            if (!ops.validate(buf_va, @min(bufsz, USER_VA_CEILING), true)) return err(EFAULT);
+            const r = ops.readlink_self(buf_va, bufsz);
+            if (r < 0) return @bitCast(r);
+            return @intCast(r);
+        }
+    }
+    return err(EFAULT);
+}
+
+/// getrandom(buf, count, flags): энтропия (TSC-микс; PUF-апгрейд — P2).
+pub fn sysGetrandom(ops: LinuxOps, buf_va: u64, count: u64, flags: u64) u64 {
+    if (flags != 0 and flags != 1) return err(EINVAL); // GRND_NONBLOCK=1
+    if (count == 0) return 0;
+    if (count > 256) return err(EIO); // фундамент: cap 256Б/вызов
+    if (!ops.validate(buf_va, count, true)) return err(EFAULT);
+    const r = ops.do_getrandom(buf_va, count);
+    if (r < 0) return @bitCast(r);
+    return @intCast(r);
+}
+
+/// clock_gettime(clk, tp): монотонное время (тик+TSC-микс).
+pub const CLOCK_MONOTONIC: u64 = 1;
+pub const CLOCK_REALTIME: u64 = 0;
+
+pub fn sysClockGettime(ops: LinuxOps, clk: u64, tp_va: u64) u64 {
+    if (clk != CLOCK_REALTIME and clk != CLOCK_MONOTONIC) return err(EINVAL);
+    if (!ops.validate(tp_va, 16, true)) return err(EFAULT);
+    const ns = ops.time_ns();
+    var b: [16]u8 = undefined;
+    std.mem.writeInt(u64, b[0..8], ns / 1_000_000_000, .little); // tv_sec
+    std.mem.writeInt(u64, b[8..16], ns % 1_000_000_000, .little); // tv_nsec
+    if (!ops.copy_out(tp_va, &b)) return err(EFAULT);
+    return 0;
+}
+
+/// fstat(fd, …): stat-заглушка для stdio (glibc: размер буфера). 144Б
+/// нулей + S_IFCHR + st_blksize=4096 (консоль = симв. устройство).
+pub const STAT_SIZE: usize = 144;
+const S_IFCHR: u64 = 0x2000;
+
+pub fn sysFstat(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    _ = e;
+    if (!ops.validate(buf_va, STAT_SIZE, true)) return err(EFAULT);
+    var st: [STAT_SIZE]u8 = [_]u8{0} ** STAT_SIZE;
+    // struct stat x86_64: st_mode@24 (u32), st_blksize@56 (i64)
+    std.mem.writeInt(u32, st[24..28], @intCast(S_IFCHR | 0x1A0), .little); // chr + 0620
+    std.mem.writeInt(u64, st[56..64], 4096, .little);
+    if (!ops.copy_out(buf_va, &st)) return err(EFAULT);
+    return 0;
+}
+
+/// mprotect(va, len, prot): RELRO-волна glibc (RW-страницы образа → RO).
+pub fn sysMprotect(ops: LinuxOps, va: u64, len: u64, prot: u64) u64 {
+    if (len == 0) return err(EINVAL);
+    if (va % PAGE_SIZE != 0) return err(EINVAL);
+    const sum = @addWithOverflow(va, len);
+    if (sum[1] != 0 or sum[0] > USER_VA_CEILING) return err(EINVAL);
+    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return err(EINVAL);
+    const r = ops.do_mprotect(va, len, prot);
+    if (r < 0) return @bitCast(r);
+    return 0;
+}
+
 /// void exit(int status) — noreturn по ABI; ядро убивает задачу.
 pub fn sysExit(ops: LinuxOps, code: u64) u64 {
     ops.do_exit(code);
@@ -835,6 +1000,16 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_uname => return sysUname(ops, args.a1),
         SYS_gettid => return sysGettid(ops),
         SYS_getpid => return sysGetpid(ops),
+        SYS_fstat => return sysFstat(ops, fds, @bitCast(args.a1), args.a2),
+        SYS_mprotect => return sysMprotect(ops, args.a1, args.a2, args.a3),
+        SYS_arch_prctl => return sysArchPrctl(ops, args.a1, args.a2),
+        SYS_set_tid_address => return sysSetTidAddress(ops, args.a1),
+        SYS_set_robust_list => return sysSetRobustList(ops, args.a1, args.a2),
+        SYS_rseq => return sysRseq(),
+        SYS_readlinkat => return sysReadlinkat(ops, args.a1, args.a2, args.a3, args.a4),
+        SYS_prlimit64 => return sysPrlimit64(ops, args.a1, args.a2, args.a3, args.a4),
+        SYS_getrandom => return sysGetrandom(ops, args.a1, args.a2, args.a3),
+        SYS_clock_gettime => return sysClockGettime(ops, args.a1, args.a2),
         SYS_getppid => return sysGetppid(ops),
         SYS_getuid => return @intCast(KUID),
         SYS_geteuid => return @intCast(KUID),
@@ -875,6 +1050,13 @@ const FakeEnv = struct {
     brk_calls: u64 = 0,
     last_brk_addr: u64 = 0,
     brk_value: u64 = 0x1000,
+    mprotect_calls: u64 = 0,
+    last_mprotect_prot: u64 = 0,
+    fs_base: u64 = 0,
+    tid_address: u64 = 0,
+    robust_head: u64 = 0,
+    getrandom_calls: u64 = 0,
+    execfn: []const u8 = "hello-static",
     park_calls: u64 = 0,
     wake_calls: u64 = 0,
     last_wake_n: u32 = 0,
@@ -1137,6 +1319,14 @@ fn fakeOps() LinuxOps {
         .current_pid = fakeCurrentPid,
         .current_tid = fakeCurrentTid,
         .do_brk = fakeDoBrk,
+        .do_mprotect = fakeDoMprotect,
+        .arch_set_fs = fakeArchSetFs,
+        .arch_get_fs = fakeArchGetFs,
+        .set_tid_address = fakeSetTidAddress,
+        .set_robust_list = fakeSetRobustList,
+        .readlink_self = fakeReadlinkSelf,
+        .do_getrandom = fakeGetrandom,
+        .time_ns = fakeTimeNs,
         .open_file = fakeOpenFile,
         .file_read = fakeFileRead,
         .file_write = fakeFileWrite,
@@ -1159,6 +1349,60 @@ fn fakeDoBrk(addr: u64) u64 {
     if (addr < 0x1000) return e.brk_value; // ниже базиса — отказ
     e.brk_value = addr;
     return addr;
+}
+
+fn fakeDoMprotect(va: u64, len: u64, prot: u64) i64 {
+    const e = g_env.?;
+    e.mprotect_calls += 1;
+    e.last_mprotect_prot = prot;
+    _ = va;
+    _ = len;
+    return 0;
+}
+
+fn fakeArchSetFs(addr: u64) i64 {
+    const e = g_env.?;
+    e.fs_base = addr;
+    return 0;
+}
+
+fn fakeArchGetFs() u64 {
+    return g_env.?.fs_base;
+}
+
+fn fakeSetTidAddress(addr: u64) u64 {
+    const e = g_env.?;
+    e.tid_address = addr;
+    return 77;
+}
+
+fn fakeSetRobustList(addr: u64, len: u64) i64 {
+    const e = g_env.?;
+    e.robust_head = addr;
+    _ = len;
+    return 0;
+}
+
+fn fakeReadlinkSelf(buf_va: u64, bufsz: u64) i64 {
+    const e = g_env.?;
+    const s = e.execfn;
+    const n = @min(bufsz, s.len);
+    if (!fakeCopyOut(buf_va, s[0..@intCast(n)])) return -EFAULT;
+    return @intCast(n);
+}
+
+fn fakeGetrandom(va: u64, count: u64) i64 {
+    const e = g_env.?;
+    e.getrandom_calls += 1;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        e.mem[@intCast(va - FakeEnv.USER_BASE + i)] = @truncate(0x5A ^ i);
+    }
+    return @intCast(count);
+}
+
+fn fakeTimeNs() u64 {
+    return 123_456_789;
 }
 
 fn envSetup() !*FakeEnv {

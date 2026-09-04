@@ -378,3 +378,35 @@ pub fn userLeafFlags(target_pml4: u64, va: u64) ?u64 {
     if (pte & PTE_PRESENT == 0) return null;
     return pte; // 4KB-лист
 }
+
+/// v0.20.0 (CDD №11, glibc-волна): mprotect — применить НОВЫЕ права
+/// (W/NX-биты) к живому 4KB-листу PTE. Только USER-страницы (kernel-листы
+/// не трогаем — инвариант изоляции). false = не найдено / не user.
+/// want — маска, которой ЗАМЕНЯЮТСЯ биты PTE_WRITABLE|PTE_NO_EXECUTE.
+pub fn userLeafApplyProt(target_pml4: u64, va: u64, want: u64) bool {
+    // Проходим иерархию до PT (4KB-листы; huge-листов в user-зоне нет)
+    const pml4e = physReadQ(target_pml4 + 8 * ((va >> 39) & 0x1FF)) orelse return false;
+    if (pml4e & PTE_PRESENT == 0) return false;
+    const pdpte = physReadQ((pml4e & 0x000FFFFFFFFFF000) + 8 * ((va >> 30) & 0x1FF)) orelse return false;
+    if (pdpte & PTE_PRESENT == 0) return false;
+    if (pdpte & PTE_HUGE != 0) return false;
+    const pde = physReadQ((pdpte & 0x000FFFFFFFFFF000) + 8 * ((va >> 21) & 0x1FF)) orelse return false;
+    if (pde & PTE_PRESENT == 0) return false;
+    if (pde & PTE_HUGE != 0) return false;
+    const pte_addr = (pde & 0x000FFFFFFFFFF000) + 8 * ((va >> 12) & 0x1FF);
+    const pte = physReadQ(pte_addr) orelse return false;
+    if (pte & PTE_PRESENT == 0) return false;
+    if (pte & PTE_USER == 0) return false; // kernel-страницу не трогаем
+
+    const mask = PTE_WRITABLE | PTE_NO_EXECUTE;
+    const new_pte = (pte & ~mask) | (want & mask);
+    const p: *volatile u64 = @ptrFromInt(pte_addr);
+    p.* = new_pte;
+    // инвал: TLB мог закэшировать старые права
+    asm volatile ("invlpg (%[virt])"
+        :
+        : [virt] "r" (va),
+        : "memory"
+    );
+    return true;
+}

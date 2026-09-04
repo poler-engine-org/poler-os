@@ -97,6 +97,11 @@ pub export var current_kernel_stack: u64 = 0;
 pub export var linux_arg5: u64 = 0;
 pub export var linux_arg6: u64 = 0;
 
+/// v0.20.0 (CDD №11, glibc-волна): FS-base per-task (Linux TLS —
+/// arch_prctl(ARCH_SET_FS)). Диспетчер восстанавливает после свитча:
+/// MSR FS живёт на CPU, а не в CR3. Win32-задачи GS-base (TEB) не трогаем.
+pub var fs_base_tab: [MAX_TASKS]u64 = [_]u64{0} ** MAX_TASKS;
+
 /// v0.18.0 (CDD №9, бисект-инструментация): трассировка тика/диспетчера/
 /// syscall-входа — ловим ПЕРВЫЙ десинк cks/TSS/owner вживую.
 pub var dbg_sched_trace: bool = false;
@@ -189,6 +194,11 @@ pub fn syscallStackOwner(ur: u64) usize {
 /// v0.18.0 (CDD №9): времяянки asm-скана владельца (isr64.S): user RAX/RBX
 /// сохраняются ДО цикла и восстанавливаются после выбора стека (IF=0).
 pub export var syscall_num_tmp: u64 = 0;
+
+/// v0.20.0 (CDD №11, glibc-волна): результат Zig-обработчика syscall.
+/// asm сохраняет сюда RAX до восстановления аргументных регистров
+/// (Linux-ABI: RDI/RSI/RDX/R10/R8/R9 прозаика syscall'а — неизменны).
+pub export var syscall_ret_tmp: u64 = 0;
 pub export var rbx_tmp: u64 = 0;
 
 /// v0.18.0 (CDD №9): ABI текущей Ring-3 задачи — для syscall-маршрутизации
@@ -934,6 +944,16 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     if (next_cr3 != current_cr3) {
         hal.writeCr3(next_cr3);
         current_cr3 = next_cr3;
+    }
+
+    // v0.20.0 (CDD №11, glibc-волна): FS-base Linux-задачи (TLS).
+    // Win32-задачам GS-base (TEB) — постоянный, FS не читают. Восстановление
+    // идемпотентно: MSR-запись ~50 тактов, свитчи Linux-тредов редки.
+    if (next_task.abi == .linux) {
+        const fs = fs_base_tab[current_task_id];
+        if (fs != 0) {
+            hal.writeMsr(hal.MSR.FS_BASE, fs);
+        }
     }
 
     return next_task.rsp;

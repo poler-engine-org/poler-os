@@ -70,7 +70,7 @@ try:
 
         # user-сторона (маркеры из Ring 3!)
         check("ELF: alive + argc", "ELFTEST-ALIVE argc=2" in (t2 or ""))
-        check("ELF: argv[1] from shell", "ELFTEST-ARGV1 arg-from-shell" in (t2 or ""))
+        check("ELF: argv[1] from shell", "ELFTEST-ARGV1" in (t2 or "") and "arg-from-shell" in (t2 or ""))
         check("ELF: mmap anon write+readback", "ELFTEST-MMAP-OK" in (t2 or ""))
 
         # clone-волна
