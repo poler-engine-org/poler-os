@@ -51,8 +51,10 @@ pub const SYS_arch_prctl: u64 = 158;
 pub const SYS_set_tid_address: u64 = 218;
 pub const SYS_clock_gettime: u64 = 228;
 pub const SYS_set_robust_list: u64 = 273;
-pub const SYS_rseq: u64 = 293;
-pub const SYS_readlinkat: u64 = 298;
+pub const SYS_rseq: u64 = 334; // 293 = pipe2 (!раньше коллизия: rseq-заглушка съедала pipe2 glibc)
+pub const SYS_pipe2: u64 = 293;
+pub const SYS_readlinkat: u64 = 267; // 298 = perf_event_open (!коллизия v0.19)
+pub const SYS_readlink: u64 = 89; // 87 = unlink (!коллизия)
 pub const SYS_prlimit64: u64 = 302;
 pub const SYS_getrandom: u64 = 318;
 pub const SYS_clone: u64 = 56;
@@ -87,6 +89,7 @@ pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
 pub const ENODEV: i64 = 19;
 pub const EINVAL: i64 = 22;
+pub const ELOOP: i64 = 40; // слишком много симлинков в цепи (readlink/resolve)
 pub const ENOTTY: i64 = 25;
 pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
@@ -419,6 +422,13 @@ pub const LinuxOps = struct {
     /// v0.20.0 (CDD №11 p3): newfstatat — stat по пути в user-VA (144Б
     /// struct stat: S_IFREG + st_size из VFS). 0/-errno.
     stat_by_path: *const fn (path: []const u8, buf_va: u64) i64,
+    /// v0.20.0 (CDD №12 p1): readlink ОБЩЕГО пути (цель симлинка initrd)
+    /// в user-буфер. Длина или -errno (-ENOENT/-EINVAL/-ELOOP).
+    readlink_path: *const fn (path: []const u8, buf_va: u64, bufsz: u64) i64,
+    /// v0.20.0 (CDD №12 p1): освобождение слота РЕЕСТРА файлов (close:
+    /// реестр runtime VFS ≠ fd-таблица — иначе 16 либ = EMFILE, ld.so
+    /// держит по одной открытой на каждую DT_NEEDED при обходе замыкания).
+    release_file: *const fn (id: u32) void,
 };
 
 // ─── Аргументы syscall (единая структура для dispatch) ─────────────────────
@@ -508,9 +518,14 @@ pub fn sysOpenat(ops: LinuxOps, fds: *FdTable, dirfd_i: i64, path_va: u64, flags
 
 /// int close(int fd)
 pub fn sysClose(ops: LinuxOps, fds: *FdTable, fd_i: i64) u64 {
-    _ = ops;
     const e = fds.get(fd_i) orelse return err(EBADF);
-    e.* = .{}; // освобождаем слот (epoll-наблюдения тоже)
+    // v0.20.0 (CDD №12 p1): слот РЕЕСТРА файлов (fd→file_id: initrd/tmpfs)
+    // освобождаем ДО затирания записи — иначе утечка (EMFILE после 16 либ).
+    switch (e.kind) {
+        .initrd_file, .tmpfs_file => ops.release_file(e.file_id),
+        else => {},
+    }
+    e.* = .{}; // освобождаем слот fd-таблицы (epoll-наблюдения тоже)
     return 0;
 }
 
@@ -1032,9 +1047,16 @@ pub fn sysReadlinkat(ops: LinuxOps, dirfd: u64, path_va: u64, buf_va: u64, bufsz
     if (bufsz == 0) return err(EINVAL);
     if (ops.validate(path_va, 1, false)) {
         if (ops.copy_in_str(path_va, 64)) |path| {
-            if (!std.mem.eql(u8, path, "/proc/self/exe")) return err(EINVAL);
+            // /proc/self/exe — спец-узел (execfn из proc-слота)
+            if (std.mem.eql(u8, path, "/proc/self/exe")) {
+                if (!ops.validate(buf_va, @min(bufsz, USER_VA_CEILING), true)) return err(EFAULT);
+                const r = ops.readlink_self(buf_va, bufsz);
+                if (r < 0) return @bitCast(r);
+                return @intCast(r);
+            }
+            // общий путь: цель симлинка initrd (CDD №12 p1: rootfs CachyOS)
             if (!ops.validate(buf_va, @min(bufsz, USER_VA_CEILING), true)) return err(EFAULT);
-            const r = ops.readlink_self(buf_va, bufsz);
+            const r = ops.readlink_path(path, buf_va, bufsz);
             if (r < 0) return @bitCast(r);
             return @intCast(r);
         }
@@ -1168,6 +1190,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_set_robust_list => return sysSetRobustList(ops, args.a1, args.a2),
         SYS_rseq => return sysRseq(),
         SYS_readlinkat => return sysReadlinkat(ops, args.a1, args.a2, args.a3, args.a4),
+        SYS_readlink => return sysReadlinkat(ops, @bitCast(@as(i64, -100)), args.a1, args.a2, args.a3),
         SYS_prlimit64 => return sysPrlimit64(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_getrandom => return sysGetrandom(ops, args.a1, args.a2, args.a3),
         SYS_clock_gettime => return sysClockGettime(ops, args.a1, args.a2),
@@ -1443,6 +1466,13 @@ fn fakeOpenFile(path: []const u8, flags: u64, out_kind: *FdKind) i64 {
         @memcpy(g_files[s].data[0..content.len], content);
         g_files[s].size = content.len;
         out_kind.* = .initrd_file;
+    } else if (std.mem.startsWith(u8, path, "/usr/lib/") and path.len > 9) {
+        // CDD #12 p1: CachyOS-rootfs — библиотеки лежат в /usr/lib (usr-merge)
+        g_files[s].kind = .initrd_file;
+        const content = "SO-LIB-PLACEHOLDER";
+        @memcpy(g_files[s].data[0..content.len], content);
+        g_files[s].size = content.len;
+        out_kind.* = .initrd_file;
     } else {
         g_files[s].used = false;
         return -ENOENT;
@@ -1505,6 +1535,23 @@ fn fakeStatByPath(path: []const u8, buf_va: u64) i64 {
     return 0;
 }
 
+fn fakeReadlinkPath(path: []const u8, buf_va: u64, bufsz: u64) i64 {
+    // fake-симлинк: /lib64/ld-linux-x86-64.so.2 → /usr/lib/ld-linux-x86-64.so.2
+    if (std.mem.eql(u8, path, "/lib64/ld-linux-x86-64.so.2")) {
+        const target = "/usr/lib/ld-linux-x86-64.so.2";
+        const n: usize = @intCast(@min(target.len, bufsz));
+        if (!fakeCopyOut(buf_va, target[0..n])) return -EFAULT;
+        return @intCast(n);
+    }
+    return -ENOENT;
+}
+
+/// CDD №12 p1: close — освобождение слота реестра (fake: 4 слота)
+fn fakeReleaseFile(id: u32) void {
+    if (id >= g_files.len) return;
+    g_files[id].used = false;
+}
+
 fn fakeFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
     if (id >= g_files.len or !g_files[id].used) return -EBADF;
     const f = &g_files[id];
@@ -1556,6 +1603,8 @@ fn fakeOps() LinuxOps {
         .file_ino = fakeFileIno,
         .path_exists = fakePathExists,
         .stat_by_path = fakeStatByPath,
+        .readlink_path = fakeReadlinkPath,
+        .release_file = fakeReleaseFile,
     };
 }
 
@@ -2567,4 +2616,94 @@ test "linux: mmap file-backed (MAP_PRIVATE) — initrd-файл; MAP_SHARED → 
     try testing.expectEqual(@as(u64, 8192), e.last_file_mmap_len);
 
     _ = buf_va;
+}
+
+// ─── Тесты CDD №12 p1: readlink/readlinkat общего пути ─────────────────────
+
+test "linux: readlink — цель симлинка initrd; /proc/self/exe сохранён" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+    g_env.?.execfn = "gamescope";
+
+    // readlink("/lib64/ld-linux-x86-64.so.2") → абсолютная цель симлинка
+    const p_link = putStr(e, 0, "/lib64/ld-linux-x86-64.so.2");
+    const buf_va = putStr(e, 0x100, ""); // пустой буфер в fake-user
+    const r1 = sysReadlinkat(ops, 0, p_link, buf_va, 64);
+    try testing.expectEqual(@as(u64, 29), r1); // len("/usr/lib/ld-linux-x86-64.so.2")
+    var out: [64]u8 = undefined;
+    try testing.expect(fakeCopyIn(&out, buf_va));
+    try testing.expectEqualStrings("/usr/lib/ld-linux-x86-64.so.2", out[0..29]);
+
+    // /proc/self/exe — прежний путь (execfn)
+    const p_exe = putStr(e, 0, "/proc/self/exe");
+    const r2 = sysReadlinkat(ops, 0, p_exe, buf_va, 64);
+    try testing.expectEqual(@as(u64, "gamescope".len), r2);
+    try testing.expect(fakeCopyIn(&out, buf_va));
+    try testing.expectEqualStrings("gamescope", out[0..9]);
+
+    // bufsz=0 → EINVAL
+    try testing.expectEqual(err(EINVAL), sysReadlinkat(ops, 0, p_link, buf_va, 0));
+    // битый path-указатель → EFAULT
+    try testing.expectEqual(err(EFAULT), sysReadlinkat(ops, 0, 0x10_0000, buf_va, 64));
+}
+
+test "linux: readlink (leg #87) — маршрутизация dispatch" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    g_env.?.execfn = "gs";
+
+    // SYS_readlink(path, buf, sz) → sysReadlinkat(AT_FDCWD, …)
+    const p_exe = putStr(e, 0, "/proc/self/exe");
+    const buf_va = FakeEnv.USER_BASE + 0x100;
+    const args = Args{ .a1 = p_exe, .a2 = buf_va, .a3 = 32 };
+    const r = dispatch(ops, &fds, SYS_readlink, args);
+    try testing.expectEqual(@as(u64, 2), r); // "gs"
+    // якорь номера (сверено с arch/x86/entry/syscalls/syscall_64.tbl:
+    // readlink=89 [87=unlink!], readlinkat=267 [298=perf_event_open!])
+    try testing.expectEqual(@as(u64, 89), SYS_readlink);
+    try testing.expectEqual(@as(u64, 267), SYS_readlinkat);
+}
+
+// ─── Тесты CDD №12 p1: close — жизненный цикл реестра файлов ────────────────
+
+test "linux: close — освобождение слота РЕЕСТРА (EMFILE-утечка вылечена)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    // цикл ld.so: open → close × 5 (реестр 4 слота — раньше 5-й open
+    // дал бы EMFILE из-за утечки слотов реестра)
+    for (0..5) |i| {
+        var name_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&name_buf, "/usr/lib/lib{d}.so.1", .{i}) catch unreachable;
+        const p = putStr(e, 0, path);
+        const fd = sysOpenat(ops, &fds, 0, p, 0, 0);
+        try testing.expect(fd >= 3 and fd < 256); // успех (ошибки — huge u64)
+        // close → слот РЕЕСТРА освобождён вместе с fd
+        try testing.expectEqual(@as(u64, 0), sysClose(ops, &fds, @intCast(fd)));
+        try testing.expectEqual(err(EBADF), sysClose(ops, &fds, @intCast(fd))); // повтор
+    }
+
+    // одновременно 4 файла — ок; 5-й без close → EMFILE (лимит реестра)
+    var opened: [6]u64 = undefined;
+    for (0..6) |i| {
+        var name_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&name_buf, "/usr/lib/libX{d}.so.1", .{i}) catch unreachable;
+        const p = putStr(e, 0, path);
+        opened[i] = sysOpenat(ops, &fds, 0, p, 0, 0);
+    }
+    try testing.expect(opened[3] >= 3 and opened[3] < 256); // 4 слота реестра
+    try testing.expectEqual(err(EMFILE), opened[4]); // 5-й — EMFILE
+
+    // close одного → open снова работает (слот реестра вернулся в пул)
+    try testing.expectEqual(@as(u64, 0), sysClose(ops, &fds, @intCast(opened[0])));
+    var name_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&name_buf, "/usr/lib/libY.so.1", .{}) catch unreachable;
+    const p = putStr(e, 0, path);
+    const fd2 = sysOpenat(ops, &fds, 0, p, 0, 0);
+    try testing.expect(fd2 >= 3 and fd2 < 256);
 }

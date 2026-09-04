@@ -31,8 +31,10 @@ TESTDATA = os.path.join(REPO, "zig-kernel", "testdata")
 
 # ─── 1. CPIO newc-билдер ────────────────────────────────────────────────────
 
-def build_cpio(files):
-    """files: dict[name(str) → bytes]. Возвращает newc-архив ( padded 512 )."""
+def build_cpio(files, symlinks=None):
+    """files: dict[name → bytes]; symlinks: dict[name → target] (S_IFLNK).
+    Возвращает newc-архив (padded 512). Ядро cpio.zig: mode@14 (S_IFLNK=0o120777,
+    data = цель симлинка — CDD #12 p1)."""
     out = bytearray()
 
     def put_entry(name: bytes, data: bytes, mode: int):
@@ -49,6 +51,8 @@ def build_cpio(files):
 
     for name, data in files.items():
         put_entry(name.encode(), data, 0o100644)
+    for name, target in (symlinks or {}).items():
+        put_entry(name.encode(), target.encode(), 0o120777)
     put_entry(b"TRAILER!!!", b"", 0)
     while len(out) % 512:
         out.append(0)

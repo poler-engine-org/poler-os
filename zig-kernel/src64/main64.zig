@@ -170,15 +170,63 @@ fn cpioNameEql(cpio_name: []const u8, query: []const u8) bool {
     return std.mem.eql(u8, cpioCanon(cpio_name), cpioCanon(query));
 }
 
-/// Поиск файла в initrd-cpio по имени (для peinfo/pestubs/elfload).
-/// Толерантный к диалектам ключей: "lib/…", "/lib/…", "./lib/…" (см. cpioCanon).
-fn initrdFindFile(name: []const u8) ?[]const u8 {
+/// Поиск УЗЛА в initrd-cpio по ОДИНОЧНОМУ ключу (сырой, без алиасов/
+/// симлинков — их резолв делает вызывающий). Возвращает CPIO-запись
+/// (data = байты файла ИЛИ цель симлинка, mode различает).
+fn initrdFindNode(name: []const u8) ?cpio.CpioFile {
     const arch = initrd_archive orelse return null;
     var cpio_parser = cpio.CpioParser.init(arch);
     while (cpio_parser.next()) |file| {
-        if (cpioNameEql(file.name, name)) return file.data;
+        if (cpioNameEql(file.name, name)) return file;
     }
     return null;
+}
+
+/// v0.20.0 (CDD #12 p1): Поиск файла в initrd по имени с ПОЛНЫМ резолвом:
+/// usr-merge алиасы (lib/… lib64/… usr/lib64/… → usr/lib/…) + разыменование
+/// симлинков (цепь ≤ 8 — ELOOP → null). Для команд ядра (elfload/PT_INTERP,
+/// peinfo/pestubs) и легаси-путей.
+fn initrdFindFile(name: []const u8) ?[]const u8 {
+    var cur_buf: [8][160]u8 = undefined;
+    var cur: []const u8 = name;
+    var depth: usize = 0;
+    while (depth < 8) : (depth += 1) {
+        const canon = cpioCanon(cur);
+        var aliases: [vfs.MAX_ALIASES][]const u8 = undefined;
+        var scratch: [vfs.ALIAS_SCRATCH]u8 = undefined;
+        const n = vfs.libPathAliases(canon, &aliases, &scratch);
+        var node: ?cpio.CpioFile = null;
+        for (aliases[0..n]) |cand| {
+            if (initrdFindNode(cand)) |f| {
+                node = f;
+                break;
+            }
+        }
+        const f = node orelse return null;
+        // симлинк? data = цель; пересчёт и продолжение цепи
+        if (f.mode & 0o170000 == 0o120000) {
+            const target = f.data;
+            if (target.len == 0) return null;
+            const dst = &cur_buf[depth];
+            if (target[0] == '/') {
+                // абсолютная цель: «/usr/lib/…» → «usr/lib/…» (cpioCanon съест '/')
+                if (target.len - 1 > dst.len) return null;
+                @memcpy(dst[0 .. target.len - 1], target[1..]);
+                cur = dst[0 .. target.len - 1];
+            } else {
+                // относительная: join(каталог(canon), target)
+                var dirlen: usize = canon.len;
+                while (dirlen > 0 and canon[dirlen - 1] != '/') dirlen -= 1;
+                if (dirlen + target.len > dst.len) return null;
+                @memcpy(dst[0..dirlen], canon[0..dirlen]);
+                @memcpy(dst[dirlen .. dirlen + target.len], target);
+                cur = dst[0 .. dirlen + target.len];
+            }
+            continue;
+        }
+        return f.data;
+    }
+    return null; // ELOOP
 }
 
 /// Случайное u32 для ядра (планировщик/крипто/соль). До привязки PUF — 0.
@@ -2400,7 +2448,7 @@ const MmapRegion = struct {
 };
 
 const MAX_LINUX_PROCS: usize = 2;
-const MAX_MMAP_REGIONS: usize = 16;
+const MAX_MMAP_REGIONS: usize = 64;
 
 var linux_task_proc: [scheduler.MAX_TASKS]u8 =
     [_]u8{255} ** scheduler.MAX_TASKS;
@@ -2611,8 +2659,10 @@ fn vfsFree(ptr: [*]u8, n: usize) void {
     _ = n; // heap64.kfree без размера (фраг-хип со своей меткой)
     heap.kfree(ptr);
 }
-fn vfsInitrdFind(name: []const u8) ?[]const u8 {
-    return initrdFindFile(name);
+fn vfsInitrdFind(name: []const u8) ?vfs.InitrdNode {
+    // сырой узел: алиасы/симлинки резолвит слой vfs.Vfs.resolve
+    const f = initrdFindNode(name) orelse return null;
+    return .{ .data = f.data, .mode = f.mode };
 }
 fn kernelVfsOps() vfs.VfsOps {
     return .{ .alloc = vfsAlloc, .free = vfsFree, .initrd_find = vfsInitrdFind };
@@ -2627,6 +2677,12 @@ fn vfsInit() void {
     puts("[VFS] Live-mode VFS: /dev (devfs) + initrd (RO) + /tmp (tmpfs RAM overlay)\n");
 }
 
+/// v0.20.0 (CDD №12 p1): close — освобождение слота реестра файлов VFS.
+fn linuxReleaseFile(id: u32) void {
+    if (id >= linux_files.len) return;
+    linux_files[id] = .{};
+}
+
 /// open_file: VFS-резолв пути (normalizePath + overlay) → file_id.
 fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind) i64 {
     if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
@@ -2638,6 +2694,8 @@ fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind)
         vfs.VfsError.TooManyFiles => return -linux_syscalls.ENOMEM,
         vfs.VfsError.NameTooLong => return -linux_syscalls.EINVAL,
         vfs.VfsError.BadPath => return -linux_syscalls.EINVAL,
+        vfs.VfsError.TooManyLinks => return -linux_syscalls.ELOOP,
+        vfs.VfsError.NotASymlink => return -linux_syscalls.EINVAL, // open: симлинк уже разыменован
     };
     // слот в реестре
     var slot: ?usize = null;
@@ -2863,6 +2921,23 @@ fn linuxPathExists(path: []const u8) i64 {
     return 0;
 }
 
+/// v0.20.0 (CDD #12 p1): readlink по ОБЩЕМУ пути (не только /proc/self/exe):
+/// цель симлинка из initrd в user-буфер. CR3 активен — user-IO.
+fn linuxReadlinkPath(path: []const u8, buf_va: u64, bufsz: u64) i64 {
+    if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    const target = kernel_vfs.readlink(path) catch |e| switch (e) {
+        vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
+        vfs.VfsError.NotASymlink => return -linux_syscalls.EINVAL,
+        vfs.VfsError.TooManyLinks => return -linux_syscalls.ELOOP,
+        else => return -linux_syscalls.EIO,
+    };
+    if (bufsz == 0) return -linux_syscalls.EINVAL;
+    const n = @min(target.len, bufsz);
+    if (!linux_user_io.copy_out(buf_va, target[0..@intCast(n)]))
+        return -linux_syscalls.EFAULT;
+    return @intCast(n);
+}
+
 /// newfstatat: stat по пути (S_IFREG + st_size из VFS — ld.so планирует
 /// mmap библиотеки по размеру!). CR3 задачи активен — copy через user-IO.
 fn linuxStatByPath(path: []const u8, buf_va: u64) i64 {
@@ -2935,6 +3010,8 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .file_ino = linuxFileIno,
         .path_exists = linuxPathExists,
         .stat_by_path = linuxStatByPath,
+        .readlink_path = linuxReadlinkPath,
+        .release_file = linuxReleaseFile,
     };
 }
 
@@ -4101,7 +4178,7 @@ fn cmd_elfload(args: []const u8) void {
             argv_count += 1;
         }
     }
-    const envp = [_][]const u8{ "HOME=/root", "TERM=linux", "PATH=/usr/bin" };
+    const envp = [_][]const u8{ "HOME=/root", "TERM=linux", "PATH=/usr/bin", "LD_LIBRARY_PATH=/usr/lib" };
 
     // 3b. PT_INTERP: динамический бинарник — грузим ИНТЕРПРЕТАТОР (ld.so)
     //     как вторую ET_DYN-картинку; управление — НА ЕГО entry (handoff);

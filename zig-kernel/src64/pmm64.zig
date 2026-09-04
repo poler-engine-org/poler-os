@@ -54,9 +54,15 @@ pub fn init(mbi_ptr: u64) void {
         }
     } else {
         // PVH direct boot (QEMU -kernel, ELF note) — карты памяти нет.
-        // Консервативный fallback: 2..128 MB usable (QEMU -m >= 128M).
-        // Ядро целиком ниже 128MB, дыр нет: рабочая гипотеза для TCG/KVM.
-        total_ram_bytes = 128 * 1024 * 1024;
+        // v0.20.0 (CDD №12 p1): RAM-размер из CMOS (QEMU заполняет 0x34/0x35
+        // выше 16МБ): CachyOS-rootfs (45МБ initrd + ld.so-маппинги 90МБ+)
+        // в старом кэпе 128МБ не помещался → PMM-истощение. Гард: кламп в
+        // [128МБ, 4ГБ] (мусорный CMOS → прежняя консервативная модель).
+        var detected = hal.cmosRamSize();
+        if (detected < 128 * 1024 * 1024 or detected > MAX_MEM_SUPPORTED) {
+            detected = 128 * 1024 * 1024; // fallback: гипотеза TCG/KVM ≥128МБ
+        }
+        total_ram_bytes = detected & ~(PAGE_SIZE - 1);
         var addr: u64 = 2 * 1024 * 1024;
         while (addr < total_ram_bytes) : (addr += PAGE_SIZE) {
             freePageInternal(addr);

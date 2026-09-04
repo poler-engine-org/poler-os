@@ -210,6 +210,26 @@ ap_lm64_entry:
     orq $0x600, %rax       // OSFXSR + OSXMMEXCPT
     movq %rax, %cr4
 
+    // v0.20.0 (CDD №12 p1): AVX + OSXSAVE + XCR0 на AP (как в BSP).
+    // EBX CPUID clobber'ит — сохраняем (контракт трэшпола AP-трамплина).
+    pushq %rbx
+    mov $1, %eax
+    xor %ecx, %ecx
+    cpuid
+    test $(1 << 26), %ecx         // XSAVE?
+    jz 2f
+    test $(1 << 28), %ecx         // AVX?
+    jz 2f
+    movq %cr4, %rax
+    orq $(1 << 18), %rax          // OSXSAVE
+    movq %rax, %cr4
+    xor %ecx, %ecx
+    mov $0x207, %eax              // XCR0: x87|SSE|AVX
+    xor %edx, %edx
+    xsetbv
+2:
+    popq %rbx
+
     // Set GSBASE for per-CPU data
     movq (0x8000 + AP_DATA_OFFSET + PERCPU_OFF), %rdi
     movl $0xC0000101, %ecx         // IA32_GS_BASE MSR

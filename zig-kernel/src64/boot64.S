@@ -273,6 +273,29 @@ _start:
     orq $0x600, %rax       // Устанавливаем OSFXSR (bit 9) и OSXMMEXCPT (bit 10)
     movq %rax, %cr4
 
+    // v0.20.0 (CDD №12 p1): AVX для x86-64-v3 юзерспейса (CachyOS rootfs:
+    // glibc/libstdc++/… v3-сборки). Условно: CPUID.1:ECX[26]=XSAVE,
+    // ECX[28]=AVX → CR4.OSXSAVE + XCR0 = x87|SSE|AVX (0x207).
+    // На CPU без AVX (qemu64) — пропускаем.
+    // ⚠ EBX (start_info/mbi из загрузчика) clobber'ится CPUID — сохраняем!
+    pushq %rbx
+    mov $1, %eax
+    xor %ecx, %ecx
+    cpuid
+    test $(1 << 26), %ecx         // XSAVE?
+    jz 1f
+    test $(1 << 28), %ecx         // AVX?
+    jz 1f
+    movq %cr4, %rax
+    orq $(1 << 18), %rax          // OSXSAVE
+    movq %rax, %cr4
+    xor %ecx, %ecx                // XCR0
+    mov $0x207, %eax              // x87(0) | SSE(1) | YMM(2)
+    xor %edx, %edx
+    xsetbv
+1:
+    popq %rbx
+
     // Сохраняем Multiboot2 info в extended регистры до очистки BSS
     movl %ebp, %r12d     // magic
     movl %ebx, %r13d     // mbi pointer

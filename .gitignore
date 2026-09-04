@@ -6,3 +6,5 @@ zig-kernel/.zig-cache/
 disk.img
 build/
 qemu-full/
+cachyos-root/pkgcache/
+cachyos-root/root/

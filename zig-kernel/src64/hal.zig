@@ -70,6 +70,28 @@ fn rtcReg(reg: u8) u8 {
     return inb(0x71);
 }
 
+/// v0.20.0 (CDD №12 p1): общий RAM-размер из CMOS (PVH-бут без MB2-карты).
+/// QEMU/Bochs заполняет: 0x34/0x35 — память ВЫШЕ 16МБ в 64КБ-единицах
+/// ((ram_size-16МБ)/64КБ); 0x30/0x31 — выше 1МБ в КБ (кэп 63МБ).
+/// Возврат: байты RAM (0 — CMOS пуст/мусор).
+pub fn cmosRamSize() u64 {
+    const ext16_hi = rtcReg(0x35);
+    const ext16_lo = rtcReg(0x34);
+    const ext16: u64 = (@as(u64, ext16_hi) << 8) | ext16_lo;
+    if (ext16 != 0) {
+        // 16МБ + N×64КБ (QEMU -m 512M → 16 + 496МБ)
+        return 16 * 1024 * 1024 + ext16 * 64 * 1024;
+    }
+    // малый RAM: 1МБ + N КБ (кэп 64МБ)
+    const ext_hi = rtcReg(0x31);
+    const ext_lo = rtcReg(0x30);
+    const ext_kb: u64 = (@as(u64, ext_hi) << 8) | ext_lo;
+    if (ext_kb != 0) {
+        return 1024 * 1024 + ext_kb * 1024;
+    }
+    return 0;
+}
+
 fn bcdToBin(v: u8) u8 {
     return (v & 0x0F) + (v >> 4) * 10;
 }
