@@ -151,12 +151,32 @@ fn parseInitrdCpio(archive: []const u8, source: []const u8) void {
     puts("\n");
 }
 
-/// Поиск файла в initrd-cpio по имени (для peinfo/pestubs).
+/// v0.20.0 (CDD №11 p3, CPIO-фикс): канонизация имени для сравнения — режем
+/// ведущий '/' и './'. CPIO-ключи бывают трёх диалектов: "lib/…", "/lib/…"
+/// (find / | cpio) и "./lib/…" (find . | cpio — gen_init_cpio-стиль); запросы
+/// приходят и от ядра ("hello-dyn"), и от ld.so ("/lib64/ld-linux…" из
+/// PT_INTERP), и из VFS ("lib/…" после norm[1..]). Сравнение ТОЛЬКО по
+/// канонизированным срезам — эмпирика dyn-elf: точный eql давал ENOENT при
+/// реально существующем файле → ld.so exit(127).
+fn cpioCanon(name: []const u8) []const u8 {
+    var n = name;
+    while (n.len >= 2 and n[0] == '.' and n[1] == '/') n = n[2..];
+    if (n.len > 0 and n[0] == '/') n = n[1..];
+    while (n.len >= 2 and n[0] == '.' and n[1] == '/') n = n[2..];
+    return n;
+}
+
+fn cpioNameEql(cpio_name: []const u8, query: []const u8) bool {
+    return std.mem.eql(u8, cpioCanon(cpio_name), cpioCanon(query));
+}
+
+/// Поиск файла в initrd-cpio по имени (для peinfo/pestubs/elfload).
+/// Толерантный к диалектам ключей: "lib/…", "/lib/…", "./lib/…" (см. cpioCanon).
 fn initrdFindFile(name: []const u8) ?[]const u8 {
     const arch = initrd_archive orelse return null;
     var cpio_parser = cpio.CpioParser.init(arch);
     while (cpio_parser.next()) |file| {
-        if (std.mem.eql(u8, file.name, name)) return file.data;
+        if (cpioNameEql(file.name, name)) return file.data;
     }
     return null;
 }
@@ -1297,6 +1317,9 @@ fn execute_command(cmd: []const u8) void {
         cmd_elfload("elftest");
     } else if (eq(cmd, "gputest")) {
         cmd_gputest();
+    } else if (eq(cmd, "ltrace")) {
+        linux_trace = !linux_trace;
+        sys_print(if (linux_trace) "[L] trace ON\n" else "[L] trace OFF\n");
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -2035,21 +2058,57 @@ fn linuxDoMunmap(va: u64, len: u64) i64 {
     return 0;
 }
 
+/// v0.20.0 (CDD №11 p3): MAP_FIXED-замена — снять пересекающиеся страницы
+/// [va, va+pages*PAGES) из PML4 задачи; регионы реестра, ПОЛНОСТЬЮ
+/// попадающие в диапазон, освободить в PMM (частично-пересекающиеся —
+/// только unmap, физику не трогаем — консервативно). Linux-семантика
+/// MAP_FIXED: старые мапы в диапазоне заменяются.
+fn linuxUnmapFixedRange(pml4: u64, va: u64, pages: u64) void {
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+    }
+    const owner = linuxOwnerTask();
+    if (owner < scheduler.MAX_TASKS) {
+        const slot = linux_task_proc[owner];
+        if (slot < MAX_LINUX_PROCS) {
+            for (&linux_mmap_regions[slot]) |*r| {
+                if (r.used and r.va >= va and
+                    r.va + r.pages * PAGE_SIZE <= va + pages * PAGE_SIZE and r.phys != 0)
+                {
+                    pmm.freeContiguousPages(r.phys, r.pages);
+                    r.used = false;
+                }
+            }
+        }
+    }
+}
+
 /// mmap(hint, len, prot, flags): MAP_ANONYMOUS|PRIVATE — ОДИН contiguous-нулевой
 /// блок в PML4 текущей задачи (RW+USER+NX; PROT_EXEC снимает NX) + запись в
 /// mmap-реестр (munmap-free + clone-стек-lookup). Сбой посреди маппинга —
 /// ОТКАТ (unmap + free) — та же дисциплина, что pe_loader.
+/// v0.20.0 (CDD №11 p3): MAP_FIXED — ТОЧНЫЙ адрес с ЗАМЕНПРЕЖНИХ
+/// мапов (эмпирика dyn-elf: ld.so кладёт bss-хвост libc АНОНИМНЫМ
+/// MAP_FIXED-мапом поверх спана — dl-map-segments.h:163; игнор хинта →
+/// bss на курсоре → #PF WRITE на RO-странице спана).
 fn linuxDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
-    _ = hint;
-    _ = flags; // MAP_FIXED не поддержан фундаментом — ядро размещает само
     const pml4 = linuxTaskPml4();
     if (pml4 == 0) return -linux_syscalls.EFAULT;
     const proc = linuxProcCurrent() orelse return -linux_syscalls.EFAULT;
     if (len > LINUX_MMAP_BUDGET) return -linux_syscalls.ENOMEM;
+    const fixed: bool = (flags & linux_syscalls.MAP_FIXED != 0) and hint != 0;
     const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (proc.mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
+    if (fixed and hint % PAGE_SIZE != 0) return -linux_syscalls.EINVAL;
+    const va: u64 = if (fixed) hint else proc.mmap_cursor;
+    if (fixed) {
+        if (va < elf_loader.MIN_USER_VA or
+            va + pages * PAGE_SIZE > linux_syscalls.USER_VA_CEILING)
+            return -linux_syscalls.EINVAL;
+        linuxUnmapFixedRange(pml4, va, pages);
+    } else if (proc.mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET) {
         return -linux_syscalls.ENOMEM;
-    const va = proc.mmap_cursor;
+    }
     var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
     if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
     // ОДИН contiguous-блок: munmap-free по реестру + clone-стек-регион
@@ -2063,7 +2122,7 @@ fn linuxDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
         };
     }
     linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true);
-    proc.mmap_cursor += pages * PAGE_SIZE;
+    if (!fixed) proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }
 
@@ -2663,6 +2722,182 @@ fn linuxFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
     return @intCast(n);
 }
 
+/// v0.20.0 (CDD №11 p3): FILE-BACKED mmap (MAP_PRIVATE): анонимные страницы
+/// + копия файловых байт [off, off+len) из VFS. ld.so грузит libc.so
+/// сегментами ровно так (эмпирика: ENODEV → exit_group(127)).
+/// fixed_va != 0 — MAP_FIXED: размещение по ТОЧНОМУ адресу поверх
+/// существующих мапов (замена: unmap пересекающихся страниц — Linux-
+/// семантика; ld.so ремапит сегменты libc на base+vaddr поверх
+/// первичного спана).
+fn linuxFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return -linux_syscalls.EFAULT;
+    const proc = linuxProcCurrent() orelse return -linux_syscalls.EFAULT;
+    if (len > LINUX_MMAP_BUDGET) return -linux_syscalls.ENOMEM;
+    if (fixed_va % PAGE_SIZE != 0) return -linux_syscalls.EINVAL;
+    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    const va: u64 = if (fixed_va != 0) fixed_va else proc.mmap_cursor;
+    if (fixed_va == 0 and proc.mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
+        return -linux_syscalls.ENOMEM;
+    if (va < elf_loader.MIN_USER_VA or va + pages * PAGE_SIZE > linux_syscalls.USER_VA_CEILING)
+        return -linux_syscalls.EINVAL;
+    // MAP_FIXED: снять пересекающиеся страницы (замена мапов; регионы,
+    // ПОЛНОСТЬЮ попадающие в диапазон, — освободить в PMM)
+    if (fixed_va != 0) {
+        var i: u64 = 0;
+        while (i < pages) : (i += 1) {
+            _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+        }
+        const owner = linuxOwnerTask();
+        if (owner < scheduler.MAX_TASKS) {
+            const slot = linux_task_proc[owner];
+            if (slot < MAX_LINUX_PROCS) {
+                for (&linux_mmap_regions[slot]) |*r| {
+                    if (r.used and r.va >= va and
+                        r.va + r.pages * PAGE_SIZE <= va + pages * PAGE_SIZE and r.phys != 0)
+                    {
+                        pmm.freeContiguousPages(r.phys, r.pages);
+                        r.used = false;
+                    }
+                }
+            }
+        }
+    }
+    var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
+    if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
+    if (prot & linux_syscalls.PROT_WRITE == 0) pte &= ~vmm.PTE_WRITABLE; // RO-копия
+    const base = pmm.allocContiguousZeroed(@intCast(pages)) orelse
+        return -linux_syscalls.ENOMEM;
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, base + i * PAGE_SIZE, pte) catch {
+            pmm.freeContiguousPages(base, pages);
+            return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
+        };
+    }
+    // копия файловых байт чанками (identity: kernel пишет в физблок)
+    var copied: u64 = 0;
+    var f_off = off;
+    while (copied < len) {
+        var chunk: [512]u8 = undefined;
+        const c = @min(len - copied, chunk.len);
+        const got = linuxFileReadBytes(id, f_off, &chunk, @intCast(c));
+        if (got <= 0) break; // EOF — хвост нулевой (BSS-семантика)
+        const dest = base + copied;
+        const dst: [*]u8 = @ptrFromInt(dest);
+        @memcpy(dst[0..@intCast(got)], chunk[0..@intCast(got)]);
+        copied += @intCast(got);
+        f_off += @intCast(got);
+    }
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true);
+    if (fixed_va == 0) proc.mmap_cursor += pages * PAGE_SIZE;
+    return @intCast(va);
+}
+
+/// Прямое чтение VFS-файла в kernel-буфер (id+offset → байты).
+fn linuxFileReadBytes(id: u32, off: u64, buf: []u8, want: usize) i64 {
+    if (id >= linux_files.len or !linux_files[id].used) return -linux_syscalls.EBADF;
+    const f = &linux_files[id];
+    switch (f.kind) {
+        .initrd_file => {
+            const data = f.initrd_data orelse return 0;
+            if (off >= data.len) return 0; // EOF
+            const avail = @min(@as(usize, @intCast(data.len - @min(off, data.len))), want);
+            @memcpy(buf[0..avail], data[@intCast(off)..][0..avail]);
+            return @intCast(avail);
+        },
+        .tmpfs_file => {
+            const t = f.tmp orelse return -linux_syscalls.EIO;
+            const got = kernel_vfs.tmp.read(t, off, buf[0..want]);
+            return @intCast(got);
+        },
+        else => return -linux_syscalls.EBADF,
+    }
+}
+
+/// Размер файла (lseek SEEK_END).
+fn linuxFileSize(id: u32) u64 {
+    if (id >= linux_files.len or !linux_files[id].used) return 0;
+    const f = &linux_files[id];
+    switch (f.kind) {
+        .initrd_file => {
+            const data = f.initrd_data orelse return 0;
+            return data.len;
+        },
+        .tmpfs_file => {
+            const t = f.tmp orelse return 0;
+            return t.size;
+        },
+        else => return 0,
+    }
+}
+
+/// v0.20.0 (CDD №11 p3): УНИКАЛЬНЫЙ inode файла — идентификация ОБЪЕКТА,
+/// а не слота (два open одного файла = один ino; glibc ld.so сверяет
+/// (st_dev, st_ino) со списком загруженных карт dl-load.c:994 — нулевой
+/// id = ложное «already loaded», БЕЗ mmap). initrd: адрес данных CPIO-entry
+/// (стабилен и уникален); tmpfs: адрес TmpFile.
+fn linuxFileIno(id: u32) u64 {
+    if (id >= linux_files.len or !linux_files[id].used) return 0;
+    const f = &linux_files[id];
+    switch (f.kind) {
+        .initrd_file => {
+            const data = f.initrd_data orelse return 0;
+            return @intFromPtr(data.ptr) >> 4;
+        },
+        .tmpfs_file => {
+            const t = f.tmp orelse return 0;
+            return @intFromPtr(t) >> 4;
+        },
+        else => return 0,
+    }
+}
+
+/// access(path): существование в VFS (ld.so: /etc/ld.so.cache и т.п.).
+fn linuxPathExists(path: []const u8) i64 {
+    if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    _ = kernel_vfs.resolve(path, false) catch |e| switch (e) {
+        vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
+        else => return -linux_syscalls.EIO,
+    };
+    return 0;
+}
+
+/// newfstatat: stat по пути (S_IFREG + st_size из VFS — ld.so планирует
+/// mmap библиотеки по размеру!). CR3 задачи активен — copy через user-IO.
+fn linuxStatByPath(path: []const u8, buf_va: u64) i64 {
+    if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    const node = kernel_vfs.resolve(path, false) catch |e| switch (e) {
+        vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
+        else => return -linux_syscalls.EIO,
+    };
+    var size: u64 = 0;
+    var ino: u64 = 0;
+    switch (node.kind) {
+        .initrd_file => {
+            const data = node.initrd_data orelse return -linux_syscalls.ENOENT;
+            size = data.len;
+            ino = @intFromPtr(data.ptr) >> 4; // уникальный id CPIO-entry
+        },
+        .tmpfs_file => {
+            const t = if (node.tmp) |t| t else return -linux_syscalls.ENOENT;
+            size = t.size;
+            ino = @intFromPtr(t) >> 4;
+        },
+        .dev => return -linux_syscalls.EIO,
+    }
+    var st: [144]u8 = [_]u8{0} ** 144;
+    std.mem.writeInt(u64, st[0..8], linux_syscalls.POLER_VFS_DEV, .little); // st_dev
+    std.mem.writeInt(u64, st[8..16], ino, .little); // st_ino (уникальный!)
+    std.mem.writeInt(u64, st[16..24], 1, .little); // st_nlink
+    std.mem.writeInt(u32, st[24..28], @intCast(0x8000 | 0x124), .little); // S_IFREG|0444
+    std.mem.writeInt(u64, st[48..56], size, .little); // st_size
+    std.mem.writeInt(u64, st[56..64], 4096, .little); // st_blksize
+    std.mem.writeInt(u64, st[64..72], (size + 511) / 512, .little); // st_blocks
+    if (!linux_user_io.copy_out(buf_va, &st)) return -linux_syscalls.EFAULT;
+    return 0;
+}
+
 fn kernelLinuxOps() linux_syscalls.LinuxOps {
     return .{
         .validate = linuxUserIoValidate,
@@ -2695,6 +2930,11 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .open_file = linuxOpenFile,
         .file_read = linuxFileRead,
         .file_write = linuxFileWrite,
+        .file_mmap = linuxFileMmap,
+        .file_size = linuxFileSize,
+        .file_ino = linuxFileIno,
+        .path_exists = linuxPathExists,
+        .stat_by_path = linuxStatByPath,
     };
 }
 
@@ -2717,8 +2957,12 @@ fn linuxCurrentTid() u64 {
 
 /// hal.linuxSyscallCallback: Linux x86_64 RAX-ABI. Аргументы №5/№6 (user
 /// R8/R9) читаем из scheduler-глобалов (asm-вход сохранил ДО затирания).
+/// v0.20.0 (CDD №11 p3): трассировка Linux-syscall'ов (команда ltrace) —
+/// crash-driven инструмент: видно ПОСЛЕДОВАТЕЛЬНОСТЬ и возвраты.
+var linux_trace: bool = false;
+
 fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
-    return linux_syscalls.dispatch(kernelLinuxOps(), linuxFdsCurrent(), num, .{
+    const r = linux_syscalls.dispatch(kernelLinuxOps(), linuxFdsCurrent(), num, .{
         .a1 = a1,
         .a2 = a2,
         .a3 = a3,
@@ -2726,6 +2970,18 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         .a5 = scheduler.linux_arg5,
         .a6 = scheduler.linux_arg6,
     });
+    if (linux_trace) {
+        hal.Serial.puts("[L] ");
+        hal.Serial.putDecimal(num);
+        hal.Serial.puts("(0x");
+        hal.Serial.putHex(a1);
+        hal.Serial.puts(",0x");
+        hal.Serial.putHex(a2);
+        hal.Serial.puts(") = 0x");
+        hal.Serial.putHex(r);
+        hal.Serial.puts("\n");
+    }
+    return r;
 }
 
 // ─── v0.19.0 (CDD №10 p1): DRM-KMS runtime — «Всё есть файл» ──────────────
@@ -3847,6 +4103,33 @@ fn cmd_elfload(args: []const u8) void {
     }
     const envp = [_][]const u8{ "HOME=/root", "TERM=linux", "PATH=/usr/bin" };
 
+    // 3b. PT_INTERP: динамический бинарник — грузим ИНТЕРПРЕТАТОР (ld.so)
+    //     как вторую ET_DYN-картинку; управление — НА ЕГО entry (handoff);
+    //     AT_BASE = базис ld.so, AT_ENTRY = entry бинарника.
+    var entry_va = img.entry_va;
+    var at_base: u64 = 0;
+    if (img.interp) |interp_path| {
+        sys_print("[ELF] PT_INTERP: ");
+        sys_print(interp_path);
+        const interp_data = initrdFindFile(interp_path) orelse {
+            sys_print("\n[ELF] FAIL: интерпретатор не найден в initrd (упакуй ld.so)\n");
+            return;
+        };
+        const interp_img = elf_loader.loadElf(ops, user_pml4, interp_data, elf_loader.LINUX_INTERP_BASE) catch |err| {
+            sys_print("[ELF] interp load error: ");
+            sys_print(@errorName(err));
+            sys_print("\n");
+            return;
+        };
+        entry_va = interp_img.entry_va; // HANDOFF: старт с ld.so
+        at_base = interp_img.base_va;
+        sys_print(" — базис 0x");
+        putHex(interp_img.base_va);
+        sys_print(" entry 0x");
+        putHex(interp_img.entry_va);
+        sys_print(" (handoff)\n");
+    }
+
     // 4. Стек Linux-ABI: argc/argv/envp/auxv + AT_RANDOM
     const stack = elf_loader.buildUserStack(
         ops,
@@ -3856,6 +4139,7 @@ fn cmd_elfload(args: []const u8) void {
         .{ .argv = argv_ptrs[0..argv_count], .envp = &envp, .execfn = argv_ptrs[0] },
         img,
         elfRandomSeed(),
+        at_base,
     ) catch |err| {
         sys_print("[ELF] stack error: ");
         sys_print(@errorName(err));
@@ -3868,8 +4152,9 @@ fn cmd_elfload(args: []const u8) void {
     printDec(argv_count);
     sys_print("\n");
 
-    // 5. Ring-3 задача + Linux-ABI + proc-слот (fd/mmap/brk)
-    const task_id = scheduler.createUserTask(img.entry_va, user_pml4, stack.entry_rsp) catch |err| {
+    // 5. Ring-3 задача + Linux-ABI + proc-слот (fd/mmap/brk);
+    //    entry = ld.so для динамических (handoff), бинарник — для статиков
+    const task_id = scheduler.createUserTask(entry_va, user_pml4, stack.entry_rsp) catch |err| {
         sys_print("createUserTask error: ");
         sys_print(@errorName(err));
         sys_print("\n");

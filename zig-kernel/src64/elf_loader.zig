@@ -47,6 +47,9 @@ pub const PTE_NO_EXECUTE: u64 = @as(u64, 1) << 63;
 // имеют собственные PML4 — коллизий между ABI нет, зоны разведены для
 // читаемости дамп-диагностики.
 pub const LINUX_IMAGE_BASE: u64 = 0x0000_1000_0000_0000;
+/// Базис интерпретатора (ld.so): вторая ET_DYN-картинка (4ТБ — между
+/// mmap-регионом и стеком; никаких пересечений с зонами образа/стека).
+pub const LINUX_INTERP_BASE: u64 = 0x0000_0400_0000_0000;
 pub const LINUX_STACK_TOP: u64 = 0x0000_0800_0000_0000;
 pub const LINUX_STACK_PAGES: u64 = 16; // 64КБ первичный стек
 /// Нижняя граница валидных user-сегментов: ниже — identity-маппинги ядра
@@ -94,6 +97,7 @@ pub const ET_DYN: u16 = 3;
 pub const EM_X86_64: u16 = 62;
 
 pub const PT_LOAD: u32 = 1;
+pub const PT_INTERP: u32 = 3; // динамический: путь интерпретатора (ld.so)
 pub const PT_GNU_STACK: u32 = 0x6474_E551; // флаги стека — просто фиксируем
 pub const PT_GNU_RELRO: u32 = 0x6474_E552; // relro-инфо, маппинга не требует
 
@@ -179,6 +183,9 @@ pub const ElfImage = struct {
     /// Суммарные страницы образа (диагностика).
     pages: u64,
     is_pie: bool,
+    /// PT_INTERP обнаружен: путь интерпретатора (slice в буфере данных
+    /// ЗАГРУЖАЕМОГО бинарника — валиден до конца загрузки). null = статик.
+    interp: ?[]const u8 = null,
 };
 
 // ─── p_flags → PTE ─────────────────────────────────────────────────────────
@@ -254,12 +261,21 @@ fn imageBaseFor(ehdr: *const Elf64_Ehdr, dyn_base: u64, max_vaddr_end: u64) ElfE
 pub fn loadElf(ops: ElfOps, pml4: u64, data: []const u8, dyn_base: u64) ElfError!ElfImage {
     const ehdr = try validateEhdr(data);
 
-    // Проход 1: валидация сегментов + вычисление span и brk
+    // Проход 1: валидация сегментов + вычисление span и brk + PT_INTERP
     var seg_lo: u64 = std.math.maxInt(u64);
     var seg_hi: u64 = 0;
+    var interp: ?[]const u8 = null;
     var i: usize = 0;
     while (i < ehdr.e_phnum) : (i += 1) {
         const ph = phdrAt(data, ehdr, i);
+        if (ph.p_type == PT_INTERP) {
+            // путь интерпретатора: C-строка в данных бинарника
+            const end = ph.p_offset + ph.p_filesz;
+            if (end > data.len) return ElfError.SegmentBounds;
+            const start = data[@intCast(ph.p_offset)..@intCast(end)];
+            const nul = std.mem.indexOfScalar(u8, start, 0) orelse start.len;
+            interp = start[0..nul];
+        }
         if (ph.p_type != PT_LOAD) continue;
         if (ph.p_memsz < ph.p_filesz) return ElfError.SegmentBounds;
         const fsum = @addWithOverflow(ph.p_offset, ph.p_filesz);
@@ -359,6 +375,7 @@ pub fn loadElf(ops: ElfOps, pml4: u64, data: []const u8, dyn_base: u64) ElfError
         .brk = img_hi,
         .pages = total_pages,
         .is_pie = ehdr.e_type == ET_DYN,
+        .interp = interp,
     };
 }
 
@@ -419,6 +436,7 @@ pub fn buildUserStack(
     strings: StackStrings,
     img: ElfImage,
     random_seed: [16]u8,
+    at_base: u64, // базис ld.so (динамик) или 0 (статик)
 ) ElfError!StackResult {
     const stack_bytes = stack_pages * PAGE_SIZE;
     const stack_lo = stack_top - stack_bytes;
@@ -535,7 +553,7 @@ pub fn buildUserStack(
         .{ AT_PHENT, img.phentsize },
         .{ AT_PHNUM, img.phnum },
         .{ AT_PAGESZ, PAGE_SIZE },
-        .{ AT_BASE, if (img.is_pie) img.base_va else 0 },
+        .{ AT_BASE, at_base },
         .{ AT_FLAGS, 0 },
         .{ AT_ENTRY, img.entry_va },
         .{ AT_UID, 1000 },
@@ -923,6 +941,7 @@ test "buildUserStack: раскладка argc/argv/envp/auxv, выравнива
         .{ .argv = &argv, .envp = &envp, .execfn = "elftest" },
         img,
         seed,
+        0, // статик: AT_BASE=0
     );
 
     // entry_rsp 16-выровнен, внутри региона стека
@@ -1003,6 +1022,7 @@ test "buildUserStack: контент больше региона → StackOverfl
         .{ .argv = &big, .envp = &[_][]const u8{}, .execfn = "x" },
         img,
         [_]u8{0} ** 16,
+        0,
     ));
 }
 
@@ -1031,4 +1051,49 @@ test "layout: константы зон не пересекаются" {
     try testing.expect(LINUX_IMAGE_BASE < USER_VA_CEILING);
     // Минимальный user-VA — выше identity-зоны ядра
     try testing.expect(MIN_USER_VA == 0x1_0000_0000);
+}
+
+
+test "loadElf: PT_INTERP — путь интерпретатора (динамические бинарники)" {
+    mockReset();
+    var te = TestElf{};
+    te.init(ET_DYN, 0, 0x2000);
+    // добавляем PT_INTERP: phnum 3→4, interp-фантом: "/lib64/ld-linux-x86-64.so.2"
+    const ehdr: *Elf64_Ehdr = @ptrCast(@alignCast(&te.buf));
+    ehdr.e_phnum = 4;
+    const ph: [*]Elf64_Phdr = @ptrCast(@alignCast(te.buf[64..].ptr));
+    ph[3] = .{
+        .p_type = PT_INTERP,
+        .p_flags = PF_R,
+        .p_offset = 0x310,
+        .p_vaddr = 0,
+        .p_paddr = 0,
+        .p_filesz = 27,
+        .p_memsz = 0,
+        .p_align = 1,
+    };
+    const interp_path = "/lib64/ld-linux-x86-64.so.2";
+    @memcpy(te.buf[0x310..][0..interp_path.len], interp_path);
+    te.buf[0x310 + interp_path.len] = 0;
+
+    const img = try loadElf(mockOps(), 0x777, te.data(), LINUX_IMAGE_BASE);
+    try testing.expect(img.interp != null);
+    try testing.expectEqualStrings("/lib64/ld-linux-x86-64.so.2", img.interp.?);
+
+    // статик (без PT_INTERP) → null
+    mockReset();
+    var te2 = TestElf{};
+    te2.init(ET_DYN, 0, 0x2000);
+    const img2 = try loadElf(mockOps(), 0x777, te2.data(), LINUX_IMAGE_BASE);
+    try testing.expect(img2.interp == null);
+
+    // PT_INTERP с p_offset вне файла → SegmentBounds
+    mockReset();
+    var te3 = TestElf{};
+    te3.init(ET_DYN, 0, 0x2000);
+    const ehdr3: *Elf64_Ehdr = @ptrCast(@alignCast(&te3.buf));
+    ehdr3.e_phnum = 4;
+    const ph3: [*]Elf64_Phdr = @ptrCast(@alignCast(te3.buf[64..].ptr));
+    ph3[3] = .{ .p_type = PT_INTERP, .p_flags = PF_R, .p_offset = 0x2000, .p_vaddr = 0, .p_paddr = 0, .p_filesz = 10, .p_memsz = 0, .p_align = 1 };
+    try testing.expectError(ElfError.SegmentBounds, loadElf(mockOps(), 0x777, te3.data(), LINUX_IMAGE_BASE));
 }

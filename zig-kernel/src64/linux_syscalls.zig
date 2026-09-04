@@ -40,7 +40,12 @@ pub const SYS_brk: u64 = 12;
 pub const SYS_munmap: u64 = 11;
 pub const SYS_ioctl: u64 = 16;
 pub const SYS_fstat: u64 = 5;
+pub const SYS_lseek: u64 = 8;
 pub const SYS_poll: u64 = 7;
+pub const SYS_pread64: u64 = 17;
+pub const SYS_writev: u64 = 20;
+pub const SYS_access: u64 = 21;
+pub const SYS_newfstatat: u64 = 262;
 pub const SYS_mprotect: u64 = 10;
 pub const SYS_arch_prctl: u64 = 158;
 pub const SYS_set_tid_address: u64 = 218;
@@ -87,6 +92,7 @@ pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
 pub const ETIMEDOUT: i64 = 110;
+pub const ESPIPE: i64 = 29; // lseek на не-файл (pipe/device)
 
 /// Кодирование ошибки в RAX: Linux возвращает -errno (u64-биткаст).
 pub inline fn err(e: i64) u64 {
@@ -397,6 +403,22 @@ pub const LinuxOps = struct {
     file_read: *const fn (id: u32, off: u64, va: u64, count: u64) i64,
     /// file_write: запись в файл (tmpfs) из user-VA.
     file_write: *const fn (id: u32, off: u64, va: u64, count: u64) i64,
+    /// v0.20.0 (CDD №11 p3): FILE-BACKED mmap (MAP_PRIVATE): страницы с
+    /// копией файловых байт [off, off+len) → размещённый VA или -errno.
+    /// fixed_va != 0 — MAP_FIXED (ld.so: сегменты libc поверх первичного
+    /// спана по точным адресам base+vaddr; замена существующих мапов).
+    file_mmap: *const fn (id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64,
+    /// v0.20.0 (CDD №11 p3): размер файла по id (lseek SEEK_END).
+    file_size: *const fn (id: u32) u64,
+    /// v0.20.0 (CDD №11 p3): УНИКАЛЬНЫЙ inode файла по id (fstat st_ino;
+    /// glibc ld.so идентифицирует объекты по (st_dev, st_ino) — нулевой
+    /// id = ложное «already loaded», библиотека не мапится!).
+    file_ino: *const fn (id: u32) u64,
+    /// v0.20.0 (CDD №11 p3): access(path) — существование (0/-errno).
+    path_exists: *const fn (path: []const u8) i64,
+    /// v0.20.0 (CDD №11 p3): newfstatat — stat по пути в user-VA (144Б
+    /// struct stat: S_IFREG + st_size из VFS). 0/-errno.
+    stat_by_path: *const fn (path: []const u8, buf_va: u64) i64,
 };
 
 // ─── Аргументы syscall (единая структура для dispatch) ─────────────────────
@@ -541,7 +563,7 @@ pub fn sysMmap(ops: LinuxOps, fds: *FdTable, hint: u64, length: u64, prot: u64, 
         if (r < 0) return @bitCast(r);
         return @intCast(r);
     }
-    // Файловый/девайс-маппинг: fd обязан быть открыт и быть устройством
+    // Файловый/девайс-маппинг: fd обязан быть открыт
     const e = fds.get(fd_i) orelse return err(EBADF);
     switch (e.kind) {
         .fb0, .dri_card0 => {
@@ -550,8 +572,121 @@ pub fn sysMmap(ops: LinuxOps, fds: *FdTable, hint: u64, length: u64, prot: u64, 
             if (r < 0) return @bitCast(r);
             return @intCast(r);
         },
+        // v0.20.0 (CDD №11 p3, ld.so-волна): FILE-BACKED mmap (initrd/tmpfs):
+        // MAP_PRIVATE = приватная копия (чтение с «USB», запись — своя).
+        // Реализация: анонимные страницы + копия файловых байт (ld.so грузит
+        // libc.so сегментами — эмпирика dyn-elf: ENODEV → exit_group(127)).
+        .initrd_file, .tmpfs_file => {
+            if (flags & MAP_SHARED != 0) return err(ENOSYS); // RO-файлы: только PRIVATE
+            // MAP_FIXED: ld.so ремапит сегменты по base+vaddr поверх спана
+            const fixed_va: u64 = if (flags & MAP_FIXED != 0 and hint != 0) hint else 0;
+            const r = ops.file_mmap(e.file_id, off, length, prot, fixed_va);
+            if (r < 0) return @bitCast(r);
+            return @intCast(r);
+        },
         else => return err(ENODEV), // event-файлы не мапятся (Linux: ENODEV)
     }
+}
+
+/// off_t lseek(int fd, off_t off, int whence): SEEK_SET=0/CUR=1/END=2.
+pub const SEEK_SET: u64 = 0;
+pub const SEEK_CUR: u64 = 1;
+pub const SEEK_END: u64 = 2;
+
+pub fn sysLseek(ops: LinuxOps, fds: *FdTable, fd_i: i64, off: i64, whence: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (!e.isFile()) return err(ESPIPE); // консоль/devices: ESPIPE (Linux)
+    var new_off: i64 = 0;
+    switch (whence) {
+        SEEK_SET => new_off = off,
+        SEEK_CUR => {
+            const sum = @addWithOverflow(@as(i64, @bitCast(e.file_off)), off);
+            if (sum[1] != 0) return err(EINVAL);
+            new_off = sum[0];
+        },
+        SEEK_END => {
+            // конец файла — через file_size op (реестр runtime)
+            const fsize: i64 = @intCast(ops.file_size(e.file_id));
+            const sum = @addWithOverflow(fsize, off);
+            if (sum[1] != 0) return err(EINVAL);
+            new_off = sum[0];
+        },
+        else => return err(EINVAL),
+    }
+    if (new_off < 0) return err(EINVAL);
+    e.file_off = @intCast(new_off);
+    return @intCast(new_off);
+}
+
+/// ssize_t pread64(fd, buf, count, offset): чтение БЕЗ сдвига file_off.
+pub fn sysPread64(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64, off: u64) u64 {
+    if (count == 0) return 0;
+    if (count > USER_VA_CEILING) return err(EINVAL);
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (!e.isFile()) return err(EBADF);
+    if (!ops.validate(buf_va, count, true)) return err(EFAULT);
+    const r = ops.file_read(e.file_id, off, buf_va, count);
+    if (r < 0) return @bitCast(r);
+    return @intCast(r);
+}
+
+/// ssize_t writev(fd, iov, iovcnt): векторная запись (glibc: stderr/stdio!).
+/// struct iovec { void *base; size_t len; } — 16Б.
+pub const MAX_IOV: usize = 32;
+
+pub fn sysWritev(ops: LinuxOps, fds: *FdTable, fd_i: i64, iov_va: u64, iovcnt: u64) u64 {
+    if (iovcnt == 0) return 0;
+    if (iovcnt > MAX_IOV) return err(EINVAL);
+    if (!ops.validate(iov_va, iovcnt * 16, false)) return err(EFAULT);
+    // пишем последовательно: каждая iovec = отдельный write (консоль/tmpfs)
+    var total: u64 = 0;
+    var i: u64 = 0;
+    while (i < iovcnt) : (i += 1) {
+        var iov: [16]u8 = undefined;
+        if (!ops.copy_in(&iov, iov_va + i * 16)) return err(EFAULT);
+        const base = std.mem.readInt(u64, iov[0..8], .little);
+        const len = std.mem.readInt(u64, iov[8..16], .little);
+        if (len == 0) continue;
+        if (len > USER_VA_CEILING) return err(EINVAL);
+        const w = sysWrite(ops, fds, fd_i, base, len);
+        if (w != err(EFAULT) and w != err(EBADF)) {
+            const bytes: i64 = @bitCast(w);
+            if (bytes < 0) return w; // errno
+            total += @intCast(bytes);
+        } else {
+            return w;
+        }
+    }
+    return total;
+}
+
+/// int access(path, mode): существование файла (ld.so: конфиги/кэш).
+pub fn sysAccess(ops: LinuxOps, path_va: u64, mode: u64) u64 {
+    _ = mode; // R_OK/W_OK/X_OK/F_OK — база: существование
+    if (ops.validate(path_va, 1, false)) {
+        if (ops.copy_in_str(path_va, 4096)) |path| {
+            const r = ops.path_exists(path);
+            if (r < 0) return @bitCast(r);
+            return 0;
+        }
+    }
+    return err(EFAULT);
+}
+
+/// int newfstatat(dirfd, path, statbuf, flags): stat по ПУТИ (ld.so:
+/// размер библиотеки для mmap-планировки). struct stat x86_64 = 144Б.
+pub fn sysNewfstatat(ops: LinuxOps, dirfd_i: i64, path_va: u64, buf_va: u64, flags: u64) u64 {
+    _ = dirfd_i; // AT_FDCWD/абсолютные пути — cwd-слоя нет (фундамент)
+    _ = flags; // AT_EMPTY_PATH-модель вне фундамента
+    if (!ops.validate(buf_va, STAT_SIZE, true)) return err(EFAULT);
+    if (ops.validate(path_va, 1, false)) {
+        if (ops.copy_in_str(path_va, 4096)) |path| {
+            const r = ops.stat_by_path(path, buf_va);
+            if (r < 0) return @bitCast(r);
+            return 0;
+        }
+    }
+    return err(EFAULT);
 }
 
 /// int munmap(void *addr, size_t length)
@@ -933,19 +1068,40 @@ pub fn sysClockGettime(ops: LinuxOps, clk: u64, tp_va: u64) u64 {
     return 0;
 }
 
-/// fstat(fd, …): stat-заглушка для stdio (glibc: размер буфера). 144Б
-/// нулей + S_IFCHR + st_blksize=4096 (консоль = симв. устройство).
+/// fstat(fd, …): файловые fd — S_IFREG + РЕАЛЬНЫЙ st_size (ld.so
+/// верифицирует библиотеку по fstat: CHR/нулевой размер → отказ без
+/// mmap → «undefined symbol: __libc_start_main» → exit(127); эмпирика
+/// dyn-elf CDD №11 p3). Устройства/консоль — S_IFCHR-заглушка. 144Б.
 pub const STAT_SIZE: usize = 144;
 const S_IFCHR: u64 = 0x2000;
+const S_IFREG: u64 = 0x8000;
+/// v0.20.0 (CDD №11 p3): st_dev VFS-файлов — НЕнулевая константа.
+/// ЭМПИРИКА dyn-elf (glibc dl-load.c:959-1006): ld.so ИДЕНТИФИЦИРУЕТ
+/// библиотеки по (st_dev, st_ino) из fstat (_dl_get_file_id) и сверяет с
+/// картами в _ns_loaded: все-нулевой id → ЛОЖНОЕ «already loaded» →
+/// close(fd) БЕЗ mmap → «undefined symbol: __libc_start_main» → exit(127).
+pub const POLER_VFS_DEV: u64 = 0x1998;
 
 pub fn sysFstat(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
-    _ = e;
     if (!ops.validate(buf_va, STAT_SIZE, true)) return err(EFAULT);
     var st: [STAT_SIZE]u8 = [_]u8{0} ** STAT_SIZE;
-    // struct stat x86_64: st_mode@24 (u32), st_blksize@56 (i64)
-    std.mem.writeInt(u32, st[24..28], @intCast(S_IFCHR | 0x1A0), .little); // chr + 0620
-    std.mem.writeInt(u64, st[56..64], 4096, .little);
+    if (e.isFile()) {
+        // struct stat x86_64: st_dev@0, st_ino@8, st_nlink@16, st_mode@24,
+        // st_rdev@40, st_size@48, st_blksize@56, st_blocks@64
+        std.mem.writeInt(u64, st[0..8], POLER_VFS_DEV, .little);
+        std.mem.writeInt(u64, st[8..16], ops.file_ino(e.file_id), .little); // УНИКАЛЬНЫЙ ino!
+        std.mem.writeInt(u64, st[16..24], 1, .little); // st_nlink
+        std.mem.writeInt(u32, st[24..28], @intCast(S_IFREG | 0x1A4), .little); // reg + 0644
+        std.mem.writeInt(u64, st[48..56], ops.file_size(e.file_id), .little); // st_size
+        std.mem.writeInt(u64, st[56..64], 4096, .little); // st_blksize
+        const blocks = (ops.file_size(e.file_id) + 511) / 512;
+        std.mem.writeInt(u64, st[64..72], blocks, .little); // st_blocks
+    } else {
+        // консоль/устройства — симв. устройство
+        std.mem.writeInt(u32, st[24..28], @intCast(S_IFCHR | 0x1A0), .little); // chr + 0620
+        std.mem.writeInt(u64, st[56..64], 4096, .little);
+    }
     if (!ops.copy_out(buf_va, &st)) return err(EFAULT);
     return 0;
 }
@@ -986,6 +1142,11 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_openat => return sysOpenat(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_close => return sysClose(ops, fds, @bitCast(args.a1)),
         SYS_mmap => return sysMmap(ops, fds, args.a1, args.a2, args.a3, args.a4, @bitCast(args.a5), args.a6),
+        SYS_lseek => return sysLseek(ops, fds, @bitCast(args.a1), @bitCast(args.a2), args.a3),
+        SYS_pread64 => return sysPread64(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
+        SYS_writev => return sysWritev(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_access => return sysAccess(ops, args.a1, args.a2),
+        SYS_newfstatat => return sysNewfstatat(ops, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_munmap => return sysMunmap(ops, args.a1, args.a2),
         SYS_ioctl => return sysIoctl(ops, fds, @bitCast(args.a1), @truncate(args.a2), args.a3),
         SYS_fcntl => return sysFcntl(ops, fds, @bitCast(args.a1), args.a2, args.a3),
@@ -1057,9 +1218,18 @@ const FakeEnv = struct {
     robust_head: u64 = 0,
     getrandom_calls: u64 = 0,
     execfn: []const u8 = "hello-static",
+    file_mmap_calls: u64 = 0,
+    last_file_mmap_off: u64 = 0,
+    last_file_mmap_len: u64 = 0,
+    last_file_mmap_prot: u64 = 0,
+    last_file_mmap_fixed: u64 = 0,
+    access_calls: u64 = 0,
+    stat_calls: u64 = 0,
     park_calls: u64 = 0,
     wake_calls: u64 = 0,
     last_wake_n: u32 = 0,
+    last_mmap_flags: u64 = 0,
+    last_mmap_fixed: u64 = 0,
     ready_kbd: u32 = 0, // управляемая тестом готовность event0
     ready_mouse: u32 = 0,
     /// fd-таблица: 0/1/2 открыты (stdin/stdout/stderr), 42 закрыт.
@@ -1171,12 +1341,17 @@ fn fakeDevMmap(kind: FdKind, off: u64, len: u64, prot: u64) i64 {
     return r;
 }
 fn fakeDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
-    _ = hint;
     _ = prot;
-    _ = flags;
     const e = g_env.?;
     e.mmap_calls += 1;
     e.last_mmap_len = len;
+    e.last_mmap_flags = flags;
+    // MAP_FIXED: точный адрес (ld.so bss-хвост libc поверх спана)
+    if (flags & MAP_FIXED != 0 and hint != 0) {
+        e.last_mmap_fixed = hint;
+        return @intCast(hint);
+    }
+    e.last_mmap_fixed = 0;
     const r: i64 = @intCast(e.mmap_cursor);
     e.mmap_cursor += (len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
     return r;
@@ -1284,6 +1459,52 @@ fn fakeFileRead(id: u32, off: u64, va: u64, count: u64) i64 {
     if (!fakeCopyOut(va, f.data[@intCast(off)..][0..n])) return -EFAULT;
     return @intCast(n);
 }
+fn fakeFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
+    const e = g_env.?;
+    e.file_mmap_calls += 1;
+    e.last_file_mmap_off = off;
+    e.last_file_mmap_len = len;
+    e.last_file_mmap_prot = prot;
+    e.last_file_mmap_fixed = fixed_va;
+    _ = id;
+    // MAP_FIXED: точный адрес (ld.so: сегменты поверх спана)
+    if (fixed_va != 0) return @intCast(fixed_va);
+    return @intCast(e.mmap_cursor); // «разместили»
+}
+
+fn fakeFileSize(id: u32) u64 {
+    _ = id;
+    return 8192; // тестовый размер
+}
+
+fn fakeFileIno(id: u32) u64 {
+    // уникальный НЕнулевой inode (glibc: (st_dev, st_ino) — идентификация)
+    return 100 + @as(u64, id);
+}
+
+fn fakePathExists(path: []const u8) i64 {
+    const e = g_env.?;
+    e.access_calls += 1;
+    if (std.mem.eql(u8, path, "/etc/ld.so.cache")) return -ENOENT; // нет кэша
+    return 0;
+}
+
+fn fakeStatByPath(path: []const u8, buf_va: u64) i64 {
+    const e = g_env.?;
+    e.stat_calls += 1;
+    if (std.mem.eql(u8, path, "/etc/ld.so.cache")) return -ENOENT; // нет кэша
+    var st: [144]u8 = [_]u8{0} ** 144;
+    std.mem.writeInt(u64, st[0..8], POLER_VFS_DEV, .little); // st_dev
+    std.mem.writeInt(u64, st[8..16], 42, .little); // st_ino (уникальный)
+    std.mem.writeInt(u64, st[16..24], 1, .little); // st_nlink
+    std.mem.writeInt(u32, st[24..28], @intCast(0x8000 | 0x124), .little); // S_IFREG|0444
+    std.mem.writeInt(u64, st[48..56], fakeFileSize(0), .little); // st_size
+    std.mem.writeInt(u64, st[56..64], 4096, .little); // st_blksize
+    std.mem.writeInt(u64, st[64..72], (fakeFileSize(0) + 511) / 512, .little); // st_blocks
+    if (!fakeCopyOut(buf_va, &st)) return -EFAULT;
+    return 0;
+}
+
 fn fakeFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
     if (id >= g_files.len or !g_files[id].used) return -EBADF;
     const f = &g_files[id];
@@ -1330,6 +1551,11 @@ fn fakeOps() LinuxOps {
         .open_file = fakeOpenFile,
         .file_read = fakeFileRead,
         .file_write = fakeFileWrite,
+        .file_mmap = fakeFileMmap,
+        .file_size = fakeFileSize,
+        .file_ino = fakeFileIno,
+        .path_exists = fakePathExists,
+        .stat_by_path = fakeStatByPath,
     };
 }
 
@@ -2062,6 +2288,22 @@ test "linux: initrd-файл — RO-чтение с «USB»; запись → -E
     const out: *const PollFd = @ptrCast(@alignCast(e.vaPtr(pva).?));
     try testing.expectEqual(POLLIN, out.revents & POLLIN);
     try testing.expectEqual(@as(i16, 0), out.revents & POLLOUT); // RO — писать нельзя
+
+    // v0.20.0 (CDD №11 p3): fstat на ФАЙЛОВОМ fd — S_IFREG + st_size +
+    // УНИКАЛЬНЫЙ (st_dev, st_ino): ld.so идентифицирует библиотеки по паре —
+    // нулевой id = ложное «already loaded» (dl-load.c:994) → без mmap → 127
+    const st_va = FakeEnv.USER_BASE + 0x280;
+    try testing.expectEqual(@as(u64, 0), sysFstat(ops, &fds, 3, st_va));
+    const q = e.vaPtr(st_va).?;
+    try testing.expectEqual(POLER_VFS_DEV, std.mem.readInt(u64, q[0..8], .little));
+    try testing.expectEqual(@as(u64, 100), std.mem.readInt(u64, q[8..16], .little)); // ino = 100+id
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, q[16..24], .little)); // nlink
+    try testing.expectEqual(@as(u32, S_IFREG | 0x1A4), std.mem.readInt(u32, q[24..28], .little));
+    try testing.expectEqual(@as(u64, 8192), std.mem.readInt(u64, q[48..56], .little)); // size (fake)
+    try testing.expectEqual(@as(u64, 16), std.mem.readInt(u64, q[64..72], .little)); // blocks
+    // консоль — по-прежнему S_IFCHR
+    try testing.expectEqual(@as(u64, 0), sysFstat(ops, &fds, 1, st_va));
+    try testing.expectEqual(@as(u32, S_IFCHR | 0x1A0), std.mem.readInt(u32, q[24..28], .little));
 }
 
 test "linux: v0.20 identity/brk — gettid/getpid/getppid/uid/brk-семантика" {
@@ -2095,4 +2337,234 @@ test "linux: v0.20 identity/brk — gettid/getpid/getppid/uid/brk-семанти
     try testing.expectEqual(@as(u64, 0x3000), dispatch(ops, &fds, SYS_brk, .{ .a1 = 0x800 })); // отказ
     try testing.expectEqual(@as(u64, 3), e.brk_calls);
     try testing.expectEqual(@as(u64, 0x3000), e.brk_value);
+}
+
+// ─── v0.20.0 (CDD №11 p3): ld.so-волна — lseek/pread64/writev/access/newfstatat/file-mmap ──
+
+test "linux: lseek — SEEK_SET/CUR/END на tmpfs; ESPIPE на консоли; EINVAL-края" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    const buf_va = FakeEnv.USER_BASE;
+
+    // tmpfs-файл с 10 байтами контента
+    const path = putStr(e, 0x100, "/tmp/seek.bin");
+    const fd = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDWR, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    @memcpy(e.vaPtr(buf_va).?[0..10], "0123456789");
+    try testing.expectEqual(@as(u64, 10), sysWrite(ops, &fds, 3, buf_va, 10));
+
+    // SEEK_SET: абсолют
+    try testing.expectEqual(@as(u64, 4), sysLseek(ops, &fds, 3, 4, SEEK_SET));
+    try testing.expectEqual(@as(u64, 4), fds.entries[3].file_off);
+    // SEEK_CUR: относительный сдвиг (+2)
+    try testing.expectEqual(@as(u64, 6), sysLseek(ops, &fds, 3, 2, SEEK_CUR));
+    // SEEK_END: хвост (fake file_size = 8192): 8192-10 = 8182
+    try testing.expectEqual(@as(u64, 8182), sysLseek(ops, &fds, 3, -10, SEEK_END));
+    // чтение с позиции 6: «6789»
+    try testing.expectEqual(@as(u64, 6), sysLseek(ops, &fds, 3, 6, SEEK_SET));
+    @memset(e.vaPtr(buf_va).?[0..16], 0);
+    try testing.expectEqual(@as(u64, 4), sysRead(ops, &fds, 3, buf_va, 16));
+    try testing.expectEqualStrings("6789", e.vaPtr(buf_va).?[0..4]);
+
+    // консоль (fd 1) — не файл: ESPIPE (Linux: lseek на tty)
+    try testing.expectEqual(err(ESPIPE), sysLseek(ops, &fds, 1, 0, SEEK_SET));
+    // неизвестный whence → EINVAL
+    try testing.expectEqual(err(EINVAL), sysLseek(ops, &fds, 3, 0, 99));
+    // отрицательный результат → EINVAL
+    try testing.expectEqual(err(EINVAL), sysLseek(ops, &fds, 3, -5, SEEK_SET));
+    // закрытый fd → EBADF
+    try testing.expectEqual(err(EBADF), sysLseek(ops, &fds, 9, 0, SEEK_SET));
+
+    // якорь номера
+    try testing.expectEqual(@as(u64, 8), SYS_lseek);
+}
+
+test "linux: pread64 — чтение БЕЗ сдвига file_off; EBADF/EFAULT" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    const buf_va = FakeEnv.USER_BASE;
+
+    const path = putStr(e, 0x100, "/tmp/pread.bin");
+    const fd = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDWR, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    @memcpy(e.vaPtr(buf_va).?[0..10], "ABCDEFGHIJ");
+    try testing.expectEqual(@as(u64, 10), sysWrite(ops, &fds, 3, buf_va, 10));
+    // подводим file_off в конец
+    _ = sysLseek(ops, &fds, 3, 10, SEEK_SET);
+
+    // pread64 с offset 2: «CDE» — file_off НЕ двигается (остался 10)
+    @memset(e.vaPtr(buf_va).?[0..16], 0);
+    try testing.expectEqual(@as(u64, 3), sysPread64(ops, &fds, 3, buf_va, 3, 2));
+    try testing.expectEqualStrings("CDE", e.vaPtr(buf_va).?[0..3]);
+    try testing.expectEqual(@as(u64, 10), fds.entries[3].file_off);
+
+    // offset за концом → EOF (0)
+    try testing.expectEqual(@as(u64, 0), sysPread64(ops, &fds, 3, buf_va, 3, 8192));
+    // консоль → EBADF (не файл)
+    try testing.expectEqual(err(EBADF), sysPread64(ops, &fds, 1, buf_va, 3, 0));
+    // битый буфер → EFAULT
+    try testing.expectEqual(err(EFAULT), sysPread64(ops, &fds, 3, 0x10_0000, 3, 0));
+    // якорь номера
+    try testing.expectEqual(@as(u64, 17), SYS_pread64);
+}
+
+test "linux: writev — векторная запись (tmpfs + консоль); EINVAL/EFAULT-края" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    const buf_va = FakeEnv.USER_BASE;
+
+    // iovec[2] в fake-user: {base=buf, len=5} и {base=buf+5, len=5}
+    const iov_va = FakeEnv.USER_BASE + 0x300;
+    const p = e.vaPtr(iov_va).?;
+    @memcpy(e.vaPtr(buf_va).?[0..10], "POLER-DYNA");
+    std.mem.writeInt(u64, p[0..8], buf_va, .little);
+    std.mem.writeInt(u64, p[8..16], 5, .little);
+    std.mem.writeInt(u64, p[16..24], buf_va + 5, .little);
+    std.mem.writeInt(u64, p[24..32], 5, .little);
+
+    // консоль: writev(1, iov, 2) = 10 байт (две записи write)
+    try testing.expectEqual(@as(u64, 10), sysWritev(ops, &fds, 1, iov_va, 2));
+
+    // tmpfs-файл: файловый writev — offset движется, контент склеен
+    const path = putStr(e, 0x100, "/tmp/wv.bin");
+    _ = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDWR, 0);
+    try testing.expectEqual(@as(u64, 10), sysWritev(ops, &fds, 3, iov_va, 2));
+    try testing.expectEqual(@as(u64, 10), fds.entries[3].file_off);
+    // перечитали с нуля (новый fd)
+    const fd2 = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDONLY, 0);
+    @memset(e.vaPtr(buf_va).?[0..16], 0);
+    try testing.expectEqual(@as(u64, 10), sysRead(ops, &fds, @intCast(fd2), buf_va, 16));
+    try testing.expectEqualStrings("POLER-DYNA", e.vaPtr(buf_va).?[0..10]);
+
+    // iovcnt=0 → 0; iovcnt > MAX_IOV → EINVAL
+    try testing.expectEqual(@as(u64, 0), sysWritev(ops, &fds, 3, iov_va, 0));
+    try testing.expectEqual(err(EINVAL), sysWritev(ops, &fds, 3, iov_va, MAX_IOV + 1));
+    // битый iov-указатель → EFAULT; битая base внутри → EFAULT
+    try testing.expectEqual(err(EFAULT), sysWritev(ops, &fds, 1, 0x10_0000, 2));
+    std.mem.writeInt(u64, p[0..8], 0x10_0000, .little);
+    try testing.expectEqual(err(EFAULT), sysWritev(ops, &fds, 1, iov_va, 1));
+    // пустая iovec (len=0) — просто скип
+    std.mem.writeInt(u64, p[0..8], buf_va, .little);
+    std.mem.writeInt(u64, p[8..16], 0, .little);
+    try testing.expectEqual(@as(u64, 0), sysWritev(ops, &fds, 1, iov_va, 1));
+
+    // якорь номера
+    try testing.expectEqual(@as(u64, 20), SYS_writev);
+}
+
+test "linux: access — существование пути (ld.so: ld.so.cache ENOENT)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+
+    // /etc/hostname есть (fake: всё кроме ld.so.cache)
+    const p_ok = putStr(e, 0, "/etc/hostname");
+    try testing.expectEqual(@as(u64, 0), sysAccess(ops, p_ok, 4)); // R_OK
+    // кэша динамического линковщика нет → ENOENT (ld.so идёт по каталогам)
+    const p_cache = putStr(e, 0x40, "/etc/ld.so.cache");
+    try testing.expectEqual(err(ENOENT), sysAccess(ops, p_cache, 4));
+    // битый указатель → EFAULT
+    try testing.expectEqual(err(EFAULT), sysAccess(ops, 0x10_0000, 4));
+    // счётчик вызовов
+    try testing.expectEqual(@as(u64, 2), g_env.?.access_calls);
+    // якорь номера (access=21 — legacy, но glibc вызывает)
+    try testing.expectEqual(@as(u64, 21), SYS_access);
+}
+
+test "linux: newfstatat — stat-раскладка 144Б: S_IFREG/st_size/st_blksize" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    const buf_va = FakeEnv.USER_BASE;
+
+    const p = putStr(e, 0, "/lib/x86_64-linux-gnu/libc.so.6");
+    try testing.expectEqual(@as(u64, 0), sysNewfstatat(ops, AT_FDCWD, p, buf_va, 0));
+    // раскладка struct stat x86_64: st_dev@0, st_ino@8, st_nlink@16,
+    // st_mode@24 (S_IFREG|0444=0x8124), st_size@48 (fake 8192), st_blksize@56
+    const q = e.vaPtr(buf_va).?;
+    try testing.expectEqual(POLER_VFS_DEV, std.mem.readInt(u64, q[0..8], .little));
+    try testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, q[8..16], .little)); // ino ≠ 0!
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, q[16..24], .little));
+    try testing.expectEqual(@as(u32, 0x8124), std.mem.readInt(u32, q[24..28], .little));
+    try testing.expectEqual(@as(u64, 8192), std.mem.readInt(u64, q[48..56], .little));
+    try testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, q[56..64], .little));
+    try testing.expectEqual(@as(u64, 16), std.mem.readInt(u64, q[64..72], .little)); // blocks
+
+    // несуществующий путь → ENOENT (fake: ld.so.cache)
+    const p404 = putStr(e, 0x80, "/etc/ld.so.cache");
+    try testing.expectEqual(err(ENOENT), sysNewfstatat(ops, AT_FDCWD, p404, buf_va, 0));
+    // битый statbuf → EFAULT; битый путь → EFAULT
+    try testing.expectEqual(err(EFAULT), sysNewfstatat(ops, AT_FDCWD, p, 0x10_0000, 0));
+    try testing.expectEqual(err(EFAULT), sysNewfstatat(ops, AT_FDCWD, 0x10_0000, buf_va, 0));
+    // dispatch-маршрут + якорь номера (262)
+    try testing.expectEqual(@as(u64, 262), SYS_newfstatat);
+    try testing.expectEqual(err(ENOENT), dispatch(ops, &fds, SYS_newfstatat, .{
+        .a1 = @bitCast(AT_FDCWD), .a2 = p404, .a3 = buf_va, .a4 = 0,
+    }));
+    // libc(1) + ld.so.cache(2) + dispatch-повтор(3); EFAULT-ветки НЕ считаются
+    try testing.expectEqual(@as(u64, 3), g_env.?.stat_calls);
+}
+
+test "linux: mmap file-backed (MAP_PRIVATE) — initrd-файл; MAP_SHARED → ENOSYS" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    const buf_va = FakeEnv.USER_BASE;
+
+    const path = putStr(e, 0, "/etc/hostname");
+    const fd = sysOpenat(ops, &fds, AT_FDCWD, path, O_RDONLY, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    try testing.expectEqual(FdKind.initrd_file, fds.entries[3].kind);
+
+    // MAP_PRIVATE: ld.so грузит libc сегментами — file_mmap-оп вызван
+    const want_va: u64 = e.mmap_cursor;
+    const r = sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_PRIVATE, 3, 0);
+    try testing.expectEqual(want_va, r);
+    try testing.expectEqual(@as(u64, 1), e.file_mmap_calls);
+    try testing.expectEqual(@as(u64, 0), e.last_file_mmap_off);
+    try testing.expectEqual(@as(u64, 4096), e.last_file_mmap_len);
+    try testing.expectEqual(PROT_READ, e.last_file_mmap_prot);
+
+    // MAP_SHARED на RO-файле → ENOSYS (осознанно: только приватные копии)
+    try testing.expectEqual(err(ENOSYS), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_SHARED, 3, 0));
+    // event-fd по-прежнему ENODEV
+    try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_PRIVATE, 0, 0));
+
+    // MAP_FIXED: ld.so-семантика — сегмент по ТОЧНОМУ адресу base+vaddr
+    // поверх первичного спана (возвращаем заданный VA, fixed передан в оп)
+    const want_fixed: u64 = 0x0000_0040_0100_2000;
+    const rf = sysMmap(ops, &fds, want_fixed, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, 3, 0x1000);
+    try testing.expectEqual(want_fixed, rf);
+    try testing.expectEqual(want_fixed, e.last_file_mmap_fixed);
+    try testing.expectEqual(@as(u64, 0x1000), e.last_file_mmap_off);
+    // hint БЕЗ MAP_FIXED — игнорируется (ядро размещает само)
+    _ = sysMmap(ops, &fds, want_fixed, 4096, PROT_READ, MAP_PRIVATE, 3, 0);
+    try testing.expectEqual(@as(u64, 0), e.last_file_mmap_fixed);
+
+    // АНОНИМНЫЙ MAP_FIXED (ld.so: bss-хвост libc поверх спана,
+    // dl-map-segments.h:163): hint+flags уходят в do_mmap op
+    const ra = sysMmap(ops, &fds, want_fixed, 0x1000, PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    try testing.expectEqual(want_fixed, ra);
+    try testing.expectEqual(want_fixed, e.last_mmap_fixed);
+    try testing.expectEqual(MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, e.last_mmap_flags);
+    // анонимный БЕЗ FIXED — курсор (fake), fixed-запись сброшена
+    _ = sysMmap(ops, &fds, 0, 0x1000, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    try testing.expectEqual(@as(u64, 0), e.last_mmap_fixed);
+
+    // dispatch-маршрут: mmap(9) с fd → file_mmap (итог: приватный+fixed+hint+dispatch)
+    _ = dispatch(ops, &fds, SYS_mmap, .{ .a1 = 0, .a2 = 8192, .a3 = PROT_READ, .a4 = MAP_PRIVATE, .a5 = 3, .a6 = 0x1000 });
+    try testing.expectEqual(@as(u64, 4), e.file_mmap_calls);
+    try testing.expectEqual(@as(u64, 0x1000), e.last_file_mmap_off);
+    try testing.expectEqual(@as(u64, 8192), e.last_file_mmap_len);
+
+    _ = buf_va;
 }
