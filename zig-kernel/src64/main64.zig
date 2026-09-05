@@ -2035,6 +2035,7 @@ fn kernelDrmUserOps() drm_kms.DrmOps {
         .copy_out = linux_user_io.copy_out,
         .alloc_pages = drmAllocPages,
         .free_pages = drmFreePages,
+        .scanout_frame = drmScanoutFrame,
     };
 }
 
@@ -3960,7 +3961,38 @@ fn kernelDrmOps() drm_kms.DrmOps {
         .copy_out = drmtestCopyOut,
         .alloc_pages = drmAllocPages,
         .free_pages = drmFreePages,
+        .scanout_frame = drmScanoutFrame,
     };
+}
+
+/// CDD №12 p4: СКАН-АУТ ФРЕЙМБУФЕРА НА ДИСПЛЕЙ — DRM PAGE_FLIP/SETCRTC →
+/// VirtIO-GPU vring 2D (RESOURCE_CREATE_2D → ATTACH_BACKING(phys) →
+/// TRANSFER_TO_HOST_2D → SET_SCANOUT → RESOURCE_FLUSH). Первый кадр
+/// gamescope = первый успешный вызов. Ресурс-ид монотонный (двойная
+/// буферизация: каждый флип = свой ресурс; gputest — фиксированный 7).
+var drm_scanout_res_id: u32 = 100;
+fn drmScanoutFrame(phys: u64, len: u64, w: u32, h: u32, pitch: u32) bool {
+    _ = pitch; // 2D-ресурс B8G8R8X8: строки плотные (pitch == width*4 —
+    // ioAddFb2/ioCreateDumb гарантируют XRGB8888-сstride)
+    if (phys == 0 or len == 0 or w == 0 or h == 0) return false;
+    const cfg = gpu_vring_cfg orelse return false;
+    if (gpu_probe == null) return false;
+    drm_scanout_res_id += 1;
+    const ok = virtio_gpu.scanoutFrame(cfg, &gpu_vring, drm_scanout_res_id, w, h, phys, len);
+    if (ok) {
+        hal.Serial.puts("[DRM] scanout=");
+        hal.Serial.putDecimal(drm_state.scanouts);
+        hal.Serial.puts(" frame ");
+        hal.Serial.putDecimal(w);
+        hal.Serial.puts("x");
+        hal.Serial.putDecimal(h);
+        hal.Serial.puts(" via vring (res ");
+        hal.Serial.putDecimal(drm_scanout_res_id);
+        hal.Serial.puts(")\n");
+    } else {
+        hal.Serial.puts("[DRM] scanout FAILED (vring)\n");
+    }
+    return ok;
 }
 
 /// mmap линейного фреймбуфера в user-PML4 c WC (PWT): страницы VRAM,

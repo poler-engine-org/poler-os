@@ -446,6 +446,12 @@ pub const DrmOps = struct {
     alloc_pages: *const fn (pages: u64) ?u64,
     /// Освободить N физ. страниц (DESTROY_DUMB).
     free_pages: *const fn (phys: u64, pages: u64) void,
+    /// CDD №12 p4: СКАН-АУТ КАДРА на дисплей (VirtIO-GPU vring 2D) —
+    /// вызывается из PAGE_FLIP/SETCRTC при mode==.virtio_gpu: физ-backing
+    /// dumb-буфера фреймбуфера → RESOURCE_CREATE_2D+ATTACH_BACKING+
+    /// TRANSFER_TO_HOST_2D+SET_SCANOUT+RESOURCE_FLUSH. false = vring
+    /// недоступен (флип всё равно валиден — кадр не дошёл до дисплея).
+    scanout_frame: *const fn (phys: u64, len: u64, w: u32, h: u32, pitch: u32) bool,
 };
 
 // ─── Состояние DRM (dumb-KMS: 1 CRTC + 1 энкодер + 1 коннектор) ────────────
@@ -513,6 +519,9 @@ pub const DrmState = struct {
     next_fb_id: u32 = 1,
     crtc_fb_id: u32 = 0, // fb на скан-ауте (PAGE_FLIP/SETCRTC)
     flips: u32 = 0, // счётчик page-flip'ов (E2E-наблюдаемо)
+    /// CDD №12 p4: успешные скан-ауты фреймбуфера через vring (первый кадр
+    /// gamescope = scanouts >= 1; e2e-маркер [DRM] scanout=N).
+    scanouts: u32 = 0,
     width_mm: u32 = 300,
     height_mm: u32 = 200,
     // CDD №12 p3: кольцо DRM-событий (flip-complete после каждого
@@ -749,6 +758,9 @@ fn ioSetCrtc(st: *DrmState, ops: DrmOps, arg: u64) i64 {
     if (c.fb_id != 0) {
         if (findFb(st, c.fb_id) == null) return -linux.ENOENT;
         st.crtc_fb_id = c.fb_id;
+        // CDD №12 p4: SETCRTC = режим уст-в фреймбуфер — СРАЗУ скан-аут
+        // (gamescope-легаси-путь задаёт CRTC до первого PAGE_FLIP).
+        _ = scanoutCrtcFb(st, ops);
     } else {
         st.crtc_fb_id = 0;
     }
@@ -848,9 +860,39 @@ fn ioPageFlip(st: *DrmState, ops: DrmOps, arg: u64) i64 {
     // немедленно, при флаге EVENT — квантуем flip-complete в кольцо событий.
     st.crtc_fb_id = p.fb_id;
     st.flips += 1;
+    // CDD №12 p4: ПЕРВЫЙ КАДР — флип выталкивает backing dumb-буфера
+    // фреймбуфера в дисплей через vring (VirtIO-GPU 2D-конвейер).
+    _ = scanoutCrtcFb(st, ops);
     if (p.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
         pushEvent(st, p.user_data, st.flips);
     return 0;
+}
+
+/// CDD №12 p4: скан-аут текущего CRTC-фреймбуфера на дисплей.
+/// mode==.virtio_gpu + fb с dumb-бэкингом → ops.scanout_frame (vring);
+/// линейный fb (VBE) — кадр уже на дисплее (загрузчик). Счётчик scanouts
+/// — e2e-маркер «первого кадра gamescope».
+fn scanoutCrtcFb(st: *DrmState, ops: DrmOps) bool {
+    if (st.mode != .virtio_gpu) return false;
+    const fb_id = st.crtc_fb_id;
+    if (fb_id == 0) return false;
+    const fb = findFb(st, fb_id) orelse return false;
+    const dumb = findDumbByHandle(st, fb.handle) orelse return false;
+    const ok = ops.scanout_frame(dumb.phys, dumb.size, fb.width, fb.height, fb.pitch);
+    if (ok) {
+        st.scanouts += 1;
+        // e2e-маркер: сериализуется через ops-окружение (ядро печатает
+        // [DRM] scanout=N в своём скан-аут-хуке — здесь только счёт).
+    }
+    return ok;
+}
+
+/// Найти dumb-буфер по GEM-handle (fb.handle = dumb.handle при ADDFB2).
+fn findDumbByHandle(st: *DrmState, handle: u32) ?*DumbBuf {
+    for (&st.dumb) |*d| {
+        if (d.used and d.handle == handle) return d;
+    }
+    return null;
 }
 
 // ─── CDD №12 p3: DRM-события (flip-complete через read(card0)) ─────────────
@@ -1201,6 +1243,25 @@ fn fakeFreePages(phys: u64, pages: u64) void {
     e.last_free_pages = pages;
 }
 
+/// CDD №12 p4: фейк-скан-аут — фиксирует последний вызов (phys/w/h/pitch).
+var fake_scan_calls: u32 = 0;
+var fake_scan_phys: u64 = 0;
+var fake_scan_w: u32 = 0;
+var fake_scan_h: u32 = 0;
+var fake_scan_pitch: u32 = 0;
+var fake_scan_ret: bool = true;
+
+fn fakeScanoutFrame(phys: u64, len: u64, w: u32, h: u32, pitch: u32) bool {
+    _ = len;
+    if (!fake_scan_ret) return false;
+    fake_scan_calls += 1;
+    fake_scan_phys = phys;
+    fake_scan_w = w;
+    fake_scan_h = h;
+    fake_scan_pitch = pitch;
+    return true;
+}
+
 fn fakeOps() DrmOps {
     return .{
         .validate = fakeValidate,
@@ -1208,6 +1269,7 @@ fn fakeOps() DrmOps {
         .copy_out = fakeCopyOut,
         .alloc_pages = fakeAllocPages,
         .free_pages = fakeFreePages,
+        .scanout_frame = fakeScanoutFrame,
     };
 }
 
@@ -1701,6 +1763,111 @@ test "drm: p3 — ADDFB2 (XR24/AR24) + client-cap гейт + flip-события
 
     // 7. GETPROPBLOB → ENOENT (blob'ов нет)
     try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_GETPROPBLOB, va));
+}
+
+// ─── Тесты CDD №12 p4: скан-аут фреймбуфера через PAGE_FLIP/SETCRTC ────────
+
+test "drm: p4 — PAGE_FLIP/SETCRTC → скан-аут vring (phys/габариты/счётчик)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initVirtioGpu(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+    fake_scan_calls = 0;
+    fake_scan_ret = true;
+    defer fake_scan_ret = true;
+
+    // dumb 320×240×32 → pitch 1280, size 307200
+    var d: CreateDumb = .{ .width = 320, .height = 240, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const gd: *const CreateDumb = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const handle = gd.handle;
+
+    // ADDFB2 XR24 (single-plane, pitch 1280) → fb
+    var f2: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    f2.handles[0] = handle;
+    f2.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const fb_id: u32 = (@as(*const FbCmd2, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+
+    // PAGE_FLIP → ПЕРВЫЙ КАДР: скан-аут с физикой dumb-бэкинга + габаритами fb
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 1), st.scanouts);
+    try testing.expectEqual(@as(u32, 1), fake_scan_calls);
+    // fake-физика alloc_pages: 0x5000_0000 + начальный mmap_cursor
+    try testing.expectEqual(@as(u64, 0x5000_0000 + FakeEnv.USER_BASE + FakeEnv.USER_LEN), fake_scan_phys);
+    try testing.expectEqual(@as(u32, 320), fake_scan_w);
+    try testing.expectEqual(@as(u32, 240), fake_scan_h);
+    try testing.expectEqual(@as(u32, 1280), fake_scan_pitch);
+
+    // второй флип (дабл-буферинг) → счётчик растёт, флипы растут
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 2), st.flips);
+    try testing.expectEqual(@as(u32, 2), st.scanouts);
+
+    // SETCRTC с fb → тоже скан-аут (легаси-путь gamescope до первого флипа)
+    var cr: ModeCrtc = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ModeCrtc)], std.mem.asBytes(&cr));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_SETCRTC, va));
+    try testing.expectEqual(@as(u32, 3), st.scanouts);
+
+    // SETCRTC fb=0 (dpms off) → БЕЗ скан-аута
+    cr = .{ .crtc_id = kmsIds()[0], .fb_id = 0 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ModeCrtc)], std.mem.asBytes(&cr));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_SETCRTC, va));
+    try testing.expectEqual(@as(u32, 3), st.scanouts);
+}
+
+test "drm: p4 — скан-аут недоступен/линейный-fb → флип валиден, scanouts=0" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+    fake_scan_calls = 0;
+
+    // A. линейный fb (VBE): флип меняет crtc_fb_id, скан-аут НЕ зовётся
+    //    (кадр уже на дисплее — backing = VRAM загрузчика)
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    var d: CreateDumb = .{ .width = 320, .height = 240, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const handle: u32 = (@as(*const CreateDumb, @ptrCast(@alignCast(e.vaPtr(va).?)))).handle;
+    var f: FbCmd = .{ .handle = handle, .width = 320, .height = 240, .pitch = 1280, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..28], std.mem.asBytes(&f));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB, va));
+    const fb_id: u32 = (@as(*const FbCmd, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 0), st.scanouts);
+    try testing.expectEqual(@as(u32, 0), fake_scan_calls);
+
+    // B. vring-отказ (false): флип валиден (Linux-семантика — буфер
+    //    «принят»), scanouts не растёт (кадр не дошёл)
+    var st2 = DrmState{};
+    initVirtioGpu(&st2, geom640());
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st2, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const h2: u32 = (@as(*const CreateDumb, @ptrCast(@alignCast(e.vaPtr(va).?)))).handle;
+    var f2: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    f2.handles[0] = h2;
+    f2.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st2, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const fb2: u32 = (@as(*const FbCmd2, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+    fake_scan_ret = false;
+    defer fake_scan_ret = true;
+    var p2: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb2 };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st2, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 0), st2.scanouts);
+    try testing.expectEqual(@as(u32, 0), fake_scan_calls);
 }
 
 // ─── Тесты: враждебные указатели (инвариант нуля паник) ────────────────────
