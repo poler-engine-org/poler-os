@@ -82,10 +82,10 @@
     "libzstd.so.1"
   ],
   "missing": [],
-  "binary": "/home/z/my-project/poler-os/cachyos-root/root/usr/bin/gamescope",
-  "total_bytes": 258162088,
-  "rootfs": "/home/z/my-project/poler-os/cachyos-root/root",
+  "binary": "/tmp/my-project/poler-os/cachyos-root/root/usr/bin/gamescope",
+  "total_bytes": 258248104,
+  "rootfs": "/tmp/my-project/poler-os/cachyos-root/root",
   "extra_files": [
-    "/home/z/my-project/poler-os/cachyos-root/root/usr/share/vulkan/icd.d/lvp_icd.json"
+    "/tmp/my-project/poler-os/cachyos-root/root/usr/share/vulkan/icd.d/lvp_icd.json"
   ]
 }
