@@ -342,7 +342,8 @@ def main():
     # dlopen-волна: gamescope dlopen'ит libSDL3.so.0 (sdl2-compat собран НА
     # SDL3) — DT_NEEDED-замыкание её НЕ видит; добавляем отдельной волной
     dlopen_extra = []
-    for dlopen_target in ("usr/lib/libSDL3.so.0",):
+    for dlopen_target in ("usr/lib/libSDL3.so.0", "usr/lib/libvulkan.so.1",
+                          "usr/lib/libvulkan_lvp.so"):
         p3 = os.path.join(ROOTFS, dlopen_target)
         if os.path.exists(p3):
             for round_no in range(8):
@@ -402,9 +403,15 @@ def main():
     print(f"  ld.so: {'OK' if os.path.exists(lds) else 'ОТСУТСТВУЕТ'}")
     print(f"  суммарно: {total/1024/1024:.1f} МБ")
 
+    # ICD-манифесты Vulkan (libvulkan ищет драйвер по /usr/share/vulkan/icd.d)
+    extra_files = []
+    icd_dir = os.path.join(ROOTFS, "usr", "share", "vulkan", "icd.d")
+    if os.path.isdir(icd_dir):
+        for n in os.listdir(icd_dir):
+            extra_files.append(os.path.join(icd_dir, n))
     report = {"interp": interp, "libs": libs, "missing": missing,
               "binary": binpath, "total_bytes": total,
-              "rootfs": ROOTFS}
+              "rootfs": ROOTFS, "extra_files": extra_files}
     with open(os.path.join(OUT, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
     print(f"  отчёт: {os.path.join(OUT, 'report.json')}")

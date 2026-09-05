@@ -69,6 +69,46 @@ pub const SYS_rt_sigaction: u64 = 13;
 pub const SYS_rt_sigprocmask: u64 = 14;
 pub const SYS_socketpair: u64 = 53;
 pub const SYS_memfd_create: u64 = 319;
+pub const SYS_ftruncate: u64 = 77; // (!не 46 — это i386-номер; x86_64 = 77)
+/// getdents64 (НЕ 220 — это старый getdents без d_type/d_ino-64)
+pub const SYS_getdents64: u64 = 217;
+/// CDD №12 p3: sched_getaffinity (glibc sysconf(_SC_NPROCESSORS_*) —
+/// РАЗМЕР пула тредов llvmpipe! ENOSYS → мусорная нумерация CPU → падение)
+pub const SYS_sched_getaffinity: u64 = 203;
+pub const SYS_sched_setaffinity: u64 = 204;
+/// CDD №12 p3: sysinfo (LLVM/Gallium оценка RAM для хипов) + mkdir (кэш Меса)
+pub const SYS_sysinfo: u64 = 99;
+pub const SYS_mkdir: u64 = 83;
+
+// ─── CDD №12 p3: dev-номера (libdrm идентифицирует DRM-узлы) ──────────
+/// Linux DRM_MAJOR (include/uapi/linux/major.h).
+pub const DRM_MAJOR: u64 = 226;
+/// new_encode_dev (Linux): major<256, minor<256 → (maj<<8)|min
+/// (glibc makedev декодирует так же — stat st_rdev/rdev)
+pub fn encodeDev(major: u64, minor: u64) u64 {
+    return (major << 8) | (minor & 0xff);
+}
+/// minor devfs-узла по ПУТИ (fstat st_rdev: card0=0, renderD128=128 —
+/// libdrm drmGetNodeTypeFromFd различает primary/render по minor!)
+pub fn devMinor(path: []const u8) u32 {
+    if (std.mem.eql(u8, path, "/dev/dri/renderD128")) return 128;
+    if (std.mem.eql(u8, path, "/dev/input/event1")) return 65;
+    if (std.mem.eql(u8, path, "/dev/input/event0")) return 64;
+    return 0; // card0, fb0, console
+}
+/// major devfs-узла по fd-kind (DRM=226, fb=29, input=13, tty=5).
+pub fn devMajorOf(kind: FdKind) u64 {
+    return switch (kind) {
+        .dri_card0 => DRM_MAJOR,
+        .fb0 => 29,
+        .input_event0, .input_event1 => 13,
+        else => 5, // console_out (tty)
+    };
+}
+/// d_type для linux_dirent64 (getdents64)
+pub const DT_CHR: u8 = 2;
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
 
 /// O_CLOEXEC/O_NONBLOCK (pipe2/socketpair/eventfd2/timerfd/signalfd4).
 pub const O_CLOEXEC: u64 = 0o2000000;
@@ -125,7 +165,10 @@ pub const EEXIST: i64 = 17;
 pub const ENODEV: i64 = 19;
 pub const ENFILE: i64 = 23; // реестры каналов/файлов исчерпаны
 pub const EINVAL: i64 = 22;
+pub const EISDIR: i64 = 21; // read/write на dir-fd (CDD №12 p3)
+pub const ENOTDIR: i64 = 20; // getdents64 не на dir-fd
 pub const ELOOP: i64 = 40; // слишком много симлинков в цепи (readlink/resolve)
+pub const EFBIG: i64 = 27; // ftruncate: сверх ANON_FILE_MAX (CDD №12 p3)
 pub const EAFNOSUPPORT: i64 = 97; // socketpair: только AF_UNIX
 pub const ESOCKTNOSUPPORT: i64 = 94; // только SOCK_STREAM
 pub const EPROTONOSUPPORT: i64 = 93; // протокол 0
@@ -245,7 +288,13 @@ pub const EpollEvent = extern struct {
 
 pub const FUTEX_WAIT: u64 = 0;
 pub const FUTEX_WAKE: u64 = 1;
+/// CDD №12 p3: glibc использует WAIT/WAKE_BITSET + CLOCK_REALTIME
+/// (pthread-мьютексы: op 0x189 = WAIT_BITSET|PRIVATE|REALTIME — эмпирика
+/// run8: EINVAL → потоки SPIN-или весь прогон)
+pub const FUTEX_WAIT_BITSET: u64 = 9;
+pub const FUTEX_WAKE_BITSET: u64 = 10;
 pub const FUTEX_PRIVATE_FLAG: u64 = 128;
+pub const FUTEX_CLOCK_REALTIME: u64 = 256; // бит-атрибут таймчасов
 
 // ─── clone (linux/sched.h) ────────────────────────────────────────────────
 
@@ -264,7 +313,7 @@ pub const CLONE_CHILD_SETTID: u64 = 0x10000000;
 /// буфер — аллокаций в syscall-пути нет). Linux-лимит RLIMIT_NOFILE больше,
 /// но WAIT-эпоха (реальные процессы) пересмотрит.
 pub const MAX_POLL_FDS: usize = 64;
-pub const MAX_EPOLL_EVENTS: usize = 256;
+pub const MAX_EPOLL_EVENTS: usize = 1024; // CAsyncWaiter MaxEvents=1024 (gamescope)
 pub const MAX_WATCHES: usize = 32;
 pub const MAX_FDS: usize = 64;
 
@@ -308,6 +357,8 @@ pub const FdKind = enum {
     timerfd,
     /// signalfd (маска хранится; готовность — нет сигналов = 0).
     signalfd,
+    /// CDD №12 p3: поток каталога (opendir → getdents64; file_id = DirStream).
+    dir,
 };
 
 pub const MAX_FILE_ID: u32 = 64; // реестр открытых файлов runtime (p2: 64 — е2е фд-фонтан)
@@ -506,6 +557,22 @@ pub const LinuxOps = struct {
     set_sigmask: *const fn (how: u32, mask: u64) u64,
     /// memfd_create: анонимный RW-файл (Wayland-shm) → file_id или -errno.
     memfd_create: *const fn () i64,
+    /// v0.20.0 (CDD №12 p3): ftruncate(id, len) — размер анонимного файла
+    /// (PMM-блок, нули). 0/-errno. Только anon-файлы (memfd).
+    truncate_file: *const fn (id: u32, len: u64) i64,
+    /// v0.20.0 (CDD №12 p3): mmap MAP_SHARED anon-файла — ОБЩИЕ физ-
+    /// страницы (Mesa lavapipe-heap, Wayland-shm). VA или -errno.
+    shared_file_mmap: *const fn (id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64,
+    /// CDD №12 p3: getdents64 — записи linux_dirent64 в user-буфер;
+    /// поток каталога (libdrm opendir("/dev/dri") сканирует узлы).
+    dir_read: *const fn (id: u32, buf_va: u64, count: u64) i64,
+    /// CDD №12 p3: закрытие потока каталога.
+    dir_close: *const fn (id: u32) void,
+    /// CDD №12 p3: парковка ТЕКУЩЕЙ задачи на ms (блокирующий epoll_wait —
+    /// анти-спин потоков композитора). Возврат — по тику/событию.
+    task_park: *const fn (ms: u64) void,
+    /// CDD №12 p3: mkdir в tmpfs (кэш-каталоги Меса: «дир» = слот-имя).
+    mkdir_tmpfs: *const fn (path: []const u8) i64,
 };
 
 // ─── Аргументы syscall (единая структура для dispatch) ─────────────────────
@@ -564,6 +631,15 @@ pub fn sysRead(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64)
             if (r < 0) return @bitCast(r);
             return @intCast(r);
         },
+        // CDD №12 p3: DRM-события (flip-complete/vblank) — read(card0)
+        .dri_card0 => {
+            if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
+            const r = ops.dev_read(e.kind, buf_va, count, e.nonblock);
+            if (r < 0) return @bitCast(r);
+            return @intCast(r);
+        },
+        // каталог: read → EISDIR (Linux-семантика; glibc opendir не читает)
+        .dir => return err(EISDIR),
         .pipe_read, .socket, .eventfd, .timerfd => {
             // канал: FIFO-чтение (pipe/socket), счётчик (eventfd), экспирации
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
@@ -595,6 +671,9 @@ pub fn sysOpenat(ops: LinuxOps, fds: *FdTable, dirfd_i: i64, path_va: u64, flags
             if (resolveDevKind(path)) |kind| {
                 const fd = fds.allocFd(kind, (flags & O_NONBLOCK) != 0);
                 if (fd < 0) return @bitCast(fd);
+                // CDD №12 p3: minor узла — fstat st_rdev (libdrm
+                // drmGetNodeTypeFromFd: renderD128 ↔ card0)
+                fds.entries[@intCast(fd)].file_id = devMinor(path);
                 return @intCast(fd);
             }
             // VFS-файл (initrd-RO / tmpfs-RW — Live-USB overlay)
@@ -620,6 +699,7 @@ pub fn sysClose(ops: LinuxOps, fds: *FdTable, fd_i: i64) u64 {
     switch (e.kind) {
         .initrd_file, .tmpfs_file => ops.release_file(e.file_id),
         .pipe_read, .pipe_write, .eventfd, .socket, .timerfd, .signalfd => ops.channel_unref(e.file_id),
+        .dir => ops.dir_close(e.file_id), // CDD №12 p3: поток каталога
         else => {},
     }
     e.* = .{}; // освобождаем слот fd-таблицы (epoll-наблюдения тоже)
@@ -689,7 +769,15 @@ pub fn sysMmap(ops: LinuxOps, fds: *FdTable, hint: u64, length: u64, prot: u64, 
         // Реализация: анонимные страницы + копия файловых байт (ld.so грузит
         // libc.so сегментами — эмпирика dyn-elf: ENODEV → exit_group(127)).
         .initrd_file, .tmpfs_file => {
-            if (flags & MAP_SHARED != 0) return err(ENOSYS); // RO-файлы: только PRIVATE
+            // CDD №12 p3: MAP_SHARED — только АНОН-файлы (memfd: lavapipe-heap,
+            // wl_shm): общие физ-страницы между маппингами. initrd/heap-tmpfs
+            // (RO/RAM-малые) — честный ENOSYS как раньше.
+            if (flags & MAP_SHARED != 0) {
+                const fixed_va: u64 = if (flags & MAP_FIXED != 0 and hint != 0) hint else 0;
+                const r = ops.shared_file_mmap(e.file_id, off, length, prot, fixed_va);
+                if (r < 0) return @bitCast(r);
+                return @intCast(r);
+            }
             // MAP_FIXED: ld.so ремапит сегменты по base+vaddr поверх спана
             const fixed_va: u64 = if (flags & MAP_FIXED != 0 and hint != 0) hint else 0;
             const r = ops.file_mmap(e.file_id, off, length, prot, fixed_va);
@@ -815,11 +903,14 @@ pub fn sysMunmap(ops: LinuxOps, va: u64, length: u64) u64 {
 
 /// long futex(u32 *uaddr, int op, u32 val, const timespec *timeout, ...)
 pub fn sysFutex(ops: LinuxOps, uaddr: u64, op_in: u64, val: u64, timeout_va: u64) u64 {
-    const op = op_in & ~FUTEX_PRIVATE_FLAG; // приватность — атрибут, не операция
+    // CDD №12 p3: PRIVATE и CLOCK_REALTIME — АТРИБУТЫ (не операции);
+    // BITSET-варианты ≈ обычные WAIT/WAKE (маска uaddr2/val3 — все-биты
+    // в наших сценариях; игнорируем выборочно-битовые ожидания)
+    const op = op_in & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     // Слово фьютекса обязано читаться (WAIT) — валидация ДО разыменования
     if (!ops.validate(uaddr, 4, false)) return err(EFAULT);
     switch (op) {
-        FUTEX_WAIT => {
+        FUTEX_WAIT, FUTEX_WAIT_BITSET => {
             var word_buf: [4]u8 = undefined;
             if (!ops.copy_in(&word_buf, uaddr)) return err(EFAULT);
             const word = std.mem.readInt(u32, &word_buf, .little);
@@ -847,7 +938,7 @@ pub fn sysFutex(ops: LinuxOps, uaddr: u64, op_in: u64, val: u64, timeout_va: u64
             if (r < 0) return @bitCast(r);
             return @intCast(r);
         },
-        FUTEX_WAKE => {
+        FUTEX_WAKE, FUTEX_WAKE_BITSET => {
             const n: u32 = std.math.cast(u32, val) orelse std.math.maxInt(u32);
             return ops.futex_wake(uaddr, n);
         },
@@ -905,6 +996,7 @@ pub fn sysPoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, timeout: i6
             .signalfd => {}, // сигналов нет — не готов
             .initrd_file => rdy = POLLIN, // RO-файл: читаем
             .tmpfs_file => rdy = POLLIN | POLLOUT, // RAM-файл: RW
+            .dir => {}, // каталог: read недоступен (EISDIR) — не готов
             .free => unreachable,
         }
         p.revents = p.events & rdy;
@@ -981,8 +1073,8 @@ pub fn sysEpollCtl(ops: LinuxOps, fds: *FdTable, epfd: i64, op: u64, fd_i: i64, 
 }
 
 /// int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
-pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, maxevents: u64, timeout: i64) u64 {
-    _ = timeout; // v0.19: неблокирующий опрос (см. sysPoll)
+/// (внутренний) одиночный скан готовности + копи-аут — неблокирующий.
+fn epollScanOnce(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, maxevents: u64) u64 {
     const ep = fds.get(epfd) orelse return err(EBADF);
     if (ep.kind != .epoll) return err(EINVAL);
     if (maxevents == 0 or maxevents > MAX_EPOLL_EVENTS) return err(EINVAL);
@@ -1002,11 +1094,17 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
             .initrd_file => rdy = EPOLLIN,
             .tmpfs_file => rdy = EPOLLIN | EPOLLOUT,
             .pipe_read, .timerfd => rdy = ops.channel_ready(e.file_id),
+            .dir => {}, // каталог: не готов (read → EISDIR)
             .pipe_write, .socket, .eventfd => rdy = ops.channel_ready(e.file_id) | EPOLLOUT,
             .signalfd => rdy = 0, // сигналов нет
             .free => unreachable,
         }
-        const combined = w.events & (rdy | EPOLLERR | EPOLLHUP);
+        // CDD №12 p3: HUP/ERR ТОЛЬКО из реальной готовности (channel_ready
+        // вернёт EPOLLHUP когда закрыт peer-конец pipe/socketpair). Раньше
+        // EPOLLHUP вводился в маску БЕЗУСЛОВНО → каждый watch немедленно
+        // «hung up» → gamescope «IWaitable hung up. Aborting.» (мгновенный
+        // abort на старте композитора).
+        const combined = w.events & rdy;
         if (combined != 0) {
             var ev: EpollEvent = .{ .events = combined, .data = w.data };
             @memcpy(ev_buf[n * 12 ..][0..12], std.mem.asBytes(&ev));
@@ -1017,6 +1115,38 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
         if (!ops.copy_out(events_va, ev_buf[0 .. n * 12])) return err(EFAULT);
     }
     return n;
+}
+
+/// epoll_wait: БЛОКИРУЮЩИЙ (CDD №12 p3 — анти-СПИН: эмпирика run8-10 —
+/// 2526 холостых вызовов: потоки gamescope жгли TCG на 100%). timeout=0 —
+/// честный неблокирующий опрос; timeout>0 — до дедлайна; timeout<0 — до
+/// события (парковка слайсами 20мс + перепроверка: готовность приходит от
+/// тика таймера/канала — кооперативная модель диспетчера).
+pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, maxevents: u64, timeout: i64) u64 {
+    if (timeout == 0) return epollScanOnce(ops, fds, epfd, events_va, maxevents);
+    // валидируем буфер ДЛЯ максимального события заранее (EFAULT до парка)
+    {
+        const ep = fds.get(epfd) orelse return err(EBADF);
+        if (ep.kind != .epoll) return err(EINVAL);
+        if (maxevents == 0 or maxevents > MAX_EPOLL_EVENTS) return err(EINVAL);
+        if (!ops.validate(events_va, maxevents * @sizeOf(EpollEvent), true)) return err(EFAULT);
+    }
+    const t0_ns = ops.time_ns();
+    while (true) {
+        const n = epollScanOnce(ops, fds, epfd, events_va, maxevents);
+        if (n != 0) return n;
+        const elapsed_ms: u64 = (ops.time_ns() - t0_ns) / 1_000_000;
+        if (timeout > 0) {
+            const total_ms: u64 = @intCast(timeout);
+            if (elapsed_ms >= total_ms) return 0; // таймаут (честные 0 событий)
+        }
+        // слайс парковки: конечный — не длиннее остатка; бесконечный — 20мс
+        const slice_ms: u64 = if (timeout > 0)
+            @min(@as(u64, @intCast(timeout)) -| elapsed_ms, 20)
+        else
+            20;
+        ops.task_park(slice_ms);
+    }
 }
 
 /// long clone(unsigned long flags, void *stack, int *parent_tid,
@@ -1212,6 +1342,7 @@ pub fn sysClockGettime(ops: LinuxOps, clk: u64, tp_va: u64) u64 {
 /// dyn-elf CDD №11 p3). Устройства/консоль — S_IFCHR-заглушка. 144Б.
 pub const STAT_SIZE: usize = 144;
 const S_IFCHR: u64 = 0x2000;
+const S_IFDIR: u64 = 0x4000; // CDD №12 p3: opendir (fstat S_ISDIR-проверка glibc)
 const S_IFREG: u64 = 0x8000;
 /// v0.20.0 (CDD №11 p3): st_dev VFS-файлов — НЕнулевая константа.
 /// ЭМПИРИКА dyn-elf (glibc dl-load.c:959-1006): ld.so ИДЕНТИФИЦИРУЕТ
@@ -1235,9 +1366,25 @@ pub fn sysFstat(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64) u64 {
         std.mem.writeInt(u64, st[56..64], 4096, .little); // st_blksize
         const blocks = (ops.file_size(e.file_id) + 511) / 512;
         std.mem.writeInt(u64, st[64..72], blocks, .little); // st_blocks
+    } else if (e.kind == .dir) {
+        // CDD №12 p3: opendir → glibc ПРОВЕРЯЕТ S_ISDIR(fstat) — иначе lose!
+        std.mem.writeInt(u64, st[0..8], POLER_VFS_DEV, .little);
+        std.mem.writeInt(u64, st[8..16], 0xD1D0 + @as(u64, e.file_id), .little);
+        std.mem.writeInt(u64, st[16..24], 2, .little); // nlink (dir-конвенция)
+        std.mem.writeInt(u32, st[24..28], @intCast(S_IFDIR | 0x1ED), .little); // dir + 0755
+        std.mem.writeInt(u64, st[48..56], 4096, .little); // st_size (конвенция)
+        std.mem.writeInt(u64, st[56..64], 4096, .little);
     } else {
         // консоль/устройства — симв. устройство
         std.mem.writeInt(u32, st[24..28], @intCast(S_IFCHR | 0x1A0), .little); // chr + 0620
+        // CDD №12 p3: st_rdev — (major<<8)|minor (libdrm drmGetNodeTypeFromFd:
+        // minor ≥ 128 = render-узел; sysfs-путь /sys/dev/char/226:128 тоже)
+        if (e.kind == .dri_card0 or e.kind == .fb0 or
+            e.kind == .input_event0 or e.kind == .input_event1)
+        {
+            const rdev = encodeDev(devMajorOf(e.kind), e.file_id);
+            std.mem.writeInt(u64, st[40..48], rdev, .little); // st_rdev
+        }
         std.mem.writeInt(u64, st[56..64], 4096, .little);
     }
     if (!ops.copy_out(buf_va, &st)) return err(EFAULT);
@@ -1264,6 +1411,102 @@ pub fn sysExit(ops: LinuxOps, code: u64) u64 {
 
 /// выравненного чтения НЕ нужно: std.mem.readInt на байтовых массивах не
 /// требует выравнивания (packed epoll_event.data читается напрямую)
+
+// ─── CDD №12 p3: ftruncate + MAP_SHARED (Mesa/Wayland-shm) ──────────────────
+
+/// ftruncate(fd, len): размер анонимного файла (memfd). Mesa:
+/// os_create_anonymous_file = memfd_create + ftruncate (без него lavapipe
+/// «Failed to create anonymous file for memory allocations»).
+pub fn sysFtruncate(ops: LinuxOps, fds: *FdTable, fd_i: i64, len: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    switch (e.kind) {
+        .tmpfs_file => {
+            const r = ops.truncate_file(e.file_id, len);
+            if (r < 0) return @bitCast(r);
+            return 0;
+        },
+        .initrd_file => return err(EINVAL), // RO
+        else => return err(EINVAL),
+    }
+}
+
+/// getdents64(fd, buf, count): записи linux_dirent64 из потока каталога
+/// (opendir glibc → getdents64; libdrm сканирует /dev/dri — базис
+/// drmGetDeviceFromDevId). Одна запись: {u64 d_ino; s64 d_off; u16 d_reclen;
+/// u8 d_type; char d_name[]}, выравнивание 8. 0 = EOF (glibc readdir).
+pub fn sysGetdents64(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .dir) return err(ENOTDIR);
+    if (count == 0) return 0;
+    if (count > 0x20_0000) return err(EINVAL); // 2МБ — предел здравого смысла
+    if (!ops.validate(buf_va, count, true)) return err(EFAULT);
+    const r = ops.dir_read(e.file_id, buf_va, count);
+    if (r < 0) return @bitCast(r);
+    return @intCast(r);
+}
+
+/// sched_getaffinity(pid, len, mask): маска CPU — glibc sysconf →
+/// NPROCESSORS → размер пула растеризации llvmpipe. Ядровая модель —
+/// 1 CPU (e2e: -smp 1): маска {0x01, 0} (128Б-кап). Возврат = len (как Linux).
+pub fn sysSchedGetaffinity(ops: LinuxOps, pid: u64, len: u64, mask_va: u64) u64 {
+    _ = pid; // маска ТЕКУЩЕГО (pid=0-семантика; чужие неинтересны)
+    if (len == 0 or len > 128) return err(EINVAL);
+    if (!ops.validate(mask_va, len, true)) return err(EFAULT);
+    var mask: [128]u8 = [_]u8{0} ** 128;
+    mask[0] = 1; // CPU 0 доступен
+    if (!ops.copy_out(mask_va, mask[0..@intCast(len)])) return err(EFAULT);
+    return len;
+}
+
+/// sched_setaffinity: принимаем (модель 1-CPU — запись в маску ни на что
+/// не влияет; glibc-pthreads зовут при создании тредов).
+pub fn sysSchedSetaffinity(ops: LinuxOps, pid: u64, len: u64, mask_va: u64) u64 {
+    _ = pid;
+    if (len == 0 or len > 128) return err(EINVAL);
+    if (!ops.validate(mask_va, len, false)) return err(EFAULT);
+    return 0;
+}
+
+/// sysinfo(struct sysinfo*): 112Б x86_64 — totalram/freeram (LLVM/Gallium
+/// оценивают хипы), procs, mem_unit. Ядровая модель: 2ГБ гостя.
+pub fn sysSysinfo(ops: LinuxOps, info_va: u64) u64 {
+    if (!ops.validate(info_va, 112, true)) return err(EFAULT);
+    var si: [112]u8 = [_]u8{0} ** 112;
+    std.mem.writeInt(u64, si[0..8], 100, .little); // uptime (с)
+    // loads[3] (1/5/15-мин средние — масштаб 65536): 0.10/0.05/0.01
+    std.mem.writeInt(u64, si[8..16], 6554, .little);
+    std.mem.writeInt(u64, si[16..24], 3277, .little);
+    std.mem.writeInt(u64, si[24..32], 655, .little);
+    std.mem.writeInt(u64, si[32..40], 2 * 1024 * 1024 * 1024, .little); // totalram
+    std.mem.writeInt(u64, si[40..48], 1 * 1024 * 1024 * 1024, .little); // freeram
+    std.mem.writeInt(u64, si[48..56], 0, .little); // sharedram
+    std.mem.writeInt(u64, si[56..64], 0, .little); // bufferram
+    std.mem.writeInt(u64, si[64..72], 0, .little); // totalswap
+    std.mem.writeInt(u64, si[72..80], 0, .little); // freeswap
+    std.mem.writeInt(u16, si[80..82], 8, .little); // procs
+    std.mem.writeInt(u16, si[82..84], 0, .little); // pad
+    std.mem.writeInt(u64, si[84..92], 0, .little); // totalhigh
+    std.mem.writeInt(u64, si[92..100], 0, .little); // freehigh
+    std.mem.writeInt(u32, si[100..104], 1, .little); // mem_unit (Б)
+    // _f[20-2*u64-u32] — нули (104..112 + хвост)
+    if (!ops.copy_out(info_va, &si)) return err(EFAULT);
+    return 0;
+}
+
+/// mkdir(path, mode): создаём в tmpfs (как open с записью) — кэш-каталоги
+/// Меса (шейдеры) пишутся в /root/.cache/... — Live-модель: RAM.
+pub fn sysMkdir(ops: LinuxOps, path_va: u64, mode: u64) u64 {
+    _ = mode; // права-модель вне фундамента
+    if (ops.validate(path_va, 1, false)) {
+        if (ops.copy_in_str(path_va, 4096)) |path| {
+            // каталог в tmpfs = слот-имя «dir:...» (дети неявно — файлы)
+            const r = ops.mkdir_tmpfs(path);
+            if (r < 0) return @bitCast(r);
+            return 0;
+        }
+    }
+    return err(EFAULT);
+}
 
 // ─── CDD №12 p2: канал-объекты + сигналы + misc-волна ───────────────────────
 
@@ -1592,6 +1835,12 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_timerfd_create => return sysTimerfdCreate(ops, fds, args.a1, args.a2),
         SYS_timerfd_settime => return sysTimerfdSettime(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_memfd_create => return sysMemfdCreate(ops, fds, args.a2),
+        SYS_ftruncate => return sysFtruncate(ops, fds, @bitCast(args.a1), args.a2),
+        SYS_getdents64 => return sysGetdents64(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_sched_getaffinity => return sysSchedGetaffinity(ops, @bitCast(args.a1), args.a2, args.a3),
+        SYS_sched_setaffinity => return sysSchedSetaffinity(ops, @bitCast(args.a1), args.a2, args.a3),
+        SYS_sysinfo => return sysSysinfo(ops, args.a1),
+        SYS_mkdir => return sysMkdir(ops, args.a1, args.a2),
         SYS_rt_sigaction => return sysRtSigaction(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_rt_sigprocmask => return sysRtSigprocmask(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_prctl => return sysPrctl(ops, args.a1, args.a2, args.a3, args.a4, args.a5),
@@ -1652,6 +1901,15 @@ const FakeEnv = struct {
     robust_head: u64 = 0,
     getrandom_calls: u64 = 0,
     execfn: []const u8 = "hello-static",
+    truncate_calls: u64 = 0,
+    last_truncate_len: u64 = 0,
+    shared_mmap_calls: u64 = 0,
+    last_shared_len: u64 = 0,
+    last_shared_prot: u64 = 0,
+    getdents_calls: u64 = 0,
+    last_park_ms: u64 = 0,
+    mkdir_calls: u64 = 0,
+    last_mkdir_path: ?[]const u8 = null,
     file_mmap_calls: u64 = 0,
     last_file_mmap_off: u64 = 0,
     last_file_mmap_len: u64 = 0,
@@ -1834,6 +2092,7 @@ fn fakeFutexWake(uaddr: u64, n: u32) u32 {
 const FakeFile = struct {
     used: bool = false,
     kind: FdKind = .free,
+    anon: bool = false, // CDD №12 p3: memfd (ftruncate/MAP_SHARED)
     name: [64]u8 = .{0} ** 64,
     name_len: usize = 0,
     data: [128]u8 = .{0} ** 128,
@@ -1841,10 +2100,102 @@ const FakeFile = struct {
 };
 var g_files: [4]FakeFile = [_]FakeFile{.{}} ** 4;
 
+// ─── CDD №12 p3: фейк getdents64 (поток каталога) ─────────────────────
+
+const FakeDir = struct {
+    used: bool = false,
+    entries: [6]DirEnt = [_]DirEnt{.{}} ** 6,
+    count: u32 = 0,
+    pos: u32 = 0,
+};
+const DirEnt = struct {
+    name: [24]u8 = .{0} ** 24,
+    name_len: u8 = 0,
+    dtype: u8 = 0,
+};
+var g_dirs: [4]FakeDir = [_]FakeDir{.{}} ** 4;
+
+/// fake-open КАТАЛОГА: /dev/dri (card0, renderD128 — libdrm-скан).
+fn fakeDirOpen(path: []const u8) i64 {
+    if (!std.mem.eql(u8, path, "/dev/dri")) return -ENODEV; // не каталог
+    for (&g_dirs, 0..) |*d, i| {
+        if (!d.used) {
+            d.* = .{ .used = true };
+            pushEnt(d, ".", DT_DIR);
+            pushEnt(d, "..", DT_DIR);
+            pushEnt(d, "card0", DT_CHR);
+            pushEnt(d, "renderD128", DT_CHR);
+            return @intCast(i);
+        }
+    }
+    return -ENFILE;
+}
+
+fn pushEnt(d: *FakeDir, name: []const u8, dtype: u8) void {
+    if (d.count >= d.entries.len or name.len >= 24) return;
+    @memcpy(d.entries[d.count].name[0..name.len], name);
+    d.entries[d.count].name_len = @intCast(name.len);
+    d.entries[d.count].dtype = dtype;
+    d.count += 1;
+}
+
+/// fake getdents64: записи dirent64 в user-буфер (счётчик вызовов в env).
+fn fakeDirRead(id: u32, buf_va: u64, count: u64) i64 {
+    const e = g_env.?;
+    e.getdents_calls += 1;
+    if (id >= g_dirs.len or !g_dirs[id].used) return -EBADF;
+    const d = &g_dirs[id];
+    const mem = e.vaPtr(buf_va).?;
+    var written: u64 = 0;
+    while (d.pos < d.count) {
+        const i: usize = @intCast(d.pos);
+        const nl: u64 = d.entries[i].name_len;
+        const reclen: u64 = 19 + nl + 1;
+        const padded: u64 = (reclen + 7) & ~@as(u64, 7);
+        if (written + padded > count) break;
+        const base: usize = @intCast(written);
+        std.mem.writeInt(u64, mem[base..][0..8], 9000 + i, .little);
+        std.mem.writeInt(u64, mem[base + 8 ..][0..8], @as(u64, i) + 1, .little);
+        std.mem.writeInt(u16, mem[base + 16 ..][0..2], @intCast(padded), .little);
+        mem[base + 18] = d.entries[i].dtype;
+        @memcpy(mem[base + 19 ..][0..@intCast(nl)], d.entries[i].name[0..@intCast(nl)]);
+        written += padded;
+        d.pos += 1;
+    }
+    return @intCast(written);
+}
+
+fn fakeDirClose(id: u32) void {
+    if (id < g_dirs.len) g_dirs[id] = .{};
+}
+
+/// fake-парковка: без сна — немедленный возврат (тест-модель времени).
+fn fakeTaskPark(ms: u64) void {
+    const e = g_env.?;
+    e.park_calls += 1;
+    e.last_park_ms = ms;
+}
+
+/// fake-mkdir: tmpfs-слот (fake-реестр — счётчик вызовов).
+fn fakeMkdirTmpfs(path: []const u8) i64 {
+    const e = g_env.?;
+    e.mkdir_calls += 1;
+    e.last_mkdir_path = path;
+    if (!std.mem.startsWith(u8, path, "/tmp") and !std.mem.startsWith(u8, path, "/root"))
+        return -EPERM;
+    return 0;
+}
+
 fn fakeOpenFile(path: []const u8, flags: u64, out_kind: *FdKind) i64 {
     _ = flags;
     const e = g_env.?;
     e.open_path = path;
+    // CDD №12 p3: КАТАЛОГ первым (как ядро — isDirPath до VFS-резолва)
+    const d = fakeDirOpen(path);
+    if (d >= 0) {
+        out_kind.* = .dir;
+        return d;
+    }
     // повторное открытие → тот же файл (offset-состояние у fd-слоя своё)
     for (&g_files, 0..) |*f, i| {
         if (f.used and std.mem.eql(u8, f.name[0..f.name_len], path)) {
@@ -2092,7 +2443,7 @@ fn fakeMemfdCreate() i64 {
     // fake: файл реестра «memfd»
     for (&g_files, 0..) |*f, i| {
         if (!f.used) {
-            f.* = .{ .used = true, .kind = .tmpfs_file };
+            f.* = .{ .used = true, .kind = .tmpfs_file, .anon = true };
             const name = "/tmp/.memfd"; // путь-имя КАК в openat (фейк-сравнение)
             @memcpy(f.name[0..name.len], name);
             f.name_len = name.len;
@@ -2101,6 +2452,40 @@ fn fakeMemfdCreate() i64 {
         }
     }
     return -ENFILE;
+}
+
+// ─── CDD №12 p3: фейк ftruncate + MAP_SHARED (Mesa lavapipe-контракт) ────
+
+/// ftruncate: размер anon-файла (fake: слот реестра; блок 128Б).
+fn fakeTruncateFile(id: u32, len: u64) i64 {
+    const e = g_env.?;
+    e.truncate_calls += 1;
+    e.last_truncate_len = len;
+    if (id >= g_files.len or !g_files[id].used) return -EBADF;
+    if (!g_files[id].anon) return -EINVAL; // heap-tmpfs/initrd — не растим
+    if (len > 128) return -EFBIG; // fake-блок 128Б (ядро: ANON_FILE_MAX 512МБ)
+    g_files[id].size = @intCast(len);
+    if (len == 0) @memset(g_files[id].data[0..], 0);
+    return 0;
+}
+
+/// mmap MAP_SHARED anon-файла: fake-валидации (ftruncate-обязателен,
+/// off кратен странице, диапазон в блоке) + «размещение» курсором.
+fn fakeSharedFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
+    const e = g_env.?;
+    e.shared_mmap_calls += 1;
+    e.last_shared_len = len;
+    e.last_shared_prot = prot;
+    if (id >= g_files.len or !g_files[id].used) return -EBADF;
+    const f = &g_files[id];
+    if (f.kind != .tmpfs_file or !f.anon) return -ENODEV; // initrd/heap — не разделяем
+    if (f.size == 0) return -ENOMEM; // ftruncate не был вызван
+    if (off % 4096 != 0) return -EINVAL;
+    const blk_len = (f.size + 4095) / 4096 * 4096;
+    if (off >= blk_len) return -EINVAL;
+    if (off + len > blk_len) return -ENOMEM; // хвост за блоком
+    _ = fixed_va;
+    return @intCast(e.mmap_cursor);
 }
 
 fn fakeFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
@@ -2165,6 +2550,12 @@ fn fakeOps() LinuxOps {
         .get_sigaction = fakeGetSigaction,
         .set_sigmask = fakeSetSigmask,
         .memfd_create = fakeMemfdCreate,
+        .truncate_file = fakeTruncateFile,
+        .shared_file_mmap = fakeSharedFileMmap,
+        .dir_read = fakeDirRead,
+        .dir_close = fakeDirClose,
+        .task_park = fakeTaskPark,
+        .mkdir_tmpfs = fakeMkdirTmpfs,
     };
 }
 
@@ -2246,6 +2637,7 @@ fn envSetup() !*FakeEnv {
     @memset(e.mem, 0);
     g_env = e;
     g_files = [_]FakeFile{.{}} ** 4; // чистый реестр файлов на каждый тест
+    g_dirs = [_]FakeDir{.{}} ** 4; // чистые потоки каталогов
     return e;
 }
 fn envTeardown(e: *FakeEnv) void {
@@ -2569,13 +2961,21 @@ test "linux: sys_futex — WAIT сверяет слово, WAKE проходит
     // futex-слово = 5 в user
     const fva = putU32(e, 0x10, 5);
 
-    // WAIT с ожидаемым 5 → паркинг (тест-модель: разбудили → 0)
+    // CDD №12 p3: BITSET+CLOCK_REALTIME-варианты — атрибуты, не операции
+    // (эмпирика run8: op 0x189 → EINVAL → pthread-потоки SPIN-или)
+    try testing.expectEqual(@as(u64, 0),
+        sysFutex(ops, fva, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME, 5, 0));
+    try testing.expectEqual(@as(u64, 2), sysFutex(ops, fva, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 3, 0));
+    try testing.expectEqual(@as(u32, 3), e.last_wake_n);
+
+    // WAIT с ожидаемым 5 → паркинг (тест-модель: разбудили → 0);
+    // park_calls=2: один уже сделан BITSET-WAIT'ом выше
     try testing.expectEqual(@as(u64, 0), sysFutex(ops, fva, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 5, 0));
-    try testing.expectEqual(@as(u64, 1), e.park_calls);
+    try testing.expectEqual(@as(u64, 2), e.park_calls);
 
     // WAIT с ожидаемым 4 (слово=5): значение изменилось → -EAGAIN
     try testing.expectEqual(err(EAGAIN), sysFutex(ops, fva, FUTEX_WAIT, 4, 0));
-    try testing.expectEqual(@as(u64, 1), e.park_calls); // не доехал до паркинга
+    try testing.expectEqual(@as(u64, 2), e.park_calls); // не доехал до паркинга
 
     // WAKE 3 → до 2 разбуженных
     try testing.expectEqual(@as(u64, 2), sysFutex(ops, fva, FUTEX_WAKE, 3, 0));
@@ -3121,7 +3521,7 @@ test "linux: newfstatat — stat-раскладка 144Б: S_IFREG/st_size/st_bl
     try testing.expectEqual(@as(u64, 3), g_env.?.stat_calls);
 }
 
-test "linux: mmap file-backed (MAP_PRIVATE) — initrd-файл; MAP_SHARED → ENOSYS" {
+test "linux: mmap file-backed (MAP_PRIVATE) — initrd-файл; MAP_SHARED (non-anon) → ENODEV" {
     const e = try envSetup();
     defer envTeardown(e);
     var fds = FdTable.init();
@@ -3143,7 +3543,8 @@ test "linux: mmap file-backed (MAP_PRIVATE) — initrd-файл; MAP_SHARED → 
     try testing.expectEqual(PROT_READ, e.last_file_mmap_prot);
 
     // MAP_SHARED на RO-файле → ENOSYS (осознанно: только приватные копии)
-    try testing.expectEqual(err(ENOSYS), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_SHARED, 3, 0));
+    // CDD №12 p3: initrd не разделяем — ENODEV (было ENOSYS до memfd-волны)
+    try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_SHARED, 3, 0));
     // event-fd по-прежнему ENODEV
     try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_PRIVATE, 0, 0));
 
@@ -3461,6 +3862,119 @@ test "linux: timerfd — create/arm/read-цикл; memfd — anon RW-файл" {
     try testing.expectEqualStrings("SHM-DATA", rb[0..8]);
 }
 
+test "linux: ftruncate + MAP_SHARED — контракт Mesa lavapipe (memfd-хип)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    // 1. memfd → ftruncate(128) → блок выделен (os_create_anonymous_file)
+    const mfd = sysMemfdCreate(ops, &fds, 0);
+    try testing.expectEqual(@as(u64, 3), mfd);
+    try testing.expectEqual(@as(u64, 0), sysFtruncate(ops, &fds, 3, 128));
+
+    // 2. mmap MAP_SHARED — ОБЩИЕ страницы (lavapipe-heap / wl_shm-буферы)
+    const va = sysMmap(ops, &fds, 0, 128, PROT_READ | PROT_WRITE, MAP_SHARED, 3, 0);
+    try testing.expectEqual(@as(u64, FakeEnv.USER_BASE + FakeEnv.USER_LEN), va);
+    try testing.expectEqual(@as(u64, 1), e.shared_mmap_calls);
+    try testing.expectEqual(@as(u64, 128), e.last_shared_len);
+    try testing.expectEqual(PROT_READ | PROT_WRITE, e.last_shared_prot);
+
+    // 3. края: БЕЗ ftruncate → ENOMEM; off не кратен странице → EINVAL;
+    //    хвост за блоком → ENOMEM
+    const mfd2 = sysMemfdCreate(ops, &fds, 0); // fd 4 — нет ftruncate
+    try testing.expectEqual(@as(u64, 4), mfd2);
+    try testing.expectEqual(err(ENOMEM), sysMmap(ops, &fds, 0, 128, PROT_READ | PROT_WRITE, MAP_SHARED, 4, 0));
+    try testing.expectEqual(err(EINVAL), sysMmap(ops, &fds, 0, 64, PROT_READ | PROT_WRITE, MAP_SHARED, 3, 1));
+    try testing.expectEqual(err(ENOMEM), sysMmap(ops, &fds, 0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, 3, 0));
+
+    // 4. initrd (RO) — не truncate-ится и не разделяется (ENODEV);
+    //    дырявый fd → EBADF; сверх-блока → EFBIG
+    const p_host = putStr(e, 0x20, "/etc/hostname");
+    const hfd = sysOpenat(ops, &fds, AT_FDCWD, p_host, 0, 0);
+    try testing.expect(hfd >= 0);
+    try testing.expectEqual(err(EINVAL), sysFtruncate(ops, &fds, @intCast(hfd), 8));
+    try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 8, PROT_READ, MAP_SHARED, @intCast(hfd), 0));
+    try testing.expectEqual(err(EBADF), sysFtruncate(ops, &fds, 42, 8));
+    try testing.expectEqual(err(EFBIG), sysFtruncate(ops, &fds, 3, 1 << 20));
+
+    // 5. якорь номера: ftruncate = 77 (НЕ 46 — это i386-номер!); dispatch-
+    //    маршрутизация; ftruncate(0) — размер снят → повторный shared-мап ENOMEM
+    try testing.expectEqual(@as(u64, 77), SYS_ftruncate);
+    try testing.expectEqual(@as(u64, 0), dispatch(ops, &fds, SYS_ftruncate, .{ .a1 = 3, .a2 = 0 }));
+    try testing.expectEqual(err(ENOMEM), sysMmap(ops, &fds, 0, 128, PROT_READ | PROT_WRITE, MAP_SHARED, 3, 0));
+
+    // 6. close memfd → реестр освобождён (физблок — в ядре; fake: слот)
+    try testing.expectEqual(@as(u64, 0), sysClose(ops, &fds, 4));
+    try testing.expectEqual(err(EBADF), sysFtruncate(ops, &fds, 4, 8));
+}
+
+test "linux: getdents64 — opendir /dev/dri (libdrm-скан drmGetDeviceFromDevId)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    // 1. open("/dev/dri") → dir-fd (fake: поток каталога)
+    const p = putStr(e, 0x20, "/dev/dri");
+    const fd = sysOpenat(ops, &fds, AT_FDCWD, p, 0, 0);
+    try testing.expectEqual(@as(u64, 3), fd);
+    try testing.expectEqual(FdKind.dir, fds.entries[3].kind);
+
+    // 2. fstat dir-fd: S_ISDIR (glibc opendir ПРОВЕРЯЕТ — иначе lose!)
+    const st_va = FakeEnv.USER_BASE + 0x400;
+    try testing.expectEqual(@as(u64, 0), sysFstat(ops, &fds, 3, st_va));
+    const stp = e.vaPtr(st_va).?;
+    const mode = std.mem.readInt(u32, stp[24..28], .little);
+    try testing.expectEqual(@as(u32, 0x4000 | 0x1ED), mode); // S_IFDIR|0755
+    try testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, stp[16..24], .little)); // nlink
+
+    // 3. getdents64: все 4 записи (".", "..", card0, renderD128)
+    const buf_va = FakeEnv.USER_BASE + 0x500;
+    const n = sysGetdents64(ops, &fds, 3, buf_va, 4096);
+    try testing.expect(n > 0);
+    var off: usize = 0;
+    var names: [8][]const u8 = undefined;
+    var dts: [8]u8 = .{0} ** 8;
+    var nrec: usize = 0;
+    while (off < @as(usize, @intCast(n))) {
+        const base = e.vaPtr(buf_va).? + off;
+        const reclen = std.mem.readInt(u16, base[16..18], .little);
+        try testing.expect(reclen >= 24 and reclen % 8 == 0); // валидная запись
+        names[nrec] = base[19..][0..@intCast(std.mem.indexOfScalar(u8, base[19..@intCast(off + reclen)], 0) orelse 0)];
+        dts[nrec] = base[18];
+        nrec += 1;
+        off += reclen;
+    }
+    try testing.expectEqual(@as(usize, 4), nrec);
+    try testing.expectEqualStrings("card0", names[2]);
+    try testing.expectEqualStrings("renderD128", names[3]);
+    try testing.expectEqual(DT_CHR, dts[2]);
+    try testing.expectEqual(DT_CHR, dts[3]);
+    try testing.expectEqual(DT_DIR, dts[0]); // "."
+    try testing.expectEqual(@as(u64, 1), e.getdents_calls);
+
+    // 4. EOF: повторный вызов → 0 (glibc readdir завершает цикл)
+    try testing.expectEqual(@as(u64, 0), sysGetdents64(ops, &fds, 3, buf_va, 4096));
+
+    // 5. края: не-dir fd → ENOTDIR; дырявый → EBADF; count=0 → 0
+    try testing.expectEqual(err(ENOTDIR), sysGetdents64(ops, &fds, 0, buf_va, 64));
+    try testing.expectEqual(err(EBADF), sysGetdents64(ops, &fds, 42, buf_va, 64));
+    try testing.expectEqual(@as(u64, 0), sysGetdents64(ops, &fds, 3, buf_va, 0));
+
+    // 6. read на каталоге → EISDIR; close освобождает поток
+    try testing.expectEqual(err(EISDIR), sysRead(ops, &fds, 3, buf_va, 8));
+    try testing.expectEqual(@as(u64, 0), sysClose(ops, &fds, 3));
+
+    // 7. якорь номера: getdents64 = 217 (220 — старый getdents без d_type);
+    //    dev-номера: libdrm-контракт makedev(226, 128)
+    try testing.expectEqual(@as(u64, 217), SYS_getdents64);
+    try testing.expectEqual(@as(u32, 128), devMinor("/dev/dri/renderD128"));
+    try testing.expectEqual(@as(u32, 0), devMinor("/dev/dri/card0"));
+    try testing.expectEqual(@as(u64, (226 << 8) | 128), encodeDev(DRM_MAJOR, 128));
+    try testing.expectEqual(@as(u64, 226), devMajorOf(.dri_card0));
+}
+
 test "linux: ppoll/epoll_pwait — маршрутизация dispatch (якоря номеров)" {
     // сверка номеров с arch/x86/entry/syscalls/syscall_64.tbl
     try testing.expectEqual(@as(u64, 293), SYS_pipe2);
@@ -3479,4 +3993,47 @@ test "linux: ppoll/epoll_pwait — маршрутизация dispatch (якор
     try testing.expectEqual(@as(u64, 53), SYS_socketpair);
     try testing.expectEqual(@as(u64, 319), SYS_memfd_create);
     try testing.expectEqual(@as(u64, 334), SYS_rseq);
+}
+
+test "linux: p3 — sched_getaffinity/sysinfo/mkdir (CPU-маска llvmpipe)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+
+    // 1. sched_getaffinity: маска CPU0 (ядро — 1 CPU), len копируется
+    const mask_va = FakeEnv.USER_BASE + 0x600;
+    try testing.expectEqual(@as(u64, 128), sysSchedGetaffinity(ops, 0, 128, mask_va));
+    const mp = e.vaPtr(mask_va).?;
+    try testing.expectEqual(@as(u8, 1), mp[0]); // CPU 0
+    try testing.expectEqual(@as(u8, 0), mp[1]);
+    // края: len=0 → EINVAL; len>128 → EINVAL; мусорный указ → EFAULT
+    try testing.expectEqual(err(EINVAL), sysSchedGetaffinity(ops, 0, 0, mask_va));
+    try testing.expectEqual(err(EINVAL), sysSchedGetaffinity(ops, 0, 256, mask_va));
+    try testing.expectEqual(err(EFAULT), sysSchedGetaffinity(ops, 0, 8, 0x0));
+
+    // 2. sched_setaffinity: 0 (принято); валидация маски
+    try testing.expectEqual(@as(u64, 0), sysSchedSetaffinity(ops, 0, 8, mask_va));
+    try testing.expectEqual(err(EFAULT), sysSchedSetaffinity(ops, 0, 8, 0x0));
+
+    // 3. sysinfo: 112Б, totalram 2ГБ, mem_unit=1
+    const si_va = FakeEnv.USER_BASE + 0x700;
+    try testing.expectEqual(@as(u64, 0), sysSysinfo(ops, si_va));
+    const sp = e.vaPtr(si_va).?;
+    try testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), std.mem.readInt(u64, sp[32..40], .little));
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, sp[100..104], .little));
+    try testing.expectEqual(err(EFAULT), sysSysinfo(ops, 0x0));
+
+    // 4. mkdir: RAM-пути принимаются, /usr — EPERM; мусорный VA → EFAULT
+    const p_cache = putStr(e, 0x20, "/root/.cache/mesa_shader_cache");
+    try testing.expectEqual(@as(u64, 0), sysMkdir(ops, p_cache, 0o755));
+    try testing.expectEqual(@as(u64, 1), e.mkdir_calls);
+    const p_usr = putStr(e, 0x120, "/usr/share/gamescope");
+    try testing.expectEqual(err(EPERM), sysMkdir(ops, p_usr, 0o755));
+    try testing.expectEqual(err(EFAULT), sysMkdir(ops, 0x0, 0o755));
+
+    // 5. якоря: 203/204/99/83
+    try testing.expectEqual(@as(u64, 203), SYS_sched_getaffinity);
+    try testing.expectEqual(@as(u64, 204), SYS_sched_setaffinity);
+    try testing.expectEqual(@as(u64, 99), SYS_sysinfo);
+    try testing.expectEqual(@as(u64, 83), SYS_mkdir);
 }

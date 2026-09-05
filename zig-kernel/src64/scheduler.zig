@@ -393,7 +393,14 @@ pub fn createTask(entry_point: u64) !usize {
 ///
 /// IRETQ restores CS with RPL=3 → switches back to Ring 3.
 /// sysretq returns with CS = STAR[63:48]+16 | RPL3 = 0x23, SS = STAR[63:48]+8 | RPL3 = 0x1B.
-pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
+/// v0.20.0 (CDD №12 p3 — КРИТИЧЕСКИЙ ФИКС ГОНКИ): abi задаётся ПАРАМЕТРОМ
+/// и пишется ДО state=.Ready. ЭМПИРИКА drm-gamescope-run7: createUserTask
+/// возвращал задачу с abi=.win32 (default), вызывающий ставил .linux ПОСЛЕ
+/// возврата — тик-прерывание в ЭТОМ окне переключался на задачу, ld.so
+/// шлёт syscall №262 → hal-маршрутизация ownerAbiIsLinux() = FALSE →
+/// легаси-свитч «[SYSCALL] Unknown syscall: 262» → все вызовы -1 → #GP
+/// (вектор 0xD, ld.so+0xF52F). КЛАССИЧЕСКАЯ гонка создания.
+pub fn createUserTaskAbi(entry_point: u64, user_cr3: u64, user_stack: u64, abi: TaskAbi) !usize {
     if (task_count >= MAX_TASKS) return error.OutOfTasks;
 
     const id = task_count;
@@ -401,6 +408,7 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
 
     const task = &tasks[id];
     task.id = id;
+    task.abi = abi; // АБИ ДО ДОСТУПНОСТИ планировщику (state ниже!)
     task.state = .Ready;
     task.privilege = .User;
     task.cr3 = user_cr3; // Per-process page tables!

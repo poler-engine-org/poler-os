@@ -283,6 +283,89 @@ pub const DRM_IOCTL_MODE_SETCRTC: u32 = iowr(ModeCrtc, DRM_IOCTL_BASE, 0xA2);
 pub const DRM_IOCTL_MODE_GETENCODER: u32 = iowr(GetEncoder, DRM_IOCTL_BASE, 0xA6);
 pub const DRM_IOCTL_MODE_GETCONNECTOR: u32 = iowr(GetConnector, DRM_IOCTL_BASE, 0xA7);
 pub const DRM_IOCTL_MODE_ADDFB: u32 = iow(FbCmd, DRM_IOCTL_BASE, 0xAE);
+/// CDD №12 p3: ADDFB2 (0xC06864B8 — IOWR, 104Б) — modern libdrm
+/// (drmModeAddFB2/WithModifiers; gamescope 3.16 legacy-путь)
+pub const DRM_IOCTL_MODE_ADDFB2: u32 = iowr(FbCmd2, DRM_IOCTL_BASE, 0xB8);
+/// RMFB (0xC00464AF — IOWR, 4Б): fb_id
+pub const DRM_IOCTL_MODE_RMFB: u32 = iowr(DrmU32, DRM_IOCTL_BASE, 0xAF);
+/// SET_VERSION (0xC0106407 — IOWR, 16Б): libdrm drmGetBusid/drmSetVersion
+pub const DRM_IOCTL_SET_VERSION: u32 = iowr(DrmSetVersion, DRM_IOCTL_BASE, 0x07);
+/// OBJ_GETPROPERTIES (0xC02064B9 — IOWR, 32Б): gamescope шуршит свойствами
+/// коннектора (DPMS/vrr) — отдаём ПУСТОЙ список (count=0)
+pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = iowr(ObjGetProps, DRM_IOCTL_BASE, 0xB9);
+/// GETPROPBLOB (0xC01064AC — IOWR, 16Б): blob по id — ENOENT (свойств нет)
+pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = iowr(GetPropBlob, DRM_IOCTL_BASE, 0xAC);
+
+// ─── CDD №12 p3: DRM-события (vblank/flip-complete через read(card0)) ─────
+
+/// struct drm_event { __u32 type; __u32 length; }
+pub const DRM_EVENT_VBLANK: u32 = 0x06;
+pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x08;
+/// DRM_MODE_PAGE_FLIP_EVENT (u32-флаг page_flip-запроса)
+pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x1;
+
+/// struct drm_event_vblank (32Б): read(card0) возвращает ЗАПИСИ этого вида;
+/// libdrm drmHandleEvent диспатчит по type/length (page_flip_handler).
+pub const DrmEventVblank = extern struct {
+    typ: u32 = DRM_EVENT_FLIP_COMPLETE,
+    length: u32 = 32,
+    user_data: u64 = 0,
+    tv_sec: u32 = 0,
+    tv_usec: u32 = 0,
+    sequence: u32 = 0,
+    reserved: u32 = 0,
+};
+
+/// struct drm_mode_fb_cmd2 (104Б) — ADDFB2 (плоскостной формат).
+/// Single-plane XR24/AR24: handles[0]/pitches[0]/offsets[0]; modifier[4]
+/// выровнен на 8 (extern struct — как C).
+pub const FbCmd2 = extern struct {
+    fb_id: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pixel_format: u32 = 0, // fourcc: 'XR24'=0x34325258 / 'AR24'=0x34325241
+    flags: u32 = 0, // DRM_MODE_FB_MODIFIERS — игнорируем (нет модификаторов)
+    handles: [4]u32 = .{0} ** 4,
+    pitches: [4]u32 = .{0} ** 4,
+    offsets: [4]u32 = .{0} ** 4,
+    modifier: [4]u64 = .{0} ** 4,
+};
+
+/// struct drm_set_version (16Б): версии DRM/driver (libdrm-хендшейк)
+pub const DrmSetVersion = extern struct {
+    drm_di_major: i32 = 0,
+    drm_di_minor: i32 = 0,
+    drm_dd_major: i32 = 0,
+    drm_dd_minor: i32 = 0,
+};
+
+/// struct drm_mode_obj_get_properties (32Б): obj_id/obj_type + массивы
+/// prop_id/prop_values (счётчики in/out). Пустой список = count=0.
+pub const ObjGetProps = extern struct {
+    props_ptr: u64 = 0,
+    prop_values_ptr: u64 = 0,
+    count_props: u32 = 0,
+    obj_id: u32 = 0,
+    obj_type: u32 = 0,
+    pad: u32 = 0,
+};
+
+/// struct drm_mode_get_blob (16Б): {blob_id, length, data(u64)}
+pub const GetPropBlob = extern struct {
+    blob_id: u32 = 0,
+    length: u32 = 0,
+    data: u64 = 0,
+};
+
+/// IOWR(u32) обёртка для RMFB (4Б — без отдельной структуры).
+pub const DrmU32 = extern struct { val: u32 = 0 };
+
+/// DRM_CLIENT_CAP_UNIVERSAL_PLANES (id 3) — отклоняем: плоскостей нет,
+/// gamescope останется на legacy CRTC/connector-пути
+pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 3;
+/// DRM_CLIENT_CAP_ATOMIC (id 5) — отклоняем: атомарного режима нет
+pub const DRM_CLIENT_CAP_ATOMIC: u64 = 5;
+
 pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = iow(PageFlip, DRM_IOCTL_BASE, 0xB0);
 pub const DRM_IOCTL_MODE_CREATE_DUMB: u32 = iowr(CreateDumb, DRM_IOCTL_BASE, 0xB2);
 pub const DRM_IOCTL_MODE_MAP_DUMB: u32 = iowr(MapDumb, DRM_IOCTL_BASE, 0xB3);
@@ -406,6 +489,9 @@ pub const FbReg = struct {
 
 pub const MAX_DUMB: usize = 8;
 pub const MAX_FBS: usize = 8;
+/// CDD №12 p3: ёмкость кольца событий (переполнение — свежие
+/// затирают старые; 16 флипов в очереди — более чем достаточно)
+pub const MAX_DRM_EVENTS: usize = 16;
 
 /// Служебные object-id (libdrm ожидает ненулевые уникальные).
 const CRTC_ID: u32 = 33;
@@ -429,6 +515,11 @@ pub const DrmState = struct {
     flips: u32 = 0, // счётчик page-flip'ов (E2E-наблюдаемо)
     width_mm: u32 = 300,
     height_mm: u32 = 200,
+    // CDD №12 p3: кольцо DRM-событий (flip-complete после каждого
+    // PAGE_FLIP|EVENT; read(card0) выдаёт записи drm_event_vblank)
+    events: [MAX_DRM_EVENTS]DrmEventVblank = [_]DrmEventVblank{.{}} ** MAX_DRM_EVENTS,
+    ev_head: u32 = 0, // индекс чтения
+    ev_tail: u32 = 0, // индекс записи (head==tail → пусто)
 };
 
 /// Активировать DRM в режиме линейного фреймбуфера (скан-аут задан
@@ -515,13 +606,18 @@ pub fn drmIoctl(st: *DrmState, ops: DrmOps, cmd: u32, arg: u64) i64 {
         },
         DRM_IOCTL_GET_CAP => return ioGetCap(ops, arg),
         DRM_IOCTL_SET_CLIENT_CAP => return ioSetClientCap(ops, arg),
+        DRM_IOCTL_SET_VERSION => return ioSetVersion(ops, arg),
         DRM_IOCTL_SET_MASTER, DRM_IOCTL_DROP_MASTER => return 0,
         DRM_IOCTL_MODE_GETRESOURCES => return ioGetResources(st, ops, arg),
         DRM_IOCTL_MODE_GETCRTC => return ioGetCrtc(st, ops, arg),
         DRM_IOCTL_MODE_SETCRTC => return ioSetCrtc(st, ops, arg),
         DRM_IOCTL_MODE_GETENCODER => return ioGetEncoder(st, ops, arg),
         DRM_IOCTL_MODE_GETCONNECTOR => return ioGetConnector(st, ops, arg),
+        DRM_IOCTL_MODE_OBJ_GETPROPERTIES => return ioObjGetProps(st, ops, arg),
+        DRM_IOCTL_MODE_GETPROPBLOB => return ioGetPropBlob(st, ops, arg),
         DRM_IOCTL_MODE_ADDFB => return ioAddFb(st, ops, arg),
+        DRM_IOCTL_MODE_ADDFB2 => return ioAddFb2(st, ops, arg),
+        DRM_IOCTL_MODE_RMFB => return ioRmFb(st, ops, arg),
         DRM_IOCTL_MODE_PAGE_FLIP => return ioPageFlip(st, ops, arg),
         DRM_IOCTL_MODE_CREATE_DUMB => return ioCreateDumb(st, ops, arg),
         DRM_IOCTL_MODE_MAP_DUMB => return ioMapDumb(st, ops, arg),
@@ -580,8 +676,12 @@ fn ioGetCap(ops: DrmOps, arg: u64) i64 {
 fn ioSetClientCap(ops: DrmOps, arg: u64) i64 {
     var c: DrmSetClientCap = undefined;
     if (!ops.copy_in(std.mem.asBytes(&c), arg)) return -linux.EFAULT;
-    // клиентские капсы не влияют на dumb-KMS: принимаем (atomic? нет —
-    // Universal planes? нет) — честная заглушка «принято, не активно».
+    // CDD №12 p3: ATOMIC (5) и UNIVERSAL_PLANES (3) — отклоняем: атомарного
+    // режима и плоскостей НЕТ; gamescope останавливается на legacy-пути
+    // (CRTC/connector/ADDFB2/PAGE_FLIP) — это и есть наш контракт.
+    // Остальные капсы (стерео-3D и пр.) — «принято, не активно».
+    if (c.capability == DRM_CLIENT_CAP_UNIVERSAL_PLANES or
+        c.capability == DRM_CLIENT_CAP_ATOMIC) return -linux.EINVAL;
     return 0;
 }
 
@@ -740,12 +840,149 @@ fn ioPageFlip(st: *DrmState, ops: DrmOps, arg: u64) i64 {
     // Linux drm_mode_page_flip: crtc-lookup неудача → -ENOENT
     if (p.crtc_id != CRTC_ID) return -linux.ENOENT;
     if (findFb(st, p.fb_id) == null) return -linux.ENOENT;
+    // CDD №12 p3: известные флаги — только EVENT; ASYNC и мусор → EINVAL
+    // (Linux тоже EINVAL на неизвестных флагах)
+    if (p.flags & ~DRM_MODE_PAGE_FLIP_EVENT != 0) return -linux.EINVAL;
     // Асинхронные флипы (DRM_MODE_PAGE_FLIP_ASYNC) и vblank-event'ы
-    // (DRM_EVENT_PAGE_FLIP в drmHandleEvent) — вне фундамента v0.19:
-    // флип применяется немедленно, счётчик для E2E.
+    // (DRM_EVENT_PAGE_FLIP в drmHandleEvent) — v0.20.0: флип применяется
+    // немедленно, при флаге EVENT — квантуем flip-complete в кольцо событий.
     st.crtc_fb_id = p.fb_id;
     st.flips += 1;
+    if (p.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
+        pushEvent(st, p.user_data, st.flips);
     return 0;
+}
+
+// ─── CDD №12 p3: DRM-события (flip-complete через read(card0)) ─────────────
+
+/// Записать событие в кольцо (переполнение — затираем старейшее).
+/// Виртуальные vblank-таймстемпы: sequence * 16667 мкс ≈ 60 Гц —
+// реалистичный каркас для drmHandleEvent/gamescope-пейсинга.
+pub fn pushEvent(st: *DrmState, user_data: u64, sequence: u32) void {
+    st.events[st.ev_tail % MAX_DRM_EVENTS] = .{
+        .typ = DRM_EVENT_FLIP_COMPLETE,
+        .length = @sizeOf(DrmEventVblank),
+        .user_data = user_data,
+        .tv_sec = (sequence * 16667) / 1_000_000,
+        .tv_usec = (sequence * 16667) % 1_000_000,
+        .sequence = sequence,
+    };
+    st.ev_tail +%= 1;
+    if (st.ev_tail - st.ev_head > @as(u32, MAX_DRM_EVENTS))
+        st.ev_head = st.ev_tail - @as(u32, MAX_DRM_EVENTS);
+}
+
+/// Есть ли события (poll/epoll-готовность card0: EPOLLIN).
+pub fn eventsPending(st: *DrmState) u32 {
+    return if (st.ev_tail != st.ev_head) 1 else 0;
+}
+
+/// read(card0): выдаём ЦЕЛЫЕ записи drm_event_vblank (по одной на вызов —
+// буфер libdrm drmHandleEvent ровно 1024Б; возвращает байты или -EAGAIN).
+// Буфер — user-VA (запись валидирована слоем syscall).
+pub fn readEvents(st: *DrmState, buf: []u8) i64 {
+    if (buf.len < @sizeOf(DrmEventVblank)) return -linux.EINVAL; // drm_event не влезает
+    if (st.ev_tail == st.ev_head) return -linux.EAGAIN; // очередь пуста
+    const ev = st.events[st.ev_head % MAX_DRM_EVENTS];
+    st.ev_head +%= 1;
+    @memcpy(buf[0..@sizeOf(DrmEventVblank)], std.mem.asBytes(&ev));
+    return @sizeOf(DrmEventVblank);
+}
+
+// ─── CDD №12 p3: ADDFB2 + RMFB + SET_VERSION + OBJ_GETPROPERTIES ──────────
+
+/// DRM_IOCTL_MODE_ADDFB2: плоскостная регистрация fb. Поддерживаем
+/// single-plane XRGB8888 ('XR24')/ARGB8888 ('AR24') — dumb-буфер с
+/// совпадающими метриками. Multi-plane/YUV — EINVAL (бэклог).
+fn ioAddFb2(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var f: FbCmd2 = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&f), arg)) return -linux.EFAULT;
+    // fourcc: little-endian u32 из 4 символов: 'X','R','2','4' → 0x34325258
+    const fourcc_xr24: u32 = 0x3432_5258;
+    const fourcc_ar24: u32 = 0x3432_5241;
+    if (f.pixel_format != fourcc_xr24 and f.pixel_format != fourcc_ar24)
+        return -linux.EINVAL; // YUV/мультиплоскостные форматы — бэклог
+    if (f.handles[0] == 0) return -linux.EINVAL;
+    for (f.handles[1..]) |h| {
+        if (h != 0) return -linux.EINVAL; // multi-plane — бэклог
+    }
+    if (f.offsets[0] != 0) return -linux.EINVAL; // смещённые плоскости — бэклог
+    const b = findDumb(st, f.handles[0]) orelse return -linux.EINVAL; // GEM-handle нет
+    if (f.width != b.width or f.height != b.height or f.pitches[0] != b.pitch)
+        return -linux.EINVAL; // рассинхрон метрик с буфером
+
+    var slot: ?*FbReg = null;
+    for (&st.fbs) |*r| {
+        if (!r.used) {
+            slot = r;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+
+    slot.?.used = true;
+    slot.?.fb_id = st.next_fb_id;
+    st.next_fb_id +%= 1;
+    slot.?.handle = b.handle;
+    slot.?.width = b.width;
+    slot.?.height = b.height;
+    slot.?.pitch = b.pitch;
+    slot.?.bpp = b.bpp;
+    slot.?.depth = if (f.pixel_format == fourcc_ar24) 32 else 24; // XR24: 24 полезных
+
+    f.fb_id = slot.?.fb_id;
+    if (!ops.copy_out(arg, std.mem.asBytes(&f))) return -linux.EFAULT;
+    return 0;
+}
+
+/// RMFB: снятие fb (gamescope пересоздаёт буферы при ресайзе). Чужой id →
+/// ENOENT (Linux-семантика).
+fn ioRmFb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var f: DrmU32 = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&f), arg)) return -linux.EFAULT;
+    const r = findFb(st, f.val) orelse return -linux.ENOENT;
+    r.used = false;
+    if (st.crtc_fb_id == f.val) st.crtc_fb_id = 0; // скан-аут потерял fb
+    return 0;
+}
+
+/// SET_VERSION: libdrm-хендшейк (drmGetBusid/drmSetInterfaceVersion).
+/// Отдаём нашу версию интерфейса, драйвер — как передал клиент.
+fn ioSetVersion(ops: DrmOps, arg: u64) i64 {
+    var v: DrmSetVersion = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&v), arg)) return -linux.EFAULT;
+    // DRM интерфейс: 1.19 (drm-di), драйвер: как просили — 1.19
+    v.drm_di_major = 1;
+    v.drm_di_minor = 19;
+    v.drm_dd_major = 1;
+    v.drm_dd_minor = 19;
+    if (!ops.copy_out(arg, std.mem.asBytes(&v))) return -linux.EFAULT;
+    return 0;
+}
+
+/// OBJ_GETPROPERTIES: свойства объекта (connector: DPMS/vrr_capable…).
+/// КОНТРАКТ: список ПУСТ (count=0) — gamescope шуршит свойствами для
+/// признаков (VRR/nondesktop), нулевой список = «нет признаков».
+fn ioObjGetProps(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    _ = st;
+    var p: ObjGetProps = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&p), arg)) return -linux.EFAULT;
+    // obj_id должен быть валиден (connector/crtc/encoder); неизвестный →
+    // ENOENT — libdrm передаёт errno, gamescope обрабатывает NULL
+    if (p.obj_id != CRTC_ID and p.obj_id != ENCODER_ID and p.obj_id != CONNECTOR_ID)
+        return -linux.ENOENT;
+    p.count_props = 0; // пустой список (массивы не трогаем)
+    if (!ops.copy_out(arg, std.mem.asBytes(&p))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPROPBLOB: blob-свойств нет → ENOENT (вызывается только если список
+/// свойств непуст — у нас пуст, defensively честный отказ).
+fn ioGetPropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    _ = st;
+    _ = ops;
+    _ = arg;
+    return -linux.ENOENT;
 }
 
 fn ioCreateDumb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
@@ -1322,6 +1559,148 @@ test "drm: ADDFB/FLIP с мусорными handle/fb → -EINVAL/-ENOENT" {
     var m: MapDumb = .{ .handle = 0 };
     @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&m));
     try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_MAP_DUMB, va));
+}
+
+// ─── CDD №12 p3: ADDFB2 + SET_CLIENT_CAP-гейт + события + misc-волна ───────
+
+test "drm: p3 — ADDFB2 (XR24/AR24) + client-cap гейт + flip-события" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+
+    // 0. сверка ioctl-НОМЕРОВ с include/uapi/drm/drm.h (x86_64, gcc-размеры)
+    try testing.expectEqual(@as(u32, 0xC068_64B8), DRM_IOCTL_MODE_ADDFB2);
+    try testing.expectEqual(@as(u32, 0xC004_64AF), DRM_IOCTL_MODE_RMFB);
+    try testing.expectEqual(@as(u32, 0xC010_6407), DRM_IOCTL_SET_VERSION);
+    try testing.expectEqual(@as(u32, 0xC020_64B9), DRM_IOCTL_MODE_OBJ_GETPROPERTIES);
+    try testing.expectEqual(@as(u32, 0xC010_64AC), DRM_IOCTL_MODE_GETPROPBLOB);
+    try testing.expectEqual(@as(u32, 104), @sizeOf(FbCmd2)); // с u64 modifier[4]
+
+    // 1. SET_CLIENT_CAP: ATOMIC(5)/UNIVERSAL_PLANES(3) → EINVAL (gamescope
+    //    остаётся на legacy CRTC/ADDFB2/PAGE_FLIP-пути — наш контракт p3)
+    var cap: DrmSetClientCap = .{ .capability = 5 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+    cap = .{ .capability = 3 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+    cap = .{ .capability = 2 }; // стерео — «принято, не активно»
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+
+    // 2. SET_VERSION — libdrm-хендшейк (drmGetBusid)
+    var sv: DrmSetVersion = .{};
+    @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&sv));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_VERSION, va));
+    const gsv: *const DrmSetVersion = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(i32, 1), gsv.drm_di_major);
+    try testing.expectEqual(@as(i32, 19), gsv.drm_di_minor);
+
+    // 3. dumb 320×240 + ADDFB2 XR24 ('XR24'=0x34325258)
+    var d: CreateDumb = .{ .width = 320, .height = 240, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const gd: *const CreateDumb = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const handle = gd.handle;
+    try testing.expect(handle != 0);
+
+    var f2: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    f2.handles[0] = handle;
+    f2.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const gf2: *const FbCmd2 = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const fb_id = gf2.fb_id;
+    try testing.expect(fb_id != 0);
+    // реестр: XR24 → depth 24 (24 полезных бит)
+    try testing.expectEqual(@as(u32, 24), findFb(&st, fb_id).?.depth);
+
+    // AR24 → depth 32
+    var f3: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5241 };
+    f3.handles[0] = handle;
+    f3.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f3));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const fb_id2: u32 = (@as(*const FbCmd2, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+    try testing.expectEqual(@as(u32, 32), findFb(&st, fb_id2).?.depth);
+
+    // края: мусорный fourcc; multi-plane; смещённая плоскость; чужой handle;
+    // рассинхрон pitch; флаги-flip мусор
+    var fx: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3631_3259 }; // YUV
+    fx.handles[0] = handle;
+    fx.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    fx = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    fx.handles[0] = handle;
+    fx.handles[1] = handle; // multi-plane
+    fx.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    fx = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    fx.handles[0] = handle;
+    fx.pitches[0] = 4096; // рассинхрон
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    fx = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    fx.handles[0] = 777; // чужой GEM-handle
+    fx.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+
+    // 4. PAGE_FLIP + EVENT → кольцо; read(card0) выдаёт drm_event_vblank
+    const ev_va = FakeEnv.USER_BASE + 0x800;
+    try testing.expectEqual(@as(u32, 0), eventsPending(&st)); // пусто
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    p.flags = DRM_MODE_PAGE_FLIP_EVENT;
+    p.user_data = 0xDEAD;
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 1), eventsPending(&st));
+    try testing.expectEqual(@as(i64, 32), readEvents(&st, e.vaPtr(ev_va).?[0..32]));
+    const gev: *const DrmEventVblank = @ptrCast(@alignCast(e.vaPtr(ev_va).?));
+    try testing.expectEqual(DRM_EVENT_FLIP_COMPLETE, gev.typ);
+    try testing.expectEqual(@as(u32, 32), gev.length);
+    try testing.expectEqual(@as(u64, 0xDEAD), gev.user_data);
+    try testing.expectEqual(@as(u32, 1), gev.sequence);
+    try testing.expect(gev.tv_sec == 0 and gev.tv_usec == 16667); // 60Гц-каркас
+    // очередь пуста → EAGAIN; буфер < 32 → EINVAL
+    try testing.expectEqual(-linux.EAGAIN, readEvents(&st, e.vaPtr(ev_va).?[0..32]));
+    try testing.expectEqual(-linux.EINVAL, readEvents(&st, e.vaPtr(ev_va).?[0..16]));
+
+    // PAGE_FLIP БЕЗ флага EVENT → событие НЕ квантуется; ASYNC(2) → EINVAL
+    p.flags = 0;
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 0), eventsPending(&st));
+    p.flags = 2; // DRM_MODE_PAGE_FLIP_ASYNC
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+
+    // 5. RMFB: снятие; повтор → ENOENT; скан-аут сброшен
+    var rm: DrmU32 = .{ .val = fb_id };
+    @memcpy(e.vaPtr(va).?[0..4], std.mem.asBytes(&rm));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_RMFB, va));
+    try testing.expect(findFb(&st, fb_id) == null);
+    try testing.expectEqual(@as(u32, 0), st.crtc_fb_id); // флипнутый fb снят
+    @memcpy(e.vaPtr(va).?[0..4], std.mem.asBytes(&rm));
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_RMFB, va));
+
+    // 6. OBJ_GETPROPERTIES: connector → ПУСТОЙ список (count=0); чужой → ENOENT
+    var op: ObjGetProps = .{ .obj_id = kmsIds()[2] };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ObjGetProps)], std.mem.asBytes(&op));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, va));
+    try testing.expectEqual(@as(u32, 0),
+        (@as(*const ObjGetProps, @ptrCast(@alignCast(e.vaPtr(va).?)))).count_props);
+    op = .{ .obj_id = 999 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ObjGetProps)], std.mem.asBytes(&op));
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, va));
+
+    // 7. GETPROPBLOB → ENOENT (blob'ов нет)
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_GETPROPBLOB, va));
 }
 
 // ─── Тесты: враждебные указатели (инвариант нуля паник) ────────────────────

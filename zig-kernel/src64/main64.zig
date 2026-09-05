@@ -1951,6 +1951,10 @@ fn linuxDevRead(kind: linux_syscalls.FdKind, va: u64, count: u64, nonblock: bool
     switch (kind) {
         .input_event0 => return hal.evdev_kbd.readBytes(buf, nonblock),
         .input_event1 => return hal.evdev_mouse.readBytes(buf, nonblock),
+        // CDD №12 p3: DRM-события (flip-complete/vblank) — записи
+        // drm_event_vblank из кольца drm_kms; пусто → -EAGAIN (poll-цикл
+        // gamescope ждёт EPOLLIN — см. linuxDevReady)
+        .dri_card0 => return drm_kms.readEvents(&drm_state, buf),
         else => return -linux_syscalls.EIO,
     }
 }
@@ -2036,6 +2040,9 @@ fn linuxDevReady(kind: linux_syscalls.FdKind) u32 {
     switch (kind) {
         .input_event0 => return if (hal.evdev_kbd.pending() > 0) linux_syscalls.EPOLLIN else 0,
         .input_event1 => return if (hal.evdev_mouse.pending() > 0) linux_syscalls.EPOLLIN else 0,
+        // CDD №12 p3: card0 читаем ТОЛЬКО при наличии событий (flip-complete);
+        // иначе poll-цикл gamescope бы крутился на read → EAGAIN
+        .dri_card0 => return if (drm_kms.eventsPending(&drm_state) != 0) linux_syscalls.EPOLLIN else 0,
         else => return linux_syscalls.EPOLLOUT,
     }
 }
@@ -2601,11 +2608,19 @@ fn linuxChannelReady(id: u32) u32 {
     if (id >= channels.len or !channels[id].used) return 0;
     const c = &channels[id];
     switch (c.kind) {
-        .pipe => return if (c.len > 0) linux_syscalls.EPOLLIN else 0,
+        // pipe: peer-конец закрыт (refs 2→1) → EPOLLHUP (gamescope
+        // «IWaitable hung up» — теперь ЧЕСТНО, только при реальном HUP)
+        .pipe => {
+            var r: u32 = 0;
+            if (c.len > 0) r |= linux_syscalls.EPOLLIN;
+            if (c.refs == 1) r |= linux_syscalls.EPOLLHUP;
+            return r;
+        },
         .socketpair, .eventfd => {
             var r: u32 = linux_syscalls.EPOLLOUT;
             if (c.kind == .eventfd and c.counter > 0) r |= linux_syscalls.EPOLLIN;
             if (c.kind == .socketpair and c.len > 0) r |= linux_syscalls.EPOLLIN;
+            if (c.kind == .socketpair and c.refs == 1) r |= linux_syscalls.EPOLLHUP;
             return r;
         },
         .timerfd => {
@@ -2629,7 +2644,10 @@ const MmapRegion = struct {
 };
 
 const MAX_LINUX_PROCS: usize = 2;
-const MAX_MMAP_REGIONS: usize = 64;
+/// CDD №12 p3: 512 — эмпирика run8-10: 79 либ × ~4 сегмента = 300+ регио-
+/// нов + стеки тредов + арены malloc (при 64/128 — «registry full» →
+/// untracked: munmap-деградация и МАПФИКС-ДИАПАЗОНЫ без контроля).
+const MAX_MMAP_REGIONS: usize = 512;
 
 var linux_task_proc: [scheduler.MAX_TASKS]u8 =
     [_]u8{255} ** scheduler.MAX_TASKS;
@@ -2825,13 +2843,226 @@ fn linuxTimeNs() u64 {
 // ─── v0.19.0 (CDD №10 p4): VFS Live-режима (initrd-RO + tmpfs-RAM) ─────────
 
 /// Реестр открытых файлов VFS (file_id ↔ узел).
+/// CDD №12 p3: anon-файлы (memfd/ftruncate) — PMM-блок, ОБЩИЕ физ-страницы
+/// между маппингами (MAP_SHARED: Mesa lavapipe-heap, Wayland-shm).
 const LinuxFile = struct {
     used: bool = false,
     kind: linux_syscalls.FdKind = .free,
-    tmp: ?*vfs.TmpFile = null, // для tmpfs_file
+    tmp: ?*vfs.TmpFile = null, // для tmpfs_file (heap-backed)
     initrd_data: ?[]const u8 = null, // для initrd_file
+    // ─── anon (memfd): PMM-блок общих страниц ───
+    anon: bool = false,
+    phys: u64 = 0, // базис физблока (0 = не выделен)
+    blk_pages: u64 = 0, // размер блока в страницах
+    size: u64 = 0, // логический размер (ftruncate)
 };
+
+/// Потолок anon-файла: 512МБ (lavapipe-heap; PMM-гвард).
+const ANON_FILE_MAX: u64 = 512 * 1024 * 1024;
 var linux_files: [linux_syscalls.MAX_FILE_ID]LinuxFile = [_]LinuxFile{.{}} ** linux_syscalls.MAX_FILE_ID;
+
+// ─── CDD №12 p3: потоки каталогов (opendir → getdents64) ───────────────────
+
+const MAX_DIR_ENTRIES: usize = 32;
+const MAX_DIR_NAME: usize = 56;
+/// Один каталогопоток: снимок детей (имя + d_type), позиция чтения.
+/// Каталоги маленькие (≤ 32 имён — /dev/dri, /sys/…, usr/lib): один
+/// слот — одна сессия getdents64 (glibc читает до EOF за 1-2 вызова).
+const DirStream = struct {
+    used: bool = false,
+    count: u32 = 0,
+    pos: u32 = 0,
+    names: [MAX_DIR_ENTRIES][MAX_DIR_NAME]u8 = [_][MAX_DIR_NAME]u8{.{0} ** MAX_DIR_NAME} ** MAX_DIR_ENTRIES,
+    name_lens: [MAX_DIR_ENTRIES]u8 = .{0} ** MAX_DIR_ENTRIES,
+    types: [MAX_DIR_ENTRIES]u8 = .{0} ** MAX_DIR_ENTRIES, // DT_*
+};
+var linux_dirs: [8]DirStream = [_]DirStream{.{}} ** 8;
+
+fn dirPush(d: *DirStream, name: []const u8, dtype: u8) void {
+    if (d.count >= MAX_DIR_ENTRIES or name.len >= MAX_DIR_NAME) return; // дедуп-границы
+    for (d.names[0..d.count], 0..) |*n, i| {
+        if (d.name_lens[i] == name.len and std.mem.eql(u8, n[0..name.len], name)) return; // дедуп
+    }
+    @memcpy(d.names[d.count][0..name.len], name);
+    d.name_lens[d.count] = @intCast(name.len);
+    d.types[d.count] = dtype;
+    d.count += 1;
+}
+
+/// Явная dir-запись CPIO (mode S_IFDIR)?
+fn initrdIsDir(path: []const u8) bool {
+    const node = initrdFindNode(path) orelse return false;
+    return node.mode & 0o170000 == 0o040000;
+}
+
+/// Есть ли у префикса ДЕТИ в initrd (неявный каталог — как ядро Linux
+/// выводит дир на лету из потомков)?
+fn initrdHasChildren(path: []const u8) bool {
+    const arch = initrd_archive orelse return false;
+    const dir = cpioCanon(path);
+    var cpio_parser = cpio.CpioParser.init(arch);
+    while (cpio_parser.next()) |file| {
+        const name = cpioCanon(file.name);
+        if (name.len <= dir.len + 1) continue;
+        if (!std.mem.startsWith(u8, name, dir) or name[dir.len] != '/') continue;
+        return true;
+    }
+    return false;
+}
+
+/// Заполнить поток детьми initrd-префикса (+ "." и ".." — Linux-семантика).
+fn initrdDirFill(path: []const u8, d: *DirStream) void {
+    const arch = initrd_archive orelse return;
+    const dir = cpioCanon(path);
+    var cpio_parser = cpio.CpioParser.init(arch);
+    while (cpio_parser.next()) |file| {
+        const name = cpioCanon(file.name);
+        if (name.len <= dir.len + 1) continue;
+        if (!std.mem.startsWith(u8, name, dir) or name[dir.len] != '/') continue;
+        const rest = name[dir.len + 1 ..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/');
+        if (slash) |s| {
+            dirPush(d, rest[0..s], linux_syscalls.DT_DIR);
+        } else {
+            const dt: u8 = if (file.mode & 0o170000 == 0o120000)
+                linux_syscalls.DT_REG // симлинк → DT_LNK=10 (реализуем когда понадобится)
+            else if (file.mode & 0o170000 == 0o040000)
+                linux_syscalls.DT_DIR
+            else
+                linux_syscalls.DT_REG;
+            dirPush(d, rest, dt);
+        }
+    }
+}
+
+/// Является ли путь каталогом (devfs-спец + явные/неявные CPIO-дир)?
+fn isDirPath(path: []const u8) bool {
+    if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/dev") or
+        std.mem.eql(u8, path, "/dev/dri") or std.mem.eql(u8, path, "/dev/input")) return true;
+    if (initrdIsDir(path)) return true;
+    return initrdHasChildren(path);
+}
+
+/// Открыть поток каталога (слот DirStream) — вызывается из linuxOpenFile
+/// ПОСЛЕ isDirPath-проверки. Возвращает dir_id или -errno.
+fn linuxOpenDir(path: []const u8) i64 {
+    var slot: ?usize = null;
+    for (&linux_dirs, 0..) |*ds, i| {
+        if (!ds.used) {
+            slot = i;
+            break;
+        }
+    }
+    const s = slot orelse return -linux_syscalls.ENFILE;
+    const d = &linux_dirs[s];
+    d.* = .{};
+    d.used = true;
+    // "." и ".." — ядро Linux выдаёт их первым (readdir-инвариант glibc)
+    dirPush(d, ".", linux_syscalls.DT_DIR);
+    dirPush(d, "..", linux_syscalls.DT_DIR);
+    if (std.mem.eql(u8, path, "/dev/dri")) {
+        dirPush(d, "card0", linux_syscalls.DT_CHR);
+        dirPush(d, "renderD128", linux_syscalls.DT_CHR);
+    } else if (std.mem.eql(u8, path, "/dev/input")) {
+        dirPush(d, "event0", linux_syscalls.DT_CHR);
+        dirPush(d, "event1", linux_syscalls.DT_CHR);
+    } else if (std.mem.eql(u8, path, "/dev")) {
+        dirPush(d, "console", linux_syscalls.DT_CHR);
+        dirPush(d, "fb0", linux_syscalls.DT_CHR);
+        dirPush(d, "dri", linux_syscalls.DT_DIR);
+        dirPush(d, "input", linux_syscalls.DT_DIR);
+    } else if (std.mem.eql(u8, path, "/")) {
+        dirPush(d, "dev", linux_syscalls.DT_DIR);
+        dirPush(d, "tmp", linux_syscalls.DT_DIR);
+        initrdDirFill("/", d);
+    } else {
+        initrdDirFill(path, d);
+    }
+    return @intCast(s);
+}
+
+/// getdents64: записи linux_dirent64 (выравн. 8) прямо в user-VA
+/// (валидация сделана слоем syscall; CR3 задачи активен — как evdev).
+fn linuxDirRead(id: u32, buf_va: u64, count: u64) i64 {
+    if (id >= linux_dirs.len or !linux_dirs[id].used) return -linux_syscalls.EBADF;
+    const d = &linux_dirs[id];
+    const p: [*]u8 = @ptrFromInt(buf_va);
+    var written: u64 = 0;
+    while (d.pos < d.count) {
+        const i: usize = @intCast(d.pos);
+        const name_len: u64 = d.name_lens[i];
+        const reclen: u64 = 19 + name_len + 1; // 8+8+2+1 + имя + NUL
+        const padded: u64 = (reclen + 7) & ~@as(u64, 7);
+        if (written + padded > count) break;
+        var rec: [MAX_DIR_NAME + 32]u8 = [_]u8{0} ** (MAX_DIR_NAME + 32);
+        // d_ino: стабильный псевдо-ino потока (0..) — НЕ 0 (реальный d_ino ≠ 0)
+        std.mem.writeInt(u64, rec[0..8], 5000 + @as(u64, id) * 100 + i, .little);
+        std.mem.writeInt(u64, rec[8..16], @as(u64, i) + 1, .little); // d_off = индекс+1
+        std.mem.writeInt(u16, rec[16..18], @intCast(padded), .little);
+        rec[18] = d.types[i];
+        @memcpy(rec[19..][0..@intCast(name_len)], d.names[i][0..@intCast(name_len)]);
+        @memcpy(p[written..][0..@intCast(padded)], rec[0..@intCast(padded)]);
+        written += padded;
+        d.pos += 1;
+    }
+    return @intCast(written);
+}
+
+fn linuxDirClose(id: u32) void {
+    if (id < linux_dirs.len) linux_dirs[id] = .{};
+}
+
+/// CDD №12 p3: mkdir — tmpfs-слот-имя «dir:<path>» (Live-модель: запись в
+/// RAM; дети — неявно файлы). Mesa кэш-каталоги деградируют мягко.
+fn linuxMkdirTmpfs(path: []const u8) i64 {
+    if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    if (!std.mem.startsWith(u8, path, "/tmp") and !std.mem.startsWith(u8, path, "/root"))
+        return -linux_syscalls.EPERM; // запись вне RAM-пространств
+    // слот-имя: реестр tmpfs плоский — «dir:»-префикс различает каталоги
+    var name_buf: [96]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "dir:{s}", .{path}) catch
+        return -linux_syscalls.EINVAL;
+    _ = kernel_vfs.tmp.create(name) catch return -linux_syscalls.ENOMEM;
+    return 0;
+}
+
+/// CDD №12 p3: парковка текущей задачи на ms — модель linuxFutexPark без
+/// фьюфекс-реестра (блокирующий epoll_wait: слайс → диспетчер → перепроверка
+/// готовности; анти-спин: потоки композитора ЖГЛИ TCG на 100%).
+fn linuxTaskPark(ms: u64) void {
+    const my_rsp = scheduler.user_rsp;
+    const owner = scheduler.syscallStackOwner(my_rsp);
+    if (owner >= scheduler.MAX_TASKS or
+        scheduler.tasks[owner].privilege != .User)
+    {
+        // shell-контекст (ldevtest): кооперативная пауза — без парковки
+        const t0 = hal.tick_count;
+        const ticks = (ms + 9) / 10;
+        while (hal.tick_count < t0 + ticks) {
+            asm volatile ("pause");
+        }
+        return;
+    }
+    const deadline = hal.tick_count + (ms + 9) / 10;
+    // резюм-кадр + будильник (модель kSleepTask — каскад на топе kstack)
+    scheduler.snapshotResumeFrame(owner, my_rsp);
+    scheduler.setTaskSleepFor(owner, ms);
+    // выпуск транзакции: тики диспетчируют задачу по будильнику
+    hal.cli();
+    scheduler.in_win32_syscall = 0;
+    hal.sti();
+    // парк: hlt до прерывания (тик 100Гц)
+    while (hal.tick_count < deadline) {
+        asm volatile ("hlt" ::: "memory");
+    }
+    // эпилог транзакции: вернуть user_rsp, резюм-указатель — .bss-слот
+    hal.cli();
+    scheduler.user_rsp = my_rsp;
+    scheduler.in_win32_syscall = 1;
+    hal.sti();
+    scheduler.setTaskSleepFor(owner, 0);
+    scheduler.installResumeFrame(owner);
+}
 
 fn vfsAlloc(n: usize) ?[*]u8 {
     return heap.kmalloc(n);
@@ -2859,14 +3090,33 @@ fn vfsInit() void {
 }
 
 /// v0.20.0 (CDD №12 p1): close — освобождение слота реестра файлов VFS.
+/// CDD №12 p3: memfd — PMM-блок общих страниц освобождается ЗДЕСЬ (послед-
+/// ний владелец = fd). Регионы shared-мапов записаны как phys=0/anon=false —
+/// munmap/exit физику НЕ трогают → close = единственная точка освобождения
+/// (анти-утечка при churn буферов wl_shm/lavapipe). Оговорка: close при
+/// живом маппинге (легален в Linux) оставит висячие PTE — lavapipe держит
+/// fd открытым на всё время жизни VkDeviceMemory (эмпирика e2e).
 fn linuxReleaseFile(id: u32) void {
     if (id >= linux_files.len) return;
+    if (linux_files[id].anon and linux_files[id].phys != 0) {
+        pmm.freeContiguousPages(linux_files[id].phys, linux_files[id].blk_pages);
+    }
     linux_files[id] = .{};
 }
 
 /// open_file: VFS-резолв пути (normalizePath + overlay) → file_id.
 fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind) i64 {
     if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    // CDD №12 p3: КАТАЛОГИ (opendir: libdrm сканирует /dev/dri —
+    // drmGetDeviceFromDevId; realpath-компоненты glibc). Порядок: каталог
+    // ПЕРВЫМ (dir-запись CPIO иначе резолвится как пустой файл)
+    if (isDirPath(path)) {
+        const id = linuxOpenDir(path);
+        if (id >= 0) {
+            out_kind.* = .dir;
+            return id;
+        }
+    }
     const write_mode = (flags & linux_syscalls.O_ACCMODE) != linux_syscalls.O_RDONLY;
     const node = kernel_vfs.resolve(path, write_mode) catch |e| switch (e) {
         vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
@@ -2906,6 +3156,17 @@ fn linuxFileRead(id: u32, off: u64, va: u64, count: u64) i64 {
     if (id >= linux_files.len or !linux_files[id].used) return -linux_syscalls.EBADF;
     const f = &linux_files[id];
     if (f.kind == .tmpfs_file) {
+        // CDD №12 p3: memfd — чтение прямо из PMM-блока (Linux-семантика:
+        // read/write на memfd валидны; основные потребители пишут через
+        // MAP_SHARED-mmap, но read() нужен fstat-производным проверкам)
+        if (f.anon) {
+            if (f.phys == 0 or off >= f.size) return 0; // EOF
+            const n: u64 = @min(count, f.size - off);
+            const src: [*]const u8 = @ptrFromInt(f.phys + off);
+            const p: [*]u8 = @ptrFromInt(va);
+            @memcpy(p[0..@intCast(n)], src[0..@intCast(n)]);
+            return @intCast(n);
+        }
         const t = f.tmp orelse return -linux_syscalls.EIO;
         var n: usize = 0;
         // постраничная запись в user-VA (CR3 задачи активен; буфер валидирован)
@@ -2940,6 +3201,18 @@ fn linuxFileWrite(id: u32, off: u64, va: u64, count: u64) i64 {
     if (id >= linux_files.len or !linux_files[id].used) return -linux_syscalls.EBADF;
     const f = &linux_files[id];
     if (f.kind != .tmpfs_file) return -linux_syscalls.EBADF;
+    // CDD №12 p3: memfd — запись в PMM-блок (без ftruncate — EFBIG: блок
+    // не выделен; Linux дал бы SIGBUS/расширение — мы консервативны)
+    if (f.anon) {
+        if (f.phys == 0) return -linux_syscalls.EFBIG;
+        if (off >= f.blk_pages * PAGE_SIZE) return -linux_syscalls.EFBIG;
+        const n: u64 = @min(count, f.blk_pages * PAGE_SIZE - off);
+        const dst: [*]u8 = @ptrFromInt(f.phys + off);
+        const p: [*]const u8 = @ptrFromInt(va);
+        @memcpy(dst[0..@intCast(n)], p[0..@intCast(n)]);
+        if (off + n > f.size) f.size = off + n;
+        return @intCast(n);
+    }
     const t = f.tmp orelse return -linux_syscalls.EIO;
     // читаем user-VA чанками (валидация уже сделана слоем)
     var n: u64 = 0;
@@ -3064,6 +3337,9 @@ fn linuxFileSize(id: u32) u64 {
             return data.len;
         },
         .tmpfs_file => {
+            // CDD №12 p3: memfd — логический размер (ftruncate; glibc/lavapipe
+            // сверяют st_size после os_create_anonymous_file)
+            if (f.anon) return f.size;
             const t = f.tmp orelse return 0;
             return t.size;
         },
@@ -3085,6 +3361,9 @@ fn linuxFileIno(id: u32) u64 {
             return @intFromPtr(data.ptr) >> 4;
         },
         .tmpfs_file => {
+            // CDD №12 p3: memfd — стабильный уникальный ino (0xA000_0000+id):
+            // mmap-клиенты fstat-ят буфер — идентификация ОБЪЕКТА, не слота
+            if (f.anon) return 0xA000_0000 + @as(u64, id);
             const t = f.tmp orelse return 0;
             return @intFromPtr(t) >> 4;
         },
@@ -3123,6 +3402,42 @@ fn linuxReadlinkPath(path: []const u8, buf_va: u64, bufsz: u64) i64 {
 /// mmap библиотеки по размеру!). CR3 задачи активен — copy через user-IO.
 fn linuxStatByPath(path: []const u8, buf_va: u64) i64 {
     if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    var st: [144]u8 = [_]u8{0} ** 144;
+    // CDD №12 p3: devfs-УЗЛЫ — S_IFCHR + st_rdev (libdrm stat("/dev/dri/
+    // renderD128") — drm_device_has_rdev сверяет с makedev(renderMajor,
+    // renderMinor) из Vulkan-пропсов!). /dev, /dev/dri — каталоги ниже.
+    if (std.mem.startsWith(u8, path, "/dev/")) {
+        if (linux_syscalls.resolveDevKind(path)) |kind| {
+            const minor = linux_syscalls.devMinor(path);
+            const major = linux_syscalls.devMajorOf(kind);
+            std.mem.writeInt(u64, st[0..8], 0, .little); // st_dev — ядро-псевдо
+            std.mem.writeInt(u64, st[8..16], 0xE00 + @as(u64, minor), .little); // st_ino
+            std.mem.writeInt(u64, st[16..24], 1, .little);
+            std.mem.writeInt(u32, st[24..28], @intCast(0x2000 | 0x1A0), .little); // S_IFCHR|0620
+            std.mem.writeInt(u64, st[40..48], linux_syscalls.encodeDev(major, minor), .little); // st_rdev!
+            std.mem.writeInt(u64, st[56..64], 4096, .little);
+            if (!linux_user_io.copy_out(buf_va, &st)) return -linux_syscalls.EFAULT;
+            return 0;
+        } // иначе fall-through: /dev/dri, /dev/input — каталоги ниже
+    }
+    // CDD №12 p3: КАТАЛОГИ — S_IFDIR (realpath glibc lstat-ит каждый компо-
+    // нент; drmNodeIsDRM stat-ит /sys/dev/char/…/device/drm)
+    if (isDirPath(path)) {
+        std.mem.writeInt(u64, st[0..8], 0, .little);
+        // стабильный ino из пути (FNV-1а — каталоги без записи в реестре)
+        var hash: u64 = 0xCBF29CE484222325;
+        for (cpioCanon(path)) |c| {
+            hash ^= c;
+            hash *%= 0x100000001B3;
+        }
+        std.mem.writeInt(u64, st[8..16], hash & 0xFFFF_FFFF, .little);
+        std.mem.writeInt(u64, st[16..24], 2, .little); // nlink
+        std.mem.writeInt(u32, st[24..28], @intCast(0x4000 | 0x1ED), .little); // S_IFDIR|0755
+        std.mem.writeInt(u64, st[48..56], 4096, .little); // size (конвенция)
+        std.mem.writeInt(u64, st[56..64], 4096, .little);
+        if (!linux_user_io.copy_out(buf_va, &st)) return -linux_syscalls.EFAULT;
+        return 0;
+    }
     const node = kernel_vfs.resolve(path, false) catch |e| switch (e) {
         vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
         else => return -linux_syscalls.EIO,
@@ -3142,15 +3457,15 @@ fn linuxStatByPath(path: []const u8, buf_va: u64) i64 {
         },
         .dev => return -linux_syscalls.EIO,
     }
-    var st: [144]u8 = [_]u8{0} ** 144;
-    std.mem.writeInt(u64, st[0..8], linux_syscalls.POLER_VFS_DEV, .little); // st_dev
-    std.mem.writeInt(u64, st[8..16], ino, .little); // st_ino (уникальный!)
-    std.mem.writeInt(u64, st[16..24], 1, .little); // st_nlink
-    std.mem.writeInt(u32, st[24..28], @intCast(0x8000 | 0x124), .little); // S_IFREG|0444
-    std.mem.writeInt(u64, st[48..56], size, .little); // st_size
-    std.mem.writeInt(u64, st[56..64], 4096, .little); // st_blksize
-    std.mem.writeInt(u64, st[64..72], (size + 511) / 512, .little); // st_blocks
-    if (!linux_user_io.copy_out(buf_va, &st)) return -linux_syscalls.EFAULT;
+    var stbuf: [144]u8 = [_]u8{0} ** 144;
+    std.mem.writeInt(u64, stbuf[0..8], linux_syscalls.POLER_VFS_DEV, .little); // st_dev
+    std.mem.writeInt(u64, stbuf[8..16], ino, .little); // st_ino (уникальный!)
+    std.mem.writeInt(u64, stbuf[16..24], 1, .little); // st_nlink
+    std.mem.writeInt(u32, stbuf[24..28], @intCast(0x8000 | 0x124), .little); // S_IFREG|0444
+    std.mem.writeInt(u64, stbuf[48..56], size, .little); // st_size
+    std.mem.writeInt(u64, stbuf[56..64], 4096, .little); // st_blksize
+    std.mem.writeInt(u64, stbuf[64..72], (size + 511) / 512, .little); // st_blocks
+    if (!linux_user_io.copy_out(buf_va, &stbuf)) return -linux_syscalls.EFAULT;
     return 0;
 }
 
@@ -3202,6 +3517,12 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .get_sigaction = linuxGetSigaction,
         .set_sigmask = linuxSetSigmask,
         .memfd_create = linuxMemfdCreate,
+        .truncate_file = linuxTruncateFile,
+        .shared_file_mmap = linuxSharedFileMmap,
+        .dir_read = linuxDirRead,
+        .dir_close = linuxDirClose,
+        .task_park = linuxTaskPark,
+        .mkdir_tmpfs = linuxMkdirTmpfs,
     };
 }
 
@@ -3240,26 +3561,96 @@ fn linuxSetSigmask(how: u32, mask: u64) u64 {
     return old;
 }
 
-/// memfd: анонимный tmpfs-файл (имя .memfd-N — не резолвится путями VFS,
-/// tmpfs-префикс /tmp гарантирует RW-семантику реестра).
+/// memfd: анонимный PMM-файл (ftruncate выделяет блок общих страниц).
 fn linuxMemfdCreate() i64 {
-    const slot = linuxProcSlot();
-    if (slot >= MAX_LINUX_PROCS) return -linux_syscalls.EPERM;
-    const proc = &linux_procs[slot];
-    proc.memfd_seq +%= 1;
-    var name_buf: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buf, "tmp/.memfd-{d}", .{proc.memfd_seq}) catch
-        return -linux_syscalls.ENOMEM;
-    // создаём tmpfs-файл напрямую (без VFS-резолва): реестр-слот
-    const f = kernel_vfs.tmp.create(name) catch return -linux_syscalls.ENOMEM;
-    // file_id: ищем слот реестра с этим TmpFile
     for (&linux_files, 0..) |*lf, i| {
-        if (!lf.used and lf.tmp == null) {
-            lf.* = .{ .used = true, .kind = .tmpfs_file, .tmp = f };
+        if (!lf.used) {
+            lf.* = .{ .used = true, .kind = .tmpfs_file, .anon = true };
             return @intCast(i);
         }
     }
     return -linux_syscalls.ENFILE;
+}
+
+/// v0.20.0 (CDD №12 p3): ftruncate anon-файла — PMM-блок (нули, копия
+/// старого при росте). Mesa: os_create_anonymous_file = memfd+ftruncate.
+fn linuxTruncateFile(id: u32, len: u64) i64 {
+    if (id >= linux_files.len or !linux_files[id].used) return -linux_syscalls.EBADF;
+    const f = &linux_files[id];
+    if (!f.anon) return -linux_syscalls.EINVAL; // heap-tmpfs: не растим (малые)
+    if (len > ANON_FILE_MAX) return -linux_syscalls.EFBIG;
+    if (len == 0) {
+        if (f.phys != 0) {
+            pmm.freeContiguousPages(f.phys, f.blk_pages);
+            f.phys = 0;
+            f.blk_pages = 0;
+        }
+        f.size = 0;
+        return 0;
+    }
+    const want_pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (want_pages > f.blk_pages) {
+        // рост: новый блок + копия старого содержимого
+        const new_phys = pmm.allocContiguousZeroed(@intCast(want_pages)) orelse
+            return -linux_syscalls.ENOMEM;
+        if (f.phys != 0) {
+            const copy_pages = @min(f.blk_pages, want_pages);
+            const src: [*]const u8 = @ptrFromInt(f.phys);
+            const dst: [*]u8 = @ptrFromInt(new_phys);
+            @memcpy(dst[0 .. copy_pages * PAGE_SIZE], src[0 .. copy_pages * PAGE_SIZE]);
+            pmm.freeContiguousPages(f.phys, f.blk_pages);
+        }
+        f.phys = new_phys;
+        f.blk_pages = want_pages;
+    }
+    f.size = len;
+    return 0;
+}
+
+/// v0.20.0 (CDD №12 p3): mmap MAP_SHARED anon-файла — ОБЩИЕ физ-страницы.
+/// Каждый маппинг (в т.ч. повторный) получает те же PTE → разделяемая
+/// память (контракт wl_shm/lavapipe).
+fn linuxSharedFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return -linux_syscalls.EFAULT;
+    if (id >= linux_files.len or !linux_files[id].used or !linux_files[id].anon)
+        return -linux_syscalls.ENODEV; // heap-tmpfs/initrd: не разделяем
+    const f = &linux_files[id];
+    if (f.phys == 0) return -linux_syscalls.ENOMEM; // ftruncate не был вызван
+    if (off % PAGE_SIZE != 0) return -linux_syscalls.EINVAL;
+    if (off >= f.blk_pages * PAGE_SIZE) return -linux_syscalls.EINVAL;
+    // хвост за блоком — ENOMEM (Linux бы дал SIGBUS; мы честно отказываем)
+    if (off + len > f.blk_pages * PAGE_SIZE) return -linux_syscalls.ENOMEM;
+    const proc = linuxProcCurrent() orelse return -linux_syscalls.EFAULT;
+    if (len > LINUX_MMAP_BUDGET) return -linux_syscalls.ENOMEM;
+    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    const va: u64 = if (fixed_va != 0) fixed_va else proc.mmap_cursor;
+    if (fixed_va != 0 and fixed_va % PAGE_SIZE != 0) return -linux_syscalls.EINVAL;
+    if (fixed_va == 0 and proc.mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET)
+        return -linux_syscalls.ENOMEM;
+    if (va < elf_loader.MIN_USER_VA or va + pages * PAGE_SIZE > linux_syscalls.USER_VA_CEILING)
+        return -linux_syscalls.EINVAL;
+    // MAP_FIXED: замещение (снимаем пересечения)
+    if (fixed_va != 0) {
+        var i: u64 = 0;
+        while (i < pages) : (i += 1) {
+            _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+        }
+    }
+    var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
+    if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
+    if (prot & linux_syscalls.PROT_WRITE == 0) pte &= ~vmm.PTE_WRITABLE;
+    // МАПИМ ОБЩИЕ ФИЗ-СТРАНИЦЫ (нет копий!)
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        const phys = f.phys + off + i * PAGE_SIZE;
+        vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, phys, pte) catch {
+            return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
+        };
+    }
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false); // phys общий — НЕ освобождаем
+    if (fixed_va == 0) proc.mmap_cursor += pages * PAGE_SIZE;
+    return @intCast(va);
 }
 
 /// pid: стабилен внутри процесса (группа тредов = слот): 100 + slot.
@@ -3302,7 +3693,7 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         hal.Serial.putHex(a1);
         hal.Serial.puts(",0x");
         hal.Serial.putHex(a2);
-        if (num == 13 or num == 14 or num == 157 or num == 281 or num == 270 or num == 289) {
+        if (num == 13 or num == 14 or num == 157 or num == 281 or num == 270 or num == 289 or num == 16) {
             hal.Serial.puts(",0x");
             hal.Serial.putHex(a3);
             hal.Serial.puts(",0x");
@@ -4432,7 +4823,16 @@ fn cmd_elfload(args: []const u8) void {
             argv_count += 1;
         }
     }
-    const envp = [_][]const u8{ "HOME=/root", "TERM=linux", "PATH=/usr/bin", "LD_LIBRARY_PATH=/usr/lib" };
+    const envp = [_][]const u8{
+        "HOME=/root",
+        "TERM=linux",
+        "PATH=/usr/bin",
+        "LD_LIBRARY_PATH=/usr/lib",
+        // CDD #12 p3: Vulkan-лоадер ищет ICD опендирем (getdents64 — бэклог);
+        // VK_ICD_FILENAMES — штатный механизм лоадера (спека Khronos):
+        // указываем lavapipe-манифест напрямую.
+        "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json",
+    };
 
     // 3b. PT_INTERP: динамический бинарник — грузим ИНТЕРПРЕТАТОР (ld.so)
     //     как вторую ET_DYN-картинку; управление — НА ЕГО entry (handoff);
@@ -4485,12 +4885,14 @@ fn cmd_elfload(args: []const u8) void {
 
     // 5. Ring-3 задача + Linux-ABI + proc-слот (fd/mmap/brk);
     //    entry = ld.so для динамических (handoff), бинарник — для статиков
-    const task_id = scheduler.createUserTask(entry_va, user_pml4, stack.entry_rsp) catch |err| {
+    const task_id = scheduler.createUserTaskAbi(entry_va, user_pml4, stack.entry_rsp, .linux) catch |err| {
         sys_print("createUserTask error: ");
         sys_print(@errorName(err));
         sys_print("\n");
         return;
     };
+    // CDD №12 p3: abi=.linux теперь ВНУТРИ createUserTaskAbi (ДО
+    // state=.Ready) — гонка тика закрыта; здесь только красная строка:
     scheduler.tasks[task_id].abi = .linux;
     // v0.18.0 (CDD №9): главный user-стек — в таблицах asm-владельца
     scheduler.registerUserStack(
@@ -5355,7 +5757,7 @@ fn cmd_peload(args: []const u8) void {
     hal.writeMsr(hal.MSR.GS_BASE, uctx.teb_va);
 
     // 11. Ring-3 задача: IRETQ-кадр с CS=0x1B/SS=0x23, диспетчеризация тикером
-    const task_id = scheduler.createUserTask(img.entry_va, user_pml4, uctx.stack_rsp) catch |err| {
+    const task_id = scheduler.createUserTaskAbi(img.entry_va, user_pml4, uctx.stack_rsp, .win32) catch |err| {
         sys_print("createUserTask error: ");
         sys_print(@errorName(err));
         sys_print("\n");

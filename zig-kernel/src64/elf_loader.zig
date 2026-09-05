@@ -51,7 +51,10 @@ pub const LINUX_IMAGE_BASE: u64 = 0x0000_1000_0000_0000;
 /// mmap-регионом и стеком; никаких пересечений с зонами образа/стека).
 pub const LINUX_INTERP_BASE: u64 = 0x0000_0400_0000_0000;
 pub const LINUX_STACK_TOP: u64 = 0x0000_0800_0000_0000;
-pub const LINUX_STACK_PAGES: u64 = 16; // 64КБ первичный стек
+/// CDD №12 p3: 64МБ — эмпирика run8/run9: 8МБ тоже малы (lavapipe/LLVM
+/// инициализация — монотонный спуск RSP основного треда до дна; Linux
+/// растит стек авто, мы премапим с запасом: 2ГБ гостя позволяет).
+pub const LINUX_STACK_PAGES: u64 = 32768; // 128МБ первичный стек (CDD №12 p3: тест предела рекурсии)
 /// Нижняя граница валидных user-сегментов: ниже — identity-маппинги ядра
 /// (PML4[0] копируется в user-PML4 БЕЗ User-бита — Ring 3 туда не ходит,
 /// но конфликт маппинга гарантирован).
@@ -946,7 +949,7 @@ test "buildUserStack: раскладка argc/argv/envp/auxv, выравнива
 
     // entry_rsp 16-выровнен, внутри региона стека
     try testing.expectEqual(@as(u64, 0), res.entry_rsp % 16);
-    try testing.expect(res.entry_rsp > LINUX_STACK_TOP - 16 * 4096);
+    try testing.expect(res.entry_rsp > LINUX_STACK_TOP - LINUX_STACK_PAGES * 4096);
     try testing.expect(res.entry_rsp < LINUX_STACK_TOP);
 
     // argc

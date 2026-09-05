@@ -744,6 +744,31 @@ fn handleException(frame: *InterruptFrame) void {
         }
     }
 
+    // CDD №12 p3: СКАН СТЕКА на ret-адреса (RBP в -O2-коде — обычный
+    // регистр, цепочка обрывается; а стек рекурсии СОДЕРЖИТ повторяющиеся
+    // ret-адреса — цикл виновников виден по ПОВТОРАМ). Диапазоны: ld.so+либы
+    // (0x400_0000_0000+) и образ gamescope (0x1000_0000_0000+, без brk).
+    if (from_user and frame.rsp > 0x1000) {
+        const vmm4 = @import("vmm64.zig");
+        const pml4 = readCr3() & 0x000FFFFFFFFFF000;
+        Serial.puts("\nSTACK-RET:");
+        var i: usize = 0;
+        while (i < 64) : (i += 1) {
+            const va = frame.rsp + i * 8;
+            const leaf = vmm4.userLeafFlags(pml4, va) orelse break;
+            if (leaf & vmm4.PTE_USER == 0) break;
+            const w: *volatile u64 = @ptrFromInt(va);
+            const v = w.*;
+            const is_ret = (v >= 0x4000_0000_0000 and v < 0x4006_0000_0000) or
+                (v >= 0x1000_0000_0000 and v < 0x1000_0040_0000);
+            if (is_ret) {
+                Serial.puts(" ");
+                Serial.putHex(v);
+            }
+        }
+        Serial.puts("\n");
+    }
+
     if (from_user) {
         // User-mode exception — kill the offending process instead of kernel panic
         Serial.puts("\n[EXCEPTION] Ring 3 fault! Killing user process.\n");

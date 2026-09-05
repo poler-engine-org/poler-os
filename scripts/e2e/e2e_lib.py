@@ -31,10 +31,12 @@ TESTDATA = os.path.join(REPO, "zig-kernel", "testdata")
 
 # ─── 1. CPIO newc-билдер ────────────────────────────────────────────────────
 
-def build_cpio(files, symlinks=None):
-    """files: dict[name → bytes]; symlinks: dict[name → target] (S_IFLNK).
-    Возвращает newc-архив (padded 512). Ядро cpio.zig: mode@14 (S_IFLNK=0o120777,
-    data = цель симлинка — CDD #12 p1)."""
+def build_cpio(files, symlinks=None, dirs=None):
+    """files: dict[name → bytes]; symlinks: dict[name → target] (S_IFLNK);
+    dirs: list[dir paths] (S_IFDIR — CDD #12 p3: /sys-дерево для libdrm
+    drmGetDeviceFromDevId; opendir → getdents64). Возвращает newc-архив
+    (padded 512). Ядро cpio.zig: mode@14 (S_IFLNK=0o120777, data = цель
+    симлинка; S_IFDIR=0o040755, data пусто)."""
     out = bytearray()
 
     def put_entry(name: bytes, data: bytes, mode: int):
@@ -49,6 +51,10 @@ def build_cpio(files, symlinks=None):
         while len(out) % 4:
             out.append(0)
 
+    # каталоги ПЕРВЫМИ (CPIO-конвенция; ядро выводит детей и без них, но
+    # stat("/sys/.../device/drm") резолвится только по dir-записи)
+    for name in (dirs or []):
+        put_entry(name.encode(), b"", 0o040755)
     for name, data in files.items():
         put_entry(name.encode(), data, 0o100644)
     for name, target in (symlinks or {}).items():
@@ -229,6 +235,12 @@ class VM:
     mem_size = "256M"
 
     def _reader(self):
+        # durable-лог: КАЖДЫЙ байт serial дублируется в файл (переживает
+        # гибель python-процесса — CDD-артефакт краша всегда на диске)
+        try:
+            logf = open(self.ser_log_path, "ab")
+        except OSError:
+            logf = None
         while True:
             try:
                 chunk = self._ser.recv(65536)
@@ -236,10 +248,15 @@ class VM:
                     break
                 with self._lock:
                     self.log.extend(chunk)
+                if logf is not None:
+                    logf.write(chunk)
+                    logf.flush()
             except BlockingIOError:
                 time.sleep(0.05)
             except OSError:
                 break
+        if logf is not None:
+            logf.close()
 
     def text(self):
         with self._lock:
