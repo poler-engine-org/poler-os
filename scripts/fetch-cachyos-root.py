@@ -222,11 +222,24 @@ def pkg_for_soname(m):
         return SONAME_PKG[m]
     if m.startswith("libLLVM.so"):
         return "llvm-libs"
+    # CDD №12 p4: хвост lvp-замыкания (эмпирика run3: 4 MISSING) — имена
+    # пакетов ≠ сонам-префиксам (expat/spirv-tools/ncurses/libxcb-keysyms)
+    if m == "libexpat.so.1":
+        return "expat"
+    if m == "libSPIRV-Tools.so" or m.startswith("libSPIRV-Tools"):
+        return "spirv-tools"
+    if m == "libncursesw.so.6" or m.startswith("libncurses"):
+        return "ncurses"
+    if m.startswith("libxcb-") or m == "libxcb.so.1":
+        return "libxcb"
     if m.startswith("libicu"):
         return "icu"
     if m.startswith("libvulkan_lvp") or m.startswith("libglapi") or \
             m.startswith("libmesa_") or m.startswith("libgallium"):
-        return "mesa"
+        # CDD №12 p4-фикс: lavapipe (libvulkan_lvp.so + lvp_icd.json) живёт в
+        # ОТДЕЛЬНОМ пакете vulkan-swrast (Arch/CachyOS split mesa 26.x);
+        # пакет «mesa» содержит только GL/EGL/gallium-*.so
+        return "vulkan-swrast"
     if m.startswith("libvulkan.so"):
         return "vulkan-icd-loader"
     if m.startswith("libSDL3"):
@@ -364,7 +377,7 @@ def main():
     # на пустом кэше пропускал волну ЦЕЛИКОМ (SDL3/Vulkan/lavapipe нет в
     # DT_NEEDED-замыкании gamescope) → e2e: «Failed loading SDL3 library.» →
     # abort. Ставим пакеты-носители волн ДО гейта (идемпотентно: кэш-хит).
-    for warm_pkg in ("sdl3", "vulkan-icd-loader", "mesa", "llvm-libs", "icu"):
+    for warm_pkg in ("sdl3", "vulkan-icd-loader", "vulkan-swrast", "mesa", "llvm-libs", "icu"):
         ensure_pkg(idx_map, warm_pkg)
 
     # dlopen-волна: gamescope dlopen'ит libSDL3.so.0 (sdl2-compat собран НА
