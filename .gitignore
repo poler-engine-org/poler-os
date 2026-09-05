@@ -8,3 +8,5 @@ build/
 qemu-full/
 cachyos-root/pkgcache/
 cachyos-root/root/
+cachyos-root/*.cpio
+scripts/e2e/*.so

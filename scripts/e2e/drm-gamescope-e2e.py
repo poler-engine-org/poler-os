@@ -174,13 +174,63 @@ files["proc/cpuinfo"] = (
 )
 print("rootfs: + /sys/dev/char/226:{0,128} + /sys/devices/system/cpu + /proc/cpuinfo")
 
-INITRD = build_cpio(files, symlinks, dirs=SYS_DIRS)
+# ─── CPIO-КЕШ (CDD №12 p4-final): сборка 246МБ чистым Python ≈ 4 мин —
+# недопустимо на каждой итерации. Ключ кеша: mtimes исходников rootfs
+# (gamescope, ld.so, все либы из report.json, VK-слой, сам скрипт).
+# Промах/расхождение — пересборка и запись.
+import hashlib as _hl
+
+_cache_path = os.path.join(REPO, "cachyos-root", "drm-gamescope.initrd.cpio")
+_h = _hl.sha256()
+_h.update(open(__file__, "rb").read())
+for _p in [os.path.join(ROOT, "usr/bin/gamescope"),
+           os.path.join(ROOT, "usr/lib/ld-linux-x86-64.so.2"),
+           LAYER_SO, REPORT]:
+    if os.path.exists(_p):
+        _h.update(str(os.path.getmtime(_p)).encode())
+        _h.update(str(os.path.getsize(_p)).encode())
+for _soname in libs:
+    _p = os.path.join(ROOT, "usr/lib", _soname)
+    if os.path.exists(_p):
+        _h.update(str(os.path.getmtime(_p)).encode())
+        _h.update(str(os.path.getsize(_p)).encode())
+_cache_key = _h.hexdigest()
+
+if os.path.exists(_cache_path) and os.path.getsize(_cache_path) > 10_000_000:
+    with open(_cache_path, "rb") as _f:
+        _blob = _f.read()
+    if _blob[: 64].decode("ascii", "ignore").strip() == _cache_key:
+        INITRD = _blob[64:]
+        print(f"cpio-cache: HIT ({len(INITRD)/1024/1024:.1f} МБ)")
+    else:
+        _blob = None
+else:
+    _blob = None
+if _blob is None:
+    INITRD = build_cpio(files, symlinks, dirs=SYS_DIRS)
+    with open(_cache_path, "wb") as _f:
+        _f.write(_cache_key.encode("ascii"))
+        _f.write(INITRD)
+    print(f"cpio-cache: MISS — собран и записан ({len(INITRD)/1024/1024:.1f} МБ)")
 del files, symlinks  # OOM-гигиена: 246МБ словаря не переживают CPIO-сборку
 
 # ─── 2. QEMU: virtio-gpu (скан-ауты), ltrace, полный запуск композитора ────
 vm = VM("drm-gamescope", initrd=INITRD, mem="2G", qemu=QEMU_FULL,
         extra_args=["-cpu", "max", "-vga", "none",
-                    "-device", "virtio-gpu-pci,xres=1024,yres=768", "-vnc", ":0"])
+                    "-device", "virtio-gpu-pci,xres=1024,yres=768", "-vnc", ":0",
+                    # CDD №12 p4-final: gdb-stub для rsp-watch.py (watchpoint
+                    # на гостевой VA — «кто пишет 0xAAAA»); env-гейт
+                    *(["-s"] if os.environ.get("E2E_GDB") else []),
+                    # второй монитор (e2e_lib держит первый) — доступ
+                    # монитору-наблюдателю (crash-dump физпамяти) env-гейтом
+                    *(["-monitor", "unix:/tmp/poler-e2e-drm-gamescope/mon2.sock,server,nowait"]
+                      if os.environ.get("E2E_MON2") else []),
+                    # CDD №12 p4-final: TCG-плагин «кто пишет» (who-aaaa2.so):
+                    # env E2E_PLUGIN="ADDR,LEN" — лог записей в гостевой
+                    # диапазон с vpc-писателем (root 0xAAAA-утечки).
+                    *(["-plugin", "file=%s/scripts/e2e/who-aaaa2.so,arg=%s"
+                       % (REPO, os.environ["E2E_PLUGIN"])]
+                      if os.environ.get("E2E_PLUGIN") else [])])
 del INITRD  # VM держит только путь к файлу — 258МБ больше не нужны в RAM
 try:
     vm.start()
@@ -192,14 +242,19 @@ try:
     check("boot: no fatal markers", not check_fatal(vm))
 
     vm.type_cmd("ltrace")
+    # CDD №12 p4-final: снять СТАРЫЙ HOLD-флаг (прерванный прошлый прогон)
+    if os.path.exists("/tmp/e2e-hold-release"):
+        os.unlink("/tmp/e2e-hold-release")
     vm.type_cmd("elfload usr/bin/gamescope -W 1024 -H 768")
 
     # ждём: DRM-конвейер / первый флип / краш-лог (паттерны гибкие)
+    # CDD №12 p4-final: окно — env E2E_DRILL (по умолчанию 900с): шейдер-
+    # компиляция lvp/LLVM в TCG волатильна (5..20+ мин по прогонам).
     markers = ["[DRM] page_flip", "page_flip", "SETCRTC", "gamescope:",
                "vblank", "VBLANK", "CPU EXCEPTION", "Fatal"]
     deadline_hit = None
     import time
-    deadline = time.time() + 380
+    deadline = time.time() + int(os.environ.get("E2E_DRILL", "900"))
     while time.time() < deadline:
         t = vm.text()
         if "CPU EXCEPTION" in t or "Fatal" in t:
@@ -261,6 +316,21 @@ try:
         check("drm-gamescope: краш-лог собран (CDD-итерация)", True)
     else:
         check("drm-gamescope: PAGE_FLIP/VBLANK цикл", False)
+
+    # CDD №12 p4-final, HOLD-режим: держим ВМ ЖИВОЙ после краша, чтобы
+    # монитор-наблюдатель (crash-dump.py) успел снять физдамп (гонка:
+    # без HOLD finally мгновенно убивал QEMU). Освобождение — файл-флаг.
+    if os.environ.get("E2E_HOLD") and deadline_hit == "crash":
+        release = "/tmp/e2e-hold-release"
+        print(f"HOLD: ВМ живёт до появления {release} (макс 600с)...")
+        t0 = time.time()
+        while time.time() - t0 < 600 and not os.path.exists(release):
+            time.sleep(1.0)
+        if os.path.exists(release):
+            os.unlink(release)
+            print("HOLD: освобождено наблюдателем — останавливаем ВМ")
+        else:
+            print("HOLD: таймаут 600с — останавливаем ВМ")
 finally:
     vm.stop()
 

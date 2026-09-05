@@ -331,6 +331,16 @@ isr_common:
     // RDI = pointer to InterruptFrame (current RSP)
     movq %rsp, %rdi
 
+    // CDD №12 p4-final (класс p2-R8): 16-байт выравнивание стека ПЕРЕД
+    // Zig .C-вызовом. SysV ABI требует RSP%16==0 в точке call: с Ring 3
+    // CPU пушит SS/RSP/RFLAGS/RCS/RIP (40Б) + стаб vector/error (16Б) +
+    // 14 регисров (112Б) = 168 → RSP≡8 (mod 16) на call — handler входил
+    // со СДВИГОМ (movaps-aligned спиллы = #GP). `andq $-16` безопасен:
+    // кадр-указатель уже в RDI; возврат handler заменяет RSP целиком
+    // (movq %rax,%rsp ниже) — выравнивающий зазор в 0/8Б мёртв.
+    movq %rsp, %rax
+    andq $-16, %rsp
+
     // Call Zig handler: isr_common_handler(frame: *InterruptFrame)
     call isr_common_handler
 
@@ -637,10 +647,19 @@ syscall_entry:
     // под flag=1 (чужой syscall не перезапишет глобал, пока мы владельцы),
     // хвост атомарен cli-ом (тик не встанет кадром на user-стеке);
     // sysretq восстановит IF из R11 (user-RFLAGS, IF=1).
-    movq user_rsp(%rip), %r10
+    // CDD №12 p4-final (класс p2-R8, КОРЕНЬ clobber): СКРЕЧ — RAX, НЕ R10!
+    // Linux x86-64 ABI: ядро обязан сохранить пользователю ВСЕ регистры
+    // кроме RCX/R11/RAX. Старый код «movq user_rsp,%r10; mov %r10,%rsp»
+    // возвращал пользователя с R10=user_rsp — КАЛЕЧЕНИЕ user-R10 на
+    // КАЖДОМ syscall (у sysretq нет других мёртвых регистров: RCX=RIP,
+    // R11=RFLAGS, RAX=результат). RAX свободен ДВАЖДЫ: результат уже
+    // можно положить в syscall_ret_tmp и вернуть в конце.
+    movq %rax, syscall_ret_tmp(%rip)
+    movq user_rsp(%rip), %rax
     cli
     movq $0, in_win32_syscall(%rip)
-    movq %r10, %rsp
+    movq %rax, %rsp
+    movq syscall_ret_tmp(%rip), %rax
 
     // Return to Ring 3
     sysretq

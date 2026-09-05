@@ -913,7 +913,12 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     tasks[current_task_id].wake_tick = 0; // v0.15.0: проснулась по будильнику
 
     // DEBUG: Log when switching to a user task
-    if (tasks[current_task_id].privilege == .User) {
+    // CDD №12 p4-final: гейт за dbg_sched_trace (по умолчанию ВЫКЛ).
+    // Эмпирика базового прогона: ~95% объёма serial-лога (1.9МБ) и
+    // основной тормоз TCG — печать ~90Б с busy-wait-поллингом COM1 на
+    // КАЖДОМ переключении контекста (100Гц × несколько задач = тысячи
+    // строк/с; shader-компиляция gamescope не успевает в drill-окно).
+    if (dbg_sched_trace and tasks[current_task_id].privilege == .User) {
         hal.Serial.puts("[SCHED] Switching to user task ");
         hal.Serial.putHex(current_task_id);
         hal.Serial.puts(" RIP=");
