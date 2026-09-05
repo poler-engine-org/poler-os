@@ -2715,7 +2715,10 @@ const MAX_LINUX_PROCS: usize = 2;
 /// CDD №12 p3: 512 — эмпирика run8-10: 79 либ × ~4 сегмента = 300+ регио-
 /// нов + стеки тредов + арены malloc (при 64/128 — «registry full» →
 /// untracked: munmap-деградация и МАПФИКС-ДИАПАЗОНЫ без контроля).
-const MAX_MMAP_REGIONS: usize = 512;
+/// CDD №12 p4: 2048 — эмпирика run7: lvp/LLVM-init ДОБАВИЛ 159 сверху
+/// 512 (LLVM-арены/JIT-таблицы) — атрибуция CR2/ret и MAP_FIXED-учёт
+/// требуют полного покрытия; .bss-цена 2×2048×80Б = 320КБ — норм.
+const MAX_MMAP_REGIONS: usize = 2048;
 
 var linux_task_proc: [scheduler.MAX_TASKS]u8 =
     [_]u8{255} ** scheduler.MAX_TASKS;

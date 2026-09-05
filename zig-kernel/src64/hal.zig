@@ -769,12 +769,13 @@ fn handleException(frame: *InterruptFrame) void {
         const main64 = @import("main64.zig");
         const pml4 = readCr3() & 0x000FFFFFFFFFF000;
         Serial.puts("\nSTACK-RET:");
-        // гистограмма повторов ret-адресов (≤64 кандидатов)
-        var hist_addr: [64]u64 = [_]u64{0} ** 64;
-        var hist_cnt: [64]u32 = [_]u32{0} ** 64;
+        // гистограмма повторов ret-адресов (≤192 кандидатов)
+        // CDD №12 p4: 64→192 слотов (vkCreateDevice-цепь глубже 64 кадров)
+        var hist_addr: [192]u64 = [_]u64{0} ** 192;
+        var hist_cnt: [192]u32 = [_]u32{0} ** 192;
         var hist_n: usize = 0;
         var i: usize = 0;
-        while (i < 64) : (i += 1) {
+        while (i < 192) : (i += 1) {
             const va = frame.rsp + i * 8;
             const leaf = vmm4.userLeafFlags(pml4, va) orelse break;
             if (leaf & vmm4.PTE_USER == 0) break;
