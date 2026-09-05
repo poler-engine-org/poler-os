@@ -1306,6 +1306,7 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  ldevtest  - Linux POSIX-слой self-test: open/ioctl/poll/epoll/futex (E2E)\n");
         sys_print("  elfload   - ELF-процесс Linux-ABI: PT_LOAD+стек argc/argv/auxv → Ring 3\n");
         sys_print("  gputest   - VirtIO-GPU vring скан-аут: паттерн НА ЭКРАН (CDD #11 p2, E2E)\n");
+        sys_print("  mmapinfo  - mmap-реестры Linux-процессов: va+size+имя модуля (CDD #12 p4)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
@@ -1368,6 +1369,8 @@ fn execute_command(cmd: []const u8) void {
     } else if (eq(cmd, "ltrace")) {
         linux_trace = !linux_trace;
         sys_print(if (linux_trace) "[L] trace ON\n" else "[L] trace OFF\n");
+    } else if (eq(cmd, "mmapinfo")) {
+        cmd_mmapinfo();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -2079,7 +2082,7 @@ fn linuxDevMmap(kind: linux_syscalls.FdKind, off: u64, len: u64, prot: u64) i64 
         else => return -linux_syscalls.ENODEV,
     }
     // dev-регион: физику НЕ освобождаем (VRAM/dumb — владение drm_kms)
-    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false);
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false, "dev");
     proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }
@@ -2176,7 +2179,7 @@ fn linuxDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
             return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
         };
     }
-    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true);
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true, "anon");
     if (!fixed) proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }
@@ -2641,7 +2644,71 @@ const MmapRegion = struct {
     /// Базис физблока (munmap-free; dev-мапы — 0, физику НЕ освобождаем).
     phys: u64 = 0,
     anon: bool = true,
+    /// CDD №12 p4: имя модуля (fd-путь при file-mmap; «anon»/«brk»/«dev»/
+    /// «[stack]»/имя образа от elfload) — атрибуция RIP→библиотека в
+    /// CPU-exception (hal.zig: [RIP]/[CR2]/STACK-RET + гистограмма).
+    name: [48]u8 = [_]u8{0} ** 48,
 };
+
+/// CDD №12 p4: результат атрибуции адреса → модуль mmap-реестра.
+pub const ModuleHit = struct {
+    name: []const u8,
+    off: u64,
+    region_va: u64,
+    region_pages: u64,
+};
+
+/// CDD №12 p4: атрибуция адреса в контексте задачи (task_id из CPU-
+/// exception: faulter-скан по kstack-диапазонам — см. hal.handleException).
+/// null = адрес вне зарегистрированных mmap-регионов (незарег. мап/стек).
+pub fn linuxModuleAt(task_id: usize, addr: u64) ?ModuleHit {
+    if (task_id >= scheduler.MAX_TASKS) return null;
+    const slot = linux_task_proc[task_id];
+    if (slot >= MAX_LINUX_PROCS) return null;
+    for (&linux_mmap_regions[slot]) |*r| {
+        if (!r.used) continue;
+        const lo = r.va;
+        const hi = r.va + r.pages * PAGE_SIZE;
+        if (addr >= lo and addr < hi) {
+            const nl = for (r.name, 0..) |c, i| {
+                if (c == 0) break i;
+            } else r.name.len;
+            return .{
+                .name = r.name[0..nl],
+                .off = addr - r.va,
+                .region_va = r.va,
+                .region_pages = r.pages,
+            };
+        }
+    }
+    return null;
+}
+
+/// CDD №12 p4: дамп mmap-таблицы процесса (компакт: va..hi name) — вызывается
+/// ТОЛЬКО из CPU-exception (редкое событие; полный дамп = вектор изоляции
+/// lvp/LLVM-краша: какие библиотеки где легли + где RIP/CR2).
+pub fn linuxDumpRegionTable(task_id: usize, max_entries: usize) usize {
+    if (task_id >= scheduler.MAX_TASKS) return 0;
+    const slot = linux_task_proc[task_id];
+    if (slot >= MAX_LINUX_PROCS) return 0;
+    var dumped: usize = 0;
+    for (&linux_mmap_regions[slot]) |*r| {
+        if (!r.used) continue;
+        if (dumped >= max_entries) break;
+        const nl = for (r.name, 0..) |c, i| {
+            if (c == 0) break i;
+        } else r.name.len;
+        hal.Serial.puts("  [MMAP] 0x");
+        hal.Serial.putHex(r.va);
+        hal.Serial.puts(" +0x");
+        hal.Serial.putHex(r.pages * PAGE_SIZE);
+        hal.Serial.puts(" ");
+        hal.Serial.puts(r.name[0..nl]);
+        hal.Serial.puts("\n");
+        dumped += 1;
+    }
+    return dumped;
+}
 
 const MAX_LINUX_PROCS: usize = 2;
 /// CDD №12 p3: 512 — эмпирика run8-10: 79 либ × ~4 сегмента = 300+ регио-
@@ -2692,6 +2759,10 @@ fn linuxNewProc(task_id: usize) ?usize {
                 .mmap_cursor = LINUX_MMAP_BASE,
             };
             linux_task_proc[task_id] = @intCast(i);
+            // CDD №12 p4: чистые регионы нового процесса (анти-поллюция
+            // атрибуции: RIP предыдущего мёртвого процесса совпадал бы
+            // с диапазонами-призраками слота).
+            for (&linux_mmap_regions[i]) |*r| r.* = .{};
             return i;
         }
     }
@@ -2699,16 +2770,20 @@ fn linuxNewProc(task_id: usize) ?usize {
 }
 
 /// Записать mmap-регион в реестр процесса.
-fn linuxRecordRegion(slot: u8, va: u64, pages: u64, phys: u64, anon: bool) void {
+/// CDD №12 p4: name — имя модуля для атрибуции RIP→библиотека в
+/// CPU-exception (file-mmap = путь fd; anon/brk/dev — литерал).
+fn linuxRecordRegion(slot: u8, va: u64, pages: u64, phys: u64, anon: bool, name: []const u8) void {
     if (slot >= MAX_LINUX_PROCS) return;
     for (&linux_mmap_regions[slot]) |*r| {
         if (!r.used) {
             r.* = .{ .used = true, .va = va, .pages = pages, .phys = phys, .anon = anon };
+            const n = @min(name.len, r.name.len);
+            @memcpy(r.name[0..n], name[0..n]);
             return;
         }
     }
     // реестр полон: регион живёт без записи (munmap-free деградирует до unmap)
-    hal.Serial.puts("[LINUX] mmap registry full (16) — region untracked\n");
+    hal.Serial.puts("[LINUX] mmap registry full — region untracked\n");
 }
 
 /// brk Linux-семантики: 0 → текущий; рост/спад — маппинг страниц [brk, addr);
@@ -2740,7 +2815,7 @@ fn linuxDoBrk(addr: u64) u64 {
                 return proc.brk;
             };
         }
-        linuxRecordRegion(linux_task_proc[linuxOwnerTask()], proc.brk, pages, base, true);
+        linuxRecordRegion(linux_task_proc[linuxOwnerTask()], proc.brk, pages, base, true, "brk");
         proc.brk = proc.brk + pages * PAGE_SIZE; // Linux: brk странично-гранулярный
         return proc.brk;
     }
@@ -2855,6 +2930,9 @@ const LinuxFile = struct {
     phys: u64 = 0, // базис физблока (0 = не выделен)
     blk_pages: u64 = 0, // размер блока в страницах
     size: u64 = 0, // логический размер (ftruncate)
+    /// CDD №12 p4: путь файла (open) — для атрибуции mmap-регионов при
+    /// file_mmap (ld.so: имя либы в CPU-exception-дампе).
+    name: [48]u8 = [_]u8{0} ** 48,
 };
 
 /// Потолок anon-файла: 512МБ (lavapipe-heap; PMM-гвард).
@@ -3148,6 +3226,12 @@ fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind)
         },
         .dev => return -linux_syscalls.EINVAL, // /dev — уже разложено dev-резолвом слоя
     }
+    // CDD №12 p4: путь → имя fd (модульная атрибуция mmap-регионов)
+    {
+        const f = &linux_files[s];
+        const n = @min(path.len, f.name.len);
+        @memcpy(f.name[0..n], path[0..n]);
+    }
     return @intCast(s);
 }
 
@@ -3301,9 +3385,20 @@ fn linuxFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
         copied += @intCast(got);
         f_off += @intCast(got);
     }
-    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true);
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true, fdRegionName(id));
     if (fixed_va == 0) proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
+}
+
+/// CDD №12 p4: имя региона из fd (fd→LinuxFile.name; «fd?» — незарег.).
+fn fdRegionName(id: u32) []const u8 {
+    if (id >= linux_files.len or !linux_files[id].used) return "fd?";
+    const f = &linux_files[id];
+    const nl = for (f.name, 0..) |c, i| {
+        if (c == 0) break i;
+    } else f.name.len;
+    if (nl == 0) return if (f.anon) "memfd" else "fd";
+    return f.name[0..nl];
 }
 
 /// Прямое чтение VFS-файла в kernel-буфер (id+offset → байты).
@@ -3648,7 +3743,7 @@ fn linuxSharedFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i6
             return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
         };
     }
-    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false); // phys общий — НЕ освобождаем
+    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false, fdRegionName(id)); // phys общий — НЕ освобождаем
     if (fixed_va == 0) proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }
@@ -4428,6 +4523,32 @@ fn ldevCopyOut(dst_va: u64, src: []const u8) bool {
     return true;
 }
 
+/// cmd_mmapinfo: CDD №12 p4 — дамп mmap-реестров Linux-процессов с именами
+/// модулей (e2e-верификация атрибуции: после elfload hello-dynamic в выводе
+/// обязаны быть libc.so.6 / [stack] / ld.so; после gamescope — либы CachyOS).
+/// Формат: [MMAPINFO] proc=N regions=M; далее таблица [MMAP] va +size name.
+fn cmd_mmapinfo() void {
+    var any = false;
+    var slot: usize = 0;
+    while (slot < MAX_LINUX_PROCS) : (slot += 1) {
+        if (!linux_procs[slot].used) continue;
+        any = true;
+        var count: usize = 0;
+        for (&linux_mmap_regions[slot]) |*r| {
+            if (r.used) count += 1;
+        }
+        sys_print("[MMAPINFO] proc=");
+        printDec(slot);
+        sys_print(" regions=");
+        printDec(count);
+        sys_print(" cursor=0x");
+        putHex(linux_procs[slot].mmap_cursor);
+        sys_print("\n");
+        _ = linuxDumpRegionTable(slot, MAX_MMAP_REGIONS);
+    }
+    if (!any) sys_print("[MMAPINFO] нет активных Linux-процессов (elfload <bin>)\n");
+}
+
 /// cmd_ldevtest: E2E-самотест Linux-POSIX графического слоя: openat → ioctl
 /// (DRM VERSION/CREATE_DUMB/MAP_DUMB/ADDFB/PAGE_FLIP) → read event0 (ЖИВЫЕ
 /// input_event!) → poll/epoll → futex → close. Маркеры [LDEVTEST] для e2e.
@@ -4839,6 +4960,8 @@ fn cmd_elfload(args: []const u8) void {
     //     AT_BASE = базис ld.so, AT_ENTRY = entry бинарника.
     var entry_va = img.entry_va;
     var at_base: u64 = 0;
+    // CDD №12 p4: страницы ld.so — для mmap-реестра (атрибуция).
+    var interp_pages: u64 = 0;
     if (img.interp) |interp_path| {
         sys_print("[ELF] PT_INTERP: ");
         sys_print(interp_path);
@@ -4854,6 +4977,7 @@ fn cmd_elfload(args: []const u8) void {
         };
         entry_va = interp_img.entry_va; // HANDOFF: старт с ld.so
         at_base = interp_img.base_va;
+        interp_pages = interp_img.pages;
         sys_print(" — базис 0x");
         putHex(interp_img.base_va);
         sys_print(" entry 0x");
@@ -4903,6 +5027,24 @@ fn cmd_elfload(args: []const u8) void {
     if (linuxNewProc(task_id)) |slot| {
         linux_procs[slot].brk_base = img.brk;
         linux_procs[slot].brk = img.brk;
+        // CDD №12 p4: образ + интерпретатор + стек → mmap-реестр С ИМЕНЕМ
+        // (модульная атрибуция RIP→библиотека в CPU-exception: gamescope-
+        // код и ld.so лежат ВНЕ ld.so-мапов — их регионы ставим МЫ).
+        // phys=0: физика принадлежит elf_loader/стек-маппингу — munmap
+        // эти регионы НЕ освобождает (только unmap-деградация).
+        const reg_slot: u8 = @intCast(slot);
+        linuxRecordRegion(reg_slot, img.base_va, img.pages, 0, false, file);
+        if (img.interp != null) {
+            linuxRecordRegion(reg_slot, elf_loader.LINUX_INTERP_BASE, interp_pages, 0, false, "ld.so");
+        }
+        linuxRecordRegion(
+            reg_slot,
+            elf_loader.LINUX_STACK_TOP - elf_loader.LINUX_STACK_PAGES * 4096,
+            elf_loader.LINUX_STACK_PAGES,
+            0,
+            false,
+            "[stack]",
+        );
         // execfn (readlink /proc/self/exe): АБСОЛЮТНЫЙ путь — glibc
         // _dl_get_origin (dl-origin.c:41) ASSERT'ит linkval[0]=='/'
         // (эмпирика glibc-static: «Fatal glibc error: assertion failed»).

@@ -748,10 +748,31 @@ fn handleException(frame: *InterruptFrame) void {
     // регистр, цепочка обрывается; а стек рекурсии СОДЕРЖИТ повторяющиеся
     // ret-адреса — цикл виновников виден по ПОВТОРАМ). Диапазоны: ld.so+либы
     // (0x400_0000_0000+) и образ gamescope (0x1000_0000_0000+, без brk).
+    // CDD №12 p4: С МОДУЛЬНОЙ АТРИБУЦИЕЙ — faulter-скан по kstack-диапазонам
+    // (ВЛАДЕЛЕЦ кадра) → mmap-реестр его процесса → имя либы+офсет; плюс
+    // гистограмма ПОВТОРОВ (цикл рекурсии = повторяющийся ret по счётчику).
+    var exc_faulter: usize = 0;
+    if (from_user) {
+        const sched0 = @import("scheduler.zig");
+        const fault_rsp0: u64 = @intFromPtr(frame);
+        var fid: usize = 0;
+        while (fid < sched0.task_count) : (fid += 1) {
+            const kb: u64 = @intFromPtr(&sched0.tasks[fid].kernel_stack);
+            if (fault_rsp0 >= kb and fault_rsp0 < kb + sched0.tasks[fid].kernel_stack.len) {
+                exc_faulter = fid;
+                break;
+            }
+        }
+    }
     if (from_user and frame.rsp > 0x1000) {
         const vmm4 = @import("vmm64.zig");
+        const main64 = @import("main64.zig");
         const pml4 = readCr3() & 0x000FFFFFFFFFF000;
         Serial.puts("\nSTACK-RET:");
+        // гистограмма повторов ret-адресов (≤64 кандидатов)
+        var hist_addr: [64]u64 = [_]u64{0} ** 64;
+        var hist_cnt: [64]u32 = [_]u32{0} ** 64;
+        var hist_n: usize = 0;
         var i: usize = 0;
         while (i < 64) : (i += 1) {
             const va = frame.rsp + i * 8;
@@ -764,9 +785,83 @@ fn handleException(frame: *InterruptFrame) void {
             if (is_ret) {
                 Serial.puts(" ");
                 Serial.putHex(v);
+                if (main64.linuxModuleAt(exc_faulter, v)) |hit| {
+                    Serial.puts("(");
+                    Serial.puts(hit.name);
+                    Serial.puts("+0x");
+                    Serial.putHex(hit.off);
+                    Serial.puts(")");
+                }
+                // повтор → счётчик
+                var h: usize = 0;
+                while (h < hist_n) : (h += 1) {
+                    if (hist_addr[h] == v) {
+                        hist_cnt[h] += 1;
+                        break;
+                    }
+                }
+                if (h == hist_n and hist_n < hist_addr.len) {
+                    hist_addr[hist_n] = v;
+                    hist_cnt[hist_n] = 1;
+                    hist_n += 1;
+                }
             }
         }
         Serial.puts("\n");
+        // TOP-повторы (цикл виновников виден по ×N)
+        if (hist_n > 0) {
+            Serial.puts("STACK-HIST:");
+            var h: usize = 0;
+            while (h < hist_n and h < 8) : (h += 1) {
+                Serial.puts(" ");
+                Serial.putHex(hist_addr[h]);
+                Serial.puts("x");
+                Serial.putDecimal(hist_cnt[h]);
+                if (main64.linuxModuleAt(exc_faulter, hist_addr[h])) |hit| {
+                    Serial.puts("(");
+                    Serial.puts(hit.name);
+                    Serial.puts("+0x");
+                    Serial.putHex(hit.off);
+                    Serial.puts(")");
+                }
+            }
+            Serial.puts("\n");
+        }
+    }
+
+    // CDD №12 p4: МОДУЛЬНЫЙ ДАМП — [RIP]/[CR2] → библиотека+офсет из
+    // mmap-реестра ВЛАДЕЛЬЦА кадра (изоляция lvp/LLVM device-init: точный
+    // модуль краша вместо гадания по диапазонам) + ТОП-5 крупнейших регио-
+    // нов + полный дамп (≤64 записи; реже — по ltrace-прогону).
+    if (from_user) {
+        const main64 = @import("main64.zig");
+        Serial.puts("[RIP] module: ");
+        if (main64.linuxModuleAt(exc_faulter, frame.rip)) |hit| {
+            Serial.puts(hit.name);
+            Serial.puts("+0x");
+            Serial.putHex(hit.off);
+            Serial.puts("\n");
+        } else {
+            Serial.puts("(unmapped)\n");
+        }
+        if (frame.vector == 14) {
+            const cr2: u64 = asm volatile ("movq %%cr2, %[v]"
+                : [v] "=r" (-> u64),
+            );
+            Serial.puts("[CR2] module: ");
+            if (main64.linuxModuleAt(exc_faulter, cr2)) |hit| {
+                Serial.puts(hit.name);
+                Serial.puts("+0x");
+                Serial.putHex(hit.off);
+                Serial.puts("\n");
+            } else {
+                Serial.puts("(unmapped)\n");
+            }
+        }
+        const dumped = main64.linuxDumpRegionTable(exc_faulter, 64);
+        Serial.puts("[MMAP] регионов в дампе: ");
+        Serial.putDecimal(dumped);
+        Serial.puts(" (топ-64 из 512)\n");
     }
 
     if (from_user) {
