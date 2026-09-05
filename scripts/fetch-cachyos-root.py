@@ -213,6 +213,27 @@ def best_pkg(idx, pkgname):
                              pkg_split(b)[1] + "." + pkg_split(b)[2])))[-1]
 
 
+# CDD №12 p4-фикс: сонам-резолв с префикс-фолбэками. Проблема: rolling-зеркало
+# бампит версии сонамов (libLLVM.so.22.1 → .23) — точный ключ карты промахивается,
+# а фолбэк «libLLVM» не является именем пакета. Префиксы маппим на стабильные
+# имена пакетов (llvm-libs / icu / mesa / vulkan-icd-loader).
+def pkg_for_soname(m):
+    if m in SONAME_PKG:
+        return SONAME_PKG[m]
+    if m.startswith("libLLVM.so"):
+        return "llvm-libs"
+    if m.startswith("libicu"):
+        return "icu"
+    if m.startswith("libvulkan_lvp") or m.startswith("libglapi") or \
+            m.startswith("libmesa_") or m.startswith("libgallium"):
+        return "mesa"
+    if m.startswith("libvulkan.so"):
+        return "vulkan-icd-loader"
+    if m.startswith("libSDL3"):
+        return "sdl3"
+    return m.split(".so")[0] if ".so" in m else m
+
+
 def ensure_pkg(idx_map, pkgname):
     """Скачивает+распаковывает пакет (кэш). True если пакет есть."""
     if pkgname == "glibc":
@@ -339,6 +360,13 @@ def main():
         print("FATAL: gamescope не встал")
         sys.exit(1)
 
+    # CDD №12 p4-фикс: ХОЛОДНЫЙ СТАРТ dlopen-волны. Гейт os.path.exists()
+    # на пустом кэше пропускал волну ЦЕЛИКОМ (SDL3/Vulkan/lavapipe нет в
+    # DT_NEEDED-замыкании gamescope) → e2e: «Failed loading SDL3 library.» →
+    # abort. Ставим пакеты-носители волн ДО гейта (идемпотентно: кэш-хит).
+    for warm_pkg in ("sdl3", "vulkan-icd-loader", "mesa", "llvm-libs", "icu"):
+        ensure_pkg(idx_map, warm_pkg)
+
     # dlopen-волна: gamescope dlopen'ит libSDL3.so.0 (sdl2-compat собран НА
     # SDL3) — DT_NEEDED-замыкание её НЕ видит; добавляем отдельной волной
     dlopen_extra = []
@@ -351,12 +379,14 @@ def main():
                 if not missing2:
                     break
                 for m in missing2:
-                    pkg = SONAME_PKG.get(m, m.split(".so")[0] if ".so" in m else m)
+                    pkg = pkg_for_soname(m)
                     ensure_pkg(idx_map, pkg)
             missing2, libs2, _ = closure(p3)
             dlopen_extra.append(os.path.basename(p3))  # САМ файл (closure его не включает)
             dlopen_extra.extend(libs2)
             print(f"  dlopen-волна {dlopen_target}: {len(libs2)} либ, missing={missing2}")
+        else:
+            print(f"  dlopen-цель {dlopen_target} НЕ ВСТАЛА (пакет? зеркало?)")
 
     for round_no in range(16):
         missing, libs, interp = closure(binpath)
@@ -365,9 +395,7 @@ def main():
         print(f"  раунд {round_no}: {len(missing)} недостающих: {missing[:8]}{'…' if len(missing) > 8 else ''}")
         installed = []
         for m in missing:
-            pkg = SONAME_PKG.get(m)
-            if pkg is None:
-                pkg = m.split(".so")[0] if ".so" in m else m
+            pkg = pkg_for_soname(m)
             fn = ensure_pkg(idx_map, pkg)
             if fn:
                 installed.append(f"{m}→{fn}")

@@ -143,6 +143,7 @@ pub const SYS_geteuid: u64 = 107;
 pub const SYS_getegid: u64 = 108;
 pub const SYS_getppid: u64 = 110;
 pub const SYS_gettid: u64 = 186;
+pub const SYS_tgkill: u64 = 234;
 pub const SYS_epoll_wait: u64 = 232;
 pub const SYS_epoll_ctl: u64 = 233;
 pub const SYS_exit_group: u64 = 231;
@@ -555,6 +556,12 @@ pub const LinuxOps = struct {
     /// rt_sigprocmask: установить маску (как 0=BLOCK/1=UNBLOCK/2=SETMASK);
     /// вернуть СТАРУЮ маску.
     set_sigmask: *const fn (how: u32, mask: u64) u64,
+    /// CDD №12 p4: tgkill(tgid, tid, sig) — завершить поток ФАТАЛЬНЫМ
+    /// сигналом по умолчанию (abort-путь glibc: rt_sigaction(SIG_DFL) →
+    /// tgkill(pid,tid,SIGABRT); без него процесс НЕ умирает — hlt-хвост
+    /// → #GP). true = поток найден и завершён (exit_code = 128+sig).
+    /// СЕБЯ ядро завершает по exit-паттерну (sti+hlt-цикл — не возвращает).
+    kill_thread: *const fn (tid: u64, sig: u64) bool,
     /// memfd_create: анонимный RW-файл (Wayland-shm) → file_id или -errno.
     memfd_create: *const fn () i64,
     /// v0.20.0 (CDD №12 p3): ftruncate(id, len) — размер анонимного файла
@@ -1694,6 +1701,32 @@ pub fn sysRtSigaction(ops: LinuxOps, sig: u64, act_va: u64, old_va: u64, sigsets
 }
 
 /// rt_sigprocmask(how, set, oldset, size): маска сигналов (хранение).
+/// CDD №12 p4: tgkill(tgid, tid, sig) — abort-путь glibc ДОЛЖЕН убивать
+/// процесс: rt_sigaction(SIGABRT, SIG_DFL) → tgkill(pid, tid, SIGABRT).
+/// Семантика p4 (минимальная, crash-driven):
+///   • SIGKILL (9) — всегда завершение (SIG_DFL по определению);
+///   • фатальный по умолчанию (term/core: 1..16) И handler==SIG_DFL (0)
+///     → kill_thread(tid, sig), exit_code = 128 + sig;
+///   • пойманный (handler ≠ 0) — доставки НЕТ (сигнальные кадры вне
+///     объёма p4) → 0 без действия (документированное ограничение);
+///   • SIGCHLD(17)/SIGCONT(18)/SIGSTOP.. — 0 без действия;
+///   • tid == 0 → ESRCH; sig > 64 / 0 → EINVAL; поток не найден → ESRCH.
+pub fn sysTgkill(ops: LinuxOps, tgid: u64, tid: u64, sig: u64) u64 {
+    _ = tgid; // группа тредов = слот (ядро резолвит по tid; Linux-kill
+    // прощает несоответствие tgid — не добавляем ESRCH-строгость).
+    if (sig == 0 or sig > 64) return err(EINVAL);
+    if (tid == 0) return err(ESRCH);
+    // Фатальные по умолчанию (term/core): SIGHUP..SIGUSR2/SIGTERM (1..16).
+    const fatal_dfl = (sig >= 1 and sig <= 16);
+    if (sig == 9 or (fatal_dfl and ops.get_sigaction(@intCast(sig)) == 0)) {
+        if (ops.kill_thread(tid, sig)) return 0;
+        return err(ESRCH);
+    }
+    // Пойманный/игнорируемый/стоп-сигнал: доставки нет — успех без действия.
+    return 0;
+}
+
+/// rt_sigprocmask(how, set, oldset, size): маска сигналов (хранение).
 pub fn sysRtSigprocmask(ops: LinuxOps, how: u64, set_va: u64, old_va: u64, size: u64) u64 {
     if (size != 8) return err(EINVAL);
     if (set_va != 0 and how > 2) return err(EINVAL); // SIG_BLOCK/UNBLOCK/SETMASK
@@ -1821,6 +1854,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_exit_group => return sysExitGroup(ops, args.a1),
         SYS_uname => return sysUname(ops, args.a1),
         SYS_gettid => return sysGettid(ops),
+        SYS_tgkill => return sysTgkill(ops, @bitCast(args.a1), @bitCast(args.a2), args.a3),
         SYS_getpid => return sysGetpid(ops),
         SYS_fstat => return sysFstat(ops, fds, @bitCast(args.a1), args.a2),
         SYS_mprotect => return sysMprotect(ops, args.a1, args.a2, args.a3),
@@ -2429,6 +2463,20 @@ fn fakeGetSigaction(sig: u32) u64 {
     if (sig == 0 or sig > 64) return 0;
     return g_sig_handlers[sig];
 }
+
+/// CDD №12 p4: фейк-kill_thread — журнал вызовов (tid, sig).
+var fake_kills: u32 = 0;
+var fake_kill_tid: u64 = 0;
+var fake_kill_sig: u64 = 0;
+var fake_kill_ret: bool = true;
+fn fakeKillThread(tid: u64, sig: u64) bool {
+    if (!fake_kill_ret) return false;
+    fake_kills += 1;
+    fake_kill_tid = tid;
+    fake_kill_sig = sig;
+    return true;
+}
+
 fn fakeSetSigmask(how: u32, mask: u64) u64 {
     const old = g_sig_mask;
     switch (how) {
@@ -2522,6 +2570,7 @@ fn fakeOps() LinuxOps {
         .futex_wake = fakeFutexWake,
         .current_pid = fakeCurrentPid,
         .current_tid = fakeCurrentTid,
+        .kill_thread = fakeKillThread,
         .do_brk = fakeDoBrk,
         .do_mprotect = fakeDoMprotect,
         .arch_set_fs = fakeArchSetFs,
@@ -3787,6 +3836,52 @@ test "linux: rt_sigaction/rt_sigprocmask — хранилище; SIGKILL → EIN
     try testing.expect(fakeCopyIn(&mb, oldm_va));
     try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, &mb, .little));
     try testing.expectEqual(@as(u64, 0xFF), g_sig_mask);
+}
+
+test "linux: p4 — tgkill: abort-смерть (SIGABRT/SIGKILL), пойманный — без доставки" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+    fake_kills = 0;
+    fake_kill_ret = true;
+    for (&g_sig_handlers) |*h| h.* = 0;
+
+    // номер syscall — якорь UAPI
+    try testing.expectEqual(@as(u64, 234), SYS_tgkill);
+
+    // abort-путь: SIGABRT(6), handler=SIG_DFL → kill_thread(3, 6) → 0
+    try testing.expectEqual(@as(u64, 0), sysTgkill(ops, 100, 3, 6));
+    try testing.expectEqual(@as(u32, 1), fake_kills);
+    try testing.expectEqual(@as(u64, 3), fake_kill_tid);
+    try testing.expectEqual(@as(u64, 6), fake_kill_sig);
+
+    // SIGKILL — даже с зарегистрированным handler (SIG_DFL по определению)
+    g_sig_handlers[9] = 0xDEAD;
+    try testing.expectEqual(@as(u64, 0), sysTgkill(ops, 100, 3, 9));
+    try testing.expectEqual(@as(u32, 2), fake_kills);
+    try testing.expectEqual(@as(u64, 9), fake_kill_sig);
+
+    // пойманный SIGUSR1(10) (handler=0xDEAD) — доставки НЕТ: 0, без kill
+    g_sig_handlers[10] = 0xDEAD;
+    try testing.expectEqual(@as(u64, 0), sysTgkill(ops, 100, 3, 10));
+    try testing.expectEqual(@as(u32, 2), fake_kills);
+
+    // SIGCHLD(17)/SIGSTOP(19) — вне фатального диапазона: 0 без kill
+    try testing.expectEqual(@as(u64, 0), sysTgkill(ops, 100, 3, 17));
+    try testing.expectEqual(@as(u64, 0), sysTgkill(ops, 100, 3, 19));
+    try testing.expectEqual(@as(u32, 2), fake_kills);
+
+    // sig=0/65 → EINVAL; tid=0 → ESRCH; поток не найден → ESRCH
+    try testing.expectEqual(err(EINVAL), sysTgkill(ops, 100, 3, 0));
+    try testing.expectEqual(err(EINVAL), sysTgkill(ops, 100, 3, 65));
+    try testing.expectEqual(err(ESRCH), sysTgkill(ops, 100, 0, 6));
+    fake_kill_ret = false;
+    defer fake_kill_ret = true;
+    try testing.expectEqual(err(ESRCH), sysTgkill(ops, 100, 3, 6));
+
+    // dispatch-якорь: SYS_tgkill маршрутизируется (EINVAL-путь виден)
+    var fds = FdTable.init();
+    try testing.expectEqual(err(EINVAL), dispatch(ops, &fds, SYS_tgkill, .{ .a1 = 100, .a2 = 3, .a3 = 0 }));
 }
 
 test "linux: prctl — CAPBSET_READ→0; madvise; getcwd; fstatfs" {

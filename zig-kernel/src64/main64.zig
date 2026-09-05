@@ -3585,6 +3585,7 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .futex_wake = linuxFutexWake,
         .current_pid = linuxCurrentPid,
         .current_tid = linuxCurrentTid,
+        .kill_thread = linuxKillThread,
         .do_brk = linuxDoBrk,
         .do_mprotect = linuxDoMprotect,
         .arch_set_fs = linuxArchSetFs,
@@ -3764,6 +3765,36 @@ fn linuxCurrentTid() u64 {
     const owner = linuxOwnerTask();
     if (owner < scheduler.MAX_TASKS) return owner;
     return 0;
+}
+
+/// CDD №12 p4: kill_thread-мост tgkill: tid = task_id (gettid-контракт).
+/// СЕБЯ (abort-путь glibc): exit-паттерн — exitCurrentTask + sti + hlt
+/// (syscall-каскад под IF=0 — парковка таймеру обязательна, см. linuxDoExit).
+/// ДРУГОЙ поток: killTask + CLEARTID-эпилог; exit_code = 128+sig (wait-
+/// семантика Linux «убит сигналом»). Вызывается только через LinuxOps.
+fn linuxKillThread(tid: u64, sig: u64) bool {
+    if (tid >= scheduler.MAX_TASKS) return false;
+    const t = &scheduler.tasks[tid];
+    if (t.state == .Killed or t.privilege != .User) return false;
+    const owner = linuxOwnerTask();
+    hal.Serial.puts("[LINUX] tgkill(");
+    hal.Serial.putDecimal(tid);
+    hal.Serial.puts(", sig=");
+    hal.Serial.putDecimal(sig);
+    if (tid == owner) {
+        hal.Serial.puts(") — self-kill (abort-путь)\n");
+        // exit_code = 128+sig (wait-семантика Linux: killed-by-signal)
+        const slot = linux_task_proc[owner];
+        if (slot < MAX_LINUX_PROCS) linux_procs[slot].exit_code = 128 + sig;
+        linuxDoExit(128 + sig);
+        unreachable; // linuxDoExit не возвращает (hlt-цикл)
+    }
+    hal.Serial.puts(") — killing thread\n");
+    const slot = linux_task_proc[tid];
+    if (slot < MAX_LINUX_PROCS) linux_procs[slot].exit_code = 128 + sig;
+    linuxClearWakeTid(tid);
+    scheduler.killTask(tid) catch return false;
+    return true;
 }
 
 /// hal.linuxSyscallCallback: Linux x86_64 RAX-ABI. Аргументы №5/№6 (user
