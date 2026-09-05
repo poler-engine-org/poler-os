@@ -624,6 +624,20 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
     return next_frame;
 }
 
+/// CDD №12 p5: владелец кадра исключения по kstack-адресу (как exc_faulter
+/// ниже, но доступен ДО печати дампа — demand-zero-путь). Возврат — task_id.
+fn halFaulterTask(frame_addr: u64) usize {
+    const sched0 = @import("scheduler.zig");
+    var fid: usize = 0;
+    while (fid < sched0.task_count) : (fid += 1) {
+        const kb: u64 = @intFromPtr(&sched0.tasks[fid].kernel_stack);
+        if (frame_addr >= kb and frame_addr < kb + sched0.tasks[fid].kernel_stack.len) {
+            return fid;
+        }
+    }
+    return sched0.MAX_TASKS; // «не найден»
+}
+
 fn handleException(frame: *InterruptFrame) void {
     // v0.10.0 (CDD №1): int3 из стаба импорта — обрабатываем ПЕРВЫМ.
     // Стаб: xor rax,rax; int3; ret — RIP после int3 указывает внутрь стаба;
@@ -637,6 +651,20 @@ fn handleException(frame: *InterruptFrame) void {
 
     // v0.7.0: Differentiate user-mode vs kernel-mode exceptions
     const from_user = (frame.cs & 0x3) != 0;
+
+    // CDD №12 p5: DEMAND-ZERO — #PF(P=0) на lazy-anon/brk-странице гостья:
+    // молча выделяем НУЛЕВУЮ физ-страницу с правами региона и ПЕРЕЗАПУСКАЕМ
+    // инструкцию (Linux-семантика анонимной памяти: страницы при касании).
+    // Хендлер входит с CR3 вины — работаем с таблицами её процесса.
+    if (from_user and frame.vector == 14 and (frame.error_code & 0x1) == 0) {
+        const cr2_dz: u64 = asm volatile ("movq %%cr2, %[v]"
+            : [v] "=r" (-> u64),
+        );
+        if (@import("main64.zig").linuxDemandZero(
+                halFaulterTask(@intFromPtr(frame)), cr2_dz)) {
+            return; // гость продолжает — фолта «не было»
+        }
+    }
 
     Serial.puts("\n!!! CPU EXCEPTION !!!\n");
     Serial.puts("Vector: ");
@@ -708,16 +736,18 @@ fn handleException(frame: *InterruptFrame) void {
     Serial.puts(" R15: ");
     Serial.putHex(frame.r15);
     if (from_user) {
-        // 16 байт опкодов вокруг RIP (user-страницы читаемы по CR3 вины)
+        // 16 байт опкодов НАЧИНАЯ С RIP (fault-инструкция — точный опкод).
+        // CDD №12 p5-фикс: старый код печатал только байт по RIP-8 (мусор
+        // для разбора) — теперь hex-строка всех байт [RIP, RIP+16).
         Serial.puts("\nRIP-bytes: ");
         const vmm2 = @import("vmm64.zig");
         var k: usize = 0;
         while (k < 16) : (k += 1) {
-            const va = frame.rip - 8 + k;
+            const va = frame.rip + k;
             const leaf = vmm2.userLeafFlags(readCr3() & 0x000FFFFFFFFFF000, va) orelse break;
             if (leaf & vmm2.PTE_USER == 0) break;
             const pb: *volatile u8 = @ptrFromInt(va);
-            if (k == 0) Serial.putHex(pb.*);
+            Serial.putHexByte(pb.*);
         }
     }
     // v0.13.0-fix (диагностика CDD №4): дамп стека юзера — ret-адрес укажет
@@ -1661,6 +1691,14 @@ pub const Serial = struct {
             if (i == 0) break;
             i -= 4;
         }
+    }
+
+    /// CDD №12 p5: hex-байт БЕЗ префикса и ведущих нулей 0x.. — для
+    /// RIP-bytes-строки опкодов (плотный дамп fault-инструкции).
+    pub fn putHexByte(val: u8) void {
+        const hex = "0123456789ABCDEF";
+        puts(&.{hex[val >> 4]});
+        puts(&.{hex[val & 0xF]});
     }
 
     pub fn putDecimal(val: u64) void {

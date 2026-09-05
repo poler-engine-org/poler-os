@@ -269,6 +269,24 @@ class VM:
         except socket.timeout:
             pass
 
+    def mon_cmd(self, c, wait=2.0):
+        """CDD №12 p5: произвольная HMP-команда монитора #1
+        (screendump и т.д.). Возвращает текст ответа."""
+        self._mon.sendall((c + "\n").encode())
+        time.sleep(wait)
+        out = b""
+        try:
+            while True:
+                d = self._mon.recv(4096)
+                if not d:
+                    break
+                out += d
+                if out.rstrip().endswith(b"(qemu)"):
+                    break
+        except socket.timeout:
+            pass
+        return out.decode("utf-8", "replace")
+
     def type_cmd(self, line, delay=0.035):
         """Печатает строку посимвольно через monitor sendkey + Enter."""
         for ch in line:

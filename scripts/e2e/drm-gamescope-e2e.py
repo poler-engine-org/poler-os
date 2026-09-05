@@ -215,7 +215,7 @@ if _blob is None:
 del files, symlinks  # OOM-гигиена: 246МБ словаря не переживают CPIO-сборку
 
 # ─── 2. QEMU: virtio-gpu (скан-ауты), ltrace, полный запуск композитора ────
-vm = VM("drm-gamescope", initrd=INITRD, mem="2G", qemu=QEMU_FULL,
+vm = VM("drm-gamescope", initrd=INITRD, mem=os.environ.get("E2E_MEM", "2G"), qemu=QEMU_FULL,
         extra_args=["-cpu", "max", "-vga", "none",
                     "-device", "virtio-gpu-pci,xres=1024,yres=768", "-vnc", ":0",
                     # CDD №12 p4-final: gdb-stub для rsp-watch.py (watchpoint
@@ -253,6 +253,7 @@ try:
     markers = ["[DRM] page_flip", "page_flip", "SETCRTC", "gamescope:",
                "vblank", "VBLANK", "CPU EXCEPTION", "Fatal"]
     deadline_hit = None
+    shot1_taken = False
     import time
     deadline = time.time() + int(os.environ.get("E2E_DRILL", "900"))
     while time.time() < deadline:
@@ -263,11 +264,55 @@ try:
         if "page_flip" in t.lower() or "vblank" in t.lower():
             deadline_hit = "flip"
             break
+        # CDD №12 p5 (ШАГ 2): скриншот ДО флипа — прогресс рендера
+        # (Wayland/fb контент) + ПОСЛЕ — первый кадр. Через мон2 (env E2E_MON2).
+        if os.environ.get("E2E_MON2") and not shot1_taken and "vulkan:" in t:
+            shot1_taken = True
+            try:
+                vm.mon_cmd("screendump /tmp/poler-e2e-drm-gamescope/shot-pre.ppm")
+                print("SHOT: /tmp/shot-pre.ppm (pre-flip)")
+            except Exception as e:
+                print("SHOT pre fail:", e)
         if vm.proc and vm.proc.poll() is not None:
             deadline_hit = "qemu-died"
             break
         time.sleep(1.0)
     text = vm.text()
+
+    # ─── 2b. Скриншот ПОСЛЕ флипа + PPM-анализ пикселей ──────────────────
+    if os.environ.get("E2E_MON2") and deadline_hit in ("flip", "crash"):
+        try:
+            vm.mon_cmd("screendump /tmp/poler-e2e-drm-gamescope/shot-post.ppm")
+            time.sleep(2.0)
+            vm.mon_cmd("screendump /tmp/poler-e2e-drm-gamescope/shot-post2.ppm")
+            print("SHOT: /tmp/shot-post.ppm + shot-post2.ppm (после флипа)")
+        except Exception as e:
+            print("SHOT post fail:", e)
+        for name in ("shot-pre.ppm", "shot-post.ppm", "shot-post2.ppm"):
+            p = f"/tmp/poler-e2e-drm-gamescope/{name}"
+            if os.path.exists(p):
+                # PPM P6: ширина/высота; считаем НЕ-чёрные пиксели
+                try:
+                    with open(p, "rb") as f:
+                        head = f.readline()  # P6
+                        dims = f.readline()
+                        while dims.startswith(b"#"):
+                            dims = f.readline()
+                        w, h = map(int, dims.split())
+                        f.readline()
+                        data = f.read()
+                    total = w * h
+                    black = 0
+                    for i in range(0, min(len(data), total * 3), 3):
+                        if data[i] == 0 and data[i+1] == 0 and data[i+2] == 0:
+                            black += 1
+                    nonblack = total - black
+                    print(f"SHOT-ANALYZE {name}: {w}x{h}, не-чёрных {nonblack}/{total} "
+                          f"({100*nonblack/total:.1f}%)")
+                    if deadline_hit == "flip":
+                        check(f"кадр {name}: есть контент (>1% не-чёрных)", nonblack * 100 > total)
+                except Exception as e:
+                    print("PPM-анализ", name, "fail:", e)
 
     # ─── 3. Анализ: DRM-ioctl декодер из ltrace ────────────────────────────
     ioctl_calls = re.findall(r"\[L\] 16\(0x[0-9A-F]+,0x([0-9A-F]+),", text)
@@ -317,7 +362,7 @@ try:
     else:
         check("drm-gamescope: PAGE_FLIP/VBLANK цикл", False)
 
-    # CDD №12 p4-final, HOLD-режим: держим ВМ ЖИВОЙ после краша, чтобы
+    # CDD №12 p5: HOLD-режим — держим ВМ ЖИВОЙ после краша, чтобы
     # монитор-наблюдатель (crash-dump.py) успел снять физдамп (гонка:
     # без HOLD finally мгновенно убивал QEMU). Освобождение — файл-флаг.
     if os.environ.get("E2E_HOLD") and deadline_hit == "crash":

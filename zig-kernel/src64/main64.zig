@@ -104,11 +104,14 @@ fn parsePvhStartInfo(si_paddr: u64) void {
     puts("\n");
 
     if (si.nr_modules == 0 or si.mods_addr == 0) return;
-    // только 1-й модуль (initrd); лимит sanity — 64 модуля
+    // только 1-й модуль (initrd); лимит sanity — 64 модуля.
+    // CDD №12 p5-фикс: sanity-лимит размера 256МБ → 512МБ. CPIO-gamescope
+    //rootfs дорос до 280 562 176 байт (267МБ) — модуль молча отбрасывался
+    // («No initrd modules») при кеше 258МБ, который проходил впритык.
     const n = @min(si.nr_modules, 64);
     const mods: [*]const HvmModListEntry = @ptrFromInt(si.mods_addr);
     for (mods[0..n]) |*m| {
-        if (m.addr == 0 or m.size == 0 or m.size > 256 * 1024 * 1024) continue;
+        if (m.addr == 0 or m.size == 0 or m.size > 512 * 1024 * 1024) continue;
         puts("[PVH] module: paddr=0x");
         putHex(m.addr);
         puts(" size=");
@@ -1857,7 +1860,10 @@ fn kernelLoaderOps() pe_loader.LoaderOps {
 /// стабы 8ГБ, TEB/PEB 0x21…, стек 0x22…, heap 0x30…). Бюджет — 1ГБ.
 const PAGE_SIZE = vmm.PAGE_SIZE;
 const LINUX_MMAP_BASE: u64 = 0x40_0000_0000;
-const LINUX_MMAP_BUDGET: u64 = 0x4000_0000;
+/// CDD №12 p5: 1ГБ → 48ГБ VA-бюджет: LLVM резервирует 10.7ГБ JIT-арен
+/// (mmap(0, 0x2AAAAB000)×2) — с demand-zero физика не резервируется, VA
+/// дёшев; USER_VA_CEILING (0x7FFF_FFFF_FFFF) вмещает с запасом.
+const LINUX_MMAP_BUDGET: u64 = 0xC_0000_0000;
 const LINUX_MAX_VALIDATE: u64 = 64 * 1024 * 1024; // зеркало MAX_VALIDATE_LEN win32
 
 /// PML4 текущей Ring-3 задачи (ABI-независимо — работает и для ELF).
@@ -1895,12 +1901,34 @@ fn linuxValidate(va: u64, len: u64, want_write: bool) bool {
     var off: u64 = 0;
     while (off < len) {
         const p = va + off;
-        const leaf = vmm.userLeafFlags(pml4, p) orelse return false;
+        var leaf_opt = vmm.userLeafFlags(pml4, p);
+        // CDD №12 p5: LAZY-СТРАНИЦА (demand-zero регион/brk): Linux-семантика
+        // «VA валидна = память доступна». madvise на untouched-страницах
+        // старого ядра возвращал 0 (eager-маппинг) — lazy-вариант давал
+        // EFAULT и ЛОМАЛ glibc/lua-путь (частичная инициализация структур
+        // → 0xAAAA в полях). Материализуем НУЛЕВЫЕ страницы прямо здесь.
+        if (leaf_opt == null or (leaf_opt.? & vmm.PTE_PRESENT == 0)) {
+            if (!linuxMaterializeLazyPage(p)) return false;
+            leaf_opt = vmm.userLeafFlags(pml4, p);
+            if (leaf_opt == null) return false;
+        }
+        const leaf = leaf_opt.?;
         if (leaf & vmm.PTE_USER == 0) return false;
         if (want_write and (leaf & vmm.PTE_WRITABLE == 0)) return false;
         off += PAGE_SIZE - (p & (PAGE_SIZE - 1));
     }
     return true;
+}
+
+/// CDD №12 p5: материализация ОДНОЙ lazy-страницы (валидация юзер-буферов
+/// и madvise/механизмы ДО фактического касания гостем). Права — из региона.
+fn linuxMaterializeLazyPage(p: u64) bool {
+    const owner = linuxOwnerTask();
+    if (owner >= scheduler.MAX_TASKS) return false;
+    const page = p & ~@as(u64, PAGE_SIZE - 1);
+    if (page < elf_loader.MIN_USER_VA) return false; // ядро/identity не трогаем
+    if (linuxDemandZero(owner, p)) return true;
+    return false;
 }
 
 /// Ядро → user: запись БАЙТОВ (uname). Вызывается ПОСЛЕ валидации слоем;
@@ -2095,9 +2123,18 @@ fn linuxDoMunmap(va: u64, len: u64) i64 {
     const pml4 = linuxTaskPml4();
     if (pml4 == 0) return 0; // нечего снимать
     const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    // CDD №12 p5: страницы могут быть demand-zero (lazy) — физику собираем
+    // по PTE-скану ДО unmap (после — PTE уже пуст); eager-регионы реестра
+    // — отдельным проходом (phys-базис).
     var i: u64 = 0;
     while (i < pages) : (i += 1) {
-        _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+        const va_pg = (va & ~@as(u64, PAGE_SIZE - 1)) + i * PAGE_SIZE;
+        if (vmm.userLeafFlags(pml4, va_pg)) |leaf| {
+            if (leaf & vmm.PTE_PRESENT != 0 and va_pg >= elf_loader.MIN_USER_VA) {
+                pmm.freePage(leaf & 0x000FFFFFFFFFF000);
+            }
+        }
+        _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
     }
     const owner = linuxOwnerTask();
     if (owner < scheduler.MAX_TASKS) {
@@ -2107,7 +2144,8 @@ fn linuxDoMunmap(va: u64, len: u64) i64 {
                 if (r.used and r.va == va and r.anon and
                     r.va + r.pages * PAGE_SIZE <= va + len)
                 {
-                    pmm.freeContiguousPages(r.phys, r.pages);
+                    // lazy-регионы: phys=0 (физика уже собрана PTE-сканом)
+                    if (r.phys != 0) pmm.freeContiguousPages(r.phys, r.pages);
                     r.used = false;
                     break;
                 }
@@ -2125,7 +2163,14 @@ fn linuxDoMunmap(va: u64, len: u64) i64 {
 fn linuxUnmapFixedRange(pml4: u64, va: u64, pages: u64) void {
     var i: u64 = 0;
     while (i < pages) : (i += 1) {
-        _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
+        // CDD №12 p5: demand-zero-страницы — физику собираем по PTE-скану
+        const va_pg = va + i * PAGE_SIZE;
+        if (vmm.userLeafFlags(pml4, va_pg)) |leaf| {
+            if (leaf & vmm.PTE_PRESENT != 0 and va_pg >= elf_loader.MIN_USER_VA) {
+                pmm.freePage(leaf & 0x000FFFFFFFFFF000);
+            }
+        }
+        _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
     }
     const owner = linuxOwnerTask();
     if (owner < scheduler.MAX_TASKS) {
@@ -2170,17 +2215,14 @@ fn linuxDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
     }
     var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
     if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
-    // ОДИН contiguous-блок: munmap-free по реестру + clone-стек-регион
-    const base = pmm.allocContiguousZeroed(@intCast(pages)) orelse
-        return -linux_syscalls.ENOMEM;
-    var i: u64 = 0;
-    while (i < pages) : (i += 1) {
-        vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, base + i * PAGE_SIZE, pte) catch {
-            pmm.freeContiguousPages(base, pages);
-            return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
-        };
-    }
-    linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, base, true, "anon");
+    // CDD №12 p5: ЛЕНИВАЯ VA-резервация (demand-zero). Linux-семантика
+    // анонимного mmap — ВИРТУАЛЬНАЯ память без физики до касания: LLVM
+    // резервирует 10.7ГБ JIT-арен (mmap(0, 0x2AAAAB000)) — eager-выдача
+    // физики невозможна (гость 2ГБ), а отказ → «LLVM ERROR: out of memory».
+    // Права протокола сохранены в r.pte — #PF-хендлер замапит нулевые
+    // страницы с этими флагами. Eager-путь оставлен старым regression-тестам
+    // (fakeDoMmap не тронут — тесты ядра проверяют errno-семантику).
+    linuxRecordRegionEx(linux_task_proc[linuxOwnerTask()], va, pages, 0, true, true, pte, "anon");
     if (!fixed) proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }
@@ -2645,6 +2687,16 @@ const MmapRegion = struct {
     /// Базис физблока (munmap-free; dev-мапы — 0, физику НЕ освобождаем).
     phys: u64 = 0,
     anon: bool = true,
+    /// CDD №12 p5: LAZY-регион — VA-резервация без физики (анон-mmap/brk).
+    /// Касание страницы → #PF (P=0) → demand-zero: НУЛЕВАЯ физ-страница.
+    /// Linux-семантика mmap: гигантские резервы (LLVM JIT-арена 10.7ГБ)
+    /// без физики до касания.
+    lazy: bool = false,
+    /// PTE-флаги demand-маппинга (RW/U/NX по prot региона).
+    pte: u64 = 0,
+    /// CDD №12 p5: счётчик demand-выделенных страниц (диагностика: сколько
+    /// из резерва реально потрогано).
+    touched: u32 = 0,
     /// CDD №12 p4: имя модуля (fd-путь при file-mmap; «anon»/«brk»/«dev»/
     /// «[stack]»/имя образа от elfload) — атрибуция RIP→библиотека в
     /// CPU-exception (hal.zig: [RIP]/[CR2]/STACK-RET + гистограмма).
@@ -2777,10 +2829,15 @@ fn linuxNewProc(task_id: usize) ?usize {
 /// CDD №12 p4: name — имя модуля для атрибуции RIP→библиотека в
 /// CPU-exception (file-mmap = путь fd; anon/brk/dev — литерал).
 fn linuxRecordRegion(slot: u8, va: u64, pages: u64, phys: u64, anon: bool, name: []const u8) void {
+    linuxRecordRegionEx(slot, va, pages, phys, anon, false, 0, name);
+}
+
+/// CDD №12 p5: запись региона с lazy-флагом и PTE-правами (demand-zero).
+fn linuxRecordRegionEx(slot: u8, va: u64, pages: u64, phys: u64, anon: bool, lazy: bool, pte: u64, name: []const u8) void {
     if (slot >= MAX_LINUX_PROCS) return;
     for (&linux_mmap_regions[slot]) |*r| {
         if (!r.used) {
-            r.* = .{ .used = true, .va = va, .pages = pages, .phys = phys, .anon = anon };
+            r.* = .{ .used = true, .va = va, .pages = pages, .phys = phys, .anon = anon, .lazy = lazy, .pte = pte };
             const n = @min(name.len, r.name.len);
             @memcpy(r.name[0..n], name[0..n]);
             return;
@@ -2799,42 +2856,98 @@ fn linuxDoBrk(addr: u64) u64 {
     if (addr == 0) return proc.brk;
     if (addr < proc.brk_base) return proc.brk; // ниже образа — отказ
     if (addr == proc.brk) return proc.brk;
+    const prev_brk = proc.brk;
 
     if (addr > proc.brk) {
-        // рост: страницы [brk, addr) — RW+USER+NX
-        const pages = (addr - proc.brk + PAGE_SIZE - 1) / PAGE_SIZE;
-        if (pages > 1024) return proc.brk; // 4МБ за вызов — подозрительно
-        const base = pmm.allocContiguousZeroed(@intCast(pages)) orelse
-            return proc.brk;
-        const pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE;
-        var i: u64 = 0;
-        while (i < pages) : (i += 1) {
-            vmm.mapPageInPML4(pml4, proc.brk + i * PAGE_SIZE, base + i * PAGE_SIZE, pte) catch {
-                // откат роста
-                var j: u64 = 0;
-                while (j < i) : (j += 1) {
-                    vmm.unmapPageInPML4(pml4, proc.brk + j * PAGE_SIZE) catch {};
-                }
-                pmm.freeContiguousPages(base, pages);
-                return proc.brk;
-            };
-        }
-        linuxRecordRegion(linux_task_proc[linuxOwnerTask()], proc.brk, pages, base, true, "brk");
-        proc.brk = proc.brk + pages * PAGE_SIZE; // Linux: brk странично-гранулярный
+        // CDD №12 p5: рост — ЛЕНИВЫЙ (demand-zero): поднимаем только границу
+        // (Linux-семантика brk = VA-резервация; страницы — нули по касанию).
+        // Лимит «4МБ за вызов» снят: glibc/LLVM делают гигантские sbrk-рывки
+        // (0x2AAAAB000=10.7ГБ) — отказ воспринимался как OOM.
+        proc.brk = addr & ~@as(u64, PAGE_SIZE - 1); // странично-гранулярный
+        // регион-запись для атрибуции #PF (lazy — страницы по касанию)
+        linuxRecordRegionEx(linux_task_proc[linuxOwnerTask()],
+            prev_brk, (proc.brk - prev_brk + PAGE_SIZE - 1) / PAGE_SIZE,
+            0, true, true,
+            vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE, "brk");
         return proc.brk;
     }
 
-    // спад: unmap [addr, brk) (физику точного региона освобождаем)
+    // спад: unmap [addr, brk) — физику demand-zero-страниц освобождаем
+    // по PTE-скану (lazy-регионы не держат базис физблока).
     const drop_pages = (proc.brk - addr + PAGE_SIZE - 1) / PAGE_SIZE;
     var i: u64 = 0;
     while (i < drop_pages) : (i += 1) {
-        _ = vmm.unmapPageInPML4(pml4, addr + i * PAGE_SIZE) catch {};
+        const va_pg = (addr & ~@as(u64, PAGE_SIZE - 1)) + i * PAGE_SIZE;
+        if (vmm.userLeafFlags(pml4, va_pg)) |leaf| {
+            if (leaf & vmm.PTE_PRESENT != 0 and va_pg >= elf_loader.MIN_USER_VA) {
+                pmm.freePage(leaf & 0x000FFFFFFFFFF000);
+            }
+        }
+        _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
     }
     proc.brk = addr & ~@as(u64, PAGE_SIZE - 1);
     return proc.brk;
 }
 
 // ─── v0.20.0 (CDD №11 p1b): glibc-волна — runtime-мосты ─────────────────────
+
+/// CDD №12 p5: DEMAND-ZERO — обработка #PF (P=0) на lazy-странице: выдать
+/// НУЛЕВУЮ физ-страницу и замапить с правами региона. Linux-семантика
+/// анонимной памяти (mmap/brk): страница «появляется» при ПЕРВОМ касании.
+/// Возврат true = инструкция перезапускается (iretq), гость не видит фолта.
+/// Память: страница зануляется ЯВНО (PMM-страницы рециклируются грязными).
+pub fn linuxDemandZero(faulter_task: usize, va: u64) bool {
+    if (faulter_task >= scheduler.MAX_TASKS) return false;
+    const slot = linux_task_proc[faulter_task];
+    if (slot >= MAX_LINUX_PROCS) return false;
+    const proc = &linux_procs[slot];
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return false;
+    const page = va & ~@as(u64, PAGE_SIZE - 1);
+
+    // 1) brk-куча: [brk_base, brk) — RW+U+NX (права кучи)
+    if (page >= proc.brk_base & ~@as(u64, PAGE_SIZE - 1) and page < proc.brk) {
+        return linuxDemandMapPage(pml4, page,
+            vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE);
+    }
+    // 2) lazy-регионы реестра: права из r.pte
+    for (&linux_mmap_regions[slot]) |*r| {
+        if (!r.used or !r.lazy) continue;
+        if (page >= r.va and page < r.va + r.pages * PAGE_SIZE) {
+            if (linuxDemandMapPage(pml4, page, r.pte)) {
+                // уже замаплена? (спеу-case: двойной fault) — не считаем
+                if (r.touched < r.pages) r.touched += 1;
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+/// Выделить НУЛЕВУЮ страницу и замапить (active-CR3 — работаем с таблицами
+/// задачи; P=0-страницы не кэшируются TLB → invlpg не обязателен, но даём).
+fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
+    // страница УЖЕ замаплена (гонка/P=1-фолт) — не выделяем вторую
+    if (vmm.userLeafFlags(pml4, page)) |leaf| {
+        if (leaf & vmm.PTE_PRESENT != 0) return true;
+    }
+    const phys = pmm.allocPage() orelse {
+        hal.Serial.puts("[LINUX] demand-zero: PMM исчерпан (OOM гостья)\n");
+        return false;
+    };
+    // ЯВНОЕ зануление: PMM-страницы рециклируются (allocContiguousZeroed
+    // раньше гарантировал нули; allocPage — нет → memset обязателен).
+    const pb: [*]volatile u8 = @ptrFromInt(phys);
+    @memset(pb[0..PAGE_SIZE], 0);
+    vmm.mapPageInPML4(pml4, page, phys, pte | vmm.PTE_PRESENT) catch {
+        pmm.freePage(phys);
+        return false;
+    };
+    // активный CR3 задачи — сброс TLB-строки
+    asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
+    return true;
+}
 
 /// mprotect(va, len, prot): обновление прав страниц [va, va+len) в PML4
 /// задачи (RELRO: RW-страницы образа → RO после загрузки glibc).
@@ -2849,6 +2962,28 @@ fn linuxDoMprotect(va: u64, len: u64, prot: u64) i64 {
     while (i < pages) : (i += 1) {
         // страница не замаплена — Linux молча пропускает (PROT_NONE-зоны)
         _ = vmm.userLeafApplyProt(pml4, va + i * PAGE_SIZE, want);
+    }
+    // CDD №12 p5: lazy-регионы в диапазоне — права протокола сохраняем в
+    // r.pte (demand-страницы получат их при первом касании). Иначе
+    // mprotect ДО касания терялся (LLVM: W^X-циклы JIT: RW → R → RWX).
+    {
+        const owner = linuxOwnerTask();
+        if (owner < scheduler.MAX_TASKS) {
+            const slot = linux_task_proc[owner];
+            if (slot < MAX_LINUX_PROCS) {
+                const pte: u64 = vmm.PTE_USER | vmm.PTE_PRESENT | want;
+                for (&linux_mmap_regions[slot]) |*r| {
+                    if (!r.used or !r.lazy) continue;
+                    const r_hi = r.va + r.pages * PAGE_SIZE;
+                    const q_hi = va + pages * PAGE_SIZE;
+                    if (r.va >= va and r.va < q_hi or r_hi > va and r_hi <= q_hi or
+                        (r.va <= va and r_hi >= q_hi))
+                    {
+                        r.pte = pte;
+                    }
+                }
+            }
+        }
     }
     return 0;
 }
