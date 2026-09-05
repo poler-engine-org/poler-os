@@ -3197,15 +3197,26 @@ fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind)
         }
     }
     const write_mode = (flags & linux_syscalls.O_ACCMODE) != linux_syscalls.O_RDONLY;
-    const node = kernel_vfs.resolve(path, write_mode) catch |e| switch (e) {
-        vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
-        vfs.VfsError.ReadOnly => return -linux_syscalls.EPERM, // запись вне /tmp
-        vfs.VfsError.NoSpace => return -linux_syscalls.ENOMEM,
-        vfs.VfsError.TooManyFiles => return -linux_syscalls.ENOMEM,
-        vfs.VfsError.NameTooLong => return -linux_syscalls.EINVAL,
-        vfs.VfsError.BadPath => return -linux_syscalls.EINVAL,
-        vfs.VfsError.TooManyLinks => return -linux_syscalls.ELOOP,
-        vfs.VfsError.NotASymlink => return -linux_syscalls.EINVAL, // open: симлинк уже разыменован
+    const node = kernel_vfs.resolve(path, write_mode) catch |e| {
+        // CDD №12 p4-диагностика: ENOENT-фронты поимённо с причиной резолва
+        // (эмпирика run5: libxcb-keysyms ENOENT при рабочем elfload-резолве)
+        if (linux_trace) {
+            hal.Serial.puts("[VFS] open-fail: ");
+            hal.Serial.puts(path);
+            hal.Serial.puts(" — ");
+            hal.Serial.puts(@errorName(e));
+            hal.Serial.puts("\n");
+        }
+        return switch (e) {
+            vfs.VfsError.NotFound => -linux_syscalls.ENOENT,
+            vfs.VfsError.ReadOnly => -linux_syscalls.EPERM, // запись вне /tmp
+            vfs.VfsError.NoSpace => -linux_syscalls.ENOMEM,
+            vfs.VfsError.TooManyFiles => -linux_syscalls.ENOMEM,
+            vfs.VfsError.NameTooLong => -linux_syscalls.EINVAL,
+            vfs.VfsError.BadPath => -linux_syscalls.EINVAL,
+            vfs.VfsError.TooManyLinks => -linux_syscalls.ELOOP,
+            vfs.VfsError.NotASymlink => -linux_syscalls.EINVAL, // open: симлинк уже разыменован
+        };
     };
     // слот в реестре
     var slot: ?usize = null;
