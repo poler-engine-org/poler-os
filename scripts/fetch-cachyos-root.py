@@ -231,6 +231,10 @@ def pkg_for_soname(m):
     if m == "libncursesw.so.6" or m.startswith("libncurses"):
         return "ncurses"
     if m.startswith("libxcb-") or m == "libxcb.so.1":
+        # CDD №12 p4: libxcb 1.17 ВЫНЕС libxcb-keysyms из себя (деприкатед-
+        # API) в отдельный пакет xcb-util-keysyms — mesa 26.2 ещё линкует её
+        if m.startswith("libxcb-keysyms"):
+            return "xcb-util-keysyms"
         return "libxcb"
     if m.startswith("libicu"):
         return "icu"
