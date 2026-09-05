@@ -325,6 +325,9 @@ pub const F_GETFD: u64 = 1;
 pub const F_SETFD: u64 = 2;
 pub const F_GETFL: u64 = 3;
 pub const F_SETFL: u64 = 4;
+/// CDD №12 p4: glibc «F_DUPFD_CLOEXEC = 1030» (linux/fcntl.h) — libwayland
+/// wl_os_dupfd_cloexec (event-loop/сокеты).
+pub const F_DUPFD_CLOEXEC: u64 = 1030;
 
 // ============================================================================
 //  FD-таблица: «Всё есть файл» — устройства как файлы
@@ -729,6 +732,26 @@ pub fn sysFcntl(ops: LinuxOps, fds: *FdTable, fd_i: i64, cmd: u64, arg: u64) u64
             return 0;
         },
         F_GETFD, F_SETFD => return 0, // FD_CLOEXEC — процессов-CLOEXEC нет
+        F_DUPFD, F_DUPFD_CLOEXEC => {
+            // CDD №12 p4: libwayland wl_display_create зовёт
+            // wl_os_dupfd_cloexec(eventfd) — EINVAL убивал дисплей →
+            // wl_display_get_event_loop(NULL) → #PF. Linux-семантика:
+            // НОВЫЙ fd ≥ arg (minfd), копия записи (file_id/off/shared-ish).
+            // epoll-watches НЕ наследуются (Linux: подписки принадлежат
+            // ЭКЗЕМПЛЯРУ epoll, а не fd-номеру — дабл-уведомления недопустимы).
+            const minfd: i64 = @bitCast(arg);
+            if (minfd < 0 or minfd >= MAX_FDS) return err(EINVAL);
+            var i: usize = @intCast(minfd);
+            while (i < MAX_FDS) : (i += 1) {
+                if (!fds.entries[i].used()) {
+                    fds.entries[i] = e.*;
+                    fds.entries[i].watches = [_]EpollWatch{.{}} ** MAX_WATCHES;
+                    fds.entries[i].watch_count = 0;
+                    return @intCast(i);
+                }
+            }
+            return err(EMFILE);
+        },
         else => return err(EINVAL),
     }
 }
@@ -2906,6 +2929,39 @@ test "linux: close/fcntl — жизненный цикл fd, O_NONBLOCK чере
     const fb_fd = sysOpenat(ops, &fds, AT_FDCWD, path2, 0, 0);
     try testing.expectEqual(@as(u64, 3), fb_fd);
     try testing.expectEqual(err(EINVAL), sysFcntl(ops, &fds, @intCast(fb_fd), 99, 0));
+}
+
+test "linux: p4 — F_DUPFD/F_DUPFD_CLOEXEC (libwayland wl_os_dupfd_cloexec)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+
+    // eventfd-подобный fd через eventfd2 (wl_display_create: terminate_efd)
+    const evfd = sysEventfd2(ops, &fds, 0, 0);
+    try testing.expect(evfd >= 3);
+
+    // F_DUPFD_CLOEXEC(evfd, minfd=5): НОВЫЙ fd ≥ 5, копия записи
+    try testing.expectEqual(@as(u64, 1030), F_DUPFD_CLOEXEC); // glibc-якорь
+    const dup = sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD_CLOEXEC, 5);
+    try testing.expectEqual(@as(u64, 5), dup);
+    try testing.expect(fds.get(5) != null);
+    // тип скопирован (eventfd), оффсет/file_id — тоже
+    try testing.expectEqual(fds.get(@intCast(evfd)).?.kind, fds.get(5).?.kind);
+
+    // F_DUPFD без CLOEXEC — тот же путь (minfd=3 → слот 3/4)
+    const dup2 = sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD, 3);
+    try testing.expect(dup2 >= 3);
+    try testing.expect(dup2 != 5);
+
+    // minfd ≥ MAX_FDS → EINVAL; отрицательный → EINVAL; EBADF на чужом fd
+    try testing.expectEqual(err(EINVAL), sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD, 64));
+    try testing.expectEqual(err(EINVAL), sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD, @bitCast(@as(i64, -1))));
+    try testing.expectEqual(err(EBADF), sysFcntl(ops, &fds, 99, F_DUPFD, 3));
+
+    // dup'd eventfd жив (read-семантика счётчика)
+    // (детали счётчика покрыты eventfd-тестом p2 — здесь жизнеспособность)
+    try testing.expect(fds.get(@intCast(dup)) != null);
 }
 
 test "linux: sys_ioctl — мост к устройствам; консоль/epoll → -ENOTTY" {
