@@ -1699,8 +1699,36 @@ pub fn initSyscalls(handler_addr: u64) void {
     Serial.puts("[HAL] Syscall mechanism initialized\n");
 }
 
-pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
-    // arg3/arg4/arg5 — позиционные rdx/rcx/r9: для syscall №6 это Win64-аргументы
+// ═══════════════════════════════════════════════════════════════════════════
+// CDD №12 p4-final: R15-POISON-детект. isr64.S зовёт ЭТО при восстановлении
+// R15 из кадра (ISR-выход/iretq и syscall-выход/sysretq), если значение =
+// 0xAAAAAAAAAAAAAAAA — паттерн Zig-Debug `undefined`-локалей ядра. Вызов из
+// asm-хвоста pop-последовательности: caller-saved (rax/rcx/rdx/rsi/rdi/
+// r8-r11) ещё будут перезаписаны НИЖЕЛЕЖАЩИМИ pop'ами — их можно калечить;
+// callee-saved (rbx/rbp/r12-r15) обязаны быть нетронутыми здесь (наш
+// пролог корректен). Печать — ТОЛЬКО первые 4 раза (анти-спам).
+// ═══════════════════════════════════════════════════════════════════════════
+var r15_poison_count: u32 = 0;
+
+pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.C) void {
+    r15_poison_count += 1;
+    if (r15_poison_count <= 4) {
+        // ручной strlen (freestanding, std не импортирован в hal)
+        var len: usize = 0;
+        while (msg[len] != 0) : (len += 1) {}
+        Serial.puts(msg[0..len]);
+        Serial.putHex(slot);
+        Serial.puts(" rip-кадр=0x");
+        // слот r15 = slot - 8*1 (r14 сверху? нет: pop r15 снял СВОЙ слот,
+        // rsp указывает на r14-слот; r15-слот = slot - 8). RIP-кадр дальше.
+        Serial.putHex(slot - 8);
+        Serial.puts(" n=");
+        Serial.putDecimal(r15_poison_count);
+        Serial.puts("\n");
+    }
+}
+
+pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {    // arg3/arg4/arg5 — позиционные rdx/rcx/r9: для syscall №6 это Win64-аргументы
 
     // v0.18.0 (CDD №9): Linux POSIX-слой. Если текущая задача — Linux-ABI
     // (ELF/Starnix), ВСЕ syscall'ы идут по Linux x86_64 конвенции: номер в

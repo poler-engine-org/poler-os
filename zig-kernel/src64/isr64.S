@@ -37,6 +37,9 @@
 .text
 .code64
 
+// CDD №12 p4-final: строка для R15-POISON-детекта (rodata, но близко к коду
+// — линкер section .text уже определён выше; кладём в .rodata ниже).
+
 // ============================================================================
 //  CPU Exception Stubs  (vectors 0 – 31)
 // ============================================================================
@@ -348,10 +351,41 @@ isr_common:
     movq %rax, %rsp
 
     // Restore all general-purpose registers
+    // CDD №12 p4-final (R15-POISON-детект): pop r15 из ISR-КАДРА на kstack.
+    // Гипотеза-лидер 0xAAAA-краша: кадр ИСПОРЧЕН Zig-Debug-локАлями ядра
+    // (0xAA-паттерн) → iretq возвращает задачу с R15=0xAAAA → гостевой
+    // mov (%r15) → #GP. Детект: pop → cmp → (совпало) — зовём Zig-принтер
+    // с указателем слота кадра. БЕЗОПАСНО: все caller-saved (rax/rcx/rdx/
+    // rsi/rdi/r8-r11) восстановятся ПОЗДНЕЕ ИЗ КАДРА — call может их
+    // калечить сколько угодно; callee-saved Zig-принтер обязан сохранить.
     popq %r15
+    cmpq .Laaaa_const(%rip), %r15
+    jne .r15_ok_isr
+    movq %rsp, %rsi
+    leaq .Lr15_msg(%rip), %rdi
+    call r15_poison_report
+.r15_ok_isr:
     popq %r14
+    cmpq .Laaaa_const(%rip), %r14
+    jne .r14_ok_isr
+    movq %rsp, %rsi
+    movabs $.Lr15_msg, %rdi
+    call r15_poison_report
+.r14_ok_isr:
     popq %r13
+    cmpq .Laaaa_const(%rip), %r13
+    jne .r13_ok_isr
+    movq %rsp, %rsi
+    movabs $.Lr15_msg, %rdi
+    call r15_poison_report
+.r13_ok_isr:
     popq %r12
+    cmpq .Laaaa_const(%rip), %r12
+    jne .r12_ok_isr
+    movq %rsp, %rsi
+    movabs $.Lr15_msg, %rdi
+    call r15_poison_report
+.r12_ok_isr:
     popq %r11
     popq %r10
     popq %r9
@@ -374,11 +408,19 @@ isr_common:
 //  ISR Stub Table — 49 function pointers (vectors 0-48 + 49=vblk, CDD №8)
 // ============================================================================
 
+.section .rodata
+.balign 8
+.Laaaa_const:
+    .quad 0xAAAAAAAAAAAAAAAA
+.Lr15_msg:
+    .asciz "[R15-POISON] кадр kstack испорчен (0xAAAAAAAAAAAAAAAA): slot="
+.globl r15_poison_msg
+.set r15_poison_msg, .Lr15_msg
+
 .section .rodata.isr_table, "a", @progbits
 .balign 8
 .globl isr_stub_table
-isr_stub_table:
-    .quad isr_stub_0
+isr_stub_table:    .quad isr_stub_0
     .quad isr_stub_1
     .quad isr_stub_2
     .quad isr_stub_3
@@ -438,6 +480,7 @@ isr_stub_table:
 .extern tss_rsp0_mirror           // v0.17.0-fix (CDD №8 p6): зеркало TSS.rsp0 — источник syscall-стека
 .extern syscall_frame          // v0.12.0: снапшот кадра (8 слов, .bss)
 .extern zig_syscall_handler
+.extern r15_poison_report       // CDD №12 p4-final: детект R15=0xAAAA при восстановлении из кадра
 .extern ucl_pending            // v0.12.0: мост Win64-колбэка (win32_api)
 .extern in_win32_syscall      // v0.13.0: транзакция syscall (schedule-guard)
 .extern ucl_rsp
@@ -632,10 +675,36 @@ syscall_entry:
     jne .ucl_launch_flagged
 
     // Restore general purpose registers
+    // CDD №12 p4-final: R15-POISON-детект и на syscall-выходе (pop r15
+    // из каскада kstack-топа) — тот же класс порчи кадра.
     popq %r15
+    cmpq .Laaaa_const(%rip), %r15
+    jne .r15_ok_sys
+    movq %rsp, %rsi
+    leaq .Lr15_msg(%rip), %rdi
+    call r15_poison_report
+.r15_ok_sys:
     popq %r14
+    cmpq .Laaaa_const(%rip), %r14
+    jne .r14_ok_sys
+    movq %rsp, %rsi
+    movabs $.Lr15_msg, %rdi
+    call r15_poison_report
+.r14_ok_sys:
     popq %r13
+    cmpq .Laaaa_const(%rip), %r13
+    jne .r13_ok_sys
+    movq %rsp, %rsi
+    movabs $.Lr15_msg, %rdi
+    call r15_poison_report
+.r13_ok_sys:
     popq %r12
+    cmpq .Laaaa_const(%rip), %r12
+    jne .r12_ok_sys
+    movq %rsp, %rsi
+    movabs $.Lr15_msg, %rdi
+    call r15_poison_report
+.r12_ok_sys:
     popq %rbp
     popq %rbx
 
@@ -654,7 +723,9 @@ syscall_entry:
     // КАЖДОМ syscall (у sysretq нет других мёртвых регистров: RCX=RIP,
     // R11=RFLAGS, RAX=результат). RAX свободен ДВАЖДЫ: результат уже
     // можно положить в syscall_ret_tmp и вернуть в конце.
-    movq %rax, syscall_ret_tmp(%rip)
+    // CDD №12 p4-fix2: ret_tmp УЖЕ хранит результат (сохранён сразу после
+    // call zig_syscall_handler) — НИКАКИХ перезаписей RAX в хвосте: любые
+    // промежуточные затирания (детекты!) не должны попадать в ret_tmp.
     movq user_rsp(%rip), %rax
     cli
     movq $0, in_win32_syscall(%rip)

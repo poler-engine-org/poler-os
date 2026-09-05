@@ -3864,7 +3864,91 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         hal.Serial.putHex(r);
         hal.Serial.puts("\n");
     }
+    // CDD №12 p4-final: АРГУМЕНТ-0xAAAA-детект. Эмпирика: гостевой ld.so
+    // после openat(→fd=3) шлёт read(0xAAAAAAAA,...) — ВАЛИДНОЕ ЗНАЧЕНИЕ
+    // (fd) ТЕРЯЕТСЯ между нашим syscall-возвратом и использованием гостем
+    // (тот же класс, что R15=0xAAAA-краш). Ловим ЛЮБОЙ syscall с мусорным
+    // аргументом → дамп гостевого стека (ret-адреса = вызывающая цепочка).
+    if (a1 == 0xAAAAAAAA or a2 == 0xAAAAAAAA or a3 == 0xAAAAAAAA or
+        a4 == 0xAAAAAAAA)
+    {
+        linuxAaaaTrace(num, a1);
+    }
     return r;
+}
+
+/// ДАМП-ТРЕЙС syscall с аргументом-0xAAAA: системный номер + гостевой
+/// стек вызывающего (кадр syscall_entry: [top-8]=r11-слот... формат
+/// каскада: top-8=r11, top-16=rcx, ..., [user_rsp] = живой стек гостя).
+/// Читаем через scheduler.user_rsp (записан атомарно asm-входом).
+var aaaa_trace_n: u32 = 0;
+fn linuxAaaaTrace(num: u64, fdarg: u64) void {
+    aaaa_trace_n += 1;
+    if (aaaa_trace_n > 3) return; // анти-спам: 3 дампа
+    hal.Serial.puts("[AAAA] syscall=");
+    hal.Serial.putDecimal(num);
+    hal.Serial.puts(" arg=0x");
+    hal.Serial.putHex(fdarg);
+    hal.Serial.puts(" user_rsp=0x");
+    const ur = scheduler.user_rsp;
+    hal.Serial.putHex(ur);
+    hal.Serial.puts("\n[AAAA] guest-stack:\n");
+    // чтение 24 слотов гостевого стека НАПРЯМУЮ по VA: CR3 задачи активен
+    // в syscall-каскаде (guest VA транслируется железом; диапазон — в
+    // каноническом user-пространстве; #PF невозможен — страницы стека
+    // замаплены: задача только что читала/писала их)
+    var i: usize = 0;
+    while (i < 24) : (i += 1) {
+        const va = ur + i * 8;
+        if (linuxProbeUser(va)) |v| {
+            hal.Serial.puts("  [rsp+");
+            hal.Serial.putDecimal(i * 8);
+            hal.Serial.puts("] 0x");
+            hal.Serial.putHex(v);
+            if (linuxModuleAt(linuxOwnerTask(), v)) |hit| {
+                hal.Serial.puts("(");
+                hal.Serial.puts(hit.name);
+                hal.Serial.puts("+0x");
+                hal.Serial.putHex(hit.off);
+                hal.Serial.puts(")");
+            }
+            hal.Serial.puts("\n");
+        } else break;
+    }
+}
+
+/// безопасное чтение 8Б гостевой VA: прямой deref + vmm-guard таблиц
+/// (fallback, если прямой путь не замаплен).
+fn linuxProbeUser(va: u64) ?u64 {
+    // CR3 задачи активен в syscall-каскаде — прямой VA-deref (таблицы
+    // задачи транслируют; стек задачи гарантированно замаплен).
+    const p: *volatile u64 = @ptrFromInt(va & ~@as(u64, 7));
+    return p.*;
+}
+
+fn linuxPeekUserOld(pml4: u64, va: u64) ?u64 {
+    // x86-64 4-уровневый walk: PML4(39)→PDP(30)→PD(21)→PT(12)
+    var table = pml4;
+    var level: u6 = 39;
+    while (true) {
+        const idx = (va >> level) & 0x1FF;
+        const entry: *volatile u64 = @ptrFromInt(table + idx * 8);
+        const e = entry.*;
+        if (e & 1 == 0) return null;
+        if (level == 12) {
+            const pa = (e & 0x000FFFFFFFFFF000) + (va & 0xFFF);
+            const p: *volatile u64 = @ptrFromInt(pa);
+            return p.*;
+        }
+        if (level == 21 and (e & (1 << 7)) != 0) {
+            // 2MB страница
+            const pa = (e & 0xFFFFFFE00000) + (va & 0x1FFFFF);
+            const p: *volatile u64 = @ptrFromInt(pa);
+            return p.*;
+        }
+        table = e & 0x000FFFFFFFFFF000;
+        level -= 9;
+    }
 }
 
 // ─── v0.19.0 (CDD №10 p1): DRM-KMS runtime — «Всё есть файл» ──────────────
