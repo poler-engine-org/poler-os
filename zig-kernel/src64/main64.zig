@@ -3818,6 +3818,26 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         hal.Serial.putDecimal(num);
         hal.Serial.puts("(0x");
         hal.Serial.putHex(a1);
+        // CDD №12 p4: ПУТЬ для path-syscall'ов (openat/access/stat/readlink —
+        // CDD-изоляция: ENOENT-фронты видны ПОИМЁННО, а не по адресу аргумента)
+        if (num == 257 or num == 21 or num == 262 or num == 267 or num == 87 or
+            num == 89 or num == 254)
+        {
+            const path_va = switch (num) {
+                257, 262, 267, 254 => a2, // openat/newfstatat/readlinkat/inotify_add_watch
+                else => a1, // access/readlink/unlink
+            };
+            if (linuxCopyInStr(path_va, 96)) |p| {
+                hal.Serial.putHex(a1);
+                hal.Serial.puts(",\"");
+                hal.Serial.puts(p[0..@min(p.len, 96)]);
+                hal.Serial.puts("\"");
+            } else {
+                hal.Serial.putHex(a1);
+            }
+        } else {
+            hal.Serial.putHex(a1);
+        }
         hal.Serial.puts(",0x");
         hal.Serial.putHex(a2);
         if (num == 13 or num == 14 or num == 157 or num == 281 or num == 270 or num == 289 or num == 16) {
