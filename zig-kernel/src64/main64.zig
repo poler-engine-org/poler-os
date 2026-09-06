@@ -5768,6 +5768,16 @@ fn cmd_elfload(args: []const u8) void {
         "TERM=linux",
         "PATH=/usr/bin",
         "LD_LIBRARY_PATH=/usr/lib",
+        // CDD №12 p9: MESA SHADER CACHE -> WRITABLE tmpfs (/tmp — единствен-
+        // ная записываемая зона Live-VFS). Эмпирика p9aa2/3: запись кеша
+        // в /root/.cache (RO-initrd) ОТКАЗЫВАЛАСЬ (open-fail: ReadOnly) ->
+        // незавершённый cache-lifecycle -> LLVM-паттерн-0xAA-заполнение
+        // буферов оставалось НЕЗАМЕЩЁННЫМ (RIP=0xAAAA / R15=0xAAAA / крах
+        // malloc-unlink на brk-чанке). XDG_CACHE_HOME + явный
+        // MESA_SHADER_CACHE_DIR (порядок Mesa: MESA_SHADER_CACHE_DIR ->
+        // XDG_CACHE_HOME -> $HOME/.cache) -> кеш живёт в /tmp (RAM).
+        "XDG_CACHE_HOME=/tmp",
+        "MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache",
         // CDD #12 p3: Vulkan-лоадер ищет ICD опендирем (getdents64 — бэклог);
         // VK_ICD_FILENAMES — штатный механизм лоадера (спека Khronos):
         // указываем lavapipe-манифест напрямую.

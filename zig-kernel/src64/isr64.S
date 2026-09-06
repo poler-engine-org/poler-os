@@ -414,6 +414,8 @@ isr_common:
     .quad 0xAAAAAAAAAAAAAAAA
 .Lr15_msg:
     .asciz "[R15-POISON] кадр kstack испорчен (0xAAAAAAAAAAAAAAAA): slot="
+.Lexpo_msg:
+    .asciz "[EXIT-POISON] .bss-строка отправлена с ядом! row="
 .globl r15_poison_msg
 .set r15_poison_msg, .Lr15_msg
 
@@ -681,18 +683,37 @@ syscall_entry:
     cmpq .Laaaa_const(%rip), %r15
     jne 1f
     orq $1, exit_poison_mask(%rip)
+    // CDD №12 p9: НЕМЕДЛЕННЫЙ отчёт (эмпирика p9env: маска гасла ДО
+    // следующего входа — крах опережал отчёт; C-call здесь БЕЗОПАСЕН:
+    // callee-saved сохранены ABI, RAX перегружаем из глобала)
+    movq %rax, %rsi
+    leaq .Lexpo_msg(%rip), %rdi
+    call r15_poison_report
+    movq syscall_exit_frame_ptr(%rip), %rax
 1:  movq 0x38(%rax), %r14
     cmpq .Laaaa_const(%rip), %r14
     jne 2f
     orq $2, exit_poison_mask(%rip)
+    movq %rax, %rsi
+    leaq .Lexpo_msg(%rip), %rdi
+    call r15_poison_report
+    movq syscall_exit_frame_ptr(%rip), %rax
 2:  movq 0x40(%rax), %r13
     cmpq .Laaaa_const(%rip), %r13
     jne 3f
     orq $4, exit_poison_mask(%rip)
+    movq %rax, %rsi
+    leaq .Lexpo_msg(%rip), %rdi
+    call r15_poison_report
+    movq syscall_exit_frame_ptr(%rip), %rax
 3:  movq 0x48(%rax), %r12
     cmpq .Laaaa_const(%rip), %r12
     jne 4f
     orq $8, exit_poison_mask(%rip)
+    movq %rax, %rsi
+    leaq .Lexpo_msg(%rip), %rdi
+    call r15_poison_report
+    movq syscall_exit_frame_ptr(%rip), %rax
 4:  movq 0x50(%rax), %rbp
     movq 0x58(%rax), %rbx
     movq 0x60(%rax), %r11     // user RFLAGS

@@ -505,6 +505,9 @@ pub export fn isr_common_handler(frame: *InterruptFrame) callconv(.C) *Interrupt
 
 pub var tick_count: u64 = 0;
 
+/// CDD №12 p9: счётчик отбраковок FRAME-CONTENT-GUARD (анти-спам-гейт).
+pub var p9_guard_drops: u64 = 0;
+
 fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
     var next_frame = frame;
 
@@ -580,7 +583,35 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                 }
                 const next_rsp = cb(@intFromPtr(frame));
                 if (next_rsp != 0 and next_rsp & 7 == 0) {
-                    next_frame = @ptrFromInt(next_rsp);
+                    // CDD №12 p9: FRAME-CONTENT-GUARD — контент-валидация
+                    // кадра ДО переключения. Эмпирика p9run3/7 (R15-POISON
+                    // n=1, slot=0x362028 = tasks[2].rsp=STALE-initial
+                    // 0x362020): диспетчер выбирал задачу с ПРОТАРЕВШИМ
+                    // tasks[].rsp → iretq-каскад «восстанавливал» R15=
+                    // 0xAAAAAAAA из Zig-undefined зон кstack → гость
+                    // #GP в спискоходе (gamescope+0xC2FB1, r15=0xAAAA).
+                    // ЛЕЧЕНИЕ: кадр с мусорным CS/RIP/RSP (content-valid
+                    // из sched_resume — kernel 0x08/0x10, user 0x23/0x1B,
+                    // канонические RIP/RSP) = НЕ переключаемся — гость не
+                    // получает ядовитый регистровый поток.
+                    if (@import("sched_resume.zig").frameContentValid(next_rsp)) {
+                        next_frame = @ptrFromInt(next_rsp);
+                    } else {
+                        p9_guard_drops += 1;
+                        if (p9_guard_drops <= 8) {
+                            Serial.puts("[P9-FRAME-GUARD] кадр 0x");
+                            Serial.putHex(next_rsp);
+                            Serial.puts(" мусорен (cs=0x");
+                            const csp: *volatile u64 = @ptrFromInt(next_rsp + 144);
+                            Serial.putHex(csp.*);
+                            Serial.puts(" rip=0x");
+                            const ripp: *volatile u64 = @ptrFromInt(next_rsp + 136);
+                            Serial.putHex(ripp.*);
+                            Serial.puts(") — no switch, cur=");
+                            Serial.putDecimal(@import("scheduler.zig").current_task_id);
+                            Serial.puts("\n");
+                        }
+                    }
                 } else {
                     // 0/мусор = битый кадр (state-расхождение или порча) —
                     // остаёмся в текущем кадре; паники @ptrFromInt нет.
@@ -662,14 +693,24 @@ fn dumpContainer(label: []const u8, addr: u64, faulter: usize) void {
         Serial.puts(")");
     }
     Serial.puts(":");
-    const w: *volatile [8]u64 = @ptrFromInt(addr);
+    // CDD №12 p9: МИСАЛИГН-ТОЛЕРАНТНОЕ ЧТЕНИЕ (эмпирика p9guard: R12
+    // =0x…40C — u32-выровненные LLVM-таблицы; выровненный u64-каст
+    // паниковал «incorrect alignment» и убивал весь краш-отчёт).
     var k: usize = 0;
     while (k < 8) : (k += 1) {
         Serial.puts(" [+0x");
         Serial.putHex(@intCast(k * 8));
         Serial.puts("]=0x");
-        Serial.putHex(w[k]);
-        if (main64.linuxModuleAt(faulter, w[k])) |hit2| {
+        var v64: u64 = 0;
+        {
+            var b: usize = 0;
+            while (b < 8) : (b += 1) {
+                const p: *volatile u8 = @ptrFromInt(addr + k * 8 + b);
+                v64 |= @as(u64, p.*) << @intCast(b * 8);
+            }
+        }
+        Serial.putHex(v64);
+        if (main64.linuxModuleAt(faulter, v64)) |hit2| {
             Serial.puts("(");
             Serial.puts(hit2.name);
             Serial.puts("+0x");
@@ -932,10 +973,23 @@ fn handleException(frame: *InterruptFrame) void {
                 if (leaf0 & vmm4.PTE_USER == 0) break;
                 const leaf1 = vmm4.userLeafFlags(pml4, rbp + 8) orelse break;
                 if (leaf1 & vmm4.PTE_USER == 0) break;
-                const w_ret: *volatile u64 = @ptrFromInt(rbp + 8);
-                const w_next: *volatile u64 = @ptrFromInt(rbp);
-                const ret = w_ret.*;
-                const next = w_next.*;
+                // CDD №12 p9: байтовая сборка (мисалигн-толерантно)
+                var ret: u64 = 0;
+                {
+                    var b: usize = 0;
+                    while (b < 8) : (b += 1) {
+                        const p: *volatile u8 = @ptrFromInt(rbp + 8 + b);
+                        ret |= @as(u64, p.*) << @intCast(b * 8);
+                    }
+                }
+                var next: u64 = 0;
+                {
+                    var b: usize = 0;
+                    while (b < 8) : (b += 1) {
+                        const p: *volatile u8 = @ptrFromInt(rbp + b);
+                        next |= @as(u64, p.*) << @intCast(b * 8);
+                    }
+                }
                 Serial.puts(" ");
                 Serial.putHex(ret);
                 if (main64.linuxModuleAt(exc_faulter, ret)) |hit| {
@@ -1908,6 +1962,34 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
         const sched7 = @import("scheduler.zig");
         sched7.snapshotExitFrame(sched7.syscallStackOwner(sched7.user_rsp));
         sched7.reportExitPoison();
+        // CDD №12 p9: ENTRY-POISON — на ВХОДЕ syscall регистр гостя уже
+        // 0xAAAA (доставка СОВЕРШИЛАСЬ после предыдущего выхода; все
+        // exit-пути под детекторами и чисты ⇒ яд загружен из user-памяти).
+        // Немедленный принт: слоты r15..rbx + user_rsp; предыдущая строка
+        // [L]-трейса = syscall-выход-виновник (или пользовательский код).
+        {
+            const sf = &sched7.syscall_frame;
+            if (sf[0] == 0xAAAAAAAAAAAAAAAA or sf[1] == 0xAAAAAAAAAAAAAAAA or
+                sf[2] == 0xAAAAAAAAAAAAAAAA or sf[3] == 0xAAAAAAAAAAAAAAAA or
+                sf[4] == 0xAAAAAAAAAAAAAAAA or sf[5] == 0xAAAAAAAAAAAAAAAA)
+            {
+                Serial.puts("[ENTRY-POISON] ur=0x");
+                Serial.putHex(sched7.user_rsp);
+                Serial.puts(" r15=0x");
+                Serial.putHex(sf[0]);
+                Serial.puts(" r14=0x");
+                Serial.putHex(sf[1]);
+                Serial.puts(" r13=0x");
+                Serial.putHex(sf[2]);
+                Serial.puts(" r12=0x");
+                Serial.putHex(sf[3]);
+                Serial.puts(" rbp=0x");
+                Serial.putHex(sf[4]);
+                Serial.puts(" rbx=0x");
+                Serial.putHex(sf[5]);
+                Serial.puts("\n");
+            }
+        }
     }
     // arg3/arg4/arg5 — позиционные rdx/rcx/r9: для syscall №6 это Win64-аргументы
 

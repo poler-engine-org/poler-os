@@ -61,6 +61,8 @@ pub const SYS_timerfd_create: u64 = 283;
 pub const SYS_timerfd_settime: u64 = 286;
 pub const SYS_epoll_pwait: u64 = 281;
 pub const SYS_ppoll: u64 = 270;
+pub const SYS_statfs: u64 = 137;
+pub const SYS_time: u64 = 201;
 pub const SYS_fstatfs: u64 = 138;
 pub const SYS_getcwd: u64 = 79;
 pub const SYS_prctl: u64 = 157;
@@ -1819,6 +1821,39 @@ pub fn sysMadvise(ops: LinuxOps, va: u64, len: u64, advice: u64) u64 {
 }
 
 /// fstatfs(fd, buf): struct statfs 120Б — tmpfs-магия (glibc: /dev-проверки).
+/// statfs(path, buf) (137): struct statfs 120Б. Кеш-директории mesa (
+/// /root/.cache/...) и /tmp: tmpfs-магия (f_type=TMPFS_MAGIC, 2ГБ).
+/// LLVM/Mesa звали при старте кеша шейдеров (ENOSYS → отказ кеша —
+/// работоспособно, но локально устраняем волну).
+pub fn sysStatfs(ops: LinuxOps, path_va: u64, buf_va: u64) u64 {
+    if (!ops.validate(buf_va, 120, true)) return err(EFAULT);
+    if (ops.copy_in_str(path_va, 4096) == null) return err(EFAULT);
+    var sb: [120]u8 = [_]u8{0} ** 120;
+    std.mem.writeInt(u32, sb[0..4], 0x01021994, .little); // f_type = TMPFS_MAGIC
+    std.mem.writeInt(u32, sb[4..8], 4096, .little);        // f_bsize
+    std.mem.writeInt(u64, sb[8..16], 512 * 1024, .little); // f_blocks (512КБ-блоки ×)
+    std.mem.writeInt(u64, sb[16..24], 256 * 1024, .little);// f_bfree
+    std.mem.writeInt(u64, sb[24..32], 256 * 1024, .little);// f_bavail
+    std.mem.writeInt(u64, sb[32..40], 1_000_000, .little); // f_files
+    std.mem.writeInt(u64, sb[40..48], 900_000, .little);   // f_ffree
+    std.mem.writeInt(u32, sb[88..92], 255, .little);       // f_namelen
+    if (!ops.copy_out(buf_va, &sb)) return err(EFAULT);
+    return 0;
+}
+
+/// time(2) (201): устаревший time_t* — секунды epoch. glibc-фоллбэк при
+/// недоступности не полагается, но llvmpipe зовёт для кеш-маркеров.
+pub fn sysTime(ops: LinuxOps, tloc_va: u64) u64 {
+    const sec: u64 = ops.time_ns() / 1_000_000_000;
+    if (tloc_va != 0) {
+        if (!ops.validate(tloc_va, 8, true)) return err(EFAULT);
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, sec, .little);
+        if (!ops.copy_out(tloc_va, &b)) return err(EFAULT);
+    }
+    return sec;
+}
+
 pub fn sysFstatfs(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
     _ = e;
@@ -1920,6 +1955,8 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_rt_sigprocmask => return sysRtSigprocmask(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_prctl => return sysPrctl(ops, args.a1, args.a2, args.a3, args.a4, args.a5),
         SYS_madvise => return sysMadvise(ops, args.a1, args.a2, args.a3),
+        SYS_statfs => return sysStatfs(ops, args.a1, args.a2),
+        SYS_time => return sysTime(ops, args.a1),
         SYS_fstatfs => return sysFstatfs(ops, fds, @bitCast(args.a1), args.a2),
         SYS_getcwd => return sysGetcwd(ops, args.a1, args.a2),
         SYS_ppoll => return sysPpoll(ops, fds, args.a1, args.a2, args.a3, args.a4, args.a5),
