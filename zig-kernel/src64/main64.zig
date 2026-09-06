@@ -1310,6 +1310,8 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  elfload   - ELF-процесс Linux-ABI: PT_LOAD+стек argc/argv/auxv → Ring 3\n");
         sys_print("  gputest   - VirtIO-GPU vring скан-аут: паттерн НА ЭКРАН (CDD #11 p2, E2E)\n");
         sys_print("  mmapinfo  - mmap-реестры Linux-процессов: va+size+имя модуля (CDD #12 p4)\n");
+        sys_print("  tasks     - Реестр парковок: задачи/wake/fd/epoll-watches/каналы (CDD #12 p8)\n");
+        sys_print("  peek <hexva> [n] - Чтение user-VA гостя (page-walk, CDD #12 p8)\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
@@ -1374,6 +1376,10 @@ fn execute_command(cmd: []const u8) void {
         sys_print(if (linux_trace) "[L] trace ON\n" else "[L] trace OFF\n");
     } else if (eq(cmd, "mmapinfo")) {
         cmd_mmapinfo();
+    } else if (eq(cmd, "tasks")) {
+        cmd_tasks();
+    } else if (startsWith(cmd, "peek ")) {
+        cmd_peek(cmd);
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -4169,7 +4175,52 @@ fn linuxKillThread(tid: u64, sig: u64) bool {
 var linux_trace: bool = false;
 
 fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
+    // CDD №12 p8: ВХОДНОЙ трейс паркующих syscall'ов ([L] печатает только
+    // ВЫХОД: sysEpollWait с timeout=-1 паркнут НАВСЕГДА — его вызов невидим
+    // в [L]-фронте; эмпирика p8run2: задачи 3/4 в 20мс-парк-петле, но WHO
+    // и с каким timeout — неизвестно). tid = владелец user_rsp; rip =
+    // syscall_frame[7] = user-RIP после syscall → точный call-site.
+    if (num == 232 or num == 281) { // epoll_wait / epoll_pwait
+        const timeout: i64 = @bitCast(a4);
+        if (timeout != 0) {
+            const owner = scheduler.syscallStackOwner(scheduler.user_rsp);
+            hal.Serial.puts("[EPW] tid=");
+            hal.Serial.putDecimal(owner);
+            hal.Serial.puts(" epfd=");
+            hal.Serial.putDecimal(a1);
+            hal.Serial.puts(" max=");
+            hal.Serial.putDecimal(a3);
+            hal.Serial.puts(" t=");
+            if (timeout < 0) {
+                hal.Serial.puts("-1");
+            } else {
+                hal.Serial.putDecimal(@as(u64, @intCast(timeout)));
+            }
+            hal.Serial.puts(" rip=0x");
+            hal.Serial.putHex(scheduler.syscall_frame[7]);
+            hal.Serial.puts("\n");
+        }
+    }
+    if (num == 202) { // futex: WAIT/WAKE на ВХОДЕ (парк невидим в [L])
+        const fop: u64 = a2 & 0x7F;
+        if (fop <= 10) {
+            const owner = scheduler.syscallStackOwner(scheduler.user_rsp);
+            hal.Serial.puts("[FXW] tid=");
+            hal.Serial.putDecimal(owner);
+            hal.Serial.puts(" op=");
+            hal.Serial.putDecimal(fop);
+            if (a2 & 128 != 0) hal.Serial.puts("P");
+            hal.Serial.puts(" uaddr=0x");
+            hal.Serial.putHex(a1);
+            hal.Serial.puts(" val=");
+            hal.Serial.putDecimal(a3);
+            hal.Serial.puts(" rip=0x");
+            hal.Serial.putHex(scheduler.syscall_frame[7]);
+            hal.Serial.puts("\n");
+        }
+    }
     const r = linux_syscalls.dispatch(kernelLinuxOps(), linuxFdsCurrent(), num, .{
+
         .a1 = a1,
         .a2 = a2,
         .a3 = a3,
@@ -4227,8 +4278,33 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
     {
         linuxAaaaTrace(num, a1);
     }
+
+    // CDD #12 p8 (ФИКС ФРОНТА): КРОСС-ТАСК ПОРЧА ВЫХОДНОГО КАДРА syscall.
+    // ЭМПИРИКА p8run4: sysClone → linuxYieldTick (транзакция выпущена,
+    // родитель парк 10мс) → ДИТЯ входит в свои syscall'ы — каждый вход
+    // ПЕРЕ-указывает ГЛОБАЛ syscall_exit_frame_ptr на СВОЮ .bss-строку →
+    // родительский выходной каскад isr64.S читает ЧУЖУЮ строку → sysretq
+    // уводит РОДИТЕЛЯ в user-RIP/стек ДИТЯ (эпилог epoll_wait-обёртки) →
+    // glibc-clone РОДИТЕЛЬ выполняет child-ветку (glue/ThreadFunc) →
+    // gamescope теряет main-поток в бесконечном ThreadFunc парке —
+    // DRM-init не начинается. user_rsp/ret_tmp восстанавливаются
+    // (парк-эпилог / asm-хвост), а ptr — НЕТ.
+    // ЛЕЧЕНИЕ ПО КОНСТРУКЦИИ: перед возвратом в asm — пере-указать глобал
+    // на .bss-строку ВЛАДЕЛЬЦА транзакции (строки пер-тасковые: их пишет
+    // ТОЛЬКО вход владельца — парки НЕ портят).
+    {
+        const owner = scheduler.syscallStackOwner(scheduler.user_rsp);
+        if (owner < scheduler.MAX_TASKS and owner != 0) {
+            scheduler.syscall_exit_frame_ptr =
+                @intFromPtr(&scheduler.syscall_exit_frame[owner]);
+        } else {
+            // shell/boot-контекст: честный pop-fallback (снапшота нет)
+            scheduler.syscall_exit_frame_ptr = 0;
+        }
+    }
     return r;
 }
+
 
 /// ДАМП-ТРЕЙС syscall с аргументом-0xAAAA: системный номер + гостевой
 /// стек вызывающего (кадр syscall_entry: [top-8]=r11-слот... формат
@@ -5081,6 +5157,215 @@ fn cmd_mmapinfo() void {
         _ = linuxDumpRegionTable(slot, MAX_MMAP_REGIONS);
     }
     if (!any) sys_print("[MMAPINFO] нет активных Linux-процессов (elfload <bin>)\n");
+}
+
+
+/// cmd_tasks: CDD №12 p8 — РЕЕСТР ПАРКОВОК: WHO паркуется, ГДЕ, НА ЧЁМ.
+/// Дамп для p8-диагноза «epoll-паркинг без wake»: задачи (state/wake_tick/
+/// rsp/priv/abi/proc/fs-base), fd-таблицы процессов (kind/file_id),
+/// epoll-watches (fd/events/data — НА ЧЁМ ждёт композитор), каналы
+/// (pipe/eventfd/socketpair/timerfd: refs/len/counter/deadline),
+/// futex-парковки. [SLEEP]-маркер = wake_tick в будущем (пропуск диспетчером).
+fn cmd_tasks() void {
+    sys_print("[TASKS] tick=");
+    printDec(hal.tick_count);
+    sys_print(" tasks=");
+    printDec(scheduler.task_count);
+    sys_print(" current=");
+    printDec(scheduler.current_task_id);
+    sys_print("\n");
+    var i: usize = 0;
+    while (i < scheduler.task_count) : (i += 1) {
+        const t = &scheduler.tasks[i];
+        sys_print("[TASK] #");
+        printDec(i);
+        sys_print(" state=");
+        switch (t.state) {
+            .Ready => sys_print("Ready"),
+            .Running => sys_print("Running"),
+            .Killed => sys_print("Killed"),
+        }
+        sys_print(" wake=");
+        printDec(t.wake_tick);
+        if (t.wake_tick != 0 and t.wake_tick > hal.tick_count) sys_print(" [SLEEP]");
+        sys_print(" rsp=0x");
+        putHex(t.rsp);
+        if (t.privilege == .User) {
+            sys_print(" USER abi=");
+            if (t.abi == .linux) sys_print("linux") else sys_print("win32");
+            sys_print(" proc=");
+            printDec(linux_task_proc[i]);
+            sys_print(" fs=0x");
+            putHex(scheduler.fs_base_tab[i]);
+        } else {
+            sys_print(" KERN");
+        }
+        sys_print("\n");
+    }
+    // fd-таблицы процессов + epoll-watches (на чём паркуется epoll_wait)
+    var slot: usize = 0;
+    while (slot < MAX_LINUX_PROCS) : (slot += 1) {
+        if (!linux_procs[slot].used) continue;
+        sys_print("[PROC] slot=");
+        printDec(slot);
+        sys_print(" brk=0x");
+        putHex(linux_procs[slot].brk);
+        sys_print(" fds:\n");
+        const fds = &linux_procs[slot].fds;
+        var f: usize = 0;
+        while (f < fds.entries.len) : (f += 1) {
+            const e = &fds.entries[f];
+            if (e.kind == .free) continue;
+            sys_print("  [FD] ");
+            printDec(f);
+            sys_print(" kind=");
+            fdKindName(e.kind);
+            sys_print(" file_id=");
+            printDec(e.file_id);
+            if (e.nonblock) sys_print(" NB");
+            sys_print("\n");
+            if (e.kind == .epoll and e.watch_count > 0) {
+                var w: usize = 0;
+                while (w < e.watch_count) : (w += 1) {
+                    const wf = e.watches[w].fd;
+                    sys_print("    watch fd=");
+                    if (wf >= 0) printDec(@intCast(wf)) else sys_print("-");
+                    sys_print(" events=0x");
+                    putHex(e.watches[w].events);
+                    sys_print(" data=0x");
+                    putHex(e.watches[w].data);
+                    sys_print("\n");
+                }
+            }
+        }
+    }
+    // каналы: pipe/eventfd/socketpair/timerfd — живость источников wake
+    var cid: usize = 0;
+    while (cid < channels.len) : (cid += 1) {
+        const c = &channels[cid];
+        if (!c.used) continue;
+        sys_print("[CHAN] id=");
+        printDec(cid);
+        sys_print(" kind=");
+        switch (c.kind) {
+            .pipe => sys_print("pipe"),
+            .eventfd => sys_print("eventfd"),
+            .socketpair => sys_print("sockpair"),
+            .timerfd => sys_print("timerfd"),
+        }
+        sys_print(" refs=");
+        printDec(c.refs);
+        sys_print(" len=");
+        printDec(c.len);
+        sys_print(" cnt=");
+        printDec(c.counter);
+        if (c.kind == .timerfd) {
+            sys_print(" dl_ns=");
+            printDec(c.deadline_ns);
+            sys_print(" iv_ns=");
+            printDec(c.interval_ns);
+        }
+        sys_print("\n");
+    }
+    // futex-парковки (реестр честных блокировок)
+    var fp: usize = 0;
+    while (fp < futex_parks.len) : (fp += 1) {
+        const p = &futex_parks[fp];
+        if (!p.active) continue;
+        sys_print("[FUTEX-PARK] task=");
+        printDec(p.task);
+        sys_print(" uaddr=0x");
+        putHex(p.uaddr);
+        if (p.woken) sys_print(" WOKEN") else sys_print(" waiting");
+        sys_print("\n");
+    }
+    sys_print("[TASKS] end\n");
+}
+
+
+/// cmd_peek: CDD #12 p8 — чтение user-VA ГВОЗЗЯ через софт-page-walk
+/// (PML4 первого живого linux-таска; vm в парке — память консистентна).
+/// Формат: peek <hexva> [count] — 8Б-слоты hex + ASCII-вид (имена тредов).
+fn cmd_peek(cmd: []const u8) void {
+    // parse: "peek 0xADDR [count]"
+    var rest = cmd[5..];
+    rest = std.mem.trim(u8, rest, " ");
+    var cnt: usize = 4;
+    if (std.mem.indexOfScalar(u8, rest, ' ')) |sp| {
+        const cnt_s = std.mem.trim(u8, rest[sp..], " ");
+        cnt = std.fmt.parseInt(usize, cnt_s, 10) catch 4;
+        rest = rest[0..sp];
+    }
+    const va = std.fmt.parseInt(u64, rest, 16) catch {
+        sys_print("peek: hex-VA ожидался (peek 0x... [count])\n");
+        return;
+    };
+    // первый живой linux-таск — его PML4
+    var cr3: u64 = 0;
+    var ti: usize = 0;
+    while (ti < scheduler.task_count) : (ti += 1) {
+        const t = &scheduler.tasks[ti];
+        if (t.privilege == .User and t.abi == .linux and t.state != .Killed and t.cr3 != 0) {
+            cr3 = t.cr3;
+            break;
+        }
+    }
+    if (cr3 == 0) {
+        sys_print("peek: нет живого linux-таска\n");
+        return;
+    }
+    sys_print("[PEEK] pml4=0x");
+    putHex(cr3);
+    sys_print(" va=0x");
+    putHex(va);
+    sys_print(" count=");
+    printDec(cnt);
+    sys_print("\n");
+    var i: usize = 0;
+    while (i < cnt) : (i += 1) {
+        const a = va + i * 8;
+        if (linuxPeekUserOld(cr3, a)) |v| {
+            sys_print("  [0x");
+            putHex(a);
+            sys_print("] 0x");
+            putHex(v);
+            sys_print("  ");
+            // ASCII-вид 8 байт
+            const bytes: [8]u8 = @bitCast(v);
+            for (bytes) |b| {
+                if (b >= 0x20 and b < 0x7F) {
+                    const ech = [1]u8{b};
+                    sys_print(&ech);
+                } else sys_print(".");
+            }
+            sys_print("\n");
+        } else {
+            sys_print("  [0x");
+            putHex(a);
+            sys_print("] <unmapped>\n");
+        }
+    }
+}
+
+fn fdKindName(k: linux_syscalls.FdKind) void {
+    switch (k) {
+        .free => sys_print("free"),
+        .console_out => sys_print("console"),
+        .fb0 => sys_print("fb0"),
+        .dri_card0 => sys_print("dri_card0"),
+        .input_event0 => sys_print("input0"),
+        .input_event1 => sys_print("input1"),
+        .epoll => sys_print("epoll"),
+        .initrd_file => sys_print("initrd"),
+        .tmpfs_file => sys_print("tmpfs"),
+        .pipe_read => sys_print("pipe_r"),
+        .pipe_write => sys_print("pipe_w"),
+        .eventfd => sys_print("eventfd"),
+        .socket => sys_print("socket"),
+        .timerfd => sys_print("timerfd"),
+        .signalfd => sys_print("signalfd"),
+        .dir => sys_print("dir"),
+    }
 }
 
 /// cmd_ldevtest: E2E-самотест Linux-POSIX графического слоя: openat → ioctl

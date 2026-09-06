@@ -22,6 +22,57 @@ static uint64_t g_lo = 0;       // CDD №12 p7: фильтр диапазона
 static uint64_t g_hi = 0;       // 0/0 = без фильтра (все VA)
 static FILE *g_out = NULL;
 
+
+// ─── CDD #12 p8 (WHO-PTR-STACK): API v4 регистров гостя ───────────────
+struct qemu_plugin_register;
+typedef struct qemu_plugin_register qemu_plugin_reg;
+typedef struct {
+    const char *name;
+    qemu_plugin_reg *handle;
+} qemu_plugin_reg_descriptor;
+extern int qemu_plugin_get_registers(qemu_plugin_reg_descriptor **out);
+extern int qemu_plugin_read_register(qemu_plugin_reg *reg, GByteArray *buf);
+static qemu_plugin_reg *g_rsp = NULL;   // дескриптор RSP (инициализация лениво)
+static int g_stack_dumps = 0;           // анти-спам: максимум 8 дампов
+
+static void dump_guest_stack(void)
+{
+    if (g_stack_dumps >= 8) return;
+    if (!g_rsp) {
+        qemu_plugin_reg_descriptor *descs = NULL;
+        int n = qemu_plugin_get_registers(&descs);
+        if (n <= 0) { g_rsp = (qemu_plugin_reg *)1; return; } // нет API — выкл
+        for (int i = 0; i < n; i++) {
+            if (descs[i].name && strcmp(descs[i].name, "rsp") == 0) {
+                g_rsp = descs[i].handle;
+                break;
+            }
+        }
+    }
+    if (!g_rsp || g_rsp == (qemu_plugin_reg *)1) return;
+    GByteArray *rspbuf = g_byte_array_sized_new(8);
+    if (qemu_plugin_read_register(g_rsp, rspbuf) && rspbuf->len >= 8) {
+        uint64_t rsp = 0;
+        memcpy(&rsp, rspbuf->data, 8);
+        g_byte_array_free(rspbuf, TRUE);
+        fprintf(g_out, "[whoPTR-STACK] rsp=0x%" PRIx64 " ret-chain:\n", rsp);
+        for (int i = 0; i < 12; i++) {
+            uint64_t va = rsp + i * 8;
+            GByteArray *ba = g_byte_array_sized_new(8);
+            if (qemu_plugin_read_memory_vaddr(va, ba, 8) && ba->len >= 8) {
+                uint64_t v = 0;
+                memcpy(&v, ba->data, 8);
+                fprintf(g_out, "  [rsp+%#04x] 0x%016" PRIx64 "\n", i * 8, v);
+            }
+            g_byte_array_free(ba, TRUE);
+        }
+        fflush(g_out);
+        g_stack_dumps++;
+    } else {
+        g_byte_array_free(rspbuf, TRUE);
+    }
+}
+
 typedef struct {
     uint64_t vpc;
 } UserData;
@@ -50,6 +101,12 @@ static void mem_cb(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
             return;
         default: val = 0; break;
     }
+    // CDD #12 p8: ФИЛЬТР ДИАПАЗОНА ПЕРВЫМ (до дорогого read_memory):
+    // kernel-VA (бут/CPIO) выходит мгновенно; readback — только guest-VA.
+    // (env WHOAAAA_LO/HI hex — guest-диапазон: 0x100000000000..0x800000000000)
+    if (g_lo | g_hi) {
+        if (vaddr < g_lo || vaddr >= g_hi) return;
+    }
     // CDD №12 p6: get_value для LOAD в QEMU 10 не заполняется (тип U-64
     // только у store) — читаем память ДО загрузки (callback срабатывает
     // ПЕРЕД операцией: pre-load чтение = значение, которое загрузится).
@@ -61,15 +118,11 @@ static void mem_cb(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
         g_byte_array_free(ba, TRUE);
     }
     if (val != g_target) return;
-    // CDD №12 p7: фильтр диапазона VA (env WHOAAAA_LO/HI hex): ядро-регион
-    // (kstacks/heap) — иначе log-взрыв от легитимных гостевых значений.
-    if (g_lo | g_hi) {
-        if (vaddr < g_lo || vaddr >= g_hi) return;
-    }
     fprintf(g_out, "[whoPTR] vcpu=%u %s vaddr=0x%" PRIx64 " vpc=0x%" PRIx64 " val=0x%016" PRIx64 "\n",
             vcpu_index, is_store ? "STORE" : "LOAD", vaddr,
             ((UserData *)udata)->vpc, val);
     fflush(g_out);
+    if (is_store) dump_guest_stack(); // CDD #12 p8: вызывающая цепочка memset
 }
 
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
@@ -79,7 +132,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         UserData *ud = malloc(sizeof(UserData));
         ud->vpc = qemu_plugin_insn_vaddr(insn);
-        qemu_plugin_register_vcpu_mem_cb(insn, mem_cb, QEMU_PLUGIN_CB_NO_REGS,
+        qemu_plugin_register_vcpu_mem_cb(insn, mem_cb, QEMU_PLUGIN_CB_R_REGS,
                                          QEMU_PLUGIN_MEM_RW, ud);
     }
 }
