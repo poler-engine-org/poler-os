@@ -236,7 +236,14 @@ class VM:
 
     def _reader(self):
         # durable-лог: КАЖДЫЙ байт serial дублируется в файл (переживает
-        # гибель python-процесса — CDD-артефакт краша всегда на диске)
+        # гибель python-процесса — CDD-артефакт краша всегда на диске).
+        # CDD №12 p7-ФИКС: ошибка записи лога (диск полон! ENOSPC) НЕ ДОЛЖНА
+        # УБИВАТЬ поток-читатель! Эмпирика p7run16: OSError → break → сокет
+        # никто не читает → QEMU 16550 THRE=0 навсегда → ядро крутится в
+        # 50000-паузах на КАЖДОМ символе → полная заморозка гостя ([L]-фронт
+        # замер, шедулер current=N вечно). Теперь: durable-лог деградирует
+        # (write-fail → закрыть файл, читать только в RAM), сокет живёт.
+        logf = None
         try:
             logf = open(self.ser_log_path, "ab")
         except OSError:
@@ -249,8 +256,16 @@ class VM:
                 with self._lock:
                     self.log.extend(chunk)
                 if logf is not None:
-                    logf.write(chunk)
-                    logf.flush()
+                    try:
+                        logf.write(chunk)
+                        logf.flush()
+                    except OSError:
+                        # диск полон/лог недоступен: деградация RAM-only
+                        try:
+                            logf.close()
+                        except OSError:
+                            pass
+                        logf = None
             except BlockingIOError:
                 time.sleep(0.05)
             except OSError:

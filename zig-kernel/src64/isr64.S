@@ -496,6 +496,8 @@ isr_stub_table:    .quad isr_stub_0
 .extern syscall_num_tmp        // времяянка user RAX на время скана
 .extern syscall_ret_tmp        // v0.20.0: результат Zig-обработчика (возврат в RAX)
 .extern rbx_tmp                // времяянка user RBX на время скана
+.extern syscall_exit_frame_ptr // CDD №12 p7: указатель .bss-строки выходного кадра
+.extern exit_poison_mask       // CDD №12 p7: битовая маска 0xAAAA-детекторов выхода
 
 .global syscall_entry
 syscall_entry:
@@ -644,21 +646,71 @@ syscall_entry:
     // Результат — в .bss времяянку (RAX обязан вернуться пользователю),
     // затем восстановить аргументные регистры
     movq %rax, syscall_ret_tmp(%rip)
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CDD №12 p7: ВЫХОДНОЙ КАДР ИЗ .BSS — pop-каскад kstack ЗАМЕНЁН.
+    //
+    //  ЭМПИРИКА (p7run6..9, детерминированная ×3): [R15-POISON] — слот
+    //  каскада [top-8] содержит 0xAAAAAAAAAAAAAAAA на pop-е → гость
+    //  получает R14/R15=0xAAAA → #GP (mov rbp,[r14], R14=0xAAAA...
+    //  = non-canonical). Слоты на kstack-топе затираются путями, НЕ
+    //  наблюдаемыми TCG-плагинами (8.4M событий, ноль на слоте) и
+    //  Z2-watchpoint — единственные непрослеживаемые записи = C-helper
+    //  push-и (interrupt entry). ЛЕЧЕНИЕ ПО КОНСТРУКЦИИ: zig-вход
+    //  снапшотит все 14 слов [top-112, top) в .bss-строку владельца
+    //  (snapshotExitFrame, scheduler.zig); ЗДЕСЬ читаем регистры из
+    //  .bss — kstack-топ больше НЕ источник регистрового потока.
+    //  RAX = указатель строки (скретч; ret в ret_tmp — хвост перезагрузит).
+    //  Детекторы 0xAAAA — дешёвые биты exit_poison_mask (отчёт — из
+    //  следующего zig-входа; C-call здесь калечил бы восстановленные).
+    // ══════════════════════════════════════════════════════════════════
+    movq syscall_exit_frame_ptr(%rip), %rax
+    testq %rax, %rax
+    jz .exit_pop_fallback
+
+    cmpq $0, ucl_pending(%rip)
+    jne .ucl_launch_flagged
+
+    movq 0x00(%rax), %r9
+    movq 0x08(%rax), %r8      // НАСТОЯЩИЙ user R8 (snapshot из linux_arg5)
+    movq 0x10(%rax), %r10
+    movq 0x18(%rax), %rdx
+    movq 0x20(%rax), %rsi
+    movq 0x28(%rax), %rdi
+    movq 0x30(%rax), %r15
+    cmpq .Laaaa_const(%rip), %r15
+    jne 1f
+    orq $1, exit_poison_mask(%rip)
+1:  movq 0x38(%rax), %r14
+    cmpq .Laaaa_const(%rip), %r14
+    jne 2f
+    orq $2, exit_poison_mask(%rip)
+2:  movq 0x40(%rax), %r13
+    cmpq .Laaaa_const(%rip), %r13
+    jne 3f
+    orq $4, exit_poison_mask(%rip)
+3:  movq 0x48(%rax), %r12
+    cmpq .Laaaa_const(%rip), %r12
+    jne 4f
+    orq $8, exit_poison_mask(%rip)
+4:  movq 0x50(%rax), %rbp
+    movq 0x58(%rax), %rbx
+    movq 0x60(%rax), %r11     // user RFLAGS
+    movq 0x68(%rax), %rcx     // user RIP
+    jmp .exit_frame_done
+
+    // ─── fallback: снапшота нет (shell-контекст / ранний бут) ───────
+.exit_pop_fallback:
     popq %r9
     popq %r8
-    // v0.20.0-fix (CDD №12 p2): ВЕРНУТЬ НАСТОЯЩИЙ user R8! Выше
-    // «movq %rax,%r8» (номер syscall → 4-й Zig-аргумент) затирал R8,
-    // а pushq/popc-пара сохраняла УЖЕ ИСКАЖЁННОЕ значение: пользователь
-    // возвращался с R8 = НОМЕР SYSCALL (13=rt_sigaction → glibc писал
-    // oldact по адресу 13 → #PF CR2=0xD!). Настоящий R8 лежит в
-    // linux_arg5 (сохранён ВХОДОМ, транзакция in_win32_syscall=1 —
-    // переключений нет, клетка стабильна). Win32-пути безразличен.
     movq linux_arg5(%rip), %r8
     popq %r10
     popq %rdx
     popq %rsi
     popq %rdi
     movq syscall_ret_tmp(%rip), %rax
+    cmpq $0, ucl_pending(%rip)
+    jne .ucl_launch_flagged
 
     // v0.16.0-fix (CDD №7, застрявшие CV-треды): сброс флага транзакции
     // ПЕРЕНЕСЁН за pop'ы — раньше окно «flag=0 до sysretq» (~12 инструкций,
@@ -711,6 +763,9 @@ syscall_entry:
     // Restore r11 and rcx
     popq %r11
     popq %rcx
+    jmp .exit_frame_done
+
+.exit_frame_done:
 
     // Транзакция завершена. v0.16.0-fix: user_rsp снимается в РЕГИСТР
     // под flag=1 (чужой syscall не перезапишет глобал, пока мы владельцы),

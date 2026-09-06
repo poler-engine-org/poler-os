@@ -219,6 +219,76 @@ pub fn ownerAbiIsLinux() callconv(.C) bool {
 /// [4]=rbp [5]=rbx [6]=r11(user RFLAGS) [7]=rcx(user RIP после syscall).
 pub export var syscall_frame: [8]u64 = .{0} ** 8;
 
+/// CDD №12 p7: ВЫХОДНОЙ КАДР SYSCALL В .BSS — иммунный к затиранию kstack.
+/// ЭМПИРИКА p7run6/7/8/9: [R15-POISON] 0xAAAAAAAAAAAAAAAA в слоте каскада
+/// [top-8] (детектор на pop-каскаде!) — слоты syscall-каскада на kstack-
+/// топе затираются путями, НЕ наблюдаемыми ни TCG-плагинами, ни Z2-watch
+/// (8.4M событий — ноль на слоте; единственные непрослеживаемые записи =
+/// C-helper push-и прерываний) → pop-каскад восстанавливает ЯД. Лечение:
+/// zig-вход снапшотит все 14 слов [top-112, top) СЮДА; asm-выход читает
+/// регистры отсюда mov-ами (pop-каскад = ЗАМЕНЁН; kstack-топ больше не
+/// источник регистров гостя).
+/// Раскладка (порядок слов в памяти):
+///   [+0x00]r9 [+0x08]r8(НАСТОЯЩИЙ из linux_arg5!) [+0x10]r10 [+0x18]rdx
+///   [+0x20]rsi [+0x28]rdi [+0x30]r15 [+0x38]r14 [+0x40]r13 [+0x48]r12
+///   [+0x50]rbp [+0x58]rbx [+0x60]r11(user RFLAGS) [+0x68]rcx(user RIP)
+pub export var syscall_exit_frame: [MAX_TASKS][14]u64 =
+    .{.{0} ** 14} ** MAX_TASKS;
+
+/// Указатель активной строки (asm-выход читает через него; 0 = снапшота
+/// нет → legacy pop-путь). Пишет zig-вход ТОЛЬКО под IF=0 транзакции.
+pub export var syscall_exit_frame_ptr: u64 = 0;
+
+/// CDD №12 p7: битовая маска 0xAAAA-детекторов asm-выхода (биты: 1=R15,
+/// 2=R14, 4=R13, 8=R12 — реальные значения, восстановленные из .bss-кадра).
+/// Отчёт (print+clear) — следующим zig-входом: C-call из asm-хвоста калечил
+/// бы уже восстановленные регистры.
+pub export var exit_poison_mask: u64 = 0;
+
+/// CDD №12 p7: отчёт+сброс маски (звонится входом zig_syscall_handler).
+pub fn reportExitPoison() void {
+    if (exit_poison_mask == 0) return;
+    hal.Serial.puts("[EXIT-POISON] .bss-выходной кадр: 0xAAAA в ");
+    if (exit_poison_mask & 1 != 0) hal.Serial.puts("R15 ");
+    if (exit_poison_mask & 2 != 0) hal.Serial.puts("R14 ");
+    if (exit_poison_mask & 4 != 0) hal.Serial.puts("R13 ");
+    if (exit_poison_mask & 8 != 0) hal.Serial.puts("R12");
+    hal.Serial.puts(" (mask=0x");
+    hal.Serial.putHex(exit_poison_mask);
+    hal.Serial.puts(")\n");
+    exit_poison_mask = 0;
+}
+
+/// CDD №12 p7: снять ВЫХОДНОЙ КАДР [kstack_top-112, top) в .bss-строку
+/// владельца. Вызывается ВХОДОМ zig_syscall_handler (каскад уже построен
+/// asm-ом; транзакция IF=0 — атомарно). r8-слот = НАСТОЯЩИЙ user R8 из
+/// linux_arg5 (asm затирал R8 номером syscall ДО push — p2-класс).
+pub fn snapshotExitFrame(owner: usize) void {
+    syscall_exit_frame_ptr = 0;
+    if (owner == 0 or owner >= MAX_TASKS) return;
+    const top = taskKstackTop(owner);
+    if (top < 112) return;
+    const src: [*]const volatile u64 = @ptrFromInt(top - 112);
+    const dst = &syscall_exit_frame[owner];
+    // arg-часть [top-112, top-64): r9 r8 r10 rdx rsi rdi (asm-порядок push)
+    dst[0] = src[0]; // r9
+    dst[1] = linux_arg5; // r8 — НАСТОЯЩИЙ (src[1] = номер syscall — яд!)
+    dst[2] = src[2]; // r10
+    dst[3] = src[3]; // rdx
+    dst[4] = src[4]; // rsi
+    dst[5] = src[5]; // rdi
+    // callee-часть [top-64, top): r15 r14 r13 r12 rbp rbx r11 rcx
+    dst[6] = src[6]; // r15
+    dst[7] = src[7]; // r14
+    dst[8] = src[8]; // r13
+    dst[9] = src[9]; // r12
+    dst[10] = src[10]; // rbp
+    dst[11] = src[11]; // rbx
+    dst[12] = src[12]; // r11 = user RFLAGS
+    dst[13] = src[13]; // rcx = user RIP
+    syscall_exit_frame_ptr = @intFromPtr(dst);
+}
+
 /// v0.13.0-fix (КРИТИЧНО, CDD №4): транзакция syscall Ring-3 активна.
 /// isr64.S ставит 1 на входе syscall_entry и 0 перед sysretq (IF=0 —
 /// атомарно). Пока флаг поднят, schedule НЕ ПЕРЕКЛЮЧАЕТ задачу: тик,

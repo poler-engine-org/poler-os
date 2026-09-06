@@ -18,6 +18,8 @@
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 static uint64_t g_target = 0;
+static uint64_t g_lo = 0;       // CDD №12 p7: фильтр диапазона (kernel-region)
+static uint64_t g_hi = 0;       // 0/0 = без фильтра (все VA)
 static FILE *g_out = NULL;
 
 typedef struct {
@@ -59,9 +61,12 @@ static void mem_cb(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
         g_byte_array_free(ba, TRUE);
     }
     if (val != g_target) return;
-
-    fprintf(g_out, "[whoPTR] vcpu=%u %s vaddr=0x%" PRIx64 " vpc=0x%" PRIx64
-                   " val=0x%016" PRIx64 "\n",
+    // CDD №12 p7: фильтр диапазона VA (env WHOAAAA_LO/HI hex): ядро-регион
+    // (kstacks/heap) — иначе log-взрыв от легитимных гостевых значений.
+    if (g_lo | g_hi) {
+        if (vaddr < g_lo || vaddr >= g_hi) return;
+    }
+    fprintf(g_out, "[whoPTR] vcpu=%u %s vaddr=0x%" PRIx64 " vpc=0x%" PRIx64 " val=0x%016" PRIx64 "\n",
             vcpu_index, is_store ? "STORE" : "LOAD", vaddr,
             ((UserData *)udata)->vpc, val);
     fflush(g_out);
@@ -105,6 +110,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
     g_target = strtoull(argbuf, NULL, 16);
+
+    const char *lo = getenv("WHOAAAA_LO");
+    const char *hi = getenv("WHOAAAA_HI");
+    if (lo) g_lo = strtoull(lo, NULL, 16);
+    if (hi) g_hi = strtoull(hi, NULL, 16);
 
     const char *logpath = getenv("WHOAAAA_LOG");
     g_out = fopen(logpath ? logpath : "/tmp/who-ptr.log", "w");

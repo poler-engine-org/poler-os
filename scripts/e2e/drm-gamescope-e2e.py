@@ -247,7 +247,10 @@ vm = VM("drm-gamescope", initrd=INITRD, mem=os.environ.get("E2E_MEM", "2G"), qem
 del INITRD  # VM держит только путь к файлу — 258МБ больше не нужны в RAM
 try:
     vm.start()
-    t = vm.wait_for("Shell started", timeout=90) or vm.wait_for("[EVDEV]", timeout=60)
+    # CDD №12 p7: TCG-плагины (who-ptr/who-aaaa) замедляют бут в 10-50× —
+    # таймаут бута управляется env (E2E_BOOT_TIMEOUT, дефолт 90с).
+    _boot_to = int(os.environ.get("E2E_BOOT_TIMEOUT", "90"))
+    t = vm.wait_for("Shell started", timeout=_boot_to) or vm.wait_for("[EVDEV]", timeout=_boot_to)
     if t is None:
         check("boot: shell ready", False)
         sys.exit(1)
@@ -290,6 +293,24 @@ try:
             deadline_hit = "qemu-died"
             break
         time.sleep(1.0)
+
+    # CDD №12 p7: КРАШ-ДАМП ДОЛЖЕН ДОПЕЧАТАТЬСЯ. Эмпирика: e2e ломал цикл
+    # на «CPU EXCEPTION» и убивал QEMU ДО завершения печать STACK-RET →
+    # RBP-CHAIN/NODE-DUMP/C-DUMP (секция диагноза) терялись. Ждём маркер
+    # завершения (≤45с: 1024-слот скан + serial — медленно под TCG).
+    if deadline_hit == "crash":
+        dump_deadline = time.time() + 45
+        while time.time() < dump_deadline:
+            t = vm.text()
+            if "User process killed" in t or "Kernel fault" in t:
+                print("DUMP: краш-отчёт допечатан (маркер kill найден)")
+                break
+            if vm.proc and vm.proc.poll() is not None:
+                break
+            time.sleep(2.0)
+        else:
+            print("DUMP: маркер завершения не найден за 45с (дамп обрезан?)")
+
     text = vm.text()
 
     # ─── 2b. Скриншот ПОСЛЕ флипа + PPM-анализ пикселей ──────────────────

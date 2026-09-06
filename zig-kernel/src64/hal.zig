@@ -638,6 +638,48 @@ fn halFaulterTask(frame_addr: u64) usize {
     return sched0.MAX_TASKS; // «не найден»
 }
 
+/// CDD №12 p7: дамп 0x40 байта контейнерной структуры (R12/R13/R14/RBX на
+/// краше) с модульной атрицбуцией адреса и каждого слота-указателя. Все
+/// чтения — ТОЛЬКО после userLeafFlags(PRESENT|USER): рекурсивный #PF в
+/// краш-дампе = двойной фолт = потеря всего отчёта (эмпирика p5/p6: лог
+/// обрывался на STACK-RET, секции RBP-CHAIN/NODE-DUMP не доходили).
+fn dumpContainer(label: []const u8, addr: u64, faulter: usize) void {
+    if (addr <= 0x10000 or addr > 0x7FFF_FFFF_FFFF) return;
+    const vmm = @import("vmm64.zig");
+    const main64 = @import("main64.zig");
+    const pml4 = readCr3() & 0x000FFFFFFFFFF000;
+    const leaf = vmm.userLeafFlags(pml4, addr) orelse return;
+    if (leaf & vmm.PTE_USER == 0) return;
+    Serial.puts("C-DUMP [");
+    Serial.puts(label);
+    Serial.puts("] @0x");
+    Serial.putHex(addr);
+    if (main64.linuxModuleAt(faulter, addr)) |hit| {
+        Serial.puts(" (");
+        Serial.puts(hit.name);
+        Serial.puts("+0x");
+        Serial.putHex(hit.off);
+        Serial.puts(")");
+    }
+    Serial.puts(":");
+    const w: *volatile [8]u64 = @ptrFromInt(addr);
+    var k: usize = 0;
+    while (k < 8) : (k += 1) {
+        Serial.puts(" [+0x");
+        Serial.putHex(@intCast(k * 8));
+        Serial.puts("]=0x");
+        Serial.putHex(w[k]);
+        if (main64.linuxModuleAt(faulter, w[k])) |hit2| {
+            Serial.puts("(");
+            Serial.puts(hit2.name);
+            Serial.puts("+0x");
+            Serial.putHex(hit2.off);
+            Serial.puts(")");
+        }
+    }
+    Serial.puts("\n");
+}
+
 fn handleException(frame: *InterruptFrame) void {
     // v0.10.0 (CDD №1): int3 из стаба импорта — обрабатываем ПЕРВЫМ.
     // Стаб: xor rax,rax; int3; ret — RIP после int3 указывает внутрь стаба;
@@ -664,6 +706,16 @@ fn handleException(frame: *InterruptFrame) void {
                 halFaulterTask(@intFromPtr(frame)), cr2_dz)) {
             return; // гость продолжает — фолта «не было»
         }
+    }
+
+    // CDD №12 p7: ДАМП-АТОМАРНОСТЬ — весь краш-отчёт под IF=0. Эмпирика
+    // p6/p7-прогонов: печать STACK-RET (медленная, сокет-serial) прерыва-
+    // лась таймером (вытеснение кадра каскадом schedule) либо убийством
+    // QEMU e2e-скриптом ДО завершения — RBP-CHAIN/NODE-DUMP/модульная
+    // атрибуция (СЕКЦИЯ ДЕНЕГ для CDD-диагноза) не доходили до лога.
+    // Возврат IF — через rflags кадра (idle_after_fault: 0x202, IF=1).
+    if (from_user and frame.vector != 3) {
+        cli();
     }
 
     Serial.puts("\n!!! CPU EXCEPTION !!!\n");
@@ -898,6 +950,18 @@ fn handleException(frame: *InterruptFrame) void {
             }
             Serial.puts("\n");
         }
+    }
+
+    // CDD №12 p7: КОНТЕЙНЕРНЫЙ ДАМП R12/R13/R14 — источники итератора.
+    // Узел #PF (RDI) лежит в нулевой lazy-странице, но КОНТЕЙНЕР (std::map
+    // в .data) — живые данные: его header {parent=ROOT, left, right} и
+    // node_count показывают, КТО выдал мусорный итератор. 0x40 байта +
+    // модульная атрибуция КАЖДОГО слота (указатели-дети → либа+офсет).
+    if (from_user) {
+        dumpContainer("R12", frame.r12, exc_faulter);
+        dumpContainer("R13", frame.r13, exc_faulter);
+        dumpContainer("R14", frame.r14, exc_faulter);
+        dumpContainer("RBX", frame.rbx, exc_faulter);
     }
 
     // CDD №12 p6: ДАМП УЗЛА #PF — [RDI, +0x40) декодировано как
@@ -1834,7 +1898,18 @@ pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.C) void
     }
 }
 
-pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {    // arg3/arg4/arg5 — позиционные rdx/rcx/r9: для syscall №6 это Win64-аргументы
+pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
+
+    // CDD №12 p7: ВЫХОДНОЙ КАДР В .BSS — СНАПШОТ ПЕРВОЙ ОПЕРАЦИЕЙ (каскад
+    // asm уже построен на kstack-топе владельца; транзакция IF=0 — никто
+    // не переключил). Далее ЛЮБАЯ порча [top-112, top) не влияет на регист-
+    // ровый поток гостя: asm-выход читает регистры из .bss-снапшота.
+    {
+        const sched7 = @import("scheduler.zig");
+        sched7.snapshotExitFrame(sched7.syscallStackOwner(sched7.user_rsp));
+        sched7.reportExitPoison();
+    }
+    // arg3/arg4/arg5 — позиционные rdx/rcx/r9: для syscall №6 это Win64-аргументы
 
     // v0.18.0 (CDD №9): Linux POSIX-слой. Если текущая задача — Linux-ABI
     // (ELF/Starnix), ВСЕ syscall'ы идут по Linux x86_64 конвенции: номер в

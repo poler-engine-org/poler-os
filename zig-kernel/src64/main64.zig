@@ -2319,6 +2319,31 @@ fn linuxDoClone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u6
     const child = scheduler.createLinuxCloneTask(parent.cr3, &frame) catch
         return -linux_syscalls.EAGAIN; // лимит задач (MAX_TASKS)
 
+    // CDD №12 p7: CLONE_SETTLS — FS-base РЕБЁНКА в fs_base_tab (диспет-
+    // черизация грузит MSR из таблицы; БЕЗ этого тред наследовал FS-base
+    // родителя → pthread-дескриптор (%fs:0) читал ЧУЖОЙ TLS → стартовый
+    // handshake glibc (spin после prlimit64) зависал НАВСЕГДА — эмпирика
+    // p7run11: задачи 0-3 заморожены, current=4 вечно, syscall-тишина).
+    if (flags & linux_syscalls.CLONE_SETTLS != 0 and tls != 0) {
+        scheduler.fs_base_tab[child] = tls;
+    } else {
+        scheduler.fs_base_tab[child] = scheduler.fs_base_tab[owner];
+    }
+    // CDD №12 p7: CLONE_CHILD_SETTID — Linux ПИШЕТ tid ребёнка в
+    // *child_tid ПРИ clone (не только exit-CLEARTID!). glibc's
+    // pthread_create-хендшейк родителя ждёт это слово (tid!=0).
+    if (flags & linux_syscalls.CLONE_CHILD_SETTID != 0 and child_tid != 0) {
+        var tidb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &tidb, @intCast(child), .little);
+        _ = linux_user_io.copy_out(child_tid, &tidb);
+    }
+    // CLONE_PARENT_SETTID — то же слово для родителя (man clone).
+    if (flags & linux_syscalls.CLONE_PARENT_SETTID != 0 and parent_tid != 0) {
+        var tidb2: [4]u8 = undefined;
+        std.mem.writeInt(u32, &tidb2, @intCast(child), .little);
+        _ = linux_user_io.copy_out(parent_tid, &tidb2);
+    }
+
     // Тред наследует ПРОЦЕСС родителя (CLONE_VM|CLONE_FILES — общие fd)
     linux_task_proc[child] = linux_task_proc[owner];
     // CLONE_CHILD_CLEARTID: слово tid — на exit треда (pthread_join)
