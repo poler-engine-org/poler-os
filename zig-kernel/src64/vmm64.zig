@@ -334,7 +334,17 @@ pub fn mapPageInPML4(target_pml4_phys: u64, virt: u64, phys: u64, flags: u64) !v
 /// (зеркало mapPageInPML4 — для PMM-rollback при сбоях загрузки PE).
 /// Освобождает опустевшие промежуточные таблицы (PT→PD→PDPT) обратно в
 /// PMM — иначе rollback образа утекал бы страницами таблиц страниц.
-/// Invlpg не нужен: target-PML4 не активный CR3 (задача ещё не запущена).
+/// CDD №12 p10: ЕСЛИ target-PML4 == АКТИВНЫЙ CR3 — invlpg ОБЯЗАТЕЛЕН.
+/// Старое допущение «target не активный CR3» держалось только для
+/// PE-rollback-путей; linux-пути (munmap / brk-спад / MADV_DONTNEED /
+/// MAP_FIXED-замена) вызывают ЭТУ функцию на таблицах РАБОТАЮЩЕЙ задачи
+/// → PTE=0 без invlpg = stale-TLB: физика уже в PMM-free, а старый VA
+/// продолжает писать через кэшированную трансляцию → PMM перевыдаёт кадр
+/// под demand-zero → КРОСС-VA АЛИАСИНГ (эмпирика p9/p10: порча
+/// LLVM-структур, NULL-deref libLLVM+0x4822696, RDI=0). Диспетчер НЕ
+/// перезагружает CR3 при переключении тредов одного процесса
+/// (scheduler.zig: next_cr3 == current_cr3 → skip) — значит между
+/// тредами TLB НЕ сбрасывается ВООБЩЕ, и инвал здесь — единственная защита.
 pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!void {
     if (virt % PAGE_SIZE != 0) return VmmError.InvalidAddress;
 
@@ -358,6 +368,22 @@ pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!void {
     const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
     diagPte("UNMAP-FIXED", virt, pt[pt_idx]); // CDD №12 p6-DIAG
     pt[pt_idx] = 0;
+
+    // CDD №12 p10: TEARDOWN-ИНВАРИАНТ — сброс TLB-строки ДО освобождения
+    // чего-либо в PMM (сам кадр — вызывающий; таблицы — ниже). Активность
+    // CR3 проверяем по факту: PE-rollback (неактивный PML4) не инвалит.
+    {
+        const active_cr3: u64 = asm volatile ("movq %%cr3, %[v]"
+            : [v] "=r" (-> u64),
+        );
+        if ((active_cr3 & 0x000FFFFFFFFFF000) == target_pml4_phys) {
+            asm volatile ("invlpg (%[virt])"
+                :
+                : [virt] "r" (virt),
+                : "memory"
+            );
+        }
+    }
 
     // Освобождение опустевших таблиц снизу вверх (как unmapPage)
     if (isTableEmpty(pt_phys)) {

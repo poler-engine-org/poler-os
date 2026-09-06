@@ -16,6 +16,15 @@ var usable_pages: u64 = 0;
 var allocated_pages: u64 = 0;
 var next_free_hint: u64 = 0; // Next-fit hint to avoid O(n) scan from 0
 
+// CDD №12 p10: ТИХИЕ УБИЙЦЫ АЛИАСИНГА → ГРОМКИЕ. freePage молча глотал
+// повторный free (бит уже чист — no-op) — двойное владение кадром
+// маскировалось, PMM выдавал ОДНУ физику ДВУМ VA (кросс-маппинг).
+// Счётчики видны в e2e-логах и в мониторе (physmap).
+pub var pmm_double_frees: u64 = 0;
+pub var pmm_free_calls: u64 = 0;
+pub var pmm_alloc_calls: u64 = 0;
+var pmm_df_reported: u64 = 0; // анти-спам: печатаем первые 16
+
 extern var _kernel_start: anyopaque;
 extern var _kernel_end: anyopaque;
 
@@ -104,6 +113,7 @@ pub fn init(mbi_ptr: u64) void {
 }
 
 pub fn allocPage() ?u64 {
+    pmm_alloc_calls += 1;
     // Start from the next-fit hint instead of always scanning from 0
     var i: u64 = next_free_hint;
     var wrapped = false;
@@ -127,6 +137,7 @@ pub fn allocPage() ?u64 {
 }
 
 pub fn freePage(addr: u64) void {
+    pmm_free_calls += 1;
     // v6 FIX (Bug #7): Boundary check — addr >= 4GB causes OOB bitmap access
     if (addr >= MAX_MEM_SUPPORTED) {
         hal.Serial.puts("[PMM] ERROR: freePage addr out of range: 0x");
@@ -150,6 +161,20 @@ pub fn freePage(addr: u64) void {
         // Update hint to point near freed page for better locality
         if (page_idx < next_free_hint) {
             next_free_hint = page_idx;
+        }
+    } else {
+        // CDD №12 p10: DOUBLE-FREE — кадр УЖЕ свободен. Раньше молчал:
+        // двойное владение (регион-реестр + PTE-скан, два VA, два слота)
+        // не детектировалось, а next-fit ГАРАНТИРОВАЛ мгновенный перевыдач
+        // этого кадра второй стороне → физ-алиасинг → порча структур.
+        pmm_double_frees += 1;
+        if (pmm_df_reported < 16) {
+            pmm_df_reported += 1;
+            hal.Serial.puts("[PMM] DOUBLE-FREE 0x");
+            hal.Serial.putHex(addr);
+            hal.Serial.puts(" (#");
+            hal.Serial.putDecimal(pmm_double_frees);
+            hal.Serial.puts(")\n");
         }
     }
 }

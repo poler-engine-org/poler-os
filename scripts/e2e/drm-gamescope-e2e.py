@@ -78,7 +78,18 @@ print(f"rootfs: {len(files)} файлов ({xkb_count} xkb) + {len(symlinks)} с
 # в АБСОЛЮТНЫЙ путь: Khronos-лоадер резолвит относительный путь ОТНОСИТЕЛЬНО
 # МАНИФЕСТА (/usr/share/vulkan/icd.d/...) — там файла нет → ICD не загружен
 # → vkCreateInstance = -9 (VK_ERROR_INCOMPATIBLE_DRIVER).
-for pth in report.get("extra_files", []):
+# CDD №12 p10: extra_files в report.json хранит АБСОЮТНЫЕ пути среды,
+# где каталогался пакеты (полер-os-recover/...) — окружение сессии могло
+# переехать (p5-авария PolarFS → git-clone в новый путь). Нормализуем:
+# не существует → срезаем всё до 'cachyos-root/' и подставляем ТЕКУЩИЙ
+# REPO. Эмпирика p10-run3: ICD тихо выпал из CPIO → ENOENT lvp_icd.json
+# → gamescope abort exit(134) ДО всякого LLVM/шейдеров.
+for _pth in report.get("extra_files", []):
+    pth = _pth
+    if not os.path.exists(pth):
+        _idx = _pth.find("cachyos-root/")
+        if _idx >= 0:
+            pth = os.path.join(REPO, "cachyos-root", _pth[_idx + len("cachyos-root/"):])
     if os.path.exists(pth):
         with open(pth, "rb") as f:
             j = f.read().decode("utf-8")
@@ -87,6 +98,9 @@ for pth in report.get("extra_files", []):
                 j = j.replace('"library_path": "%s"' % soname,
                               '"library_path": "/usr/lib/%s"' % soname)
         files["usr/share/vulkan/icd.d/" + os.path.basename(pth)] = j.encode()
+    else:
+        print(f"WARN: ICD-манифест не найден ни по исходному, ни по "
+              f"нормализованному пути: {_pth}")
 
 # ─── CDD #12 p3: VK-слой POLER_drm + виртуальное /sys-дерево libdrm ─────────
 # КОРЕНЬ ЗАДАЧИ: gamescope требует VK_EXT_physical_device_drm (ValidPhysical
@@ -241,8 +255,9 @@ vm = VM("drm-gamescope", initrd=INITRD, mem=os.environ.get("E2E_MEM", "2G"), qem
                     # (who-ptr.so): env E2E_PTR="TARGET_HEX" — логирует КАЖДУЮ
                     # load/store-операцию со значением TARGET (источник
                     # мусорного указателя: vaddr чтения + vpc записи).
-                    *(["-plugin", "file=%s/scripts/e2e/who-ptr.so,%s"
-                       % (REPO, os.environ["E2E_PTR"])]
+                    *(["-plugin", "file=%s/scripts/e2e/%s,%s"
+                       % (REPO, os.environ.get("E2E_WHO", "who-ptr.so"),
+                          os.environ["E2E_PTR"])]
                       if os.environ.get("E2E_PTR") else [])])
 del INITRD  # VM держит только путь к файлу — 258МБ больше не нужны в RAM
 try:

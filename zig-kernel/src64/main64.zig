@@ -1376,6 +1376,8 @@ fn execute_command(cmd: []const u8) void {
         sys_print(if (linux_trace) "[L] trace ON\n" else "[L] trace OFF\n");
     } else if (eq(cmd, "mmapinfo")) {
         cmd_mmapinfo();
+    } else if (startsWith(cmd, "physmap")) {
+        linuxPhysScan();
     } else if (eq(cmd, "tasks")) {
         cmd_tasks();
     } else if (startsWith(cmd, "peek ")) {
@@ -3002,15 +3004,28 @@ fn linuxRangeDrop(va: u64, pages: u64) void {
         while (p < r.pages) : (p += 1) {
             const va_pg = r.va + p * PAGE_SIZE;
             if (r.anon) {
+                // CDD №12 p10: ПОРЯДОК TEARDOWN-ИНВАРИАНТА — ПTE=0 + invlpg
+                // ДО freePage. Было freePage → unmap(catch{}) — при сбое
+                // unmap кадр уходил в PMM-фри ПОД живым PTE → мгновенный
+                // перевыдач = алиасинг. Плюс БЕЗ инвала (см. vmm64.zig)
+                // stale-TLB продолжал писать по старому VA в отданный кадр.
+                var pa_to_free: u64 = 0;
                 if (vmm.userLeafRaw(pml4, va_pg)) |pte| {
                     const pa = pte & 0x000FFFFFFFFFF000;
-                    if (pa != 0 and va_pg >= elf_loader.MIN_USER_VA) {
-                        pmm.freePage(pa);
+                    if (pa != 0 and va_pg >= elf_loader.MIN_USER_VA) pa_to_free = pa;
+                }
+                if (vmm.unmapPageInPML4(pml4, va_pg)) |_| {
+                    // PTE снят + TLB-строка сброшена (активный CR3):
+                    // только ТЕПЕРЬ кадр можно возвращать PMM.
+                    if (pa_to_free != 0) {
+                        pmm.freePage(pa_to_free);
                         freed += 1;
                     }
-                }
+                } else |_| {}
+            } else {
+                // shared/dev: физика принадлежит memfd/dumb — только unmap.
+                _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
             }
-            _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
         }
         r.used = false;
         linux_mmap_drops += 1;
@@ -3050,14 +3065,19 @@ fn linuxDoDontneed(va: u64, len: u64) i64 {
             var p: u64 = 0;
             while (p < r.pages) : (p += 1) {
                 const va_pg = r.va + p * PAGE_SIZE;
+                // CDD №12 p10: инвариант teardown — unmap(PTE=0+invlpg)
+                // СНАЧАЛА, freePage — ПОТОМ (см. linuxRangeDrop).
+                var pa_to_free: u64 = 0;
                 if (vmm.userLeafRaw(pml4, va_pg)) |pte| {
                     const pa = pte & 0x000FFFFFFFFFF000;
-                    if (pa != 0 and va_pg >= elf_loader.MIN_USER_VA) {
-                        pmm.freePage(pa);
+                    if (pa != 0 and va_pg >= elf_loader.MIN_USER_VA) pa_to_free = pa;
+                }
+                if (vmm.unmapPageInPML4(pml4, va_pg)) |_| {
+                    if (pa_to_free != 0) {
+                        pmm.freePage(pa_to_free);
                         linux_dontneed_zaps += 1;
                     }
-                }
-                _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
+                } else |_| {}
             }
             r.touched = 0;
         }
@@ -5157,6 +5177,220 @@ fn cmd_mmapinfo() void {
         _ = linuxDumpRegionTable(slot, MAX_MMAP_REGIONS);
     }
     if (!any) sys_print("[MMAPINFO] нет активных Linux-процессов (elfload <bin>)\n");
+}
+
+// ─── CDD №12 p10: PHYS-MAP-СКАНЕР — инвариант отсутствия алиасинга ──────────
+// Обход user-PTE ВСЕХ активных адресных пространств: физ-кадр, выданный PMM
+// (anon-регион: demand-zero/brk/eager-anon), НЕ может быть замаплен более
+// чем в один user-VA (в любом пространстве) — иначе два VA пишут/читают
+// один кадр = кросс-порча (эмпирика p9/p10: NULL-deref libLLVM через
+// порчу свежих структур). Освобождённые от алиасинга: MAP_SHARED-memfd,
+// dev-мапы, file-backed страницы (page-cache-семантика), untracked
+// (стеки/образы — физика принадлежит образу, не PMM).
+
+/// 4ГБ / 4К = 1М кадров — покрыто сканером (гость ≤ 4ГБ, PMM-диапазон).
+const PHYS_SCAN_FRAMES: usize = 0x100000;
+var phys_scan_strict: [PHYS_SCAN_FRAMES]u8 = undefined; // счётчик anon-маппингов кадра
+var phys_scan_exempt: [PHYS_SCAN_FRAMES]u8 = undefined; // 1 = кадр виден как file/shared/untracked
+pub var phys_scan_runs: u64 = 0;
+pub var phys_scan_anon_alias: u64 = 0;
+pub var phys_scan_mixed_alias: u64 = 0;
+
+inline fn physScanReadQ(pa: u64) u64 {
+    const p: *const volatile u64 = @ptrFromInt(pa);
+    return p.*;
+}
+
+/// Классификация VA в пространстве задачи: strict (anon, PMM-кадр)?
+/// Линейный поиск по реестру (с last-hit-кэшем — страницы региона
+/// идут подряд, попадание в тот же регион = O(1) на 2-й+ странице).
+var phys_scan_hint: usize = 0;
+fn physScanRegionStrict(slot: usize, va: u64) bool {
+    if (slot >= MAX_LINUX_PROCS) return false;
+    const regs = &linux_mmap_regions[slot];
+    if (phys_scan_hint < regs.len) {
+        const h = &regs[phys_scan_hint];
+        if (h.used and va >= h.va and va < h.va + h.pages * PAGE_SIZE)
+            return h.anon;
+    }
+    var i: usize = 0;
+    while (i < regs.len) : (i += 1) {
+        const r = &regs[i];
+        if (!r.used) continue;
+        if (va >= r.va and va < r.va + r.pages * PAGE_SIZE) {
+            phys_scan_hint = i;
+            return r.anon;
+        }
+    }
+    return false;
+}
+
+/// Полный проход одного PML4 (user-половина, 4К-листья): классифицирует
+/// каждый PRESENT+USER лист в strict/exempt счётчики.
+fn physScanSpace(pml4_phys: u64, slot: usize) u64 {
+    var mapped: u64 = 0;
+    var pml4_i: usize = 0;
+    while (pml4_i < 256) : (pml4_i += 1) {
+        const pml4e = physScanReadQ(pml4_phys + 8 * pml4_i);
+        if (pml4e & (vmm.PTE_PRESENT | vmm.PTE_USER) != (vmm.PTE_PRESENT | vmm.PTE_USER)) continue;
+        const pdpt = pml4e & 0x000FFFFFFFFFF000;
+        var pdpt_i: usize = 0;
+        while (pdpt_i < 512) : (pdpt_i += 1) {
+            const pdpte = physScanReadQ(pdpt + 8 * pdpt_i);
+            if (pdpte & vmm.PTE_PRESENT == 0) continue;
+            if (pdpte & vmm.PTE_HUGE != 0) continue; // 1G-лист: user-зоне нет
+            const pd = pdpte & 0x000FFFFFFFFFF000;
+            var pd_i: usize = 0;
+            while (pd_i < 512) : (pd_i += 1) {
+                const pde = physScanReadQ(pd + 8 * pd_i);
+                if (pde & vmm.PTE_PRESENT == 0) continue;
+                if (pde & vmm.PTE_HUGE != 0) continue; // 2M-лист: user-зоне нет
+                const pt = pde & 0x000FFFFFFFFFF000;
+                var pt_i: usize = 0;
+                while (pt_i < 512) : (pt_i += 1) {
+                    const pte = physScanReadQ(pt + 8 * pt_i);
+                    if (pte & vmm.PTE_PRESENT == 0) continue;
+                    if (pte & vmm.PTE_USER == 0) continue;
+                    const pa = pte & 0x000FFFFFFFFFF000;
+                    if (pa == 0) continue;
+                    const idx: usize = @intCast(pa / PAGE_SIZE);
+                    if (idx >= PHYS_SCAN_FRAMES) continue;
+                    const va: u64 = (@as(u64, pml4_i) << 39) | (@as(u64, pdpt_i) << 30) |
+                        (@as(u64, pd_i) << 21) | (@as(u64, pt_i) << 12);
+                    mapped += 1;
+                    if (physScanRegionStrict(slot, va)) {
+                        phys_scan_strict[idx] +%= 1;
+                    } else {
+                        phys_scan_exempt[idx] = 1;
+                    }
+                }
+            }
+        }
+    }
+    return mapped;
+}
+
+/// Додетект: найти ВСЕ (slot, va), мапящие кадр pa (печать до 8) —
+/// вызывается ТОЛЬКО на нарушении (редко, дорогой полный проход).
+fn physScanReportFrame(pa: u64) void {
+    var shown: usize = 0;
+    var t: usize = 0;
+    while (t < scheduler.task_count and shown < 8) : (t += 1) {
+        const task = &scheduler.tasks[t];
+        if (task.state == .Killed or task.cr3 == 0) continue;
+        const slot: usize = linux_task_proc[t];
+        var pml4_i: usize = 0;
+        outer: while (pml4_i < 256) : (pml4_i += 1) {
+            const pml4e = physScanReadQ(task.cr3 + 8 * pml4_i);
+            if (pml4e & (vmm.PTE_PRESENT | vmm.PTE_USER) != (vmm.PTE_PRESENT | vmm.PTE_USER)) continue;
+            const pdpt = pml4e & 0x000FFFFFFFFFF000;
+            var pdpt_i: usize = 0;
+            while (pdpt_i < 512) : (pdpt_i += 1) {
+                const pdpte = physScanReadQ(pdpt + 8 * pdpt_i);
+                if (pdpte & vmm.PTE_PRESENT == 0 or pdpte & vmm.PTE_HUGE != 0) continue;
+                const pd = pdpte & 0x000FFFFFFFFFF000;
+                var pd_i: usize = 0;
+                while (pd_i < 512) : (pd_i += 1) {
+                    const pde = physScanReadQ(pd + 8 * pd_i);
+                    if (pde & vmm.PTE_PRESENT == 0 or pde & vmm.PTE_HUGE != 0) continue;
+                    const pt = pde & 0x000FFFFFFFFFF000;
+                    var pt_i: usize = 0;
+                    while (pt_i < 512) : (pt_i += 1) {
+                        const pte = physScanReadQ(pt + 8 * pt_i);
+                        if (pte & (vmm.PTE_PRESENT | vmm.PTE_USER) != (vmm.PTE_PRESENT | vmm.PTE_USER)) continue;
+                        if ((pte & 0x000FFFFFFFFFF000) != pa) continue;
+                        if (shown >= 8) break :outer;
+                        sys_print("  [PHYSMAP]   mapped: task=");
+                        printDec(t);
+                        sys_print(" slot=");
+                        printDec(slot);
+                        sys_print(" va=0x");
+                        putHex((@as(u64, pml4_i) << 39) | (@as(u64, pdpt_i) << 30) |
+                            (@as(u64, pd_i) << 21) | (@as(u64, pt_i) << 12));
+                        sys_print("\n");
+                        shown += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Скан: сбор уникальных CR3 активных задач → проход каждого → отчёт.
+/// Гарантии: PF-безопасность не нужна (таблицы identity-мапплены, ядровый
+/// контекст монитора), вызов из monitor-команды physmap.
+fn linuxPhysScan() void {
+    phys_scan_runs += 1;
+    @memset(&phys_scan_strict, 0);
+    @memset(&phys_scan_exempt, 0);
+    phys_scan_hint = 0;
+
+    var frames: u64 = 0;
+    var spaces: u64 = 0;
+    var t: usize = 0;
+    while (t < scheduler.task_count) : (t += 1) {
+        const task = &scheduler.tasks[t];
+        if (task.state == .Killed or task.cr3 == 0) continue;
+        // дедупликация CR3 (треды процесса шарят PML4)
+        var dup = false;
+        var u: usize = 0;
+        while (u < t) : (u += 1) {
+            if (scheduler.tasks[u].state != .Killed and scheduler.tasks[u].cr3 == task.cr3) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        spaces += 1;
+        frames += physScanSpace(task.cr3, linux_task_proc[t]);
+    }
+
+    // вердикт: strict-кадр с ≥2 маппингами = АНОН-АЛИАС; strict+exempt
+    // на одном кадре = СМЕШАННЫЙ (PMM выдал кадр, уже занятый file/dev —
+    // сигнатура p5-бага «munmap освобождал общие страницы»).
+    var violations: u64 = 0;
+    var idx: usize = 0;
+    while (idx < PHYS_SCAN_FRAMES) : (idx += 1) {
+        if (phys_scan_strict[idx] >= 2) {
+            phys_scan_anon_alias += 1;
+            violations += 1;
+            sys_print("[PHYSMAP] ANON-ALIAS pa=0x");
+            putHex(@as(u64, idx) * PAGE_SIZE);
+            sys_print(" count=");
+            printDec(phys_scan_strict[idx]);
+            sys_print("\n");
+            physScanReportFrame(@as(u64, idx) * PAGE_SIZE);
+        } else if (phys_scan_strict[idx] == 1 and phys_scan_exempt[idx] != 0) {
+            phys_scan_mixed_alias += 1;
+            violations += 1;
+            sys_print("[PHYSMAP] MIXED-ALIAS pa=0x");
+            putHex(@as(u64, idx) * PAGE_SIZE);
+            sys_print(" (PMM-кадр перекрыт file/dev-мапом)\n");
+            physScanReportFrame(@as(u64, idx) * PAGE_SIZE);
+        }
+    }
+
+    sys_print("[PHYSMAP] scan #");
+    printDec(phys_scan_runs);
+    sys_print(": spaces=");
+    printDec(spaces);
+    sys_print(" frames=");
+    printDec(frames);
+    sys_print(" violations=");
+    printDec(violations);
+    sys_print(" | PMM: allocs=");
+    printDec(pmm.pmm_alloc_calls);
+    sys_print(" frees=");
+    printDec(pmm.pmm_free_calls);
+    sys_print(" DOUBLE-FREE=");
+    printDec(pmm.pmm_double_frees);
+    sys_print("\n");
+    sys_print("[PHYSMAP] RESULT: ");
+    if (violations == 0 and pmm.pmm_double_frees == 0) {
+        sys_print("CLEAN (0 violations, 0 double-frees)\n");
+    } else {
+        sys_print("ALIASING DETECTED — см. ANON/MIXED-ALIAS выше\n");
+    }
 }
 
 
