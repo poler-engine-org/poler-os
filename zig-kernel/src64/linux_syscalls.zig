@@ -491,6 +491,9 @@ pub const LinuxOps = struct {
     /// glibc-волна (CDD №11 p1b): mprotect(va, len, prot) — обновление
     /// прав страниц (RELRO: RW→RO после загрузки). 0 / -errno.
     do_mprotect: *const fn (va: u64, len: u64, prot: u64) i64,
+    /// CDD №12 p6: madvise(MADV_DONTNEED) — zap PTE + free физики (диапазон
+    /// остаётся lazy-резервацией: zero-on-next-touch). 0 / -errno.
+    do_dontneed: *const fn (va: u64, len: u64) i64,
     /// arch_prctl(ARCH_SET_FS, addr): TLS-база задачи. 0 / -errno.
     arch_set_fs: *const fn (addr: u64) i64,
     /// arch_prctl(ARCH_GET_FS): текущая TLS-база.
@@ -1792,10 +1795,25 @@ pub fn sysPrctl(ops: LinuxOps, option: u64, arg2: u64, arg3: u64, arg4: u64, arg
     }
 }
 
-/// madvise(va, len, advice): DAMP-заглушка (RELRO/malloc-советы — успех).
+/// madvise-советы: DONTNEED (4) — единственный с VM-действием в стеке
+/// guests (glibc malloc-арены, Mesa-пулы); FREE (8) — «ленивый» вариант
+/// (возврат 0 допустим: Linux оставляет страницу до давления).
+pub const MADV_DONTNEED: u64 = 4;
+pub const MADV_FREE: u64 = 8;
+
+/// madvise(va, len, advice): CDD №12 p6 — DONTNEED честно зануляет анонимную
+/// память (zap PTE + free физики; диапазон остаётся резервацией — следующее
+/// касание = НУЛЕВАЯ страница; glibc/LLVM завязаны на эту гарантию).
+/// Остальные советы — без действия (успех, как Linux для «не применимо»).
+/// Валидация не требуется: dontneed-путь ядра безопасен на любом VA (Linux
+/// принимает PROT_NONE/частично-размапленные диапазоны).
 pub fn sysMadvise(ops: LinuxOps, va: u64, len: u64, advice: u64) u64 {
-    _ = advice; // MADV_NORMAL/DONTNEED/… — без VM-подсказок (анонимные страницы)
     if (len == 0) return 0;
+    if (advice == MADV_DONTNEED) {
+        const r = ops.do_dontneed(va, len);
+        if (r < 0) return @bitCast(r);
+        return @intCast(r);
+    }
     if (!ops.validate(va, len, false)) return err(EFAULT);
     return 0;
 }
@@ -1953,6 +1971,9 @@ const FakeEnv = struct {
     brk_value: u64 = 0x1000,
     mprotect_calls: u64 = 0,
     last_mprotect_prot: u64 = 0,
+    dontneed_calls: u64 = 0,
+    last_dontneed_va: u64 = 0,
+    last_dontneed_len: u64 = 0,
     fs_base: u64 = 0,
     tid_address: u64 = 0,
     robust_head: u64 = 0,
@@ -2596,6 +2617,7 @@ fn fakeOps() LinuxOps {
         .kill_thread = fakeKillThread,
         .do_brk = fakeDoBrk,
         .do_mprotect = fakeDoMprotect,
+        .do_dontneed = fakeDoDontneed,
         .arch_set_fs = fakeArchSetFs,
         .arch_get_fs = fakeArchGetFs,
         .set_tid_address = fakeSetTidAddress,
@@ -2655,6 +2677,14 @@ fn fakeDoMprotect(va: u64, len: u64, prot: u64) i64 {
     e.last_mprotect_prot = prot;
     _ = va;
     _ = len;
+    return 0;
+}
+
+fn fakeDoDontneed(va: u64, len: u64) i64 {
+    const e = g_env.?;
+    e.dontneed_calls += 1;
+    e.last_dontneed_va = va;
+    e.last_dontneed_len = len;
     return 0;
 }
 
@@ -3953,6 +3983,18 @@ test "linux: prctl — CAPBSET_READ→0; madvise; getcwd; fstatfs" {
     const buf = FakeEnv.USER_BASE;
     try testing.expectEqual(@as(u64, 0), sysMadvise(ops, buf, 16, 3));
     try testing.expectEqual(err(EFAULT), sysMadvise(ops, 0x10_0000, 16, 3));
+    // CDD №12 p6: MADV_DONTNEED — диспетчеризация в do_dontneed (zap PTE:
+    // zero-on-next-touch); валидация НЕ нужна (Linux принимает PROT_NONE)
+    try testing.expectEqual(@as(u64, 0), sysMadvise(ops, buf + 0x1000, 0x2000, MADV_DONTNEED));
+    try testing.expectEqual(@as(u64, 1), e.dontneed_calls);
+    try testing.expectEqual(buf + 0x1000, e.last_dontneed_va);
+    try testing.expectEqual(@as(u64, 0x2000), e.last_dontneed_len);
+    // len=0 → без действия (даже DONTNEED)
+    try testing.expectEqual(@as(u64, 0), sysMadvise(ops, buf, 0, MADV_DONTNEED));
+    try testing.expectEqual(@as(u64, 1), e.dontneed_calls);
+    // MADV_FREE — без VM-действия (успех, не DONTNEED-путь)
+    try testing.expectEqual(@as(u64, 0), sysMadvise(ops, buf, 16, MADV_FREE));
+    try testing.expectEqual(@as(u64, 1), e.dontneed_calls);
     // getcwd: «/» + NUL = 2 байта
     const cwd_va = FakeEnv.USER_BASE + 0x80;
     try testing.expectEqual(@as(u64, 2), sysGetcwd(ops, cwd_va, 64));

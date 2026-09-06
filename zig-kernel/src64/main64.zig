@@ -2116,76 +2116,25 @@ fn linuxDevMmap(kind: linux_syscalls.FdKind, off: u64, len: u64, prot: u64) i64 
     return @intCast(va);
 }
 
-/// munmap(va, len): снятие страниц в PML4 задачи. v0.20.0: ТОЧНЫЙ anon-регион
-/// (va+len = конец) → физблок освобождается (анти-утечка); dev-мапы и частич-
-/// ные диапазоны — только unmap (реестр-деградация документирована).
+/// munmap(va, len): CDD №12 p6 — ЕДИНАЯ drop-механика: выравнивание Linux
+/// (addr вниз, len вверх), резка реестра (куски целиком внутри — удаляются:
+/// p5 оставлял stale-записи при частичном munmap) и region-aware освобождение
+/// физики (p5 возвращал ОБЩИЕ страницы wl_shm/dumb в PMM — кросс-порча).
 fn linuxDoMunmap(va: u64, len: u64) i64 {
-    const pml4 = linuxTaskPml4();
-    if (pml4 == 0) return 0; // нечего снимать
-    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    // CDD №12 p5: страницы могут быть demand-zero (lazy) — физику собираем
-    // по PTE-скану ДО unmap (после — PTE уже пуст); eager-регионы реестра
-    // — отдельным проходом (phys-базис).
-    var i: u64 = 0;
-    while (i < pages) : (i += 1) {
-        const va_pg = (va & ~@as(u64, PAGE_SIZE - 1)) + i * PAGE_SIZE;
-        if (vmm.userLeafFlags(pml4, va_pg)) |leaf| {
-            if (leaf & vmm.PTE_PRESENT != 0 and va_pg >= elf_loader.MIN_USER_VA) {
-                pmm.freePage(leaf & 0x000FFFFFFFFFF000);
-            }
-        }
-        _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
-    }
-    const owner = linuxOwnerTask();
-    if (owner < scheduler.MAX_TASKS) {
-        const slot = linux_task_proc[owner];
-        if (slot < MAX_LINUX_PROCS) {
-            for (&linux_mmap_regions[slot]) |*r| {
-                if (r.used and r.va == va and r.anon and
-                    r.va + r.pages * PAGE_SIZE <= va + len)
-                {
-                    // lazy-регионы: phys=0 (физика уже собрана PTE-сканом)
-                    if (r.phys != 0) pmm.freeContiguousPages(r.phys, r.pages);
-                    r.used = false;
-                    break;
-                }
-            }
-        }
-    }
+    if (len == 0) return 0;
+    const qva = va & ~@as(u64, PAGE_SIZE - 1);
+    if (va + len < va) return -linux_syscalls.EINVAL;
+    const pages = (va + len - qva + PAGE_SIZE - 1) / PAGE_SIZE;
+    linuxRangeDrop(qva, pages);
     return 0;
 }
 
-/// v0.20.0 (CDD №11 p3): MAP_FIXED-замена — снять пересекающиеся страницы
-/// [va, va+pages*PAGES) из PML4 задачи; регионы реестра, ПОЛНОСТЬЮ
-/// попадающие в диапазон, освободить в PMM (частично-пересекающиеся —
-/// только unmap, физику не трогаем — консервативно). Linux-семантика
-/// MAP_FIXED: старые мапы в диапазоне заменяются.
-fn linuxUnmapFixedRange(pml4: u64, va: u64, pages: u64) void {
-    var i: u64 = 0;
-    while (i < pages) : (i += 1) {
-        // CDD №12 p5: demand-zero-страницы — физику собираем по PTE-скану
-        const va_pg = va + i * PAGE_SIZE;
-        if (vmm.userLeafFlags(pml4, va_pg)) |leaf| {
-            if (leaf & vmm.PTE_PRESENT != 0 and va_pg >= elf_loader.MIN_USER_VA) {
-                pmm.freePage(leaf & 0x000FFFFFFFFFF000);
-            }
-        }
-        _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
-    }
-    const owner = linuxOwnerTask();
-    if (owner < scheduler.MAX_TASKS) {
-        const slot = linux_task_proc[owner];
-        if (slot < MAX_LINUX_PROCS) {
-            for (&linux_mmap_regions[slot]) |*r| {
-                if (r.used and r.va >= va and
-                    r.va + r.pages * PAGE_SIZE <= va + pages * PAGE_SIZE and r.phys != 0)
-                {
-                    pmm.freeContiguousPages(r.phys, r.pages);
-                    r.used = false;
-                }
-            }
-        }
-    }
+/// v0.20.0 (CDD №11 p3): MAP_FIXED-замена — CDD №12 p6: единая drop-механика
+/// (резка + удаление покрытых кусков ВКЛЮЧАЯ lazy; region-aware освобождение
+/// физики). p5-вариант вычищал только eager-регионы (phys≠0) — lazy-записи
+/// оставались stale поверх живых данных → demand-zero накрывал их нулями.
+fn linuxUnmapFixedRange(va: u64, pages: u64) void {
+    linuxRangeDrop(va, pages);
 }
 
 /// mmap(hint, len, prot, flags): MAP_ANONYMOUS|PRIVATE — ОДИН contiguous-нулевой
@@ -2209,7 +2158,7 @@ fn linuxDoMmap(hint: u64, len: u64, prot: u64, flags: u64) i64 {
         if (va < elf_loader.MIN_USER_VA or
             va + pages * PAGE_SIZE > linux_syscalls.USER_VA_CEILING)
             return -linux_syscalls.EINVAL;
-        linuxUnmapFixedRange(pml4, va, pages);
+        linuxUnmapFixedRange(va, pages);
     } else if (proc.mmap_cursor + pages * PAGE_SIZE > LINUX_MMAP_BASE + LINUX_MMAP_BUDGET) {
         return -linux_syscalls.ENOMEM;
     }
@@ -2291,6 +2240,38 @@ fn linuxClearWakeTid(task_id: usize) void {
     }
 }
 
+/// CDD №12 p6: YIELD-СЛАЙС — парковка ТЕКУЩЕЙ задачи на 1 тик (futex-модель
+/// каскада: snapshot → release → hlt → эпилог). СЕМАНТИКА Linux CFS
+/// wake_up_new_task/wakeup-preemption: после clone() и futex(WAKE)
+/// будильник/родитель НЕ тикает остаток слайса, а НЕМЕДЛЕННО отдаёт CPU
+/// новому/разбуженному треду. ЭМПИРИКА p6-run9/run11: round-robin с 10мс-
+/// слайсами давал родителю ~10мс гонки (main-тред уходил в Lua/LLVM-
+/// инициализацию раньше, чем воркер заполнял структуры → чтения 0xAAAA
+/// и пустые Rb_tree-деревья на 579/867-syscall фронтах).
+fn linuxYieldTick() void {
+    const my_rsp = scheduler.user_rsp;
+    const owner = scheduler.syscallStackOwner(my_rsp);
+    if (owner >= scheduler.MAX_TASKS) return; // shell-контекст — не паркуем
+    // резюм-кадр (возврат «после syscall» той же транзакции)
+    scheduler.snapshotResumeFrame(owner, my_rsp);
+    scheduler.setTaskSleepFor(owner, 10); // 1 тик — будильник
+    const deadline = scheduler.tasks[owner].wake_tick;
+    // выпуск транзакции: тики диспетчируют другие ready-задачи (вкл. НОВЫЙ тред)
+    hal.cli();
+    scheduler.in_win32_syscall = 0;
+    hal.sti();
+    while (hal.tick_count < deadline) {
+        asm volatile ("hlt" ::: "memory");
+    }
+    // эпилог транзакции: вернуть свой user_rsp + резюм-кадр
+    hal.cli();
+    scheduler.user_rsp = my_rsp;
+    scheduler.in_win32_syscall = 1;
+    hal.sti();
+    scheduler.setTaskSleepFor(owner, 0);
+    scheduler.installResumeFrame(owner);
+}
+
 /// clone: НАСТОЯЩИЕ Linux-треды (CDD №11 p1). Ребёнок — задача с кадром
 /// «возврата из clone-syscall»: RAX=0, RSP=новый стек, RIP=после-syscall,
 /// callee-saved от родителя, общий CR3 (CLONE_VM). Родитель получает tid.
@@ -2365,6 +2346,10 @@ fn linuxDoClone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u6
     hal.Serial.puts(", flags 0x");
     hal.Serial.putHex(flags);
     hal.Serial.puts(")\n");
+    // CDD №12 p6: CHILD-RUNS-FIRST (Linux CFS wake_up_new_task): родитель
+    // отдаёт остаток слайса — ребёнок немедленно получает CPU на инициализацию
+    // (стек/TLS/синхронизируемые структуры). Без yield — 10мс-окно гонки.
+    linuxYieldTick();
     return @intCast(child);
 }
 
@@ -2453,6 +2438,9 @@ fn linuxFutexPark(uaddr: u64, timeout_ms: u64, infinite: bool) i64 {
 }
 
 /// futex-WAKE: разбудить до n паркуемых на uaddr (реестр → будильник-снятие).
+/// CDD №12 p6: WAKEUP-PREEMPTION (CFS): разбудивший отдаёт слайс —
+/// разбуженный получает CPU немедленно (producer/consumer-handshake
+/// pthread_join/cond: иначе ждёт своего слайса в round-robin до N×10мс).
 fn linuxFutexWake(uaddr: u64, n: u32) u32 {
     var cnt: u32 = 0;
     for (&futex_parks) |*p| {
@@ -2463,6 +2451,7 @@ fn linuxFutexWake(uaddr: u64, n: u32) u32 {
             cnt += 1;
         }
     }
+    if (cnt > 0) linuxYieldTick(); // будильник уступает CPU разбужденному
     return cnt;
 }
 
@@ -2697,6 +2686,9 @@ const MmapRegion = struct {
     /// CDD №12 p5: счётчик demand-выделенных страниц (диагностика: сколько
     /// из резерва реально потрогано).
     touched: u32 = 0,
+    /// CDD №12 p6: PROT_NONE-кусок — demand-zero НЕ воскрешает (Linux: SIGSEGV
+    /// на доступе). mprotect(prot≠0) снимает флаг.
+    prot_none: bool = false,
     /// CDD №12 p4: имя модуля (fd-путь при file-mmap; «anon»/«brk»/«dev»/
     /// «[stack]»/имя образа от elfload) — атрибуция RIP→библиотека в
     /// CPU-exception (hal.zig: [RIP]/[CR2]/STACK-RET + гистограмма).
@@ -2760,6 +2752,18 @@ pub fn linuxDumpRegionTable(task_id: usize, max_entries: usize) usize {
         hal.Serial.puts("\n");
         dumped += 1;
     }
+    // CDD №12 p6: телеметрия VMA-механики (дробление/слияния/сборы)
+    hal.Serial.puts("[MMAP] p6: splits=");
+    hal.Serial.putDecimal(linux_mmap_splits);
+    hal.Serial.puts(" merges=");
+    hal.Serial.putDecimal(linux_mmap_merges);
+    hal.Serial.puts(" drops=");
+    hal.Serial.putDecimal(linux_mmap_drops);
+    hal.Serial.puts(" freed=");
+    hal.Serial.putDecimal(linux_mmap_drops_freed);
+    hal.Serial.puts(" dontneed=");
+    hal.Serial.putDecimal(linux_dontneed_zaps);
+    hal.Serial.puts("\n");
     return dumped;
 }
 
@@ -2847,6 +2851,190 @@ fn linuxRecordRegionEx(slot: u8, va: u64, pages: u64, phys: u64, anon: bool, laz
     hal.Serial.puts("[LINUX] mmap registry full — region untracked\n");
 }
 
+// ─── CDD №12 p6: VMA-семантика Linux — split/merge/drop реестра регионов ────
+
+/// Счётчики p6-механики (краш-дамп: [MMAP] splits/merges/drops/dontneed).
+pub var linux_mmap_splits: u64 = 0;
+pub var linux_mmap_merges: u64 = 0;
+pub var linux_mmap_drops: u64 = 0;
+pub var linux_mmap_drops_freed: u64 = 0;
+pub var linux_dontneed_zaps: u64 = 0;
+
+/// Вставить КОПИЮ региона (split-кусок) в свободный слот. phys сдвигается
+/// вместе с va (кусок непрерывного блока начинается глубже).
+fn linuxRegionInsertCopy(slot: u8, src: *const MmapRegion, va: u64, pages: u64) void {
+    if (slot >= MAX_LINUX_PROCS) return;
+    for (&linux_mmap_regions[slot]) |*r| {
+        if (!r.used) {
+            r.* = src.*;
+            r.va = va;
+            r.pages = pages;
+            if (src.phys != 0) r.phys = src.phys + (va - src.va);
+            r.touched = @intCast(@min(pages, @as(u64, src.touched)));
+            return;
+        }
+    }
+    // реестр полон — кусок живёт без записи (деградация документирована)
+    hal.Serial.puts("[LINUX] mmap registry full — split piece untracked\n");
+}
+
+/// CDD №12 p6: РЕЗКА реестра по границам [va, va+pages*P): после резки любой
+/// кусок лежит ЦЕЛИКОМ внутри или ЦЕЛИКОМ вне диапазона. Замена «правки
+/// всего региона при любом пересечении» (p5-баги: mprotect под-диапазона
+/// PROT_NONE срывал W-бит r.pte ВСЕГО региона → арены LLVM мутировали в RO;
+/// а частичный munmap оставлял lazy-запись на живых данных → demand-zero
+/// накрывал их НУЛЕВОЙ страницей → libstdc++ _Rb_tree_decrement NULL+8).
+fn linuxRegionSplit(slot: u8, va: u64, pages: u64) void {
+    if (slot >= MAX_LINUX_PROCS) return;
+    const hi = va + pages * PAGE_SIZE;
+    var i: usize = 0;
+    while (i < linux_mmap_regions[slot].len) : (i += 1) {
+        const r = &linux_mmap_regions[slot][i];
+        if (!r.used) continue;
+        const r_hi = r.va + r.pages * PAGE_SIZE;
+        if (r.va >= va and r_hi <= hi) continue; // целиком внутри
+        if (r_hi <= va or r.va >= hi) continue; // целиком вне
+
+        const mid_lo = if (r.va < va) va else r.va;
+        const mid_hi = if (r_hi > hi) hi else r_hi;
+        // боковые куски — новые записи (phys сдвигается вдоль блока)
+        if (mid_lo > r.va) linuxRegionInsertCopy(slot, r, r.va, (mid_lo - r.va) / PAGE_SIZE);
+        if (r_hi > mid_hi) linuxRegionInsertCopy(slot, r, mid_hi, (r_hi - mid_hi) / PAGE_SIZE);
+        // исходная запись стягивается в средний кусок
+        if (r.phys != 0) r.phys = r.phys + (mid_lo - r.va);
+        r.va = mid_lo;
+        r.pages = (mid_hi - mid_lo) / PAGE_SIZE;
+        if (r.pages == 0) r.used = false;
+        linux_mmap_splits += 1;
+    }
+}
+
+/// CDD №12 p6: СЛИЯНИЕ соседних кусков с идентичными свойствами (Linux
+/// VMA-merge): W^X-фрагментация LLVM без слияния распухает реестр (2048 →
+/// full → untracked → атрибуция и demand-zero слепнут). Сливаются A,B если
+/// A стыкуется с B и совпадают lazy/pte/prot_none/anon/name; phys непрерывен
+/// (или оба 0).
+fn linuxRegionMerge(slot: u8) void {
+    if (slot >= MAX_LINUX_PROCS) return;
+    var pass: usize = 0;
+    while (pass < 64) : (pass += 1) {
+        var merged_any = false;
+        var i: usize = 0;
+        while (i < linux_mmap_regions[slot].len) : (i += 1) {
+            const a = &linux_mmap_regions[slot][i];
+            if (!a.used) continue;
+            var j: usize = 0;
+            while (j < linux_mmap_regions[slot].len) : (j += 1) {
+                if (j == i) continue;
+                const b = &linux_mmap_regions[slot][j];
+                if (!b.used) continue;
+                if (a.va + a.pages * PAGE_SIZE != b.va) continue;
+                if (a.lazy != b.lazy or a.anon != b.anon or a.prot_none != b.prot_none) continue;
+                if (a.pte != b.pte) continue;
+                if (!std.mem.eql(u8, &a.name, &b.name)) continue;
+                if ((a.phys == 0) != (b.phys == 0)) continue;
+                if (a.phys != 0 and a.phys + a.pages * PAGE_SIZE != b.phys) continue;
+                a.pages += b.pages;
+                b.used = false;
+                linux_mmap_merges += 1;
+                merged_any = true;
+            }
+        }
+        if (!merged_any) break;
+    }
+}
+
+/// CDD №12 p6: СНЯТИЕ диапазона [va, va+pages*P) — ЕДИНАЯ механика для
+/// munmap / MAP_FIXED-замены / brk-спада: резка → куски ЦЕЛИКОМ внутри:
+///   • anon (приватные: lazy-арены, eager-файлы): PTE-скан — физика в PMM
+///     (СКРЫТЫЕ PROT_NONE-страницы тоже: PTE≠0, !PRESENT — иначе утечка),
+///     PTE снимается, запись удаляется;
+///   • shared/dev (физика принадлежит drm_kms/memfd-файлу): ТОЛЬКО unmap
+///     PTE — страницы НЕ освобождаются (p5-баг: PTE-скан munmap'а возвращал
+///     ОБЩИЕ страницы wl_shm/dumb в PMM → PMM выдавал их demand-zero под
+///     чужие данные → кросс-маппинг-порча деревьев).
+fn linuxRangeDrop(va: u64, pages: u64) void {
+    const pml4 = linuxTaskPml4();
+    const owner = linuxOwnerTask();
+    if (pml4 == 0 or owner >= scheduler.MAX_TASKS) return;
+    const slot = linux_task_proc[owner];
+    if (slot >= MAX_LINUX_PROCS) return;
+    const hi = va + pages * PAGE_SIZE;
+    linuxRegionSplit(slot, va, pages);
+    var i: usize = 0;
+    while (i < linux_mmap_regions[slot].len) : (i += 1) {
+        const r = &linux_mmap_regions[slot][i];
+        if (!r.used) continue;
+        if (r.va < va or r.va + r.pages * PAGE_SIZE > hi) continue; // не целиком внутри
+        var p: u64 = 0;
+        var freed: u64 = 0;
+        while (p < r.pages) : (p += 1) {
+            const va_pg = r.va + p * PAGE_SIZE;
+            if (r.anon) {
+                if (vmm.userLeafRaw(pml4, va_pg)) |pte| {
+                    const pa = pte & 0x000FFFFFFFFFF000;
+                    if (pa != 0 and va_pg >= elf_loader.MIN_USER_VA) {
+                        pmm.freePage(pa);
+                        freed += 1;
+                    }
+                }
+            }
+            _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
+        }
+        r.used = false;
+        linux_mmap_drops += 1;
+        linux_mmap_drops_freed += freed;
+    }
+    linuxRegionMerge(slot);
+}
+
+/// CDD №12 p6: madvise(MADV_DONTNEED) — честная Linux-семантика анонимной
+/// памяти: PTE диапазона снимается, физика в PMM; диапазон ОСТАЁТСЯ
+/// резервацией (lazy) — следующее касание = НУЛЕВАЯ страница (demand-zero).
+/// glibc (malloc-арены) и Mesa-пулы завязаны на «обнуление после DONTNEED»;
+/// заглушка-p5 не возвращала страницы (утечка) и не давала нулей.
+fn linuxDoDontneed(va: u64, len: u64) i64 {
+    const pml4 = linuxTaskPml4();
+    if (pml4 == 0) return 0;
+    if (len == 0) return 0;
+    const owner = linuxOwnerTask();
+    if (owner >= scheduler.MAX_TASKS) return 0;
+    const slot = linux_task_proc[owner];
+    if (slot >= MAX_LINUX_PROCS) return 0;
+    const qva = va & ~@as(u64, PAGE_SIZE - 1);
+    if (va + len < va) return 0;
+    const pages = (va + len - qva + PAGE_SIZE - 1) / PAGE_SIZE;
+    const hi = qva + pages * PAGE_SIZE;
+
+    linuxRegionSplit(slot, qva, pages);
+    var i: usize = 0;
+    while (i < linux_mmap_regions[slot].len) : (i += 1) {
+        const r = &linux_mmap_regions[slot][i];
+        if (!r.used) continue;
+        if (r.va < qva or r.va + r.pages * PAGE_SIZE > hi) continue; // только целиком внутри
+        // anon (lazy-арены/brk): зануляем. eager-файл/shared/dev: private-копия
+        // или общая физика — НЕ трогаем (Linux дропает clean-страницы файла;
+        // наши копии «dirty» по определению).
+        if (r.anon) {
+            var p: u64 = 0;
+            while (p < r.pages) : (p += 1) {
+                const va_pg = r.va + p * PAGE_SIZE;
+                if (vmm.userLeafRaw(pml4, va_pg)) |pte| {
+                    const pa = pte & 0x000FFFFFFFFFF000;
+                    if (pa != 0 and va_pg >= elf_loader.MIN_USER_VA) {
+                        pmm.freePage(pa);
+                        linux_dontneed_zaps += 1;
+                    }
+                }
+                _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
+            }
+            r.touched = 0;
+        }
+    }
+    linuxRegionMerge(slot);
+    return 0;
+}
+
 /// brk Linux-семантики: 0 → текущий; рост/спад — маппинг страниц [brk, addr);
 /// отказ (ниже базиса / нет памяти) → вернуть СТАРЫЙ brk.
 fn linuxDoBrk(addr: u64) u64 {
@@ -2861,31 +3049,36 @@ fn linuxDoBrk(addr: u64) u64 {
     if (addr > proc.brk) {
         // CDD №12 p5: рост — ЛЕНИВЫЙ (demand-zero): поднимаем только границу
         // (Linux-семантика brk = VA-резервация; страницы — нули по касанию).
-        // Лимит «4МБ за вызов» снят: glibc/LLVM делают гигантские sbrk-рывки
-        // (0x2AAAAB000=10.7ГБ) — отказ воспринимался как OOM.
         proc.brk = addr & ~@as(u64, PAGE_SIZE - 1); // странично-гранулярный
-        // регион-запись для атрибуции #PF (lazy — страницы по касанию)
-        linuxRecordRegionEx(linux_task_proc[linuxOwnerTask()],
-            prev_brk, (proc.brk - prev_brk + PAGE_SIZE - 1) / PAGE_SIZE,
+        const grow_pages = (proc.brk - prev_brk + PAGE_SIZE - 1) / PAGE_SIZE;
+        // CDD №12 p6: ОДНА brk-запись — хвостовой кусок ПРОДОЛЖАЕТСЯ (раньше
+        // каждый sbrk-рывок = НОВАЯ запись → pile-up + перекрытия скана).
+        const slot = linux_task_proc[linuxOwnerTask()];
+        var extended = false;
+        if (slot < MAX_LINUX_PROCS) {
+            for (&linux_mmap_regions[slot]) |*r| {
+                if (r.used and r.lazy and r.anon and !r.prot_none and
+                    r.va + r.pages * PAGE_SIZE == prev_brk and
+                    r.name[0] == 'b' and r.name[1] == 'r' and r.name[2] == 'k' and r.name[3] == 0)
+                {
+                    r.pages += grow_pages;
+                    extended = true;
+                    break;
+                }
+            }
+        }
+        if (!extended) linuxRecordRegionEx(slot, prev_brk, grow_pages,
             0, true, true,
             vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE, "brk");
         return proc.brk;
     }
 
-    // спад: unmap [addr, brk) — физику demand-zero-страниц освобождаем
-    // по PTE-скану (lazy-регионы не держат базис физблока).
-    const drop_pages = (proc.brk - addr + PAGE_SIZE - 1) / PAGE_SIZE;
-    var i: u64 = 0;
-    while (i < drop_pages) : (i += 1) {
-        const va_pg = (addr & ~@as(u64, PAGE_SIZE - 1)) + i * PAGE_SIZE;
-        if (vmm.userLeafFlags(pml4, va_pg)) |leaf| {
-            if (leaf & vmm.PTE_PRESENT != 0 and va_pg >= elf_loader.MIN_USER_VA) {
-                pmm.freePage(leaf & 0x000FFFFFFFFFF000);
-            }
-        }
-        _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
-    }
-    proc.brk = addr & ~@as(u64, PAGE_SIZE - 1);
+    // CDD №12 p6: спад — единая drop-механика (PTE-скан освобождает физику
+    // demand-страниц; brk-записи над addr — режутся/удаляются, stale-нет).
+    const qva = addr & ~@as(u64, PAGE_SIZE - 1);
+    const drop_pages = (proc.brk - qva + PAGE_SIZE - 1) / PAGE_SIZE;
+    linuxRangeDrop(qva, drop_pages);
+    proc.brk = qva;
     return proc.brk;
 }
 
@@ -2905,15 +3098,13 @@ pub fn linuxDemandZero(faulter_task: usize, va: u64) bool {
     if (pml4 == 0) return false;
     const page = va & ~@as(u64, PAGE_SIZE - 1);
 
-    // 1) brk-куча: [brk_base, brk) — RW+U+NX (права кучи)
-    if (page >= proc.brk_base & ~@as(u64, PAGE_SIZE - 1) and page < proc.brk) {
-        return linuxDemandMapPage(pml4, page,
-            vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE);
-    }
-    // 2) lazy-регионы реестра: права из r.pte
+    // CDD №12 p6: записи реестра ПЕРВЫМИ (brk-запись тоже ленивая — права
+    // mprotect видны). prot_none-куски НЕ воскрешаются — Linux: SIGSEGV.
+    // (После split/merge записи НЕ перекрываются — первый match = единственный.)
     for (&linux_mmap_regions[slot]) |*r| {
         if (!r.used or !r.lazy) continue;
         if (page >= r.va and page < r.va + r.pages * PAGE_SIZE) {
+            if (r.prot_none) return false; // PROT_NONE не resurrect-ится
             if (linuxDemandMapPage(pml4, page, r.pte)) {
                 // уже замаплена? (спеу-case: двойной fault) — не считаем
                 if (r.touched < r.pages) r.touched += 1;
@@ -2921,6 +3112,12 @@ pub fn linuxDemandZero(faulter_task: usize, va: u64) bool {
             }
             return false;
         }
+    }
+
+    // 2) brk-куча (bss-хвост образа может быть без записи): RW+U+NX
+    if (page >= proc.brk_base & ~@as(u64, PAGE_SIZE - 1) and page < proc.brk) {
+        return linuxDemandMapPage(pml4, page,
+            vmm.PTE_USER | vmm.PTE_WRITABLE | vmm.PTE_NO_EXECUTE);
     }
     return false;
 }
@@ -2949,42 +3146,57 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
     return true;
 }
 
-/// mprotect(va, len, prot): обновление прав страниц [va, va+len) в PML4
-/// задачи (RELRO: RW-страницы образа → RO после загрузки glibc).
+/// mprotect(va, len, prot): CDD №12 p6 — Linux-семантика: выравнивание
+/// (addr вниз, len вверх), права ТОЛЬКО покрытых кусков (резка реестра;
+/// p5-баг: права срывались на ВЕСЬ регион при любом пересечении — арены
+/// LLVM теряли W), PROT_NONE = снятие PRESENT (страница «скрывается»,
+/// физика сохранена в PTE — повторный mprotect RW/RX восстановит данные
+/// W^X-цикла). mprotect ДО касания: r.pte запомнит права для demand-страниц.
 fn linuxDoMprotect(va: u64, len: u64, prot: u64) i64 {
     const pml4 = linuxTaskPml4();
     if (pml4 == 0) return -linux_syscalls.EFAULT;
+    if (len == 0) return 0;
+    if (va + len < va) return -linux_syscalls.ENOMEM;
+    const qva = va & ~@as(u64, PAGE_SIZE - 1);
+    const pages = (va + len - qva + PAGE_SIZE - 1) / PAGE_SIZE;
+    const hi = qva + pages * PAGE_SIZE;
+
     var want: u64 = 0;
     if (prot & linux_syscalls.PROT_WRITE != 0) want |= vmm.PTE_WRITABLE;
     if (prot & linux_syscalls.PROT_EXEC == 0) want |= vmm.PTE_NO_EXECUTE;
-    const pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    var i: u64 = 0;
-    while (i < pages) : (i += 1) {
-        // страница не замаплена — Linux молча пропускает (PROT_NONE-зоны)
-        _ = vmm.userLeafApplyProt(pml4, va + i * PAGE_SIZE, want);
-    }
-    // CDD №12 p5: lazy-регионы в диапазоне — права протокола сохраняем в
-    // r.pte (demand-страницы получат их при первом касании). Иначе
-    // mprotect ДО касания терялся (LLVM: W^X-циклы JIT: RW → R → RWX).
-    {
-        const owner = linuxOwnerTask();
-        if (owner < scheduler.MAX_TASKS) {
-            const slot = linux_task_proc[owner];
-            if (slot < MAX_LINUX_PROCS) {
-                const pte: u64 = vmm.PTE_USER | vmm.PTE_PRESENT | want;
-                for (&linux_mmap_regions[slot]) |*r| {
-                    if (!r.used or !r.lazy) continue;
-                    const r_hi = r.va + r.pages * PAGE_SIZE;
-                    const q_hi = va + pages * PAGE_SIZE;
-                    if (r.va >= va and r.va < q_hi or r_hi > va and r_hi <= q_hi or
-                        (r.va <= va and r_hi >= q_hi))
-                    {
-                        r.pte = pte;
-                    }
-                }
-            }
+    const prot_none = (prot & (linux_syscalls.PROT_READ |
+        linux_syscalls.PROT_WRITE | linux_syscalls.PROT_EXEC)) == 0;
+
+    const owner = linuxOwnerTask();
+    if (owner >= scheduler.MAX_TASKS) return -linux_syscalls.EFAULT;
+    const slot = linux_task_proc[owner];
+    if (slot >= MAX_LINUX_PROCS) return -linux_syscalls.EFAULT;
+
+    // резка по границам диапазона: права меняются ТОЛЬКО у кусков ЦЕЛИКОМ внутри
+    linuxRegionSplit(slot, qva, pages);
+    for (&linux_mmap_regions[slot]) |*r| {
+        if (!r.used) continue;
+        if (r.va < qva or r.va + r.pages * PAGE_SIZE > hi) continue;
+        if (prot_none) {
+            r.prot_none = true;
+        } else {
+            r.pte = vmm.PTE_USER | vmm.PTE_PRESENT | want;
+            r.prot_none = false;
         }
     }
+
+    // страницы диапазона: права PTE (present-замена / hidden-восстановление)
+    // или скрытие (PROT_NONE: PRESENT снят, физика в PTE сохранена)
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        const va_pg = qva + i * PAGE_SIZE;
+        if (prot_none) {
+            _ = vmm.userLeafClearPresent(pml4, va_pg);
+        } else {
+            _ = vmm.userLeafApplyProtEx(pml4, va_pg, want, true);
+        }
+    }
+    linuxRegionMerge(slot);
     return 0;
 }
 
@@ -3487,28 +3699,10 @@ fn linuxFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
         return -linux_syscalls.ENOMEM;
     if (va < elf_loader.MIN_USER_VA or va + pages * PAGE_SIZE > linux_syscalls.USER_VA_CEILING)
         return -linux_syscalls.EINVAL;
-    // MAP_FIXED: снять пересекающиеся страницы (замена мапов; регионы,
-    // ПОЛНОСТЬЮ попадающие в диапазон, — освободить в PMM)
-    if (fixed_va != 0) {
-        var i: u64 = 0;
-        while (i < pages) : (i += 1) {
-            _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
-        }
-        const owner = linuxOwnerTask();
-        if (owner < scheduler.MAX_TASKS) {
-            const slot = linux_task_proc[owner];
-            if (slot < MAX_LINUX_PROCS) {
-                for (&linux_mmap_regions[slot]) |*r| {
-                    if (r.used and r.va >= va and
-                        r.va + r.pages * PAGE_SIZE <= va + pages * PAGE_SIZE and r.phys != 0)
-                    {
-                        pmm.freeContiguousPages(r.phys, r.pages);
-                        r.used = false;
-                    }
-                }
-            }
-        }
-    }
+    // CDD №12 p6: MAP_FIXED-замена — единая drop-механика (p5: только unmap
+    // PTE без освобождения lazy-физики — утечка + stale-записи поверх живых
+    // данных нового мапа → demand-zero накрывал их нулём).
+    if (fixed_va != 0) linuxUnmapFixedRange(va, pages);
     var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
     if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
     if (prot & linux_syscalls.PROT_WRITE == 0) pte &= ~vmm.PTE_WRITABLE; // RO-копия
@@ -3737,6 +3931,7 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .kill_thread = linuxKillThread,
         .do_brk = linuxDoBrk,
         .do_mprotect = linuxDoMprotect,
+        .do_dontneed = linuxDoDontneed,
         .arch_set_fs = linuxArchSetFs,
         .arch_get_fs = linuxArchGetFs,
         .set_tid_address = linuxSetTidAddress,
@@ -3876,13 +4071,9 @@ fn linuxSharedFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i6
         return -linux_syscalls.ENOMEM;
     if (va < elf_loader.MIN_USER_VA or va + pages * PAGE_SIZE > linux_syscalls.USER_VA_CEILING)
         return -linux_syscalls.EINVAL;
-    // MAP_FIXED: замещение (снимаем пересечения)
-    if (fixed_va != 0) {
-        var i: u64 = 0;
-        while (i < pages) : (i += 1) {
-            _ = vmm.unmapPageInPML4(pml4, va + i * PAGE_SIZE) catch {};
-        }
-    }
+    // CDD №12 p6: MAP_FIXED-замещение — единая drop-механика (shared-физика
+    // принадлежит memfd-файлу: drop её не освобождает — только unmap PTE)
+    if (fixed_va != 0) linuxUnmapFixedRange(va, pages);
     var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
     if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
     if (prot & linux_syscalls.PROT_WRITE == 0) pte &= ~vmm.PTE_WRITABLE;
@@ -3989,7 +4180,9 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         }
         hal.Serial.puts(",0x");
         hal.Serial.putHex(a2);
-        if (num == 13 or num == 14 or num == 157 or num == 281 or num == 270 or num == 289 or num == 16) {
+        if (num == 13 or num == 14 or num == 157 or num == 281 or num == 270 or num == 289 or num == 16 or
+            num == 10 or num == 28 or num == 56 or num == 202)
+        {
             hal.Serial.puts(",0x");
             hal.Serial.putHex(a3);
             hal.Serial.puts(",0x");

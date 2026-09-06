@@ -226,11 +226,24 @@ vm = VM("drm-gamescope", initrd=INITRD, mem=os.environ.get("E2E_MEM", "2G"), qem
                     *(["-monitor", "unix:/tmp/poler-e2e-drm-gamescope/mon2.sock,server,nowait"]
                       if os.environ.get("E2E_MON2") else []),
                     # CDD №12 p4-final: TCG-плагин «кто пишет» (who-aaaa2.so):
-                    # env E2E_PLUGIN="ADDR,LEN" — лог записей в гостевой
-                    # диапазон с vpc-писателем (root 0xAAAA-утечки).
-                    *(["-plugin", "file=%s/scripts/e2e/who-aaaa2.so,arg=%s"
+                    # env E2E_PLUGIN="ADDR,LEN[,ADDR2,LEN2...]" — лог записей
+                    # в гостевой диапазон с vpc-писателем (root 0xAAAA-утечки).
+                    # CDD №12 p6: БАГ ИНСТРУМЕНТА — «arg=%s» ЛОМАЛ ДИАПАЗОН:
+                    # QEMU режет -plugin по запятым на key=val/позиционные
+                    # куски → плагин получал только «arg=ADDR» (8Б-часы!), LEN
+                    # терялся → пустые логи run12/p6run2/p6run3. Правильно —
+                    # ПОЗИЦИОННЫЕ куски: file=...,ADDR,LEN,ADDR2,LEN2 —
+                    # who-aaaa.c склеивает их обратно в «ADDR,LEN,ADDR2,LEN2».
+                    *(["-plugin", "file=%s/scripts/e2e/who-aaaa2.so,%s"
                        % (REPO, os.environ["E2E_PLUGIN"])]
-                      if os.environ.get("E2E_PLUGIN") else [])])
+                      if os.environ.get("E2E_PLUGIN") else []),
+                    # CDD №12 p6: value-трассировщик «откуда указатель?»
+                    # (who-ptr.so): env E2E_PTR="TARGET_HEX" — логирует КАЖДУЮ
+                    # load/store-операцию со значением TARGET (источник
+                    # мусорного указателя: vaddr чтения + vpc записи).
+                    *(["-plugin", "file=%s/scripts/e2e/who-ptr.so,%s"
+                       % (REPO, os.environ["E2E_PTR"])]
+                      if os.environ.get("E2E_PTR") else [])])
 del INITRD  # VM держит только путь к файлу — 258МБ больше не нужны в RAM
 try:
     vm.start()

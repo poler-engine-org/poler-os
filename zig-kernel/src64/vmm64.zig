@@ -18,6 +18,33 @@ pub const PTE_NO_EXECUTE: u64 = @as(u64, 1) << 63;
 
 pub const PAGE_SIZE: u64 = 4096;
 
+// ─── CDD №12 p6-DIAG: трекер PTE-жизни страницы (кросс-маппинг-охота) ───────
+// Диагностический билд: печать КАЖДОГО map/unmap/hide/prot события на
+// выбранных VA (креш-страницы 0x4002EED000 и 0x400F21C000 — детерминированы).
+// Серийный лог покажет полный PTE-цикл: phys1 → drop → phys2 (порча!).
+pub var diag_watch: [2]struct { va: u64, len: u64 } = .{
+    .{ .va = 0x4002_EED0_00, .len = 0x1000 }, // 0xAAAA-структура (gamescope+0xC2FB1)
+    .{ .va = 0x400F_21C0_00, .len = 0x1000 }, // header Rb_tree (_Rb_tree_decrement)
+};
+
+pub fn diagWatchOn(va: u64) bool {
+    for (&diag_watch) |*w| {
+        if (va >= w.va and va < w.va + w.len) return true;
+    }
+    return false;
+}
+
+pub fn diagPte(event: []const u8, virt: u64, val: u64) void {
+    if (!diagWatchOn(virt)) return;
+    hal.Serial.puts("[PTE-DIAG] ");
+    hal.Serial.puts(event);
+    hal.Serial.puts(" va=0x");
+    hal.Serial.putHex(virt);
+    hal.Serial.puts(" x=0x");
+    hal.Serial.putHex(val);
+    hal.Serial.puts("\n");
+}
+
 pub const VmmError = error{
     OutOfMemory,
     InvalidAddress,
@@ -298,6 +325,7 @@ pub fn mapPageInPML4(target_pml4_phys: u64, virt: u64, phys: u64, flags: u64) !v
         return VmmError.AlreadyMapped;
     }
     pt[pt_idx] = phys | flags | PTE_PRESENT;
+    diagPte("MAP-FIXED", virt, pt[pt_idx]); // CDD №12 p6-DIAG
 
     // No invlpg needed — this PML4 is not the active CR3 yet
 }
@@ -328,6 +356,7 @@ pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!void {
     const pt_phys = pd[pd_idx] & 0x000FFFFFFFFFF000;
 
     const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
+    diagPte("UNMAP-FIXED", virt, pt[pt_idx]); // CDD №12 p6-DIAG
     pt[pt_idx] = 0;
 
     // Освобождение опустевших таблиц снизу вверх (как unmapPage)
@@ -403,6 +432,91 @@ pub fn userLeafApplyProt(target_pml4: u64, va: u64, want: u64) bool {
     const p: *volatile u64 = @ptrFromInt(pte_addr);
     p.* = new_pte;
     // инвал: TLB мог закэшировать старые права
+    asm volatile ("invlpg (%[virt])"
+        :
+        : [virt] "r" (va),
+        : "memory"
+    );
+    return true;
+}
+
+// ─── CDD №12 p6: mprotect-семантика Linux (PROT_NONE / W^X-циклы LLVM) ──────
+
+/// CDD №12 p6: RAW leaf-PTE без требования PRESENT. «Скрытая» страница
+/// (PROT_NONE: бит PRESENT снят, физ-адрес СОХРАНЁН в записи) обязана
+/// находиться drop/dontneed-путями — иначе её физика утечёт навсегда.
+/// 0 = пустой слот; null = таблицы нет.
+pub fn userLeafRaw(target_pml4: u64, va: u64) ?u64 {
+    const pml4e = physReadQ(target_pml4 + 8 * ((va >> 39) & 0x1FF)) orelse return null;
+    if (pml4e & PTE_PRESENT == 0) return null;
+    const pdpte = physReadQ((pml4e & 0x000FFFFFFFFFF000) + 8 * ((va >> 30) & 0x1FF)) orelse return null;
+    if (pdpte & PTE_PRESENT == 0) return null;
+    if (pdpte & PTE_HUGE != 0) return null; // huge-листов в user-зоне нет
+    const pde = physReadQ((pdpte & 0x000FFFFFFFFFF000) + 8 * ((va >> 21) & 0x1FF)) orelse return null;
+    if (pde & PTE_PRESENT == 0) return null;
+    if (pde & PTE_HUGE != 0) return null;
+    return physReadQ((pde & 0x000FFFFFFFFFF000) + 8 * ((va >> 12) & 0x1FF));
+}
+
+/// CDD №12 p6: mprotect(PROT_NONE) — снять бит PRESENT у ЖИВОЙ user-страницы
+/// (физ-адрес и прочие биты ОСТАЮТСЯ в записи — «скрытая страница»: повторный
+/// mprotect(RW/RX) восстановит PRESENT и данные останутся на месте —
+/// W^X-циклы LLVM: RW→PROT_NONE→RW не должен терять код/данные).
+/// false = не найдено / не user.
+pub fn userLeafClearPresent(target_pml4: u64, va: u64) bool {
+    const pml4e = physReadQ(target_pml4 + 8 * ((va >> 39) & 0x1FF)) orelse return false;
+    if (pml4e & PTE_PRESENT == 0) return false;
+    const pdpte = physReadQ((pml4e & 0x000FFFFFFFFFF000) + 8 * ((va >> 30) & 0x1FF)) orelse return false;
+    if (pdpte & PTE_PRESENT == 0) return false;
+    if (pdpte & PTE_HUGE != 0) return false;
+    const pde = physReadQ((pdpte & 0x000FFFFFFFFFF000) + 8 * ((va >> 21) & 0x1FF)) orelse return false;
+    if (pde & PTE_PRESENT == 0) return false;
+    if (pde & PTE_HUGE != 0) return false;
+    const pte_addr = (pde & 0x000FFFFFFFFFF000) + 8 * ((va >> 12) & 0x1FF);
+    const pte = physReadQ(pte_addr) orelse return false;
+    if (pte & PTE_PRESENT == 0) return false; // уже скрыта/пуста
+    if (pte & PTE_USER == 0) return false; // kernel-страницу не трогаем
+
+    const p: *volatile u64 = @ptrFromInt(pte_addr);
+    p.* = pte & ~PTE_PRESENT; // физ-адрес остаётся в записи!
+    diagPte("HIDE", va, p.*); // CDD №12 p6-DIAG
+    asm volatile ("invlpg (%[virt])"
+        :
+        : [virt] "r" (va),
+        : "memory"
+    );
+    return true;
+}
+
+/// CDD №12 p6: применить права W|NX к листу: PRESENT-страница — замена бит
+/// (как userLeafApplyProt); СКРЫТАЯ (PTE≠0, !PRESENT, phys≠0) при
+/// restore_hidden — ВОССТАНОВИТЬ PRESENT с новыми правами (данные на месте).
+/// false = пустой слот / не user / restore не попросили.
+pub fn userLeafApplyProtEx(target_pml4: u64, va: u64, want: u64, restore_hidden: bool) bool {
+    const pml4e = physReadQ(target_pml4 + 8 * ((va >> 39) & 0x1FF)) orelse return false;
+    if (pml4e & PTE_PRESENT == 0) return false;
+    const pdpte = physReadQ((pml4e & 0x000FFFFFFFFFF000) + 8 * ((va >> 30) & 0x1FF)) orelse return false;
+    if (pdpte & PTE_PRESENT == 0) return false;
+    if (pdpte & PTE_HUGE != 0) return false;
+    const pde = physReadQ((pdpte & 0x000FFFFFFFFFF000) + 8 * ((va >> 21) & 0x1FF)) orelse return false;
+    if (pde & PTE_PRESENT == 0) return false;
+    if (pde & PTE_HUGE != 0) return false;
+    const pte_addr = (pde & 0x000FFFFFFFFFF000) + 8 * ((va >> 12) & 0x1FF);
+    const pte = physReadQ(pte_addr) orelse return false;
+    if (pte & PTE_USER == 0) return false; // kernel-страницу не трогаем
+    const mask = PTE_WRITABLE | PTE_NO_EXECUTE;
+
+    if (pte & PTE_PRESENT != 0) {
+        const p: *volatile u64 = @ptrFromInt(pte_addr);
+        p.* = (pte & ~mask) | (want & mask);
+        diagPte("PROT", va, p.*); // CDD №12 p6-DIAG
+    } else if (restore_hidden and (pte & 0x000FFFFFFFFFF000) != 0) {
+        // скрытая PROT_NONE-страница: вернуть в строй с новыми правами
+        const p: *volatile u64 = @ptrFromInt(pte_addr);
+        p.* = ((pte & ~mask) | (want & mask)) | PTE_PRESENT;
+        diagPte("RESTORE", va, p.*); // CDD №12 p6-DIAG
+    } else return false;
+
     asm volatile ("invlpg (%[virt])"
         :
         : [virt] "r" (va),

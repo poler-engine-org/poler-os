@@ -79,9 +79,23 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         }
     }
     if (!argbuf[0]) {
-        if (argc >= 1) snprintf(argbuf, sizeof(argbuf), "%s", argv[0]);
-        if (argc >= 2) snprintf(argbuf + strlen(argbuf),
-                                sizeof(argbuf) - strlen(argbuf), ",%s", argv[1]);
+        // CDD №12 p6: QEMU передаёт диапазоны ПОЗИЦИОННЫМИ кусками (по
+        // запятым -plugin); старый код склеивал только argv[0]+argv[1] —
+        // второй диапазон (ADDR2,LEN2) ТЕРЯЛСЯ (пустые логи half-watch!).
+        // Склеиваем ВСЕ куски (кроме file=, который QEMU потребляет сам).
+        int first = 1;
+        for (int i = 0; i < argc; i++) {
+            if (strncmp(argv[i], "file=", 5) == 0) continue;
+            if (!first) {
+                size_t l = strlen(argbuf);
+                if (l + 1 < sizeof(argbuf)) {
+                    argbuf[l] = ',';
+                    argbuf[l + 1] = 0;
+                }
+            }
+            strncat(argbuf, argv[i], sizeof(argbuf) - strlen(argbuf) - 1);
+            first = 0;
+        }
     }
     const char *argstr = argbuf[0] ? argbuf : NULL;
     if (!argstr) {

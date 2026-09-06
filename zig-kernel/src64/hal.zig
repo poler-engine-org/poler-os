@@ -799,13 +799,15 @@ fn handleException(frame: *InterruptFrame) void {
         const main64 = @import("main64.zig");
         const pml4 = readCr3() & 0x000FFFFFFFFFF000;
         Serial.puts("\nSTACK-RET:");
-        // гистограмма повторов ret-адресов (≤192 кандидатов)
-        // CDD №12 p4: 64→192 слотов (vkCreateDevice-цепь глубже 64 кадров)
-        var hist_addr: [192]u64 = [_]u64{0} ** 192;
-        var hist_cnt: [192]u32 = [_]u32{0} ** 192;
+        // гистограмма повторов ret-адресов
+        // CDD №12 p6: 192→1024 слота (кадр _Rb_tree-цепи >1.5КБ локалов;
+        // ПЕРВЫЙ код-вказівник от RSP = ближайший caller — порядок важен)
+        var hist_addr: [1024]u64 = [_]u64{0} ** 1024;
+        var hist_cnt: [1024]u32 = [_]u32{0} ** 1024;
         var hist_n: usize = 0;
+        var code_printed: usize = 0;
         var i: usize = 0;
-        while (i < 192) : (i += 1) {
+        while (i < 1024) : (i += 1) {
             const va = frame.rsp + i * 8;
             const leaf = vmm4.userLeafFlags(pml4, va) orelse break;
             if (leaf & vmm4.PTE_USER == 0) break;
@@ -814,14 +816,20 @@ fn handleException(frame: *InterruptFrame) void {
             const is_ret = (v >= 0x4000_0000_0000 and v < 0x4006_0000_0000) or
                 (v >= 0x1000_0000_0000 and v < 0x1000_0040_0000);
             if (is_ret) {
-                Serial.puts(" ");
-                Serial.putHex(v);
-                if (main64.linuxModuleAt(exc_faulter, v)) |hit| {
-                    Serial.puts("(");
-                    Serial.puts(hit.name);
-                    Serial.puts("+0x");
-                    Serial.putHex(hit.off);
-                    Serial.puts(")");
+                // CDD №12 p6: первые 32 — с номером слота (порядок = глубина)
+                if (code_printed < 32) {
+                    Serial.puts(" +0x");
+                    Serial.putHex(@intCast(i * 8));
+                    Serial.puts(":");
+                    Serial.putHex(v);
+                    if (main64.linuxModuleAt(exc_faulter, v)) |hit| {
+                        Serial.puts("(");
+                        Serial.puts(hit.name);
+                        Serial.puts("+0x");
+                        Serial.putHex(hit.off);
+                        Serial.puts(")");
+                    }
+                    code_printed += 1;
                 }
                 // повтор → счётчик
                 var h: usize = 0;
@@ -857,6 +865,66 @@ fn handleException(frame: *InterruptFrame) void {
                 }
             }
             Serial.puts("\n");
+        }
+        // CDD №12 p6: RBP-ЦЕПОЧКА кадров — НАСТОЯЩИЙ backtrace (STACK-RET
+        // сканит локальные данные кадра: 192 слота могут быть сплошь
+        // указателями-данными; return-адреса сидят на [rbp+8], следующий
+        // кадр — на [rbp]). 10 кадров с модульной атрибуцией.
+        {
+            var rbp: u64 = frame.rbp;
+            var frames: usize = 0;
+            Serial.puts("RBP-CHAIN:");
+            while (frames < 10) : (frames += 1) {
+                if (rbp < 0x1000 or rbp > 0x7FFF_FFFF_FFFF) break;
+                const leaf0 = vmm4.userLeafFlags(pml4, rbp) orelse break;
+                if (leaf0 & vmm4.PTE_USER == 0) break;
+                const leaf1 = vmm4.userLeafFlags(pml4, rbp + 8) orelse break;
+                if (leaf1 & vmm4.PTE_USER == 0) break;
+                const w_ret: *volatile u64 = @ptrFromInt(rbp + 8);
+                const w_next: *volatile u64 = @ptrFromInt(rbp);
+                const ret = w_ret.*;
+                const next = w_next.*;
+                Serial.puts(" ");
+                Serial.putHex(ret);
+                if (main64.linuxModuleAt(exc_faulter, ret)) |hit| {
+                    Serial.puts("(");
+                    Serial.puts(hit.name);
+                    Serial.puts("+0x");
+                    Serial.putHex(hit.off);
+                    Serial.puts(")");
+                }
+                if (next <= rbp or next - rbp > 0x40000) break; // анти-цикл/мусор
+                rbp = next;
+            }
+            Serial.puts("\n");
+        }
+    }
+
+    // CDD №12 p6: ДАМП УЗЛА #PF — [RDI, +0x40) декодировано как
+    // _Rb_tree_node_base {color, pad, parent, left, right} + value-слоты:
+    // пустое дерево (parent=0, left/right=self) vs живые ссылки.
+    if (from_user and frame.vector == 14 and frame.rdi > 0x10000) {
+        const vmm4 = @import("vmm64.zig");
+        const pml4n = readCr3() & 0x000FFFFFFFFFF000;
+        if (vmm4.userLeafFlags(pml4n, frame.rdi) != null) {
+            Serial.puts("NODE-DUMP [rdi]: color=0x");
+            const wn: *volatile [8]u64 = @ptrFromInt(frame.rdi);
+            Serial.putHex(wn[0]);
+            Serial.puts(" parent=0x");
+            Serial.putHex(wn[1]);
+            Serial.puts(" left=0x");
+            Serial.putHex(wn[2]);
+            Serial.puts(" right=0x");
+            Serial.putHex(wn[3]);
+            Serial.puts(" val=[0x");
+            Serial.putHex(wn[4]);
+            Serial.puts(" 0x");
+            Serial.putHex(wn[5]);
+            Serial.puts(" 0x");
+            Serial.putHex(wn[6]);
+            Serial.puts(" 0x");
+            Serial.putHex(wn[7]);
+            Serial.puts("]\n");
         }
     }
 
