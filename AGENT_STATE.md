@@ -1,8 +1,8 @@
-updated_utc: 2026-09-06T00:00:00Z
+updated_utc: 2026-09-06T02:30:00Z
 repo: poler-os
 branch: main
-commit: 3d86e54 (CDD №12 p5: DEMAND-ZERO ПЕЙДЖИНГ — Linux-семантика анонимной памяти; фронт: libstdc++ Rb_tree NULL / многопоточные гонки)
-tag: v0.19.0 (следующий релиз — v0.20.0-rc)
+commit: c73b85b (CDD №12 p6: VMA-СЕМАНТИКА LINUX (split/merge/drop, PROT_NONE, MADV_DONTNEED) + CFS-wakeup-yield (clone/futex) + арсенал изоляции 0xAAAA; фронт: 0xAAAA-в-регистре — регистровый поток, ловить bt-catch)
+tag: v0.19.0 (следующий релиз — v0.20.0-rc: после первого PAGE_FLIP)
 pushed: true
 tests: zig build 5/5; zig build test 573/573 (CDD №12 p4: +2 drm-scanout (PAGE_FLIP/SETCRTC→vring: phys/габариты/счётчик; линейный-fb/vring-fail толерантность), +1 tgkill (abort-смерть SIGABRT/SIGKILL/пойманный-без-доставки/EINVAL-ESRCH), +1 F_DUPFD/F_DUPFD_CLOEXEC (dup≥minfd/копия FdEntry/ошибки)). E2E QEMU: drm-gamescope идёт до КОМПИЛЯЦИИ ШЕЙДЕРОВ (wayland-display ✓, vulkan-instance ✓, physical-device+слой ✓, vkCreateDevice ✓✓, pipeline/ш Shader-компиляция — фронт); РЕГРЕСС-МАТРИЦА p4 (финальная): elf-run 17/17, dyn-elf 4/4, glibc-static 7/7, drm 8/8, input 11/11, ldev 12/12, gpu-scanout 11/11 — ВСЁ ЗЕЛЕНОЕ; gamescope e2e 4/6 (краш-лог = CDD-артефакт)
 current_task: CDD №12 p4 (промежуточный итог, 10 коммитов запушено). ФРОНТ: gamescope падает на компиляции шейдеров — «tgsi_to_nir: unhandled TGSI property 0 = 0xAAAAAAAA» + «*** stack smashing detected ***» → abort → tgkill(6) → exit(134) (механизм смерти РАБОТАЕТ). HOST ground-truth (vkprobe2 + РЕАЛЬНЫЕ вложенные шейдеры gamescope, extract-gs-shaders.py): libvulkan_lvp компилирует шейдеры gamescope БЕЗ краша (pipeline=-13 из-за упрощённого pipeline-state проба) → КОРЕНЬ В ЯДРЕ-СРЕДЕ, не в либах
