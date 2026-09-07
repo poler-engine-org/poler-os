@@ -21,7 +21,10 @@
 const hal = @import("hal.zig");
 const sres = @import("sched_resume.zig"); // v0.18.1: пер-таск резюм-кадры (.bss)
 
-pub const MAX_TASKS = 8;
+/// CDD №12 p13: 8 → 16 — gamescope-глубина (wlserver + шейдер-тред + eis +
+/// render + vulkan-треды): 8-й слот исчерпывался → clone=EAGAIN → abort
+/// («std::system_error: Resource temporarily unavailable»).
+pub const MAX_TASKS = 16;
 
 /// v0.13.0-fix: канарейка переполнения kstack (низ 256Б каждого стека
 /// заполняется паттерном при создании; schedule проверяет — smash = overflow).

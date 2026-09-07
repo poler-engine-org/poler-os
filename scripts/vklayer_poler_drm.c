@@ -30,6 +30,8 @@ typedef uint32_t VkResult;
 typedef uint32_t VkBool32;
 typedef uint64_t VkInstance;   // opaque handle
 typedef uint64_t VkPhysicalDevice;
+typedef uint64_t VkDevice;
+typedef uint64_t VkDeviceMemory;
 typedef void* (*PFN_vkVoidFunction_ptr)(void);
 
 typedef struct VkBaseOut {
@@ -102,6 +104,62 @@ typedef struct {
 
 static PFN_vkGetInstanceProcAddr_t g_next_gipa;
 static VkInstance g_instance;
+
+// ─── CDD №12 p13: device-цепь (vkCreateDevice/vkGetDeviceProcAddr + лог
+// vkAllocateMemory — диагностика -2 «failed to allocate buffer for KMS») ──
+typedef struct VkLayerDeviceLink2 {
+    struct VkLayerDeviceLink2* pNext;
+    void* pfnNextGetInstanceProcAddr;
+    void* pfnNextGetDeviceProcAddr;
+} VkLayerDeviceLink2;
+
+typedef struct {
+    uint32_t sType;
+    void* pNext;
+    uint32_t function;
+    union {
+        VkLayerDeviceLink2* pLayerInfo;
+        void* pfnSetDeviceLoaderData;
+    } u;
+} VkLayerDeviceCreateInfo;
+
+typedef VkResult (*PFN_vkCreateDevice_t)(VkPhysicalDevice, const void*, const void*, VkDevice*);
+typedef void* (*PFN_vkGetDeviceProcAddr_t)(VkDevice, const char*);
+typedef VkResult (*PFN_vkAllocateMemory_t)(VkDevice, const void*, const void*, VkDeviceMemory*);
+
+// VkMemoryAllocateInfo: {sType u32, pad, pNext, allocationSize u64, memoryTypeIndex u32}
+typedef struct {
+    uint32_t sType;
+    void* pNext;
+    uint64_t allocationSize;
+    uint32_t memoryTypeIndex;
+} MemAllocInfo;
+
+static PFN_vkGetDeviceProcAddr_t g_next_gdpa;
+static VkDevice g_dev;
+static uint32_t g_alloc_log_n = 0;
+
+static char g_logbuf[256];
+static int g_loglen = 0;
+static void lput(const char* s) {
+    int n = strlen(s);
+    if (g_loglen + n > 250) { write(2, g_logbuf, g_loglen); g_loglen = 0; }
+    memcpy(g_logbuf + g_loglen, s, n);
+    g_loglen += n;
+}
+static void lflush(void) {
+    if (g_loglen + 1 < (int)sizeof(g_logbuf)) g_logbuf[g_loglen++] = 10;
+    write(2, g_logbuf, g_loglen);
+    g_loglen = 0;
+}
+static void loghex(uint64_t v) {
+    char b[18] = "0x0000000000000000";
+    for (int i = 0; i < 16; i++) {
+        int nib = (int)((v >> (60 - 4 * i)) & 0xF);
+        b[2 + i] = nib < 10 ? '0' + nib : 'a' + (nib - 10);
+    }
+    lput(b);
+}
 
 static VkResult vkEnumerateInstanceExtensionProperties_shim(
     const char* pLayerName, uint32_t* pCount, void* pProperties);
@@ -206,6 +264,13 @@ VkResult vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo,
     return r;
 }
 
+// форвард-объявления (device-цепь p13)
+__attribute__((visibility("default")))
+VkResult vkCreateDevice(VkPhysicalDevice pd, const void* pCreateInfo_v,
+                        const void* pAllocator, VkDevice* pDevice);
+__attribute__((visibility("default")))
+void* vkGetDeviceProcAddr(VkDevice dev, const char* pName);
+
 __attribute__((visibility("default")))
 void* vkGetInstanceProcAddr(VkInstance instance, const char* pName)
 {
@@ -225,6 +290,12 @@ void* vkGetInstanceProcAddr(VkInstance instance, const char* pName)
     if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
         strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0)
         return (void*)wrap_vkGetPhysicalDeviceProperties2;
+    // CDD №12 p13: device-цепь — загрузчик строит её через GIPA-запрос
+    // «vkCreateDevice» (слой, вернувший свой vkCreateDevice, попадает в цепь)
+    if (strcmp(pName, "vkCreateDevice") == 0)
+        return (void*)vkCreateDevice;
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
+        return (void*)vkGetDeviceProcAddr;
     return g_next_gipa ? g_next_gipa(instance, pName) : 0;
 }
 
@@ -247,6 +318,123 @@ void* vkEnumerateInstanceLayerProperties(uint32_t* pCount, void* pProps)
     (void)pProps;
     if (pCount) *pCount = 0;
     return (void*)0;
+}
+
+// ─── CDD №12 p13: device-цепь протокола слоя ────────────────────────────────
+
+__attribute__((visibility("default")))
+VkResult vkCreateDevice(VkPhysicalDevice pd, const void* pCreateInfo_v,
+                        const void* pAllocator, VkDevice* pDevice)
+{
+    const VkInstanceCreateInfo* ci = (const VkInstanceCreateInfo*)pCreateInfo_v;
+    (void)ci;
+    // pCreateInfo — VkDeviceCreateInfo; линк в pNext (sType=48)
+    // VkDeviceCreateInfo: {sType,pNext,flags,...}
+    typedef struct { uint32_t sType; void* pNext; } BaseHdr;
+    const BaseHdr* base = (const BaseHdr*)pCreateInfo_v;
+    VkLayerDeviceCreateInfo* chain = (VkLayerDeviceCreateInfo*)base->pNext;
+    while (chain && !(chain->sType == 48 && chain->function == 0))
+        chain = (VkLayerDeviceCreateInfo*)chain->pNext;
+    if (!chain || !chain->u.pLayerInfo) {
+        lput("[POLER-LAYER] createDevice: NOLINK\n");
+        return -3;
+    }
+    VkLayerDeviceLink2* link = chain->u.pLayerInfo;
+    // протокол: слой ВЫРЕЗАЕТ свой линк из цепи ДО вызова вниз
+    chain->u.pLayerInfo = link->pNext;
+    PFN_vkGetInstanceProcAddr_t gipa =
+        (PFN_vkGetInstanceProcAddr_t)link->pfnNextGetInstanceProcAddr;
+    g_next_gdpa = (PFN_vkGetDeviceProcAddr_t)link->pfnNextGetDeviceProcAddr;
+    if (!gipa) gipa = g_next_gipa;
+    PFN_vkCreateDevice_t next = (PFN_vkCreateDevice_t)gipa(0, "vkCreateDevice");
+    if (!next) { lput("[POLER-LAYER] createDevice:NOCREATE\n"); return -3; }
+    VkResult r = next(pd, pCreateInfo_v, pAllocator, pDevice);
+    if (r == 0) g_dev = *pDevice;
+    lput("[POLER-LAYER] createDevice:OK\n");
+    return r;
+}
+
+static VkResult wrap_vkAllocateMemory(VkDevice dev, const void* pAllocateInfo_v,
+                                      const void* pAllocator, VkDeviceMemory* pMemory)
+{
+    const MemAllocInfo* ai = (const MemAllocInfo*)pAllocateInfo_v;
+    g_alloc_log_n++;
+    g_loglen = 0;
+    lput("[POLER-LAYER] AllocMem#");
+    loghex(g_alloc_log_n);
+    lput(" size=");
+    loghex(ai->allocationSize);
+    lput(" typeIdx=");
+    loghex(ai->memoryTypeIndex);
+    lput(" pNext=");
+    loghex((uintptr_t)ai->pNext);
+    if (ai->pNext) {
+        lput(" chain:");
+        const void* node = ai->pNext;
+        for (int k = 0; k < 5 && node; k++) {
+            uint32_t st = ((const uint32_t*)node)[0];
+            loghex(st);
+            node = ((const void* const*)node)[1];
+            if (node) lput(">");
+        }
+    }
+    // p13-ДИАГНОЗ: срезаем pNext (WSI-mesa/garbage) — если аллокация
+    // проходит, причина -2 в pNext-цепочке
+    MemAllocInfo patched = *ai;
+    // p13-ФИНАЛ: цепь gamescope = [EXPORT, DEDICATED, WSI-MESA-implicit-sync].
+    // WSI-MESA-узел ломает аллокацию на lvp (-2); EXPORT нужен экспорту fd.
+    // Срезаем ПОСЛЕДНИЙ узел (WSI-MESA): [1]->[2]->[3]->NULL => [1]->[2]->NULL
+    if (ai->pNext) {
+        void* n1 = (void*)ai->pNext;
+        void* n2 = ((void**)n1)[1];
+        if (n2) {
+            void* n3 = ((void**)n2)[1];
+            if (n3) ((void**)n2)[1] = ((void**)n3)[1]; // вырезаем n3
+        }
+        patched.pNext = n1;
+    }
+    PFN_vkAllocateMemory_t next = (PFN_vkAllocateMemory_t)g_next_gdpa(dev, "vkAllocateMemory");
+    VkResult r = next ? next(dev, &patched, pAllocator, pMemory) : -3;
+    lput(" => ");
+    loghex((uint32_t)(int32_t)r);
+    lflush();
+    return r;
+}
+
+// p13: VkMemoryGetFdInfoKHR {sType=1000003000, pNext, handleType u32}
+typedef struct {
+    uint32_t sType;
+    void* pNext;
+    uint32_t handleType;
+} MemGetFdInfo;
+
+static VkResult wrap_vkGetMemoryFdKHR(VkDevice dev, const MemGetFdInfo* gi,
+                                      const void* pAllocator, int* pFd)
+{
+    g_loglen = 0;
+    lput("[POLER-LAYER] GetMemoryFd: handleType=");
+    loghex(gi ? gi->handleType : 0);
+    void* next = g_next_gdpa(dev, "vkGetMemoryFdKHR");
+    VkResult r = next ? ((VkResult(*)(VkDevice, const void*, const void*, int*))next)(dev, gi, pAllocator, pFd) : -3;
+    lput(" => ");
+    loghex((uint32_t)(int32_t)r);
+    lput(" fd=");
+    loghex(pFd ? (uint64_t)(uint32_t)*pFd : 0);
+    lflush();
+    return r;
+}
+
+__attribute__((visibility("default")))
+void* vkGetDeviceProcAddr(VkDevice dev, const char* pName)
+{
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
+        return (void*)vkGetDeviceProcAddr;
+    if (strcmp(pName, "vkAllocateMemory") == 0)
+        return (void*)wrap_vkAllocateMemory;
+    // p13-ТЕСТ: обёртка отключена (проверка: не ломает ли она экспорт)
+    // if (strcmp(pName, "vkGetMemoryFdKHR") == 0)
+    //     return (void*)wrap_vkGetMemoryFdKHR;
+    return g_next_gdpa ? g_next_gdpa(dev, pName) : 0;
 }
 
 // vkGetDeviceProcAddr: НЕ ЭКСПОРТИРУЕМ (v0.20.0-фикс host-эмпирики):

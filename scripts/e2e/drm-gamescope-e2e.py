@@ -60,6 +60,31 @@ for soname in libs:
                 files["usr/lib/" + soname] = f.read()
             break
 
+# CDD №12 p13: ТЁПЛЫЙ mesa-кэш из host-прогонов (LLVM-JIT-компиляция шейдеров
+# gamescope уже выполнена на host — хэши совпадают: те же бинарники/либы/ICD).
+# VFS-overlay: initrd-RO читается, новые записи идут в tmpfs-RW.
+import os as _os
+SYS_DIRS_EXTRA = []
+_warm_root = "/tmp/p13-host/mesa-cache/mesa_shader_cache"
+_warm_n = 0
+if _os.path.isdir(_warm_root):
+    for _base, _, _names in _os.walk(_warm_root):
+        for _n in _names:
+            _p = _os.path.join(_base, _n)
+            _arc = "tmp/mesa_shader_cache/mesa_shader_cache" + _p[len(_warm_root):]
+            with open(_p, "rb") as _f:
+                files[_arc] = _f.read()
+            _warm_n += 1
+    # директории кэша (двухбуквенные корзины) — как dir-записи
+    for _d in ("tmp", "tmp/mesa_shader_cache", "tmp/mesa_shader_cache/mesa_shader_cache"):
+        files.pop(_d, None)
+        SYS_DIRS_EXTRA.append(_d)
+    for _base, _dirs, _ in _os.walk(_warm_root):
+        for _d in _dirs:
+            _arc = "tmp/mesa_shader_cache/mesa_shader_cache" + (_os.path.join(_base, _d)[len(_warm_root):])
+            SYS_DIRS_EXTRA.append(_arc)
+print(f"rootfs: + ТЁПЛЫЙ mesa-кэш ({_warm_n} записей из host-прогонов)")
+
 # xkb-данные (libxkbcommon компилирует раскладку при создании устройств ввода)
 XKB_ROOT = os.path.join(ROOT, "usr", "share", "X11", "xkb")
 xkb_count = 0
@@ -142,6 +167,10 @@ SYS_DIRS = [
     "sys/devices", "sys/devices/system", "sys/devices/system/cpu",
     "sys/devices/system/cpu/cpu0",
     "sys/devices/system/cpu/cpu0/cpufreq",
+    # CDD #12 p13: /sys/class/drm — udev-энумерация DRM-узлов сессии
+    "sys/class", "sys/class/drm",
+    "sys/class/drm/card0",
+    "sys/class/drm/renderD128",
 ]
 for d in SYS_DIRS:
     files.pop(d, None)  # страховка: файлы не должны затереть дир-записи
@@ -155,6 +184,11 @@ for node_minor in (0, 128):
     # readlink возвращает ЦЕЛЬ — get_subsystem_type ищет "/pci" в хвосте
     symlinks[base + "/subsystem"] = "../../../bus/pci"
 # CPU-маска/топология: glibc sysconf(_SC_NPROCESSORS_*) fallback
+# CDD #12 p13: DRM-узлы класса (udev: dev=«major:minor», uevent)
+files["sys/class/drm/card0/dev"] = b"226:0\n"
+files["sys/class/drm/renderD128/dev"] = b"226:128\n"
+files["sys/class/drm/card0/uevent"] = b"MAJOR=226\nMINOR=0\nDEVTYPE=drm_minor\n"
+files["sys/class/drm/renderD128/uevent"] = b"MAJOR=226\nMINOR=128\nDEVTYPE=drm_minor\n"
 files["sys/devices/system/cpu/online"] = b"0\n"
 files["sys/devices/system/cpu/offline"] = b"\n"
 files["sys/devices/system/cpu/possible"] = b"0\n"
@@ -221,7 +255,7 @@ if os.path.exists(_cache_path) and os.path.getsize(_cache_path) > 10_000_000:
 else:
     _blob = None
 if _blob is None:
-    INITRD = build_cpio(files, symlinks, dirs=SYS_DIRS)
+    INITRD = build_cpio(files, symlinks, dirs=SYS_DIRS + SYS_DIRS_EXTRA)
     with open(_cache_path, "wb") as _f:
         _f.write(_cache_key.encode("ascii"))
         _f.write(INITRD)
@@ -364,7 +398,9 @@ try:
                     print("PPM-анализ", name, "fail:", e)
 
     # ─── 3. Анализ: DRM-ioctl декодер из ltrace ────────────────────────────
-    ioctl_calls = re.findall(r"\[L\] 16\(0x[0-9A-F]+,0x([0-9A-F]+),", text)
+    # p13: формат [L] печатает склеенные аргументы 0x0xADDR0xADDR →
+    # cmd идёт вторым аргументом с двойным префиксом
+    ioctl_calls = re.findall(r"\[L\] 16\([^,]+,0x[0-9A-F]*x([0-9A-F]+),", text)
     KNOWN = {  # сверено с /usr/include/drm/drm.h (gcc sizeof, x86_64)
         "C0406400": "VERSION", "C006640C": "GET_CAP", "C010640D": "SET_CLIENT_CAP",
         "6401E": "SET_MASTER", "6401F": "DROP_MASTER", "C0106407": "SET_VERSION",

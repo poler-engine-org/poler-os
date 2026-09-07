@@ -284,6 +284,17 @@ pub const Vfs = struct {
         if (write) {
             if (!std.mem.startsWith(u8, norm, "/tmp")) return VfsError.ReadOnly;
             const name = norm[1..]; // "tmp/имя" — плоское tmpfs-пространство
+            // CDD №12 p13: overlay-write БЕЗ тени: путь существует ТОЛЬКО в
+            // initrd-слое → возвращаем RO-ноду (fstat/чтение/mmap-COW живут;
+            // запись в RO — честный отказ). Тень в tmpfs создаётся только
+            // для НОВЫХ путей (кэш-записи mesa поверх пустого tmpfs-слоя).
+            // Эмпирика: open(index, O_RDWR|O_CREAT) создавал ПУСТУЮ тень,
+            // затеняющую 2МБ-индекс → шейдер-кэш всегда мажет → TCG-медленная
+            // перекомпиляция на каждом прогоне.
+            if (self.tmp.find(name) == null) {
+                if (self.resolveInitrd(norm, depth)) |node| return node
+                else |_| {} // нет и в initrd → тень ниже
+            }
             const f = try self.tmp.create(name);
             return .{ .kind = .tmpfs_file, .tmp = f };
         }

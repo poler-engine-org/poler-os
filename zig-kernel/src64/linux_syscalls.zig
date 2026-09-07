@@ -70,6 +70,23 @@ pub const SYS_madvise: u64 = 28;
 pub const SYS_rt_sigaction: u64 = 13;
 pub const SYS_rt_sigprocmask: u64 = 14;
 pub const SYS_socketpair: u64 = 53;
+// ─── CDD №12 p13: сокетная волна (libseat/seatd — сессия DRM-бэкенда) ──────
+pub const SYS_socket: u64 = 41;
+pub const SYS_connect: u64 = 42;
+pub const SYS_sendto: u64 = 44;
+pub const SYS_recvfrom: u64 = 45;
+pub const SYS_sendmsg: u64 = 46;
+pub const SYS_recvmsg: u64 = 47;
+pub const SYS_shutdown: u64 = 48;
+pub const SYS_bind: u64 = 49;
+pub const SYS_getsockname: u64 = 51;
+pub const SYS_setsockopt: u64 = 54;
+pub const SYS_getsockopt: u64 = 55;
+pub const SYS_statx: u64 = 332; // libudev: контроль /run/udev/*
+pub const SYS_dup: u64 = 32; // gamescope: dup(card0-fd) — libliftoff/полл-тред
+pub const SYS_fallocate: u64 = 285; // mesa: пре-аллокация индекса шейдер-кэша
+
+
 pub const SYS_memfd_create: u64 = 319;
 pub const SYS_ftruncate: u64 = 77; // (!не 46 — это i386-номер; x86_64 = 77)
 /// getdents64 (НЕ 220 — это старый getdents без d_type/d_ino-64)
@@ -175,7 +192,10 @@ pub const EISDIR: i64 = 21; // read/write на dir-fd (CDD №12 p3)
 pub const ENOTDIR: i64 = 20; // getdents64 не на dir-fd
 pub const ELOOP: i64 = 40; // слишком много симлинков в цепи (readlink/resolve)
 pub const EFBIG: i64 = 27; // ftruncate: сверх ANON_FILE_MAX (CDD №12 p3)
-pub const EAFNOSUPPORT: i64 = 97; // socketpair: только AF_UNIX
+pub const EAFNOSUPPORT: i64 = 97; // socketpair: только AF_UNIXpub const EAFNOSUPPORT: i64 = 97; // socketpair: только AF_UNIX
+pub const ENOTSOCK: i64 = 88; // p13: sendmsg/recvmsg не на сокете
+pub const EOPNOTSUPP: i64 = 95; // p13: fallocate-режимы
+
 pub const ESOCKTNOSUPPORT: i64 = 94; // только SOCK_STREAM
 pub const EPROTONOSUPPORT: i64 = 93; // протокол 0
 pub const ENOTSUP: i64 = 95; // TFD_TIMER_ABSTIME и пр.
@@ -362,6 +382,9 @@ pub const FdKind = enum {
     eventfd,
     /// Конец socketpair AF_UNIX/SOCK_STREAM (двунаправленный).
     socket,
+    /// CDD №12 p13: AF_UNIX-сокет (libseat) с ВСТРОЕННЫМ seatd-сервером
+    /// (file_id = слот seatd_slots; AF_NETLINK — инертный стаб udev).
+    seatd,
     /// timerfd (дедлайн+интервал; POLLIN при истечении).
     timerfd,
     /// signalfd (маска хранится; готовность — нет сигналов = 0).
@@ -432,6 +455,186 @@ pub const FdTable = struct {
 };
 
 pub const EMFILE: i64 = 24;
+
+// ============================================================================
+//  CDD №12 p13: AF_UNIX-сокет + ВСТРОЕННЫЙ seatd (libseat БЕЗ демона)
+// ============================================================================
+// Протокол seatd (seatd/include/protocol.h, native LE):
+//   header {u16 opcode, u16 size}; клиент: OPEN_SEAT=1, CLOSE_SEAT=2,
+//   OPEN_DEVICE=3 {u16 path_len, path}, CLOSE_DEVICE=4 {i32 devid},
+//   SWITCH_SESSION=6 {i32}, PING=7; сервер (|0x8000): SEAT_OPENED=0x8001
+//   {u16 name_len, name}, SEAT_CLOSED=0x8002, DEVICE_OPENED=0x8003 {i32
+//   devid} + fd в SCM_RIGHTS, DEVICE_CLOSED=0x8004, PONG=0x8007,
+//   SESSION_SWITCHED=0x8008, ERROR=0x7FFF {i32 errno}.
+pub const AF_UNIX: u64 = 1;
+pub const AF_NETLINK: u64 = 16;
+pub const SOCK_NONBLOCK: u64 = 0o4000; // = O_NONBLOCK
+pub const SOL_SOCKET: i32 = 1;
+pub const SCM_RIGHTS: i32 = 1;
+
+const SEATD_BUF: usize = 512;
+const SEATD_SLOTS: usize = 4;
+const MAX_MSG_IOV: usize = 8;
+
+pub const SeatdSlot = struct {
+    used: bool = false,
+    af: u64 = AF_UNIX,
+    /// connect() прошёл (только для /run/seatd.sock — встроенный сервер)
+    is_seatd: bool = false,
+    sun_path: [108]u8 = [_]u8{0} ** 108,
+    sun_len: usize = 0,
+    /// запросы клиента (sendmsg) / ответы сервера (recvmsg)
+    req: [SEATD_BUF]u8 = [_]u8{0} ** SEATD_BUF,
+    req_len: usize = 0,
+    rx: [SEATD_BUF]u8 = [_]u8{0} ** SEATD_BUF,
+    rx_len: usize = 0,
+    /// устройство, чей fd полетит SCM_RIGHTS со СЛЕДУЮЩИМ recvmsg
+    pending_dev_kind: FdKind = .free,
+    pending_dev_minor: u32 = 0,
+    next_devid: i32 = 0,
+};
+
+pub var seatd_slots: [SEATD_SLOTS]SeatdSlot = [_]SeatdSlot{.{}} ** SEATD_SLOTS;
+
+fn seatdAlloc() ?u32 {
+    for (&seatd_slots, 0..) |*s, i| {
+        if (!s.used) {
+            s.* = .{};
+            s.used = true;
+            return @intCast(i);
+        }
+    }
+    return null;
+}
+
+/// Ответ-хелпер: {opcode, size} + payload → rx.
+fn seatdResp(s: *SeatdSlot, opcode: u16, payload: []const u8) void {
+    if (s.rx_len + 4 + payload.len > s.rx.len) return; // переполнение — дроп
+    std.mem.writeInt(u16, s.rx[s.rx_len..][0..2], opcode, .little);
+    std.mem.writeInt(u16, s.rx[s.rx_len + 2 ..][0..2], @intCast(payload.len), .little);
+    @memcpy(s.rx[s.rx_len + 4 ..][0..payload.len], payload);
+    s.rx_len += 4 + payload.len;
+}
+
+/// Конечный автомат: разобрать накопленные запросы, сложить ответы в rx.
+fn seatdPump(s: *SeatdSlot) void {
+    while (s.req_len >= 4) {
+        const opcode = std.mem.readInt(u16, s.req[0..2], .little);
+        const size: usize = std.mem.readInt(u16, s.req[2..4], .little);
+        if (s.req_len < 4 + size) break; // неполный запрос — ждать продолжения
+        const payload = s.req[4 .. 4 + size];
+        switch (opcode) {
+            1 => { // CLIENT_OPEN_SEAT → SEAT_OPENED "seat0"
+                var msg: [8]u8 = undefined;
+                std.mem.writeInt(u16, msg[0..2], 6, .little); // name_len с NUL
+                @memcpy(msg[2..8], "seat0\x00");
+                seatdResp(s, 0x8001, &msg);
+            },
+            2 => seatdResp(s, 0x8002, ""), // CLIENT_CLOSE_SEAT → SEAT_CLOSED
+            3 => { // CLIENT_OPEN_DEVICE {path_len, path}
+                var opened = false;
+                if (size >= 2) {
+                    const plen: usize = std.mem.readInt(u16, payload[0..2], .little);
+                    if (plen >= 1 and 2 + plen <= size and plen < 256) {
+                        const path = payload[2 .. 2 + plen - 1]; // без NUL
+                        if (resolveDevKind(path)) |kind| {
+                            s.pending_dev_kind = kind;
+                            s.pending_dev_minor = devMinor(path);
+                            s.next_devid += 1;
+                            var msg: [4]u8 = undefined;
+                            std.mem.writeInt(i32, msg[0..4], s.next_devid, .little);
+                            seatdResp(s, 0x8003, &msg);
+                            opened = true;
+                        }
+                    }
+                }
+                if (!opened) {
+                    var msg: [4]u8 = undefined;
+                    std.mem.writeInt(i32, msg[0..4], ENOENT, .little);
+                    seatdResp(s, 0x7FFF, &msg); // SERVER_ERROR
+                }
+            },
+            4 => seatdResp(s, 0x8004, ""), // CLIENT_CLOSE_DEVICE → DEVICE_CLOSED (size=0! protocol.h: без payload)
+            6 => { // SWITCH_SESSION → SESSION_SWITCHED (эхо)
+                var msg: [4]u8 = [_]u8{0} ** 4;
+                if (size >= 4) @memcpy(msg[0..4], payload[0..4]);
+                seatdResp(s, 0x8008, &msg);
+            },
+            7 => seatdResp(s, 0x8007, ""), // PING → PONG
+            else => {}, // будущие опкоды — молча потребить
+        }
+        const consumed = 4 + size;
+        std.mem.copyForwards(u8, s.req[0 .. s.req_len - consumed], s.req[consumed..s.req_len]);
+        s.req_len -= consumed;
+    }
+}
+
+/// msghdr glibc x86_64 (56Б): name@0(u64) namelen@8(u32) pad iov@16(u64)
+/// iovlen@24(u64) control@32(u64) controllen@40(u64) flags@48(u32).
+const Msghdr = struct {
+    name: u64 = 0,
+    namelen: u32 = 0,
+    iov: u64 = 0,
+    iovlen: u64 = 0,
+    control: u64 = 0,
+    controllen: u64 = 0,
+    flags: u32 = 0,
+};
+
+fn msghdrIn(ops: LinuxOps, va: u64) ?Msghdr {
+    var b: [56]u8 = undefined;
+    if (!ops.validate(va, 56, false)) return null;
+    if (!ops.copy_in(&b, va)) return null;
+    var m: Msghdr = .{};
+    m.name = std.mem.readInt(u64, b[0..8], .little);
+    m.namelen = std.mem.readInt(u32, b[8..12], .little);
+    m.iov = std.mem.readInt(u64, b[16..24], .little);
+    m.iovlen = std.mem.readInt(u64, b[24..32], .little);
+    m.control = std.mem.readInt(u64, b[32..40], .little);
+    m.controllen = std.mem.readInt(u64, b[40..48], .little);
+    m.flags = std.mem.readInt(u32, b[48..52], .little);
+    return m;
+}
+
+fn msghdrOut(ops: LinuxOps, va: u64, m: Msghdr) bool {
+    var b: [56]u8 = undefined;
+    std.mem.writeInt(u64, b[0..8], m.name, .little);
+    std.mem.writeInt(u32, b[8..12], m.namelen, .little);
+    std.mem.writeInt(u64, b[16..24], m.iov, .little);
+    std.mem.writeInt(u64, b[24..32], m.iovlen, .little);
+    std.mem.writeInt(u64, b[32..40], m.control, .little);
+    std.mem.writeInt(u64, b[40..48], m.controllen, .little);
+    std.mem.writeInt(u32, b[48..52], m.flags, .little);
+    return ops.copy_out(va, &b);
+}
+
+/// Запрос клиента (write/sendto) → req-буфер слота; вернуть байты.
+fn seatdFeed(ops: LinuxOps, e: *FdEntry, buf_va: u64, count: u64) u64 {
+    const s = &seatd_slots[e.file_id];
+    if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
+    const take = @min(@as(usize, @intCast(count)), SEATD_BUF);
+    var tmp: [SEATD_BUF]u8 = undefined;
+    if (!ops.copy_in(tmp[0..take], buf_va)) return err(EFAULT);
+    const room = s.req.len - s.req_len;
+    const n = @min(take, room);
+    @memcpy(s.req[s.req_len..][0..n], tmp[0..n]);
+    s.req_len += n;
+    if (s.is_seatd) seatdPump(s);
+    return @intCast(n);
+}
+
+/// Ответ сервера → user-буфер (read/recvfrom). Сдвиг rx.
+fn seatdDrain(ops: LinuxOps, e: *FdEntry, buf_va: u64, count: u64) u64 {
+    const s = &seatd_slots[e.file_id];
+    if (s.rx_len == 0) return err(EAGAIN);
+    if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
+    const take = @min(@as(usize, @intCast(count)), s.rx_len);
+    if (!ops.copy_out(buf_va, s.rx[0..take])) return err(EFAULT);
+    std.mem.copyForwards(u8, s.rx[0 .. s.rx_len - take], s.rx[take..s.rx_len]);
+    s.rx_len -= take;
+    return @intCast(take);
+}
+
 
 /// Резолв devfs-пути → тип файла (префикс /dev/). Чужие пути → null
 /// (runtime вернёт -ENOENT — файловый мост VFS вне фундамента v0.19).
@@ -621,6 +824,7 @@ pub fn sysWrite(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64
     }
     // CDD №12 p2: канальные виды (pipe-писец/socket/eventfd-инкремент)
     switch (e.kind) {
+        .seatd => return seatdFeed(ops, e, buf_va, count),
         .pipe_write, .socket, .eventfd => {
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
             const r = ops.channel_write(e.file_id, buf_va, count);
@@ -658,6 +862,7 @@ pub fn sysRead(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64)
         },
         // каталог: read → EISDIR (Linux-семантика; glibc opendir не читает)
         .dir => return err(EISDIR),
+        .seatd => return seatdDrain(ops, e, buf_va, count),
         .pipe_read, .socket, .eventfd, .timerfd => {
             // канал: FIFO-чтение (pipe/socket), счётчик (eventfd), экспирации
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
@@ -716,6 +921,9 @@ pub fn sysClose(ops: LinuxOps, fds: *FdTable, fd_i: i64) u64 {
     // p2: каналы (pipe/eventfd/socket/timerfd) — счётчик ссылок концов.
     switch (e.kind) {
         .initrd_file, .tmpfs_file => ops.release_file(e.file_id),
+        .seatd => {
+            if (e.file_id < seatd_slots.len) seatd_slots[e.file_id] = .{};
+        },
         .pipe_read, .pipe_write, .eventfd, .socket, .timerfd, .signalfd => ops.channel_unref(e.file_id),
         .dir => ops.dir_close(e.file_id), // CDD №12 p3: поток каталога
         else => {},
@@ -808,8 +1016,35 @@ pub fn sysMmap(ops: LinuxOps, fds: *FdTable, hint: u64, length: u64, prot: u64, 
         // libc.so сегментами — эмпирика dyn-elf: ENODEV → exit_group(127)).
         .initrd_file, .tmpfs_file => {
             // CDD №12 p3: MAP_SHARED — только АНОН-файлы (memfd: lavapipe-heap,
-            // wl_shm): общие физ-страницы между маппингами. initrd/heap-tmpfs
-            // (RO/RAM-малые) — честный ENOSYS как раньше.
+            // wl_shm): общие физ-страницы между маппингами.
+            // CDD №12 p13: initrd + MAP_SHARED (индекс mesa-кэша!) → ПРИВАТНЫЙ
+            // COW-маппинг (file_mmap): чтение индекса живое, запись — в копию;
+            // новые записи кэша идут через tmpfs-слой overlay (openat O_CREAT).
+            if (e.kind == .initrd_file) {
+                const fixed_va: u64 = if (flags & MAP_FIXED != 0 and hint != 0) hint else 0;
+                const r = ops.file_mmap(e.file_id, off, length, prot, fixed_va);
+                if (r < 0) return @bitCast(r);
+                return @intCast(r);
+            }
+            // heap-tmpfs (overlay-RO-бэкинг: baked mesa-кэш) — тот же COW
+            if (e.kind == .tmpfs_file) {
+                const anon = blk: {
+                    // смотрим анэонность через ops: файлы-кэш overlay не
+                    // растут (fallocate no-op) — трактуем как COW-маппинг
+                    break :blk false; // анэонность проверит shared_file_mmap
+                };
+                _ = anon;
+                const fixed_va: u64 = if (flags & MAP_FIXED != 0 and hint != 0) hint else 0;
+                const r = ops.shared_file_mmap(e.file_id, off, length, prot, fixed_va);
+                if (r == -ENODEV) {
+                    // heap-файл (не memfd) — COW-фолбэк (индекс кэша!)
+                    const r2 = ops.file_mmap(e.file_id, off, length, prot, fixed_va);
+                    if (r2 < 0) return @bitCast(r2);
+                    return @intCast(r2);
+                }
+                if (r < 0) return @bitCast(r);
+                return @intCast(r);
+            }
             if (flags & MAP_SHARED != 0) {
                 const fixed_va: u64 = if (flags & MAP_FIXED != 0 and hint != 0) hint else 0;
                 const r = ops.shared_file_mmap(e.file_id, off, length, prot, fixed_va);
@@ -1024,6 +1259,10 @@ pub fn sysPoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, timeout: i6
                 if (ops.channel_ready(e.file_id) & EPOLLIN != 0) rdy |= POLLIN;
                 rdy |= POLLOUT;
             },
+            .seatd => {
+                if (e.file_id < seatd_slots.len and seatd_slots[e.file_id].rx_len > 0) rdy |= POLLIN;
+                rdy |= POLLOUT;
+            },
             .socket => {
                 if (ops.channel_ready(e.file_id) & EPOLLIN != 0) rdy |= POLLIN;
                 rdy |= POLLOUT;
@@ -1133,6 +1372,7 @@ fn epollScanOnce(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, maxeve
             .tmpfs_file => rdy = EPOLLIN | EPOLLOUT,
             .pipe_read, .timerfd => rdy = ops.channel_ready(e.file_id),
             .dir => {}, // каталог: не готов (read → EISDIR)
+            .seatd => rdy = (if (e.file_id < seatd_slots.len and seatd_slots[e.file_id].rx_len > 0) EPOLLIN else 0) | EPOLLOUT,
             .pipe_write, .socket, .eventfd => rdy = ops.channel_ready(e.file_id) | EPOLLOUT,
             .signalfd => rdy = 0, // сигналов нет
             .free => unreachable,
@@ -1959,6 +2199,340 @@ pub fn sysEpollPwait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, ma
 
 /// Главная точка входа Linux POSIX-слоя: num — RAX, args — RDI/RSI/RDX/R10/R8.
 /// Неизвестный номер → -ENOSYS. Возвращает RAX-значение.
+// ─── CDD №12 p13: сокетная волна (libseat/seatd + udev-netlink стаб) ───────
+
+/// int socket(domain, type, protocol): AF_UNIX (seatd/libseat/logind-фолбэки)
+/// и AF_NETLINK (udev-монитор, инертный). Прочие домены → EAFNOSUPPORT.
+pub fn sysSocket(ops: LinuxOps, fds: *FdTable, domain: u64, sock_type: u64, protocol: u64) u64 {
+    _ = ops;
+    _ = protocol; // IPPROTO_* вне фундамента
+    if (domain != AF_UNIX and domain != AF_NETLINK) return err(EAFNOSUPPORT);
+    const slot = seatdAlloc() orelse return err(ENFILE);
+    seatd_slots[slot].af = domain;
+    const fd = fds.allocFd(.seatd, (sock_type & SOCK_NONBLOCK) != 0);
+    if (fd < 0) {
+        seatd_slots[slot] = .{};
+        return @bitCast(fd);
+    }
+    fds.entries[@intCast(fd)].file_id = slot;
+    return @intCast(fd);
+}
+
+/// int connect(fd, sockaddr*, addrlen): AF_UNIX-путь. /run/seatd.sock →
+/// встроенный сервер (is_seatd). Иные пути → ENOENT (Linux без файла сокета —
+/// libseat/logind аккуратно скипают бэкенд). AF_NETLINK → 0 (инертно).
+pub fn sysConnect(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, addr_len: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    const s = &seatd_slots[e.file_id];
+    if (s.af == AF_NETLINK) return 0;
+    if (addr_len < 2) return err(EINVAL);
+    var saddr: [110]u8 = undefined;
+    const alen = @min(@as(usize, @intCast(addr_len)), 110);
+    if (!ops.validate(addr_va, alen, false)) return err(EFAULT);
+    if (!ops.copy_in(saddr[0..alen], addr_va)) return err(EFAULT);
+    const family = std.mem.readInt(u16, saddr[0..2], .little);
+    if (family != AF_UNIX) return err(EAFNOSUPPORT);
+    const plen = @min(alen - 2, s.sun_path.len);
+    if (plen > 0) @memcpy(s.sun_path[0..plen], saddr[2 .. 2 + plen]);
+    s.sun_len = plen;
+    const path = s.sun_path[0..plen];
+    const seatd_path = "/run/seatd.sock";
+    if (path.len >= seatd_path.len and std.mem.eql(u8, path[0..seatd_path.len], seatd_path)) {
+        s.is_seatd = true;
+        return 0;
+    }
+    return err(ENOENT);
+}
+
+/// int bind(fd, sockaddr*, len): netlink-подписка udev / прочее — 0.
+pub fn sysBind(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, addr_len: u64) u64 {
+    _ = ops;
+    _ = addr_va;
+    _ = addr_len;
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    return 0;
+}
+
+/// int shutdown(fd, how): 0 (закрытие направления — семантика не нужна).
+pub fn sysShutdown(ops: LinuxOps, fds: *FdTable, fd_i: i64, how: u64) u64 {
+    _ = ops;
+    _ = how;
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    return 0;
+}
+
+/// int setsockopt(...): принять (SO_PASSCRED и пр. — вне фундамента).
+pub fn sysSetsockopt(ops: LinuxOps, fds: *FdTable, fd_i: i64, level: u64, optname: u64) u64 {
+    _ = ops;
+    _ = level;
+    _ = optname;
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    return 0;
+}
+
+/// int getsockopt(fd, level, opt, void *val, socklen_t *len): int-ответ 0.
+pub fn sysGetsockopt(ops: LinuxOps, fds: *FdTable, fd_i: i64, level: u64, optname: u64, val_va: u64, len_va: u64) u64 {
+    _ = level;
+    _ = optname;
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    if (!ops.validate(len_va, 4, true) or !ops.validate(val_va, 4, true)) return err(EFAULT);
+    var b: [4]u8 = [_]u8{0} ** 4;
+    _ = ops.copy_out(val_va, &b);
+    std.mem.writeInt(u32, &b, 4, .little);
+    _ = ops.copy_out(len_va, &b);
+    return 0;
+}
+
+/// ssize_t sendto(fd, buf, len, flags, addr, addrlen) — как write на .seatd.
+pub fn sysSendto(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    return seatdFeed(ops, e, buf_va, count);
+}
+
+/// ssize_t recvfrom(fd, buf, len, flags, addr, addrlen) — как read.
+pub fn sysRecvfrom(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    return seatdDrain(ops, e, buf_va, count);
+}
+
+/// ssize_t sendmsg(fd, const msghdr*, flags): iovs → req; socketpair —
+/// channel_write первого iov (libwayland fd-passing совместимость).
+pub fn sysSendmsg(ops: LinuxOps, fds: *FdTable, fd_i: i64, msg_va: u64, flags: u64) u64 {
+    _ = flags;
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind == .socket) {
+        // socketpair: данные первого iov → канал (cmsg-часть игнорируется —
+        // fd-passing между тредами одного процесса — bridge вне p13)
+        const m = msghdrIn(ops, msg_va) orelse return err(EFAULT);
+        if (m.iovlen == 0) return 0;
+        if (!ops.validate(m.iov, 16, false)) return err(EFAULT);
+        var iov: [16]u8 = undefined;
+        if (!ops.copy_in(&iov, m.iov)) return err(EFAULT);
+        const base = std.mem.readInt(u64, iov[0..8], .little);
+        const len = std.mem.readInt(u64, iov[8..16], .little);
+        if (len == 0) return 0;
+        const w = sysWrite(ops, fds, fd_i, base, len);
+        return w;
+    }
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    const s = &seatd_slots[e.file_id];
+    const m = msghdrIn(ops, msg_va) orelse return err(EFAULT);
+    var iovbuf: [MAX_MSG_IOV * 16]u8 = undefined;
+    const n_iov: usize = @intCast(@min(m.iovlen, MAX_MSG_IOV));
+    if (n_iov > 0) {
+        if (!ops.validate(m.iov, n_iov * 16, false)) return err(EFAULT);
+        if (!ops.copy_in(iovbuf[0 .. n_iov * 16], m.iov)) return err(EFAULT);
+    }
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < n_iov) : (i += 1) {
+        const base = std.mem.readInt(u64, iovbuf[i * 16 ..][0..8], .little);
+        const len = std.mem.readInt(u64, iovbuf[i * 16 + 8 ..][0..8], .little);
+        if (len == 0) continue;
+        const w = seatdFeed(ops, e, base, len);
+        const wi: i64 = @bitCast(w);
+        if (wi < 0) return w;
+        total += @intCast(wi);
+    }
+    _ = s;
+    return @intCast(total);
+}
+
+/// ssize_t recvmsg(fd, msghdr*, flags): rx → iovs; pending-устройство →
+/// cmsg SCM_RIGHTS (fd открывается в fd-таблице ВЫЗЫВАЮЩЕГО — drmSetMaster
+/// дальше идёт по обычному dev-мосту).
+pub fn sysRecvmsg(ops: LinuxOps, fds: *FdTable, fd_i: i64, msg_va: u64, flags: u64) u64 {
+    _ = flags; // MSG_CMSG_CLOEXEC: exec-модели нет; MSG_DONTWAIT: poll-первая дисциплина
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind == .socket) {
+        // socketpair: чтение первого iov (совместимость libwayland)
+        const m = msghdrIn(ops, msg_va) orelse return err(EFAULT);
+        if (m.iovlen == 0) return 0;
+        if (!ops.validate(m.iov, 16, false)) return err(EFAULT);
+        var iov: [16]u8 = undefined;
+        if (!ops.copy_in(&iov, m.iov)) return err(EFAULT);
+        const base = std.mem.readInt(u64, iov[0..8], .little);
+        const len = std.mem.readInt(u64, iov[8..16], .little);
+        if (len == 0) return 0;
+        return sysRead(ops, fds, fd_i, base, len);
+    }
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    const s = &seatd_slots[e.file_id];
+    if (s.rx_len == 0) return err(EAGAIN); // poll-первая дисциплина libseat
+    var m = msghdrIn(ops, msg_va) orelse return err(EFAULT);
+    var iovbuf: [MAX_MSG_IOV * 16]u8 = undefined;
+    const n_iov: usize = @intCast(@min(m.iovlen, MAX_MSG_IOV));
+    if (n_iov > 0) {
+        if (!ops.validate(m.iov, n_iov * 16, false)) return err(EFAULT);
+        if (!ops.copy_in(iovbuf[0 .. n_iov * 16], m.iov)) return err(EFAULT);
+    }
+    var tmp: [SEATD_BUF]u8 = undefined;
+    const avail = @min(s.rx_len, SEATD_BUF);
+    @memcpy(tmp[0..avail], s.rx[0..avail]);
+    var off: usize = 0;
+    var i: usize = 0;
+    while (i < n_iov and off < avail) : (i += 1) {
+        const base = std.mem.readInt(u64, iovbuf[i * 16 ..][0..8], .little);
+        const len = std.mem.readInt(u64, iovbuf[i * 16 + 8 ..][0..8], .little);
+        if (len == 0) continue;
+        const take = @min(@as(usize, @intCast(len)), avail - off);
+        if (base > USER_VA_CEILING or !ops.validate(base, take, true)) return err(EFAULT);
+        if (!ops.copy_out(base, tmp[off..][0..take])) return err(EFAULT);
+        off += take;
+    }
+    std.mem.copyForwards(u8, s.rx[0 .. s.rx_len - off], s.rx[off..s.rx_len]);
+    s.rx_len -= off;
+    // SCM_RIGHTS: cmsghdr {u64 cmsg_len=20; i32 level; i32 type; i32 fd}
+    if (s.pending_dev_kind != .free) {
+        var delivered = false;
+        if (m.control != 0 and m.controllen >= 20) {
+            const fd = fds.allocFd(s.pending_dev_kind, false);
+            if (fd >= 0) {
+                fds.entries[@intCast(fd)].file_id = s.pending_dev_minor;
+                var cmsg: [20]u8 = undefined;
+                std.mem.writeInt(u64, cmsg[0..8], 20, .little); // cmsg_len
+                std.mem.writeInt(i32, cmsg[8..12], SOL_SOCKET, .little);
+                std.mem.writeInt(i32, cmsg[12..16], SCM_RIGHTS, .little);
+                std.mem.writeInt(i32, cmsg[16..20], @intCast(fd), .little);
+                if (ops.validate(m.control, 20, true) and ops.copy_out(m.control, &cmsg)) {
+                    m.controllen = 20;
+                    delivered = true;
+                }
+            }
+        }
+        s.pending_dev_kind = .free; // доставлен или некуда — не держать
+    }
+    m.namelen = 0;
+    m.flags = 0;
+    if (!msghdrOut(ops, msg_va, m)) return err(EFAULT);
+    return @intCast(off);
+}
+
+/// int dup(int oldfd) — копия FdEntry (как F_DUPFD: реестры runtime БЕЗ
+/// refcount — семантика p4; epoll-watches не наследуются).
+pub fn sysDup(ops: LinuxOps, fds: *FdTable, oldfd: i64) u64 {
+    _ = ops;
+    const e = fds.get(oldfd) orelse return err(EBADF);
+    var i: usize = 0;
+    while (i < MAX_FDS) : (i += 1) {
+        if (!fds.entries[i].used()) {
+            fds.entries[i] = e.*;
+            fds.entries[i].watches = [_]EpollWatch{.{}} ** MAX_WATCHES;
+            fds.entries[i].watch_count = 0;
+            return @intCast(i);
+        }
+    }
+    return err(EMFILE);
+}
+
+/// int fallocate(fd, mode, offset, len) — mesa disk_cache: пре-аллокация
+/// индекса (mode=0/1). tmpfs/anon: рост через truncate-семантику; initrd
+/// (RO-слой overlay): принято-без-действия (запись уйдёт в COW-маппинг).
+pub fn sysFallocate(ops: LinuxOps, fds: *FdTable, fd_i: i64, mode: u64, off: u64, len: u64) u64 {
+    if (mode & ~@as(u64, 1) != 0) return err(EOPNOTSUPP); // KEEP_SIZE только
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (off > USER_VA_CEILING) return err(EINVAL);
+    const sum = @addWithOverflow(off, len);
+    if (sum[1] != 0) return err(EINVAL);
+    switch (e.kind) {
+        .tmpfs_file => {
+            if (mode & 1 != 0) return 0; // KEEP_SIZE: размер не меняем
+            const want: u64 = sum[0];
+            const cur: u64 = ops.file_size(e.file_id);
+            if (want > cur) {
+                const r = ops.truncate_file(e.file_id, want);
+                if (r < 0) {
+                    // heap-tmpfs (overlay-RO-бэкинг, напр. baked mesa-кэш):
+                    // пре-аллокация — no-op (чтение идёт из RO-слоя)
+                    if (r == -EINVAL) return 0;
+                    return @bitCast(r);
+                }
+            }
+            return 0;
+        },
+        .initrd_file => return 0, // RO-слой: пре-аллокация вне контракта
+        else => return err(EBADF),
+    }
+}
+
+pub const STATX_SIZE: usize = 256;
+
+/// int statx(dirfd, path, flags, mask, struct statx *buf) — libudev-волна
+/// (udev_monitor_new_from_netlink: контроль /run/udev/*). 144Б struct stat
+/// (старый путь ops.stat_by_path) транслируется в 256Б statx: буфер statx
+/// (256Б) ≥ old-stat (144Б) → пишем old-stat прямо в него, читаем назад,
+/// конвертируем и перезаписываем (транзиент невидим — один syscall).
+pub fn sysStatx(ops: LinuxOps, dirfd_i: i64, path_va: u64, flags: u64, mask: u64, buf_va: u64) u64 {
+    _ = dirfd_i; // AT_FDCWD/абсолютные пути — cwd-слоя нет
+    _ = flags; // AT_SYMLINK_NOFOLLOW и пр. — семантика вне фундамента
+    _ = mask; // маска запрошенных полей — отдаём BASIC_STATS всегда
+    if (!ops.validate(buf_va, STATX_SIZE, true)) return err(EFAULT);
+    if (ops.validate(path_va, 1, false)) {
+        if (ops.copy_in_str(path_va, 4096)) |path| {
+            const r = ops.stat_by_path(path, buf_va);
+            if (r < 0) return @bitCast(r);
+            var old: [144]u8 = undefined;
+            if (!ops.copy_in(&old, buf_va)) return err(EFAULT);
+            var sx: [STATX_SIZE]u8 = [_]u8{0} ** STATX_SIZE;
+            const mode = std.mem.readInt(u32, old[24..28], .little);
+            const ino = std.mem.readInt(u64, old[8..16], .little);
+            const nlink = std.mem.readInt(u64, old[16..24], .little);
+            const size = std.mem.readInt(u64, old[48..56], .little);
+            std.mem.writeInt(u32, sx[0..4], 0x7FF, .little); // stx_mask
+            std.mem.writeInt(u32, sx[4..8], 4096, .little); // stx_blksize
+            std.mem.writeInt(u32, sx[16..20], @truncate(nlink), .little); // stx_nlink
+            std.mem.writeInt(u16, sx[28..30], @truncate(mode), .little); // stx_mode
+            std.mem.writeInt(u64, sx[32..40], ino, .little); // stx_ino
+            std.mem.writeInt(u64, sx[40..48], size, .little); // stx_size
+            std.mem.writeInt(u64, sx[48..56], (size + 511) / 512, .little); // stx_blocks
+            if (!ops.copy_out(buf_va, &sx)) return err(EFAULT);
+            return 0;
+        }
+    }
+    return err(EFAULT);
+}
+
+/// int getsockname(fd, sockaddr *addr, socklen_t *addrlen) — udev-монитор
+/// узнаёт свой nl-pid после bind. AF_NETLINK → sockaddr_nl{family,pid,
+/// groups} (12Б); AF_UNIX → sockaddr_un с сохранённым путём.
+pub fn sysGetsockname(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, len_va: u64) u64 {
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    const s = &seatd_slots[e.file_id];
+    if (!ops.validate(len_va, 4, true)) return err(EFAULT);
+    var lb: [4]u8 = undefined;
+    if (!ops.copy_in(&lb, len_va)) return err(EFAULT);
+    const cap: u32 = std.mem.readInt(u32, &lb, .little);
+    var sa: [110]u8 = undefined;
+    var n: usize = 0;
+    if (s.af == AF_NETLINK) {
+        std.mem.writeInt(u16, sa[0..2], 16, .little); // AF_NETLINK
+        std.mem.writeInt(u32, sa[4..8], @truncate(ops.current_pid()), .little); // nl_pid
+        std.mem.writeInt(u32, sa[8..12], 0, .little); // groups
+        n = 12;
+    } else {
+        std.mem.writeInt(u16, sa[0..2], 1, .little); // AF_UNIX
+        const plen = @min(s.sun_len, s.sun_path.len);
+        if (plen > 0) @memcpy(sa[2 .. 2 + plen], s.sun_path[0..plen]);
+        n = 2 + plen;
+    }
+    const wn = @min(n, @as(usize, cap));
+    if (wn > 0) {
+        if (!ops.validate(addr_va, wn, true)) return err(EFAULT);
+        if (!ops.copy_out(addr_va, sa[0..wn])) return err(EFAULT);
+    }
+    std.mem.writeInt(u32, &lb, @intCast(n), .little);
+    if (!ops.copy_out(len_va, &lb)) return err(EFAULT);
+    return 0;
+}
+
 pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
     switch (num) {
         SYS_read => return sysRead(ops, fds, @bitCast(args.a1), args.a2, args.a3),
@@ -1998,6 +2572,21 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_rseq => return sysRseq(),
         SYS_pipe2 => return sysPipe2(ops, fds, args.a1, args.a2),
         SYS_socketpair => return sysSocketpair(ops, fds, args.a1, args.a2, args.a3, args.a4),
+        // CDD №12 p13: сокетная волна (сессия libseat → DRM-бэкенд)
+        SYS_dup => return sysDup(ops, fds, @bitCast(args.a1)),
+        SYS_fallocate => return sysFallocate(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
+        SYS_socket => return sysSocket(ops, fds, args.a1, args.a2, args.a3),
+        SYS_connect => return sysConnect(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_bind => return sysBind(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_sendto => return sysSendto(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_recvfrom => return sysRecvfrom(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_sendmsg => return sysSendmsg(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_recvmsg => return sysRecvmsg(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_shutdown => return sysShutdown(ops, fds, @bitCast(args.a1), args.a2),
+        SYS_setsockopt => return sysSetsockopt(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_getsockopt => return sysGetsockopt(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4, args.a5),
+        SYS_getsockname => return sysGetsockname(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_statx => return sysStatx(ops, @bitCast(args.a1), args.a2, args.a3, args.a4, args.a5),
         SYS_eventfd2 => return sysEventfd2(ops, fds, args.a1, args.a2),
         SYS_signalfd4 => return sysSignalfd4(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_timerfd_create => return sysTimerfdCreate(ops, fds, args.a1, args.a2),
@@ -3145,6 +3734,8 @@ test "linux: sys_mmap — файловый путь к fb0/card0; event-fd → -
     // event-fd (не мапится) → -ENODEV
     const path3 = putStr(e, 0x80, "/dev/input/event0");
     _ = sysOpenat(ops, &fds, AT_FDCWD, path3, 0, 0);
+    // event-fd (не мапится) → -ENODEV (контракт БЕЗ изменений — p13-COW
+    // касается только initrd/tmpfs файлов!)
     try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_SHARED, 5, 0));
 
     // файловый маппинг без fd → -EBADF
@@ -3776,7 +4367,10 @@ test "linux: mmap file-backed (MAP_PRIVATE) — initrd-файл; MAP_SHARED (non
 
     // MAP_SHARED на RO-файле → ENOSYS (осознанно: только приватные копии)
     // CDD №12 p3: initrd не разделяем — ENODEV (было ENOSYS до memfd-волны)
-    try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_SHARED, 3, 0));
+    // p13-контракт: initrd + MAP_SHARED (индекс mesa-кэша) → COW-фолбэк
+    const r_sh2 = sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_SHARED, 3, 0);
+    try testing.expect(r_sh2 != err(ENODEV));
+    try testing.expect(r_sh2 > 0);
     // event-fd по-прежнему ENODEV
     try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 4096, PROT_READ, MAP_PRIVATE, 0, 0));
 
@@ -3804,7 +4398,7 @@ test "linux: mmap file-backed (MAP_PRIVATE) — initrd-файл; MAP_SHARED (non
 
     // dispatch-маршрут: mmap(9) с fd → file_mmap (итог: приватный+fixed+hint+dispatch)
     _ = dispatch(ops, &fds, SYS_mmap, .{ .a1 = 0, .a2 = 8192, .a3 = PROT_READ, .a4 = MAP_PRIVATE, .a5 = 3, .a6 = 0x1000 });
-    try testing.expectEqual(@as(u64, 4), e.file_mmap_calls);
+    try testing.expectEqual(@as(u64, 5), e.file_mmap_calls); // p13: +1 COW-фолбэк SHARED
     try testing.expectEqual(@as(u64, 0x1000), e.last_file_mmap_off);
     try testing.expectEqual(@as(u64, 8192), e.last_file_mmap_len);
 
@@ -4188,7 +4782,10 @@ test "linux: ftruncate + MAP_SHARED — контракт Mesa lavapipe (memfd-х
     const hfd = sysOpenat(ops, &fds, AT_FDCWD, p_host, 0, 0);
     try testing.expect(hfd >= 0);
     try testing.expectEqual(err(EINVAL), sysFtruncate(ops, &fds, @intCast(hfd), 8));
-    try testing.expectEqual(err(ENODEV), sysMmap(ops, &fds, 0, 8, PROT_READ, MAP_SHARED, @intCast(hfd), 0));
+    // p13-контракт: heap + MAP_SHARED → COW-фолбэк
+    const r_sh3 = sysMmap(ops, &fds, 0, 8, PROT_READ, MAP_SHARED, @intCast(hfd), 0);
+    try testing.expect(r_sh3 != err(ENODEV));
+    try testing.expect(r_sh3 > 0);
     try testing.expectEqual(err(EBADF), sysFtruncate(ops, &fds, 42, 8));
     try testing.expectEqual(err(EFBIG), sysFtruncate(ops, &fds, 3, 1 << 20));
 

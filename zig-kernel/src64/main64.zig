@@ -2040,10 +2040,56 @@ fn linuxCopyIn(dst: []u8, src_va: u64) bool {
 }
 
 /// ioctl-мост: DRM/fb0 → drm_kms (UAPI-номера), evdev → evdev.ioctlEvdev.
+/// CDD №12 p13: drmPrimeFDToHandle(fd) → GEM-handle. lvp экспортирует
+/// память как memfd (linux_files[file_id].phys — PMM-блок, user-маппинг
+/// MAP_SHARED делит страницы) — скан-аут заберёт ЖИВОЙ рендер композитора.
+fn linuxPrimeFdToHandle(arg: u64) i64 {
+    var ph: [12]u8 = undefined;
+    if (!linux_user_io.copy_in(&ph, arg)) return -linux_syscalls.EFAULT;
+    const fd: i32 = @bitCast(std.mem.readInt(u32, ph[8..12], .little));
+    const proc = linuxProcCurrent() orelse return -linux_syscalls.EFAULT;
+    // p13-диагностика: какой fd передан и его kind
+    hal.Serial.puts("[DRM] PRIME FD_TO_HANDLE: fd=");
+    hal.Serial.putDecimal(@bitCast(@as(i64, fd)));
+    const e0 = proc.fds.get(fd);
+    hal.Serial.puts(" kind=");
+    if (e0) |x| {
+        hal.Serial.puts(@tagName(x.kind));
+        hal.Serial.puts(" file_id=");
+        hal.Serial.putDecimal(x.file_id);
+    } else {
+        hal.Serial.puts("NOENT");
+    }
+    hal.Serial.puts("\n");
+    const e = proc.fds.get(fd) orelse return -linux_syscalls.EBADF;
+    if (e.kind != .tmpfs_file) return -linux_syscalls.EINVAL;
+    const file_id = e.file_id;
+    if (file_id >= linux_files.len or !linux_files[file_id].used)
+        return -linux_syscalls.EINVAL;
+    const f = &linux_files[file_id];
+    if (!f.anon or f.phys == 0 or f.size == 0) return -linux_syscalls.EINVAL;
+    const h = drm_kms.primeImportSlot(&drm_state, file_id, f.phys, f.size);
+    if (h < 0) return h;
+    std.mem.writeInt(u32, ph[0..4], @intCast(h), .little);
+    if (!linux_user_io.copy_out(arg, &ph)) return -linux_syscalls.EFAULT;
+    hal.Serial.puts("[DRM] PRIME import: memfd(file=");
+    hal.Serial.putDecimal(file_id);
+    hal.Serial.puts(") -> GEM handle ");
+    hal.Serial.putDecimal(@intCast(h));
+    hal.Serial.puts("\n");
+    return 0;
+}
+
 fn linuxDevIoctl(kind: linux_syscalls.FdKind, cmd: u32, arg: u64) i64 {
     switch (kind) {
         .fb0 => return drm_kms.fbIoctl(&drm_state, kernelDrmUserOps(), cmd, arg),
-        .dri_card0 => return drm_kms.drmIoctl(&drm_state, kernelDrmUserOps(), cmd, arg),
+        .dri_card0 => {
+            // CDD №12 p13: PRIME FD_TO_HANDLE — lvp-память (memfd с PMM-
+            // блоком) становится GEM-буфером (скан-аут без копий!)
+            if (cmd == drm_kms.DRM_IOCTL_PRIME_FD_TO_HANDLE)
+                return linuxPrimeFdToHandle(arg);
+            return drm_kms.drmIoctl(&drm_state, kernelDrmUserOps(), cmd, arg);
+        },
         .input_event0, .input_event1 => {
             // размер из IOC-бита cmd (≤ 1КБ); копируем в ядро-буфер,
             // зовём evdev-обработчик, копируем назад
@@ -5608,6 +5654,7 @@ fn fdKindName(k: linux_syscalls.FdKind) void {
         .pipe_write => sys_print("pipe_w"),
         .eventfd => sys_print("eventfd"),
         .socket => sys_print("socket"),
+        .seatd => sys_print("seatd"),
         .timerfd => sys_print("timerfd"),
         .signalfd => sys_print("signalfd"),
         .dir => sys_print("dir"),
@@ -6024,6 +6071,10 @@ fn cmd_elfload(args: []const u8) void {
         // XDG_CACHE_HOME -> $HOME/.cache) -> кеш живёт в /tmp (RAM).
         "XDG_CACHE_HOME=/tmp",
         "MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache",
+        // CDD №12 p13: glibc-харденинг против heap-race CachyOS-стека
+        // (lvp+LLVM 22.1.8: шейдер-тред + main-тред; host-репро: с
+        // PERTURB коррупция «corrupted size vs. prev_size» ИСЧЕЗАЕТ).
+        "MALLOC_PERTURB_=170",
         // CDD #12 p3: Vulkan-лоадер ищет ICD опендирем (getdents64 — бэклог);
         // VK_ICD_FILENAMES — штатный механизм лоадера (спека Khronos):
         // указываем lavapipe-манифест напрямую.

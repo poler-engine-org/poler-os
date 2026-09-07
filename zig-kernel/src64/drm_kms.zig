@@ -145,20 +145,20 @@ pub const GetEncoder = extern struct {
 pub const GetConnector = extern struct {
     encoders_ptr: u64 = 0,
     modes_ptr: u64 = 0,
-    count_encoders: u32 = 0,
-    count_modes: u32 = 0,
-    count_props: u32 = 0,
-    pad: u32 = 0,
     props_ptr: u64 = 0,
     prop_values_ptr: u64 = 0,
+    count_modes: u32 = 0,
+    count_props: u32 = 0,
+    count_encoders: u32 = 0,
     encoder_id: u32 = 0,
     connector_id: u32 = 0,
     connector_type: u32 = 0,
     connector_type_id: u32 = 0,
+    connection: u32 = 0,
     mm_width: u32 = 0,
     mm_height: u32 = 0,
     subpixel: u32 = 0,
-    pad2: u32 = 0,
+    pad: u32 = 0,
 };
 
 /// struct drm_mode_fb_cmd (28Б) — ADDFB/GETFB (legacy, без модификаторов)
@@ -290,10 +290,75 @@ pub const DRM_IOCTL_MODE_ADDFB2: u32 = iowr(FbCmd2, DRM_IOCTL_BASE, 0xB8);
 pub const DRM_IOCTL_MODE_RMFB: u32 = iowr(DrmU32, DRM_IOCTL_BASE, 0xAF);
 /// SET_VERSION (0xC0106407 — IOWR, 16Б): libdrm drmGetBusid/drmSetVersion
 pub const DRM_IOCTL_SET_VERSION: u32 = iowr(DrmSetVersion, DRM_IOCTL_BASE, 0x07);
+/// OBJ_GETPROPERTIES (0xC02064B9 — IOWR, 32Б): gamescope шуршит свойствами/// GETPLANE_RES (0xC01064B5 — IOWR, 16Б)
+pub const PlaneRes = extern struct {
+    plane_id_ptr: u64 = 0,
+    count_planes: u32 = 0,
+    _pad: u32 = 0,
+};
+/// GETPLANE (0xC02064B6 — IOWR, 32Б)
+pub const GetPlane = extern struct {
+    plane_id: u32 = 0,
+    crtc_id: u32 = 0,
+    fb_id: u32 = 0,
+    possible_crtcs: u32 = 0,
+    gamma_size: u32 = 0,
+    count_format_types: u32 = 0,
+    format_type_ptr: u64 = 0, // @24 — 8-выравнено, пада НЕТ (sizeof 32!)
+};
+/// GETPROPERTY (0xC04064AA — IOWR, 64Б): метаданные пропа (имя! либлifтофф
+/// резолвит пропы ПО ИМЕНИ)
+pub const GetProperty = extern struct {
+    values_ptr: u64 = 0,
+    enum_blob_ptr: u64 = 0,
+    prop_id: u32 = 0,
+    flags: u32 = 0,
+    name: [32]u8 = [_]u8{0} ** 32,
+    count_values: u32 = 0,
+    count_enum_blobs: u32 = 0,
+};
+/// ATOMIC (0xC03864BC — IOWR, 56Б)
+pub const ModeAtomic = extern struct {
+    flags: u32 = 0,
+    count_objs: u32 = 0,
+    objs_ptr: u64 = 0,
+    count_props_ptr: u64 = 0,
+    props_ptr: u64 = 0,
+    prop_values_ptr: u64 = 0,
+    reserved: u64 = 0,
+    user_data: u64 = 0,
+};
+/// CREATEPROPBLOB (0x401064BD — IOW, 16Б)
+pub const CreatePropBlob = extern struct {
+    data: u64 = 0,
+    length: u32 = 0,
+    blob_id: u32 = 0,
+};
+/// DESTROYPROPBLOB (0x400464BE — IOW, 8Б)
+pub const DestroyPropBlob = extern struct {
+    blob_id: u32 = 0, // sizeof 4 (без пада!)
+};
+/// drm_mode_property_enum (40Б): {u64 value; char name[32]}
+pub const PropertyEnum = extern struct {
+    value: u64 = 0,
+    name: [32]u8 = [_]u8{0} ** 32,
+};
+
 /// OBJ_GETPROPERTIES (0xC02064B9 — IOWR, 32Б): gamescope шуршит свойствами
 /// коннектора (DPMS/vrr) — отдаём ПУСТОЙ список (count=0)
 pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = iowr(ObjGetProps, DRM_IOCTL_BASE, 0xB9);
-/// GETPROPBLOB (0xC01064AC — IOWR, 16Б): blob по id — ENOENT (свойств нет)
+/// GETPROPBLOB (0xC01064AC — IOWR, 16Б): blob по id — ENOENT (свойств нет)/// GETPROPBLOB (0xC01064AC — IOWR, 16Б): blob по id — ENOENT (свойств нет)
+/// CDD №12 p13: атомарная волна (libliftoff/gamescope atomic-only)
+pub const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = iowr(PlaneRes, DRM_IOCTL_BASE, 0xB5);
+pub const DRM_IOCTL_MODE_GETPLANE: u32 = iowr(GetPlane, DRM_IOCTL_BASE, 0xB6);
+pub const DRM_IOCTL_MODE_GETPROPERTY: u32 = iowr(GetProperty, DRM_IOCTL_BASE, 0xAA);
+pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = iow(CreatePropBlob, DRM_IOCTL_BASE, 0xBD);
+pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = iow(DestroyPropBlob, DRM_IOCTL_BASE, 0xBE);
+pub const DRM_IOCTL_MODE_ATOMIC: u32 = iowr(ModeAtomic, DRM_IOCTL_BASE, 0xBC);
+/// CDD №12 p13: GEM_CLOSE (IOW 0x09, 4Б) + PRIME (IOWR 0x2D/0x2E, 12Б)
+pub const DRM_IOCTL_GEM_CLOSE: u32 = 0x4004_6409;
+pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C_642E;
+pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C_642D;
 pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = iowr(GetPropBlob, DRM_IOCTL_BASE, 0xAC);
 
 // ─── CDD №12 p3: DRM-события (vblank/flip-complete через read(card0)) ─────
@@ -474,6 +539,9 @@ pub const DumbBuf = struct {
     used: bool = false,
     handle: u32 = 0,
     phys: u64 = 0, // физ. база backing-страниц
+    /// CDD №12 p13: PRIME-импорт (lvp memfd): phys/size от файла, метрики
+    /// заполняются на ADDFB2 (запросу доверяем — источник: сам композитор)
+    prime_file: u32 = 0,
     size: u64 = 0,
     pages: u64 = 0,
     width: u32 = 0,
@@ -501,6 +569,45 @@ pub const MAX_DRM_EVENTS: usize = 16;
 
 /// Служебные object-id (libdrm ожидает ненулевые уникальные).
 const CRTC_ID: u32 = 33;
+/// CDD №12 p13: PRIMARY-плоскость (atomic-only gamescope 3.16/libliftoff)
+const PLANE_ID: u32 = 36;
+/// DRM_FORMAT_XRGB8888 ('XR24') — единственный формат dumb/плоскости
+const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
+/// DRM_PLANE_TYPE_PRIMARY
+const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+/// Проп-флаги (drm_mode.h): RANGE/IMMUTABLE/ENUM/BLOB/OBJECT/SIGNED/ATOMIC
+const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
+const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
+const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
+const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+const DRM_MODE_PROP_SIGNED_RANGE: u32 = 1 << 7;
+const DRM_MODE_PROP_ATOMIC: u32 = 0x80000000;
+/// Флаги атомарного коммита
+const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
+const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
+const DRM_MODE_PAGE_FLIP_ASYNC_KNOWN: u32 = 0x02;
+
+/// Фиксированный реестр prop-id (полу-ABI poler-drm; 0x1000+ — вне
+/// пространства объектных id 1..99):
+const PROP_CRTC_ACTIVE: u32 = 0x1001;
+const PROP_CRTC_MODE_ID: u32 = 0x1002;
+const PROP_PLANE_TYPE: u32 = 0x1010;
+const PROP_PLANE_FB_ID: u32 = 0x1011;
+const PROP_PLANE_CRTC_ID: u32 = 0x1012;
+const PROP_PLANE_SRC_X: u32 = 0x1013;
+const PROP_PLANE_SRC_Y: u32 = 0x1014;
+const PROP_PLANE_SRC_W: u32 = 0x1015;
+const PROP_PLANE_SRC_H: u32 = 0x1016;
+const PROP_PLANE_CRTC_X: u32 = 0x1017;
+const PROP_PLANE_CRTC_Y: u32 = 0x1018;
+const PROP_PLANE_CRTC_W: u32 = 0x1019;
+const PROP_PLANE_CRTC_H: u32 = 0x101A;
+const PROP_PLANE_IN_FENCE_FD: u32 = 0x101B;
+const PROP_CONN_CRTC_ID: u32 = 0x1031;
+const PROP_CONN_DPMS: u32 = 0x1032;
+
 const ENCODER_ID: u32 = 34;
 const CONNECTOR_ID: u32 = 35;
 
@@ -529,7 +636,26 @@ pub const DrmState = struct {
     events: [MAX_DRM_EVENTS]DrmEventVblank = [_]DrmEventVblank{.{}} ** MAX_DRM_EVENTS,
     ev_head: u32 = 0, // индекс чтения
     ev_tail: u32 = 0, // индекс записи (head==tail → пусто)
+    // CDD №12 p13: blob-реестр (MODE_ID атомарных коммитов; mod-blob ≤ 128Б)
+    blobs: [8]PropBlob = [_]PropBlob{.{}} ** 8,
+    next_blob_id: u32 = 0x2001,
 };
+
+/// Blob атомарных пропов (MODE_ID): копия данных user (обычно Modeinfo)
+pub const PropBlob = struct {
+    used: bool = false,
+    id: u32 = 0,
+    len: u32 = 0,
+    data: [128]u8 = [_]u8{0} ** 128,
+};
+
+fn findBlob(st: *DrmState, blob_id: u32) ?*PropBlob {
+    if (blob_id == 0) return null;
+    for (&st.blobs) |*b| {
+        if (b.used and b.id == blob_id) return b;
+    }
+    return null;
+}
 
 /// Активировать DRM в режиме линейного фреймбуфера (скан-аут задан
 /// бут-лоадером: VBE через GRUB-multiboot2 или консольный linear fb).
@@ -628,6 +754,15 @@ pub fn drmIoctl(st: *DrmState, ops: DrmOps, cmd: u32, arg: u64) i64 {
         DRM_IOCTL_MODE_ADDFB2 => return ioAddFb2(st, ops, arg),
         DRM_IOCTL_MODE_RMFB => return ioRmFb(st, ops, arg),
         DRM_IOCTL_MODE_PAGE_FLIP => return ioPageFlip(st, ops, arg),
+        // CDD №12 p13: атомарная волна
+        DRM_IOCTL_MODE_GETPLANERESOURCES => return ioGetPlaneRes(st, ops, arg),
+        DRM_IOCTL_MODE_GETPLANE => return ioGetPlane(st, ops, arg),
+        DRM_IOCTL_MODE_GETPROPERTY => return ioGetProperty(ops, arg),
+        DRM_IOCTL_MODE_CREATEPROPBLOB => return ioCreatePropBlob(st, ops, arg),
+        DRM_IOCTL_MODE_DESTROYPROPBLOB => return ioDestroyPropBlob(st, ops, arg),
+        DRM_IOCTL_MODE_ATOMIC => return ioModeAtomic(st, ops, arg),
+        // CDD №12 p13: GEM_CLOSE — освободить слот буфера (PRIME/dumb)
+        DRM_IOCTL_GEM_CLOSE => return ioGemClose(st, ops, arg),
         DRM_IOCTL_MODE_CREATE_DUMB => return ioCreateDumb(st, ops, arg),
         DRM_IOCTL_MODE_MAP_DUMB => return ioMapDumb(st, ops, arg),
         DRM_IOCTL_MODE_DESTROY_DUMB => return ioDestroyDumb(st, ops, arg),
@@ -685,12 +820,10 @@ fn ioGetCap(ops: DrmOps, arg: u64) i64 {
 fn ioSetClientCap(ops: DrmOps, arg: u64) i64 {
     var c: DrmSetClientCap = undefined;
     if (!ops.copy_in(std.mem.asBytes(&c), arg)) return -linux.EFAULT;
-    // CDD №12 p3: ATOMIC (5) и UNIVERSAL_PLANES (3) — отклоняем: атомарного
-    // режима и плоскостей НЕТ; gamescope останавливается на legacy-пути
-    // (CRTC/connector/ADDFB2/PAGE_FLIP) — это и есть наш контракт.
+    // CDD №12 p13: ATOMIC (5) и UNIVERSAL_PLANES (3) — ПРИНИМАЕМ:
+    // gamescope 3.16 atomic-only (drmSetClientCap(ATOMIC) != 0 → фатал);
+    // атомарный UAPI транслируется в legacy-скан-аут (MODE_ATOMIC ниже).
     // Остальные капсы (стерео-3D и пр.) — «принято, не активно».
-    if (c.capability == DRM_CLIENT_CAP_UNIVERSAL_PLANES or
-        c.capability == DRM_CLIENT_CAP_ATOMIC) return -linux.EINVAL;
     return 0;
 }
 
@@ -801,6 +934,8 @@ fn ioGetConnector(st: *DrmState, ops: DrmOps, arg: u64) i64 {
 
     c.connector_id = CONNECTOR_ID;
     c.encoder_id = if (has_mode) ENCODER_ID else 0;
+    // CDD №12 p13: connection=CONNECTED — libdrm/gamescope проверяют статус
+    c.connection = 1; // DRM_MODE_CONNECTED
     c.connector_type = DRM_MODE_CONNECTOR_VIRTUAL;
     c.connector_type_id = 1;
     c.mm_width = st.width_mm;
@@ -950,7 +1085,15 @@ fn ioAddFb2(st: *DrmState, ops: DrmOps, arg: u64) i64 {
     }
     if (f.offsets[0] != 0) return -linux.EINVAL; // смещённые плоскости — бэклог
     const b = findDumb(st, f.handles[0]) orelse return -linux.EINVAL; // GEM-handle нет
-    if (f.width != b.width or f.height != b.height or f.pitches[0] != b.pitch)
+    if (b.prime_file != 0) {
+        // p13: PRIME-буфер — метрики ИЗ ЗАПРОСА (композитор), phys уже стоит
+        b.width = f.width;
+        b.height = f.height;
+        b.pitch = f.pitches[0];
+        b.bpp = 32;
+        const need: u64 = @as(u64, b.pitch) * @as(u64, b.height);
+        if (need > b.size) return -linux.EINVAL; // буфер мал — отказ
+    } else if (f.width != b.width or f.height != b.height or f.pitches[0] != b.pitch)
         return -linux.EINVAL; // рассинхрон метрик с буфером
 
     var slot: ?*FbReg = null;
@@ -1002,29 +1145,340 @@ fn ioSetVersion(ops: DrmOps, arg: u64) i64 {
     return 0;
 }
 
-/// OBJ_GETPROPERTIES: свойства объекта (connector: DPMS/vrr_capable…).
-/// КОНТРАКТ: список ПУСТ (count=0) — gamescope шуршит свойствами для
-/// признаков (VRR/nondesktop), нулевой список = «нет признаков».
+/// Одна запись текущего значения пропа (для ioObjGetProps/atomic)
+const PropVal = struct { id: u32, value: u64 };
+
+fn crtcActive(st: *DrmState) u64 {
+    return if (st.mode != .inactive and st.geom.width > 0) 1 else 0;
+}
+
+fn planeProps(st: *DrmState) [12]PropVal {
+    const active = crtcActive(st);
+    const w: u64 = @intCast(@min(st.geom.width, 16383));
+    const h: u64 = @intCast(@min(st.geom.height, 16383));
+    return .{
+        .{ .id = PROP_PLANE_TYPE, .value = DRM_PLANE_TYPE_PRIMARY },
+        .{ .id = PROP_PLANE_FB_ID, .value = st.crtc_fb_id },
+        .{ .id = PROP_PLANE_CRTC_ID, .value = if (active != 0) CRTC_ID else 0 },
+        .{ .id = PROP_PLANE_SRC_X, .value = 0 },
+        .{ .id = PROP_PLANE_SRC_Y, .value = 0 },
+        .{ .id = PROP_PLANE_SRC_W, .value = w << 16 },
+        .{ .id = PROP_PLANE_SRC_H, .value = h << 16 },
+        .{ .id = PROP_PLANE_CRTC_X, .value = 0 },
+        .{ .id = PROP_PLANE_CRTC_Y, .value = 0 },
+        .{ .id = PROP_PLANE_CRTC_W, .value = w },
+        .{ .id = PROP_PLANE_CRTC_H, .value = h },
+        .{ .id = PROP_PLANE_IN_FENCE_FD, .value = 0xFFFFFFFFFFFFFF01 }, // -1
+    };
+}
+
+fn crtcProps(st: *DrmState) [2]PropVal {
+    return .{
+        .{ .id = PROP_CRTC_ACTIVE, .value = crtcActive(st) },
+        .{ .id = PROP_CRTC_MODE_ID, .value = 0 },
+    };
+}
+
+fn connProps(st: *DrmState) [2]PropVal {
+    return .{
+        .{ .id = PROP_CONN_CRTC_ID, .value = if (crtcActive(st) != 0) CRTC_ID else 0 },
+        .{ .id = PROP_CONN_DPMS, .value = 0 },
+    };
+}
+
 fn ioObjGetProps(st: *DrmState, ops: DrmOps, arg: u64) i64 {
-    _ = st;
     var p: ObjGetProps = undefined;
     if (!ops.copy_in(std.mem.asBytes(&p), arg)) return -linux.EFAULT;
-    // obj_id должен быть валиден (connector/crtc/encoder); неизвестный →
-    // ENOENT — libdrm передаёт errno, gamescope обрабатывает NULL
-    if (p.obj_id != CRTC_ID and p.obj_id != ENCODER_ID and p.obj_id != CONNECTOR_ID)
-        return -linux.ENOENT;
-    p.count_props = 0; // пустой список (массивы не трогаем)
+    // CDD №12 p13: атомарные пропы с ТЕКУЩИМИ значениями (либлифтофф
+    // резолвит по именам через GETPROPERTY; gamescope читает значения)
+    var vals: []const PropVal = &[_]PropVal{};
+    if (p.obj_id == CRTC_ID) {
+        vals = &crtcProps(st);
+    } else if (p.obj_id == PLANE_ID) {
+        vals = &planeProps(st);
+    } else if (p.obj_id == CONNECTOR_ID) {
+        vals = &connProps(st);
+    } else {
+        return -linux.ENOENT; // энкодер/неизвестный — libdrm передаст errno
+    }
+    // Linux-семантика: счётчик — фактический; массивы — если вмещает
+    if (p.props_ptr != 0 and p.prop_values_ptr != 0 and p.count_props >= vals.len) {
+        var idbuf: [12]u32 = undefined;
+        for (vals, 0..) |v, i| idbuf[i] = v.id;
+        if (!ops.copy_out(p.props_ptr, std.mem.sliceAsBytes(idbuf[0..vals.len])))
+            return -linux.EFAULT;
+        var valbuf: [12]u64 = undefined;
+        for (vals, 0..) |v, i| valbuf[i] = v.value;
+        if (!ops.copy_out(p.prop_values_ptr, std.mem.sliceAsBytes(valbuf[0..vals.len])))
+            return -linux.EFAULT;
+    }
+    p.count_props = @intCast(vals.len);
     if (!ops.copy_out(arg, std.mem.asBytes(&p))) return -linux.EFAULT;
     return 0;
 }
 
-/// GETPROPBLOB: blob-свойств нет → ENOENT (вызывается только если список
-/// свойств непуст — у нас пуст, defensively честный отказ).
-fn ioGetPropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+/// GETPLANERESOURCES: одна PRIMARY-плоскость.
+fn ioGetPlaneRes(st: *DrmState, ops: DrmOps, arg: u64) i64 {
     _ = st;
-    _ = ops;
-    _ = arg;
-    return -linux.ENOENT;
+    var r: PlaneRes = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&r), arg)) return -linux.EFAULT;
+    if (r.plane_id_ptr != 0 and r.count_planes >= 1) {
+        if (!writeU32(ops, r.plane_id_ptr, PLANE_ID)) return -linux.EFAULT;
+    }
+    r.count_planes = 1;
+    if (!ops.copy_out(arg, std.mem.asBytes(&r))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPLANE: PRIMARY, форматы [XRGB8888].
+fn ioGetPlane(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var p: GetPlane = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&p), arg)) return -linux.EFAULT;
+    if (p.plane_id != 0 and p.plane_id != PLANE_ID) return -linux.ENOENT;
+    if (p.format_type_ptr != 0 and p.count_format_types >= 1) {
+        if (!writeU32(ops, p.format_type_ptr, DRM_FORMAT_XRGB8888)) return -linux.EFAULT;
+    }
+    p.plane_id = PLANE_ID;
+    p.crtc_id = if (crtcActive(st) != 0) CRTC_ID else 0;
+    p.fb_id = st.crtc_fb_id;
+    p.possible_crtcs = 1; // бит 0 = CRTC-0
+    p.gamma_size = 0;
+    p.count_format_types = 1;
+    if (!ops.copy_out(arg, std.mem.asBytes(&p))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPROPERTY: метаданные пропа по id — ИМЯ (либлифтофф резолвит по имени).
+fn ioGetProperty(ops: DrmOps, arg: u64) i64 {
+    var g: GetProperty = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&g), arg)) return -linux.EFAULT;
+    const name: []const u8 = switch (g.prop_id) {
+        PROP_CRTC_ACTIVE => "ACTIVE",
+        PROP_CRTC_MODE_ID => "MODE_ID",
+        PROP_PLANE_TYPE => "type",
+        PROP_PLANE_FB_ID => "FB_ID",
+        PROP_PLANE_CRTC_ID => "CRTC_ID",
+        PROP_PLANE_SRC_X => "SRC_X",
+        PROP_PLANE_SRC_Y => "SRC_Y",
+        PROP_PLANE_SRC_W => "SRC_W",
+        PROP_PLANE_SRC_H => "SRC_H",
+        PROP_PLANE_CRTC_X => "CRTC_X",
+        PROP_PLANE_CRTC_Y => "CRTC_Y",
+        PROP_PLANE_CRTC_W => "CRTC_W",
+        PROP_PLANE_CRTC_H => "CRTC_H",
+        PROP_PLANE_IN_FENCE_FD => "IN_FENCE_FD",
+        PROP_CONN_CRTC_ID => "CRTC_ID",
+        PROP_CONN_DPMS => "DPMS",
+        else => return -linux.ENOENT,
+    };
+    const prop_obj: bool = (g.prop_id == PROP_PLANE_FB_ID or
+        g.prop_id == PROP_PLANE_CRTC_ID or g.prop_id == PROP_CONN_CRTC_ID);
+    var flags: u32 = 0;
+    var nvals: u32 = 0;
+    var enum3 = false;
+    if (g.prop_id == PROP_CRTC_MODE_ID) {
+        flags = DRM_MODE_PROP_BLOB; // blob (MODE_ID) — не ATOMIC-флаг (legacy BLOB)
+    } else if (g.prop_id == PROP_PLANE_TYPE) {
+        flags = DRM_MODE_PROP_IMMUTABLE | DRM_MODE_PROP_ENUM;
+        enum3 = true;
+    } else if (g.prop_id == PROP_CONN_DPMS) {
+        flags = DRM_MODE_PROP_ENUM;
+        enum3 = true;
+    } else if (g.prop_id == PROP_PLANE_IN_FENCE_FD) {
+        flags = DRM_MODE_PROP_SIGNED_RANGE;
+        nvals = 2;
+    } else if (prop_obj) {
+        flags = DRM_MODE_PROP_OBJECT; // FB_ID/CRTC_ID — указатели на объекты
+    } else {
+        flags = DRM_MODE_PROP_RANGE;
+        nvals = 2;
+    }
+    flags |= DRM_MODE_PROP_ATOMIC; // все наши пропы — атомарные
+    @memcpy(g.name[0..name.len], name);
+    if (nvals == 2 and g.values_ptr != 0 and g.count_values >= 2) {
+        var vals = [2]u64{ 0, 0xFFFFFFFFFFFFFFFF };
+        if (g.prop_id == PROP_PLANE_IN_FENCE_FD) vals = .{ 0xFFFFFFFFFFFFFF01, 0x7FFFFFFFFFFFFFFF };
+        if (!ops.copy_out(g.values_ptr, std.mem.sliceAsBytes(&vals))) return -linux.EFAULT;
+    }
+    if (enum3 and g.enum_blob_ptr != 0 and g.count_enum_blobs >= 3) {
+        // DRM_PLANE_TYPE / DPMS-энумы (имена ≤31Б)
+        var enums: [3]PropertyEnum = [_]PropertyEnum{.{}} ** 3;
+        setEnumName(&enums[0], "Overlay");
+        setEnumName(&enums[1], "Primary");
+        setEnumName(&enums[2], "Cursor");
+        if (g.prop_id == PROP_CONN_DPMS) {
+            setEnumName(&enums[0], "On");
+            setEnumName(&enums[1], "Standby");
+            setEnumName(&enums[2], "Off");
+        }
+        enums[0].value = 0;
+        enums[1].value = 1;
+        enums[2].value = 2;
+        if (!ops.copy_out(g.enum_blob_ptr, std.mem.sliceAsBytes(&enums))) return -linux.EFAULT;
+    }
+    g.flags = flags;
+    g.count_values = nvals;
+    g.count_enum_blobs = if (enum3) 3 else 0;
+    if (!ops.copy_out(arg, std.mem.asBytes(&g))) return -linux.EFAULT;
+    return 0;
+}
+
+fn setEnumName(e: *PropertyEnum, name: []const u8) void {
+    @memcpy(e.name[0..name.len], name);
+}
+
+/// CREATEPROPBLOB: копия ≤128Б (gamescope: blob мод-инфо для MODE_ID).
+fn ioCreatePropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var b: CreatePropBlob = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&b), arg)) return -linux.EFAULT;
+    if (b.length == 0 or b.length > 128) return -linux.EINVAL;
+    var slot: ?*PropBlob = null;
+    for (&st.blobs) |*x| {
+        if (!x.used) {
+            slot = x;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+    if (!ops.validate(b.data, b.length, false)) return -linux.EFAULT;
+    slot.?.used = true;
+    slot.?.len = b.length;
+    slot.?.id = st.next_blob_id;
+    st.next_blob_id +%= 1;
+    // копия данных блоба (через 2 шага: копи-ин-максимум — в temp нельзя:
+    // данные уже в user — читаем порциями в поле слота)
+    if (!ops.copy_in(slot.?.data[0..b.length], b.data)) return -linux.EFAULT;
+    b.blob_id = slot.?.id;
+    if (!ops.copy_out(arg, std.mem.asBytes(&b))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPROPBLOB: blob по id (modeinfo для MODE_ID-коммитов).
+fn ioGetPropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var b: GetPropBlob = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&b), arg)) return -linux.EFAULT;
+    const blob = findBlob(st, b.blob_id) orelse return -linux.ENOENT;
+    // Linux-семантика: length — фактический; данные — если вмещает
+    if (b.data != 0 and b.length >= blob.len) {
+        if (!ops.copy_out(b.data, blob.data[0..blob.len])) return -linux.EFAULT;
+    }
+    b.length = blob.len;
+    if (!ops.copy_out(arg, std.mem.asBytes(&b))) return -linux.EFAULT;
+    return 0;
+}
+
+/// DESTROYPROPBLOB: освободить слот.
+fn ioDestroyPropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var b: DestroyPropBlob = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&b), arg)) return -linux.EFAULT;
+    const blob = findBlob(st, b.blob_id) orelse return -linux.ENOENT;
+    blob.* = .{};
+    return 0;
+}
+
+/// GEM_CLOSE (0x40046409, 4Б): слот dumb/prime-буфера освобождается.
+fn ioGemClose(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var g: [4]u8 = undefined;
+    if (!ops.copy_in(&g, arg)) return -linux.EFAULT;
+    const handle: u32 = std.mem.readInt(u32, g[0..4], .little);
+    if (findDumb(st, handle) == null) return -linux.EINVAL;
+    for (&st.dumb) |*b| {
+        if (b.used and b.handle == handle) b.* = .{};
+    }
+    return 0;
+}
+
+/// CDD №12 p13: PRIME FD_TO_HANDLE — слот создаётся main64 (fd→memfd→phys);
+/// здесь только регистрация. Возвращает GEM-handle или -errno.
+pub fn primeImportSlot(st: *DrmState, file_id: u32, phys: u64, size: u64) i64 {
+    var slot: ?*DumbBuf = null;
+    for (&st.dumb) |*b| {
+        if (!b.used) {
+            slot = b;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+    slot.?.used = true;
+    slot.?.handle = st.next_handle;
+    st.next_handle +%= 1;
+    slot.?.prime_file = file_id;
+    slot.?.phys = phys; // memfd PMM-блок: user-VA маппинг делит страницы!
+    slot.?.size = size;
+    slot.?.pages = (size + 4095) / 4096;
+    return @intCast(slot.?.handle);
+}
+
+/// MODE_ATOMIC (CDD №12 p13): ТРАНСЛЯТОР атомарного коммита в наш
+/// SETCRTC/PAGE_FLIP-механизм. Объекты: PRIMARY-плоскость {FB_ID, CRTC_ID,
+/// SRC_*, CRTC_*}, CRTC {ACTIVE, MODE_ID}, коннектор {CRTC_ID}. Применение:
+/// плоскость с CRTC_ID=нашему + FB_ID → crtc_fb_id + СКАН-АУТ (vring).
+fn ioModeAtomic(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var a: ModeAtomic = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&a), arg)) return -linux.EFAULT;
+    if (a.count_objs == 0 or a.count_objs > 4) return -linux.EINVAL;
+    if ((a.flags & ~(DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_ASYNC_KNOWN |
+        DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_NONBLOCK |
+        DRM_MODE_ATOMIC_ALLOW_MODESET)) != 0) return -linux.EINVAL;
+    // копим массивы запроса (объекты ≤4, пропов на объект ≤12 → ≤48 пар)
+    var objs: [4]u32 = undefined;
+    var counts: [4]u32 = undefined;
+    var props: [48]u32 = undefined;
+    var values: [48]u64 = undefined;
+    if (!ops.copy_in(std.mem.sliceAsBytes(objs[0..a.count_objs]), a.objs_ptr))
+        return -linux.EFAULT;
+    if (!ops.copy_in(std.mem.sliceAsBytes(counts[0..a.count_objs]), a.count_props_ptr))
+        return -linux.EFAULT;
+    var total: usize = 0;
+    for (counts[0..a.count_objs]) |c| total += c;
+    if (total == 0 or total > 48) return -linux.EINVAL;
+    if (!ops.copy_in(std.mem.sliceAsBytes(props[0..total]), a.props_ptr))
+        return -linux.EFAULT;
+    if (!ops.copy_in(std.mem.sliceAsBytes(values[0..total]), a.prop_values_ptr))
+        return -linux.EFAULT;
+
+    // разбор коммита
+    var fb_id: u32 = 0;
+    var plane_crtc: u32 = 0;
+    var have_plane = false;
+    var mode_blob: u32 = 0;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        switch (props[i]) {
+            PROP_PLANE_FB_ID => {
+                fb_id = @truncate(values[i]);
+                have_plane = true;
+            },
+            PROP_PLANE_CRTC_ID => plane_crtc = @truncate(values[i]),
+            PROP_CRTC_MODE_ID => mode_blob = @truncate(values[i]),
+            // ACTIVE/SRC_*/CRTC_*/IN_FENCE/коннектор — принимаем (геометрия
+            // фиксирована топологией; фенс-объектов нет)
+            else => {},
+        }
+    }
+    // TEST_ONLY: валидация без применения
+    if (a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0) {
+        if (have_plane and plane_crtc == CRTC_ID and fb_id != 0) {
+            if (findFb(st, fb_id) == null) return -linux.ENOENT;
+            if (mode_blob != 0 and findBlob(st, mode_blob) == null) return -linux.ENOENT;
+        }
+        return 0;
+    }
+    // применение: плоскость → наш CRTC
+    if (!have_plane or plane_crtc != CRTC_ID) return 0; // чужое/пустое — принято
+    if (fb_id == 0) {
+        st.crtc_fb_id = 0; // disable — как SETCRTC(fb=0)
+        return 0;
+    }
+    if (findFb(st, fb_id) == null) return -linux.ENOENT;
+    if (mode_blob != 0 and findBlob(st, mode_blob) == null) return -linux.ENOENT;
+    st.crtc_fb_id = fb_id;
+    st.flips += 1;
+    // СКАН-АУТ: общий путь с SETCRTC/PAGE_FLIP (vring 2D → первый кадр)
+    _ = scanoutCrtcFb(st, ops);
+    if (a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
+        pushEvent(st, a.user_data, st.flips);
+    return 0;
 }
 
 fn ioCreateDumb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
@@ -1641,14 +2095,15 @@ test "drm: p3 — ADDFB2 (XR24/AR24) + client-cap гейт + flip-события
     try testing.expectEqual(@as(u32, 0xC010_64AC), DRM_IOCTL_MODE_GETPROPBLOB);
     try testing.expectEqual(@as(u32, 104), @sizeOf(FbCmd2)); // с u64 modifier[4]
 
-    // 1. SET_CLIENT_CAP: ATOMIC(5)/UNIVERSAL_PLANES(3) → EINVAL (gamescope
-    //    остаётся на legacy CRTC/ADDFB2/PAGE_FLIP-пути — наш контракт p3)
+    // 1. SET_CLIENT_CAP: p13-контракт — ATOMIC(5)/UNIVERSAL_PLANES(3)
+    //    ПРИНИМАЮТСЯ (gamescope 3.16 atomic-only: отказ = фатал бэкенда);
+    //    атомарный UAPI транслируется в legacy-скан-аут (MODE_ATOMIC).
     var cap: DrmSetClientCap = .{ .capability = 5 };
     @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
-    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
     cap = .{ .capability = 3 };
     @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
-    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
     cap = .{ .capability = 2 }; // стерео — «принято, не активно»
     @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
     try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
@@ -1751,11 +2206,12 @@ test "drm: p3 — ADDFB2 (XR24/AR24) + client-cap гейт + flip-события
     @memcpy(e.vaPtr(va).?[0..4], std.mem.asBytes(&rm));
     try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_RMFB, va));
 
-    // 6. OBJ_GETPROPERTIES: connector → ПУСТОЙ список (count=0); чужой → ENOENT
+    // 6. OBJ_GETPROPERTIES: p13-контракт — connector → 2 пропа
+    //    (CRTC_ID + DPMS; атомарная волна либлифтоффа); чужой → ENOENT
     var op: ObjGetProps = .{ .obj_id = kmsIds()[2] };
     @memcpy(e.vaPtr(va).?[0..@sizeOf(ObjGetProps)], std.mem.asBytes(&op));
     try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, va));
-    try testing.expectEqual(@as(u32, 0),
+    try testing.expectEqual(@as(u32, 2),
         (@as(*const ObjGetProps, @ptrCast(@alignCast(e.vaPtr(va).?)))).count_props);
     op = .{ .obj_id = 999 };
     @memcpy(e.vaPtr(va).?[0..@sizeOf(ObjGetProps)], std.mem.asBytes(&op));
