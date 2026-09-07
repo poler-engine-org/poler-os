@@ -4284,6 +4284,18 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
             hal.Serial.puts(",0x");
             hal.Serial.putHex(a4);
         }
+        // CDD №12 p11: mmap — прот/флаги/fd/оффс (JIT-страницы: anon vs
+        // memfd/кеш — fd решает спор «двойной маппинг vs приват»)
+        if (num == 9) {
+            hal.Serial.puts(",0x");
+            hal.Serial.putHex(a3); // prot
+            hal.Serial.puts(",0x");
+            hal.Serial.putHex(a4); // flags
+            hal.Serial.puts(",fd=");
+            hal.Serial.putHex(scheduler.linux_arg5);
+            hal.Serial.puts(",off=");
+            hal.Serial.putHex(scheduler.linux_arg6);
+        }
         hal.Serial.puts(") = 0x");
         hal.Serial.putHex(r);
         hal.Serial.puts("\n");

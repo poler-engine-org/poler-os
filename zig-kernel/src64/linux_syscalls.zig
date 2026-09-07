@@ -78,6 +78,9 @@ pub const SYS_getdents64: u64 = 217;
 /// РАЗМЕР пула тредов llvmpipe! ENOSYS → мусорная нумерация CPU → падение)
 pub const SYS_sched_getaffinity: u64 = 203;
 pub const SYS_sched_setaffinity: u64 = 204;
+// CDD №12 p11 (host-diff): lvp/LLVM-треды зовут на host и ОЖИДАЮТ 0
+pub const SYS_sched_setscheduler: u64 = 145;
+pub const SYS_setpriority: u64 = 141;
 /// CDD №12 p3: sysinfo (LLVM/Gallium оценка RAM для хипов) + mkdir (кэш Меса)
 pub const SYS_sysinfo: u64 = 99;
 pub const SYS_mkdir: u64 = 83;
@@ -1304,21 +1307,74 @@ pub fn sysRseq() u64 {
     return err(ENOSYS);
 }
 
-/// prlimit64(0, res, NULL, &rlim): RLIMIT_STACK = 8МБ (glibc: стек-модель
-/// stdio-буферов). Прочие ресурсы — EINVAL.
+/// prlimit64(0, res, new, old): rlimits-таблица (CDD №12 p11 SYSCALL-DIFF:
+/// host-Linux возвращает лимиты для ВСЕХ ресурсов 0..15; старая версия
+/// умела только RLIMIT_STACK → prlimit64(RLIMIT_NOFILE)=EINVAL гнала
+/// Mesa/gamescope в error-ветки). Значения = типичные systemd/CachyOS.
+/// Сеттер: валидируем 16Б и применяем (глобальная таблица — приближение
+/// per-proc; сеттеры наших прогонов: glibc start NOFILE-проба).
 pub const RLIMIT_STACK: u64 = 3;
 pub const STACK_LIMIT: u64 = 8 * 1024 * 1024;
+pub const RLIM_INFINITY: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+pub const RLIMIT_COUNT: u64 = 16;
+
+var rlimit_table: [16][2]u64 = blk: {
+    var t: [16][2]u64 = [_][2]u64{.{ RLIM_INFINITY, RLIM_INFINITY }} ** 16;
+    t[3] = .{ 8 * 1024 * 1024, RLIM_INFINITY }; // STACK: 8МБ / inf
+    t[4] = .{ 0, RLIM_INFINITY }; // CORE: 0 / inf
+    t[6] = .{ 63446, 63446 }; // NPROC
+    t[7] = .{ 1024, 524288 }; // NOFILE: systemd soft/hard
+    t[8] = .{ 8 * 1024 * 1024, 8 * 1024 * 1024 }; // MEMLOCK: 8МБ
+    t[11] = .{ 63446, 63446 }; // SIGPENDING
+    t[12] = .{ 819200, 819200 }; // MSGQUEUE
+    t[13] = .{ 0, 0 }; // NICE
+    t[14] = .{ 0, 0 }; // RTPRIO
+    break :blk t;
+};
 
 pub fn sysPrlimit64(ops: LinuxOps, pid: u64, res: u64, new_va: u64, old_va: u64) u64 {
     if (pid != 0) return err(EPERM); // только о себе
-    if (res != RLIMIT_STACK) return err(EINVAL);
-    if (new_va != 0) return err(EPERM); // setter — не фундамент
+    if (res >= RLIMIT_COUNT) return err(EINVAL);
+    const ri: usize = @intCast(res);
+    if (new_va != 0) {
+        if (!ops.validate(new_va, 16, false)) return err(EFAULT);
+        var nb: [16]u8 = undefined;
+        if (!ops.copy_in(&nb, new_va)) return err(EFAULT);
+        const cur = std.mem.readInt(u64, nb[0..8], .little);
+        const max = std.mem.readInt(u64, nb[8..16], .little);
+        if (cur != RLIM_INFINITY and cur > max) return err(EINVAL);
+        rlimit_table[ri] = .{ cur, max };
+    }
     if (old_va == 0) return 0;
     if (!ops.validate(old_va, 16, true)) return err(EFAULT);
     var b: [16]u8 = undefined;
-    std.mem.writeInt(u64, b[0..8], STACK_LIMIT, .little); // rlim_cur
-    std.mem.writeInt(u64, b[8..16], STACK_LIMIT, .little); // rlim_max
+    std.mem.writeInt(u64, b[0..8], rlimit_table[ri][0], .little); // rlim_cur
+    std.mem.writeInt(u64, b[8..16], rlimit_table[ri][1], .little); // rlim_max
     if (!ops.copy_out(old_va, &b)) return err(EFAULT);
+    return 0;
+}
+
+/// sched_setscheduler(pid, policy, param): SCHED_OTHER(0)/BATCH(3)/IDLE(5)
+/// успехом (LLVM/lvp утил-треды понижают приоритет; host-Linux для
+/// unprivileged SCHED_BATCH = 0). SCHED_FIFO(1)/RR(2) без CAP → EPERM.
+pub fn sysSchedSetscheduler(ops: LinuxOps, pid: u64, policy: u64, param_va: u64) u64 {
+    if (pid != 0 and pid != ops.current_pid()) return err(EPERM);
+    if (policy == 1 or policy == 2) return err(EPERM); // RT без CAP
+    if (policy > 5) return err(EINVAL);
+    if (param_va != 0) {
+        if (!ops.validate(param_va, 4, false)) return err(EFAULT);
+    }
+    return 0;
+}
+
+/// setpriority(which, who, prio): PRIO_PROCESS(0)/PRIO_PGRP(1)/PRIO_USER(2)
+/// → успех (nice-политика вне фундамента; host-diff: glibc/LLVM зовут для
+/// фоновых lvp-тредов и ОЖИДАЮТ 0; prio ядро Linux видит 0..39).
+pub fn sysSetpriority(ops: LinuxOps, which: u64, who: u64, prio: u64) u64 {
+    if (which > 2) return err(EINVAL);
+    if (prio > 39) return err(EINVAL);
+    _ = who;
+    _ = ops;
     return 0;
 }
 
@@ -1806,9 +1862,9 @@ pub const MADV_FREE: u64 = 8;
 /// madvise(va, len, advice): CDD №12 p6 — DONTNEED честно зануляет анонимную
 /// память (zap PTE + free физики; диапазон остаётся резервацией — следующее
 /// касание = НУЛЕВАЯ страница; glibc/LLVM завязаны на эту гарантию).
-/// Остальные советы — без действия (успех, как Linux для «не применимо»).
-/// Валидация не требуется: dontneed-путь ядра безопасен на любом VA (Linux
-/// принимает PROT_NONE/частично-размапленные диапазоны).
+/// CDD №12 p11 (host-diff): НЕИЗВЕСТНЫЙ advice → EINVAL (Linux-семантика;
+/// MADV_GUARD_INSTALL=102 glibc 2.41 шлёт для guard-страниц тредов —
+/// host-эталон возвращает EINVAL, glibc толерантен: без guard живём).
 pub fn sysMadvise(ops: LinuxOps, va: u64, len: u64, advice: u64) u64 {
     if (len == 0) return 0;
     if (advice == MADV_DONTNEED) {
@@ -1816,6 +1872,8 @@ pub fn sysMadvise(ops: LinuxOps, va: u64, len: u64, advice: u64) u64 {
         if (r < 0) return @bitCast(r);
         return @intCast(r);
     }
+    // известные Linux-советы 0..25 → no-op success; прочие — EINVAL
+    if (advice > 25) return err(EINVAL);
     if (!ops.validate(va, len, false)) return err(EFAULT);
     return 0;
 }
@@ -1949,6 +2007,8 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_getdents64 => return sysGetdents64(ops, fds, @bitCast(args.a1), args.a2, args.a3),
         SYS_sched_getaffinity => return sysSchedGetaffinity(ops, @bitCast(args.a1), args.a2, args.a3),
         SYS_sched_setaffinity => return sysSchedSetaffinity(ops, @bitCast(args.a1), args.a2, args.a3),
+        SYS_sched_setscheduler => return sysSchedSetscheduler(ops, @bitCast(args.a1), args.a2, args.a3),
+        SYS_setpriority => return sysSetpriority(ops, args.a1, args.a2, args.a3),
         SYS_sysinfo => return sysSysinfo(ops, args.a1),
         SYS_mkdir => return sysMkdir(ops, args.a1, args.a2),
         SYS_rt_sigaction => return sysRtSigaction(ops, args.a1, args.a2, args.a3, args.a4),
@@ -4032,6 +4092,10 @@ test "linux: prctl — CAPBSET_READ→0; madvise; getcwd; fstatfs" {
     // MADV_FREE — без VM-действия (успех, не DONTNEED-путь)
     try testing.expectEqual(@as(u64, 0), sysMadvise(ops, buf, 16, MADV_FREE));
     try testing.expectEqual(@as(u64, 1), e.dontneed_calls);
+    // CDD №12 p11: MADV_GUARD_INSTALL=102 (glibc 2.41 guard-страницы) —
+    // host-эталон = EINVAL (неизвестный advice), НЕ «тихий успех»
+    try testing.expectEqual(err(EINVAL), sysMadvise(ops, buf, 0x1000, 102));
+    try testing.expectEqual(err(EINVAL), sysMadvise(ops, buf, 0x1000, 103));
     // getcwd: «/» + NUL = 2 байта
     const cwd_va = FakeEnv.USER_BASE + 0x80;
     try testing.expectEqual(@as(u64, 2), sysGetcwd(ops, cwd_va, 64));
@@ -4266,4 +4330,65 @@ test "linux: p3 — sched_getaffinity/sysinfo/mkdir (CPU-маска llvmpipe)" {
     try testing.expectEqual(@as(u64, 204), SYS_sched_setaffinity);
     try testing.expectEqual(@as(u64, 99), SYS_sysinfo);
     try testing.expectEqual(@as(u64, 83), SYS_mkdir);
+}
+
+test "linux: p11 — prlimit64-таблица + sched_setscheduler + setpriority (host-diff)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+
+    // 1. prlimit64(RLIMIT_STACK=3): rlim_cur=8МБ, rlim_max=INFINITY
+    const out_va = FakeEnv.USER_BASE + 0x800;
+    try testing.expectEqual(@as(u64, 0), sysPrlimit64(ops, 0, 3, 0, out_va));
+    const op = e.vaPtr(out_va).?;
+    try testing.expectEqual(STACK_LIMIT, std.mem.readInt(u64, op[0..8], .little));
+    try testing.expectEqual(RLIM_INFINITY, std.mem.readInt(u64, op[8..16], .little));
+    // 2. prlimit64(RLIMIT_NOFILE=7): 1024/524288 — КОРЕНЬ p11-диффа
+    //    (старое ядро: EINVAL → error-ветки gamescope/LLVM)
+    try testing.expectEqual(@as(u64, 0), sysPrlimit64(ops, 0, 7, 0, out_va));
+    try testing.expectEqual(@as(u64, 1024), std.mem.readInt(u64, op[0..8], .little));
+    try testing.expectEqual(@as(u64, 524288), std.mem.readInt(u64, op[8..16], .little));
+    // прочие ресурсы: успех; ≥16 — EINVAL; pid≠0 — EPERM; мусор → EFAULT
+    try testing.expectEqual(@as(u64, 0), sysPrlimit64(ops, 0, 0, 0, out_va));
+    try testing.expectEqual(@as(u64, 0), sysPrlimit64(ops, 0, 9, 0, 0));
+    try testing.expectEqual(err(EINVAL), sysPrlimit64(ops, 0, 16, 0, out_va));
+    try testing.expectEqual(err(EPERM), sysPrlimit64(ops, 77, 7, 0, out_va));
+    // p11-fix: old_va=NULL — ВАЛИДЕН по man prlimit64 (без old-лимита) → 0, не EFAULT
+    try testing.expectEqual(@as(u64, 0), sysPrlimit64(ops, 0, 7, 0, 0x0));
+    // сеттер: валидная пара {4096, 4096} принимается; cur>max → EINVAL
+    var nb: [16]u8 = .{0} ** 16;
+    std.mem.writeInt(u64, nb[0..8], 4096, .little);
+    std.mem.writeInt(u64, nb[8..16], 4096, .little);
+    const new_va = FakeEnv.USER_BASE + 0x880;
+    try testing.expect(fakeCopyOut(new_va, &nb));
+    try testing.expectEqual(@as(u64, 0), sysPrlimit64(ops, 0, 7, new_va, out_va));
+    try testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, op[0..8], .little));
+    std.mem.writeInt(u64, nb[0..8], 8192, .little); // cur > max
+    try testing.expect(fakeCopyOut(new_va, &nb));
+    try testing.expectEqual(err(EINVAL), sysPrlimit64(ops, 0, 7, new_va, 0));
+    // восстанавливаем дефолт для других тестов
+    std.mem.writeInt(u64, nb[0..8], 1024, .little);
+    std.mem.writeInt(u64, nb[8..16], 524288, .little);
+    try testing.expect(fakeCopyOut(new_va, &nb));
+    _ = sysPrlimit64(ops, 0, 7, new_va, 0);
+
+    // 3. sched_setscheduler: SCHED_BATCH(3)/OTHER(0)/IDLE(5) → 0;
+    //    FIFO(1)/RR(2) без CAP → EPERM; policy>5 → EINVAL
+    try testing.expectEqual(@as(u64, 0), sysSchedSetscheduler(ops, 0, 3, 0));
+    try testing.expectEqual(@as(u64, 0), sysSchedSetscheduler(ops, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 0), sysSchedSetscheduler(ops, 0, 5, 0));
+    try testing.expectEqual(err(EPERM), sysSchedSetscheduler(ops, 0, 1, 0));
+    try testing.expectEqual(err(EPERM), sysSchedSetscheduler(ops, 0, 2, 0));
+    try testing.expectEqual(err(EINVAL), sysSchedSetscheduler(ops, 0, 6, 0));
+
+    // 4. setpriority: which 0..2, prio ≤39 → 0; which>2/prio>39 → EINVAL
+    try testing.expectEqual(@as(u64, 0), sysSetpriority(ops, 0, 1, 19));
+    try testing.expectEqual(@as(u64, 0), sysSetpriority(ops, 2, 0, 0));
+    try testing.expectEqual(err(EINVAL), sysSetpriority(ops, 3, 1, 0));
+    try testing.expectEqual(err(EINVAL), sysSetpriority(ops, 0, 1, 40));
+
+    // 5. якоря: 145/141/302
+    try testing.expectEqual(@as(u64, 145), SYS_sched_setscheduler);
+    try testing.expectEqual(@as(u64, 141), SYS_setpriority);
+    try testing.expectEqual(@as(u64, 302), SYS_prlimit64);
 }

@@ -1,0 +1,58 @@
+rootfs: 91 файлов, 243.3 МБ
+cpio-cache: HIT (243.3 МБ)
+FAIL: boot: shell ready
+: 1378352 bytes
+  - File: usr/lib/librav1e.so.0.8 Size: 3239576 bytes
+  - File: usr/lib/libseat.so.1 Size: 47072 bytes
+  - File: usr/lib/libsharpyuv.so.0 Size: 42896 bytes
+  - File: usr/lib/libstdc++.so.6 Size: 3312696 bytes
+  - File: usr/lib/libsystemd.so.0 Size: 1336840 bytes
+  - File: usr/lib/libudev.so.1 Size: 326752 bytes
+  - File: usr/lib/libuuid.so.1 Size: 39072 bytes
+  - File: usr/lib/libvulkan.so.1 Size: 641024 bytes
+  - File: usr/lib/libvulkan_lvp.so Size: 14890208 bytes
+  - File: usr/lib/libwacom.so.9 Size: 71792 bytes
+  - File: usr/lib/libwayland-client.so.0 Size: 64264 bytes
+  - File: usr/lib/libwayland-server.so.0 Size: 92968 bytes
+  - File: usr/lib/libxcb-dri3.so.0 Size: 22496 bytes
+  - File: usr/lib/libxcb-keysyms.so.1 Size: 14208 bytes
+  - File: usr/lib/libxcb-present.so.0 Size: 14312 bytes
+  - File: usr/lib/libxcb-randr.so.0 Size: 71648 bytes
+  - File: usr/lib/libxcb-shm.so.0 Size: 14304 bytes
+  - File: usr/lib/libxcb-sync.so.1 Size: 34784 bytes
+  - File: usr/lib/libxcb-xfixes.so.0 Size: 34792 bytes
+  - File: usr/lib/libxcb.so.1 Size: 178176 bytes
+  - File: usr/lib/libxkbcommon.so.0 Size: 440488 bytes
+  - File: usr/lib/libxml2.so.16 Size: 1563592 bytes
+  - File: usr/lib/libxshmfence.so.1 Size: 14208 bytes
+  - File: usr/lib/libyuv.so Size: 1337296 bytes
+  - File: usr/lib/libz.so.1 Size: 120848 bytes
+  - File: usr/lib/libzstd.so.1 Size: 1148760 bytes
+  - File: usr/share/vulkan/icd.d/lvp_icd.json Size: 144 bytes
+  - File: sys/devices/system/cpu/online Size: 2 bytes
+  - File: sys/devices/system/cpu/offline Size: 1 bytes
+  - File: sys/devices/system/cpu/possible Size: 2 bytes
+  - File: sys/devices/system/cpu/present Size: 2 bytes
+  - File: sys/devices/system/cpu/kernel_max Size: 4 bytes
+  - File: sys/devices/system/cpu/cpu0/online Size: 2 bytes
+  - File: sys/devices/system/cpu/cpu0/topology/core_id Size: 2 bytes
+  - File: sys/devices/system/cpu/cpu0/topology/physical_package_id Size: 2 bytes
+  - File: sys/devices/system/cpu/cpu0/topology/thread_siblings Size: 9 bytes
+  - File: proc/cpuinfo Size: 937 bytes
+  - File: lib64/ld-linux-x86-64.so.2 Size: 29 bytes
+[INITRD] Total files parsed: 100
+[VFS] Live-mode VFS: /dev (devfs) + initrd (RO) + /tmp (tmpfs RAM overlay)
+
+╔══════════════════════════════════════════════════════╗
+║         POLER-OS v0.15.0 — BOOT COMPLETE             ║
+║  HAL+PUF+Enrollment-Gate+PE Runtime — all systems GO║
+╚══════════════════════════════════════════════════════╝
+[CDD9] v0.18.0: RX-bounds · validateRange ceiling · PMM rollback · Linux POSIX
+
+Next steps: Memory Manager (PMM/VMM) → Process Service → Intent Layer
+Timer: APIC periodic, tick count will increment in idle loop
+[HAL] Syscall mechanism initialized
+[SCHED] Scheduler initialized (v0.7.0 Ring 3 + exit syscall)
+[SCHED] Created kernel task 0x0000000000000001 at entry 0x0000000000134180 RSP=0x0000000000344FF0
+[SCHED] Created kernel task 0x0000000000000002 at entry 0x00000000001344B0 RSP=0x0000000000365020
+

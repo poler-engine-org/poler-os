@@ -494,9 +494,69 @@ pub fn idle_after_fault() callconv(.C) noreturn {
 // ISR Common Handler — called from isr64.S isr_common
 // ============================================================================
 
+// CDD №12 p11-FIX: XMM0-15 ПРИ ИСКЛЮЧЕНИИ. Стаб сохраняет только GPR —
+// Zig-хендлер (SSE-мемсет demand-zero) КАЛЕЧИТ векторные регистры гостя
+// → фолтящий SSE-стор libc-memmove ретраится с затёртым XMM0 → 11 нулевых
+// байт в начале JIT-страницы LLVM → call мусора → #PF(0) (весь CDD #12
+// «0xAAAA-шторм» — тот же класс: порча гостевого состояния через хендлер).
+// Сохранение в .bss (пер-вхождение; исключения входят с IF=0 — вложенности
+// нет). movups = без выравнивания. Путь IRQ (вектор ≥ 32) НЕ тронут —
+// раскладка кадра на kstack не меняется ВООБЩЕ.
+var isr_xmm_buf: [32]u64 align(16) = [_]u64{0} ** 32;
+
+inline fn isrSaveXmm() void {
+    asm volatile (
+        \\movups %%xmm0,  0(%[b])
+        \\movups %%xmm1,  16(%[b])
+        \\movups %%xmm2,  32(%[b])
+        \\movups %%xmm3,  48(%[b])
+        \\movups %%xmm4,  64(%[b])
+        \\movups %%xmm5,  80(%[b])
+        \\movups %%xmm6,  96(%[b])
+        \\movups %%xmm7,  112(%[b])
+        \\movups %%xmm8,  128(%[b])
+        \\movups %%xmm9,  144(%[b])
+        \\movups %%xmm10, 160(%[b])
+        \\movups %%xmm11, 176(%[b])
+        \\movups %%xmm12, 192(%[b])
+        \\movups %%xmm13, 208(%[b])
+        \\movups %%xmm14, 224(%[b])
+        \\movups %%xmm15, 240(%[b])
+        :
+        : [b] "r" (&isr_xmm_buf)
+        : "memory"
+    );
+}
+
+inline fn isrRestoreXmm() void {
+    asm volatile (
+        \\movups  0(%[b]), %%xmm0
+        \\movups 16(%[b]), %%xmm1
+        \\movups 32(%[b]), %%xmm2
+        \\movups 48(%[b]), %%xmm3
+        \\movups 64(%[b]), %%xmm4
+        \\movups 80(%[b]), %%xmm5
+        \\movups 96(%[b]), %%xmm6
+        \\movups 112(%[b]), %%xmm7
+        \\movups 128(%[b]), %%xmm8
+        \\movups 144(%[b]), %%xmm9
+        \\movups 160(%[b]), %%xmm10
+        \\movups 176(%[b]), %%xmm11
+        \\movups 192(%[b]), %%xmm12
+        \\movups 208(%[b]), %%xmm13
+        \\movups 224(%[b]), %%xmm14
+        \\movups 240(%[b]), %%xmm15
+        :
+        : [b] "r" (&isr_xmm_buf)
+        : "memory"
+    );
+}
+
 pub export fn isr_common_handler(frame: *InterruptFrame) callconv(.C) *InterruptFrame {
     if (frame.vector < 32) {
+        isrSaveXmm();
         handleException(frame);
+        isrRestoreXmm();
         return frame;
     } else {
         return handleIRQ(frame);
@@ -832,15 +892,43 @@ fn handleException(frame: *InterruptFrame) void {
         // 16 байт опкодов НАЧИНАЯ С RIP (fault-инструкция — точный опкод).
         // CDD №12 p5-фикс: старый код печатал только байт по RIP-8 (мусор
         // для разбора) — теперь hex-строка всех байт [RIP, RIP+16).
-        Serial.puts("\nRIP-bytes: ");
+        // CDD №12 p11: расширение до 96 байт + СЫРОЙ PTE страницы RIP —
+        // эмпирика sysharness: краш ИСПОЛНЕНИЯ нулей в свежем RX-JIT-регионе
+        // (код, записанный в RW-фазу, «пропал») — PTE (фрейм+флаги) и контент
+        // решают спор «записи потеряны vs адрес вызова неверен».
+        Serial.puts("\nRIP-bytes[96]: ");
         const vmm2 = @import("vmm64.zig");
+        const cr3_base = readCr3() & 0x000FFFFFFFFFF000;
         var k: usize = 0;
-        while (k < 16) : (k += 1) {
+        while (k < 96) : (k += 1) {
             const va = frame.rip + k;
-            const leaf = vmm2.userLeafFlags(readCr3() & 0x000FFFFFFFFFF000, va) orelse break;
+            const leaf = vmm2.userLeafFlags(cr3_base, va) orelse break;
             if (leaf & vmm2.PTE_USER == 0) break;
             const pb: *volatile u8 = @ptrFromInt(va);
             Serial.putHexByte(pb.*);
+            if ((k & 31) == 31) Serial.puts(" "); // визуальный сепаратор
+        }
+        // PTE страницы RIP (сырой qword: физфрейм+флаги)
+        Serial.puts("\nRIP-PTE: 0x");
+        if (vmm2.userLeafRaw(cr3_base, frame.rip & ~@as(u64, 4095))) |pte| {
+            Serial.putHex(pte);
+        } else {
+            Serial.puts("(no-leaf)");
+        }
+        // CDD №12 p11: сырой дамп [rsp..rsp+0x80) — ret-адрес ВЫЗЫВАЮЩЕГО
+        // JIT-функции (лесенка кадров воркера llvmpipe); C++-вызывающий
+        // символизируется objdump по [RIP]-модулю из [MMAP]-реестра.
+        if (frame.rsp > 0x1000) {
+            Serial.puts("\nRSP-RAW: ");
+            var q: usize = 0;
+            while (q < 16) : (q += 1) {
+                const va = frame.rsp + q * 8;
+                const leaf = vmm2.userLeafFlags(cr3_base, va) orelse break;
+                if (leaf & vmm2.PTE_USER == 0) break;
+                const sp: *volatile u64 = @ptrFromInt(va);
+                Serial.putHex(sp.*);
+                Serial.puts(" ");
+            }
         }
     }
     // v0.13.0-fix (диагностика CDD №4): дамп стека юзера — ret-адрес укажет
@@ -1952,7 +2040,72 @@ pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.C) void
     }
 }
 
+// CDD №12 p11-FIX(2): SYSCALL-XMM. Linux-инвариант: ядро НЕ трогает
+// XMM гостя (у Linux — kernel_fpu_begin/end). Zig-хендлер свободно
+// юзает SSE (мемсеты memcpy/memset, string-опы) → КАЖДЫЙ syscall
+// возвращал гостю затёртые XMM0-15 → gamescope падал в llvm::SelectionDAG
+// (call через мусорный указатель → 0x40). Обёртка: сейв/реставр .bss
+// (IF=0 от SYSCALL — атомарно). Побочный след: futex-парковки в
+// глубине хендлера всё равно теряют XMM (пер-таск XMM-слоты — фронт
+// p12); горячий путь (mmap/mprotect/brk/clock) закрыт.
+var sys_xmm_buf: [32]u64 align(16) = [_]u64{0} ** 32;
+
+inline fn sysSaveXmm() void {
+    asm volatile (
+        \\movups %%xmm0,  0(%[b])
+        \\movups %%xmm1,  16(%[b])
+        \\movups %%xmm2,  32(%[b])
+        \\movups %%xmm3,  48(%[b])
+        \\movups %%xmm4,  64(%[b])
+        \\movups %%xmm5,  80(%[b])
+        \\movups %%xmm6,  96(%[b])
+        \\movups %%xmm7,  112(%[b])
+        \\movups %%xmm8,  128(%[b])
+        \\movups %%xmm9,  144(%[b])
+        \\movups %%xmm10, 160(%[b])
+        \\movups %%xmm11, 176(%[b])
+        \\movups %%xmm12, 192(%[b])
+        \\movups %%xmm13, 208(%[b])
+        \\movups %%xmm14, 224(%[b])
+        \\movups %%xmm15, 240(%[b])
+        :
+        : [b] "r" (&sys_xmm_buf)
+        : "memory"
+    );
+}
+
+inline fn sysRestoreXmm() void {
+    asm volatile (
+        \\movups  0(%[b]), %%xmm0
+        \\movups 16(%[b]), %%xmm1
+        \\movups 32(%[b]), %%xmm2
+        \\movups 48(%[b]), %%xmm3
+        \\movups 64(%[b]), %%xmm4
+        \\movups 80(%[b]), %%xmm5
+        \\movups 96(%[b]), %%xmm6
+        \\movups 112(%[b]), %%xmm7
+        \\movups 128(%[b]), %%xmm8
+        \\movups 144(%[b]), %%xmm9
+        \\movups 160(%[b]), %%xmm10
+        \\movups 176(%[b]), %%xmm11
+        \\movups 192(%[b]), %%xmm12
+        \\movups 208(%[b]), %%xmm13
+        \\movups 224(%[b]), %%xmm14
+        \\movups 240(%[b]), %%xmm15
+        :
+        : [b] "r" (&sys_xmm_buf)
+        : "memory"
+    );
+}
+
 pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
+    sysSaveXmm();
+    const rc = zig_syscall_handler_inner(arg1, arg2, arg3, arg4, syscall_num, arg5);
+    sysRestoreXmm();
+    return rc;
+}
+
+pub fn zig_syscall_handler_inner(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
 
     // CDD №12 p7: ВЫХОДНОЙ КАДР В .BSS — СНАПШОТ ПЕРВОЙ ОПЕРАЦИЕЙ (каскад
     // asm уже построен на kstack-топе владельца; транзакция IF=0 — никто

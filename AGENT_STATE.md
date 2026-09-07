@@ -34,3 +34,42 @@ credentials: ВАЛИДЕН — файл-хранилище upload/«гитха�
 | 2026-09-01 | v0.11.0–v0.10.0: CDD-циклы №2-1 — Ring-3 запуск curl.exe | pe_loader/win32_stubs/win32_api; МОМЕНТ ИСТИНЫ №1: curl дошёл до main(). |
 | 2026-09-01 | v0.9.0: PE/COFF-лоадер + CDD-стабы | addRunArtifact-инвариант (тесты ЗАПУСКАЮТСЯ). E2E 16/16. |
 | 2026-08-31 — 2026-09-01 | v0.7.x — v0.8.0 | entropy-hub, PVH, PUF, перенос в оргу. |
+
+---
+## CDD №12 p11 — ИТОГ: XMM-КОРЕНЬ 0xAAAA-ШТОРМА НАЙДЕН И ЗАКРЫТ
+
+**ГЛАВНЫЙ ПРОРЫВ ВСЕЙ CDD #12:** корень «0xAAAA-шторма»/JIT-крашей — **порча XMM0-15
+гостевого состояния через exception/syscall-пути ядра**. ISR-стаб (isr64.S) и
+syscall_entry сохраняли ТОЛЬКО GPR; Zig-хендлеры свободно юзали SSE (мемсеты
+demand-zero — 16Б-сторы!) → фолтящий SSE-стор libc-memmove ретраился с затёртым
+XMM0 → 11 нулевых байт вместо [endbr64+imul×2]-пролога в JIT-странице LLVM →
+call мусора → #PF(0). Forensic-цепочка: jit-writer.c (TCG-плагин v1-v13) —
+staging-буфер, PREFIX-QW, LOAD-watch, read_memory_vaddr; host-дифференциал
+shim-mprotect.c (LD_PRELOAD). Все логи: logs-p11/.
+
+**Фиксы (hal.zig):**
+1. `isrSaveXmm/isrRestoreXmm` (movups×16 → .bss) в isr_common_handler, vector<32.
+2. `sysSaveXmm/sysRestoreXmm` — обёртка zig_syscall_handler (Linux-инвариант
+   kernel_fpu_begin: syscall обязан вернуть XMM нетронутыми; gamescope падал
+   в llvm::SelectionDAG: call → 0x40 после mprotect-шторма).
+
+**Результаты:**
+- sysharness (Vulkan compute) = **6/6 PASS, ПОЛНЫЙ ПРОГОН DONE** — LLVM-JIT
+  шейдера + dispatch + waitIdle работают на POLER-OS.
+- elf-run = **17/17 PASS** (×2), юнит-тесты = **зелёные** (прlimit64-тест
+  поправлен: old_va=NULL → 0 по man, не EFAULT).
+- gamescope: дальше всех прошлых прогонов — выбор vulkan-устройства
+  «llvmpipe (LLVM 22.1.8, 256 bits)», mesa_shader_cache, 25-мин drill жив.
+- p11-syscall-фиксы (prlimit64-таблица 0..15, sched_setscheduler/setpriority,
+  madvise-валидация) — подтверждены host-дифом и тестами.
+
+**Фронт p12 (стратегия):**
+1. **R15-POISON (флаки-киллер gamescope):** «[R15-POISON] кадр kstack испорчен
+   (0xAAAA…) slot=…» — детектор ядра ловит; кадры на kstack-топе портятся
+   невидимыми для TCG-плагинов путями (p7-гипотеза: interrupt-entry push-и).
+   Нужен per-task XMM+GPR exit-слоты и аудит вложенных входов.
+2. Пер-таск XMM при futex-парковках (сейчас общий .bss-буфер).
+3. После R15-фикса: gamescope → SET_MASTER → CREATE_DUMB → ADDFB2 → SETCRTC →
+   **PAGE_FLIP** → screendump 1024×768 → tag **v0.20.0-rc**.
+
+Тулчейн: /tmp/my-project/tools/zig-0.14.0/zig (сеть в песочнице недоступна).
