@@ -10,3 +10,4 @@ cachyos-root/pkgcache/
 cachyos-root/root/
 cachyos-root/*.cpio
 scripts/e2e/*.so
+scripts/e2e/__pycache__/

@@ -70,6 +70,13 @@ pub const Task = struct {
     wake_tick: u64 = 0,
     /// v0.18.0 (CDD №9): syscall-ABI задачи (маршрутизация в hal.zig).
     abi: TaskAbi = .win32,
+    /// CDD №12 p12: полный FPU-контекст задачи (x87|SSE|AVX, 832Б, XSAVE).
+    /// Пишется: входом IRQ (вытеснение — userspace-векторный код или ядерный
+    /// Zig-каскад mid-SSE; см. hal.handleIRQ). Читается: хвостом IRQ
+    /// (реставр адресата iretq — включая диспетчерский свич schedule()).
+    /// Нулевой слот = XRSTOR-INIT (FCW=0x037F, MXCSR=0x1F80) — обнуление
+    /// при создании обязательно: tasks[] = undefined-глобал!
+    fpu: [hal.FPU_AREA_SIZE]u8 align(64) = [_]u8{0} ** hal.FPU_AREA_SIZE,
 };
 
 pub var tasks: [MAX_TASKS]Task = undefined;
@@ -162,6 +169,10 @@ fn registerKstack(id: usize) void {
     const base: u64 = @intFromPtr(&tasks[id].kernel_stack);
     kstack_lo_tab[id] = base;
     kstack_hi_tab[id] = base + tasks[id].kernel_stack.len;
+    // CDD №12 p12-ТРИПВАЙР: инструмент охоты за 0xAAAA-писателем в слот
+    // [top-176] kstack (живой poll на каждом IRQ-входе — hal.zig).
+    // Авто-арм снят по закрытии охоты (фиксы 3+4+5): армит ручная запись
+    // hal.p12_watch_addr = <top-176> + hal.p12_watch_magic в слот.
 }
 
 /// Регистрация user-стека задачи (главный стек при createUserTask;
@@ -238,6 +249,37 @@ pub export var syscall_exit_frame: [MAX_TASKS][14]u64 =
 /// Указатель активной строки (asm-выход читает через него; 0 = снапшота
 /// нет → legacy pop-путь). Пишет zig-вход ТОЛЬКО под IF=0 транзакции.
 pub export var syscall_exit_frame_ptr: u64 = 0;
+
+/// CDD №12 p12-ФИКС3: ПЕР-ТАСК FPU-СТРОКИ SYSCALL-ПУТИ (832Б, XSAVE-формат).
+/// Владелец определяется по user_rsp (asm owner-scan авторитет; та же
+/// семантика, что у syscall_exit_frame). Парк-безопасность: чужие syscall
+/// пишут ТОЛЬКО свои строки. Геометрия обёртки восстановлена (тонкий кадр
+/// — 8Б-зазор до STALE-резервуара [top-176] цел; см. hal.zig шапку p12).
+/// Формат: нулевой слот = XRSTOR-INIT; после fpuSave = живой контекст.
+pub export var syscall_fpu_frame: [MAX_TASKS][832]u8 align(64) =
+    .{.{0} ** 832} ** MAX_TASKS;
+
+/// CDD №12 p12-ФИКС3: fallback-буфер для ВЛАДЕЛЬЦА ВНЕ ТАБЛИЦ
+/// (shell/Win32-InitOnce-колбэки: парковок нет, вложенности нет).
+pub export var syscall_fpu_fallback: [832]u8 align(64) = .{0} ** 832;
+
+/// CDD №12 p12-ФИКС5: ПЕР-ТАСК FPU-СТРОКИ EXCEPTION-ПУТИ (глубина 2).
+/// КОРЕНЬ: Zig-Debug 0xAA-филл стек-локали (memset $0xAA,$0x340 — SSE-
+/// бродкаст!) в isr_common_handler затирал XMM0 ДО xsave ⇒ каждый
+/// exception-сейв сохранял мусор (дизассембл @0x2191cd). Строки
+/// статически нулевые: рантайм-филла НЕТ, BV=0 → xrstor INIT честен.
+/// Глубина: вложенный #PF-в-#PF получает свой уровень (IRQ не
+/// вкладываются — interrupt-gates). Утечка глубины (kill без возврата)
+/// безвредна: слоты — симметричные пары save/restore.
+pub export var exc_fpu_frame: [MAX_TASKS][2][832]u8 align(64) =
+    .{(.{(([1]u8{0}) ** 832)} ** 2)} ** MAX_TASKS;
+
+/// Глубина вложенности exception-FPU-сейвов (пер-таск).
+pub export var exc_fpu_depth: [MAX_TASKS]u8 = .{0} ** MAX_TASKS;
+
+/// CDD №12 p12-ФИКС5: fallback для владельца вне таблиц (IST/#DF/
+/// ранний бут — парковок и вложенности нет).
+pub export var exc_fpu_fallback: [832]u8 align(64) = .{0} ** 832;
 
 /// CDD №12 p7: битовая маска 0xAAAA-детекторов asm-выхода (биты: 1=R15,
 /// 2=R14, 4=R13, 8=R12 — реальные значения, восстановленные из .bss-кадра).
@@ -332,6 +374,14 @@ pub fn init() void {
     kstack_lo_tab[0] = 0x108000;
     kstack_hi_tab[0] = 0x10C000;
 
+    // CDD №12 p12: FPU-слоты — нулевой init ВСЕХ задач (tasks[] =
+    // undefined-глобал; idle-0 вообще живёт без createTask, а диспетчер
+    // может выбрать его до первого вытеснения). XSTATE_BV=0 → XRSTOR
+    // даёт INIT-FPU (каноника glibc: FCW=0x037F, MXCSR=0x1F80).
+    for (&tasks) |*t| {
+        @memset(t.fpu[0..], 0);
+    }
+
     // Register exit callback — HAL calls this on syscall exit(4)
     // Breaks circular dependency hal.zig ↔ scheduler.zig via function pointer.
     hal.exitCallback = exitCurrentTask;
@@ -394,6 +444,7 @@ pub fn createTask(entry_point: u64) !usize {
     task.privilege = .Kernel;
     task.cr3 = 0; // Use kernel CR3
     task.user_stack_top = 0;
+    @memset(task.fpu[0..], 0); // p12: XRSTOR-INIT слот
     task.wake_tick = 0; // v0.15.0: не спит при рождении
 
     // Set up the initial stack frame in the kernel stack.
@@ -483,6 +534,7 @@ pub fn createUserTaskAbi(entry_point: u64, user_cr3: u64, user_stack: u64, abi: 
     task.privilege = .User;
     task.cr3 = user_cr3; // Per-process page tables!
     task.user_stack_top = user_stack;
+    @memset(task.fpu[0..], 0); // p12: XRSTOR-INIT слот
     task.wake_tick = 0; // v0.15.0: не спит при рождении
 
     // Set up the initial stack frame in the kernel stack.
@@ -550,6 +602,7 @@ pub fn createUserThreadTask(entry_point: u64, user_cr3: u64, thread_rsp: u64, pa
     task.privilege = .User;
     task.cr3 = user_cr3;
     task.user_stack_top = thread_rsp;
+    @memset(task.fpu[0..], 0); // p12: XRSTOR-INIT слот
 
     const kstack_top = @intFromPtr(&task.kernel_stack) + task.kernel_stack.len;
     const frame_ptr: *hal.InterruptFrame = @ptrFromInt(kstack_top - 176);
@@ -603,6 +656,7 @@ pub fn createLinuxCloneTask(user_cr3: u64, frame_src: *const hal.InterruptFrame)
     task.user_stack_top = frame_src.rsp;
     task.wake_tick = 0; // не спит при рождении
     task.abi = .linux; // RAX-ABI Linux
+    @memset(task.fpu[0..], 0); // p12: XRSTOR-INIT слот
 
     const kstack_top = @intFromPtr(&task.kernel_stack) + task.kernel_stack.len;
     const frame_ptr: *hal.InterruptFrame = @ptrFromInt(kstack_top - 176);

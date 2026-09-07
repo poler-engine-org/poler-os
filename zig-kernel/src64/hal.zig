@@ -494,69 +494,206 @@ pub fn idle_after_fault() callconv(.C) noreturn {
 // ISR Common Handler — called from isr64.S isr_common
 // ============================================================================
 
-// CDD №12 p11-FIX: XMM0-15 ПРИ ИСКЛЮЧЕНИИ. Стаб сохраняет только GPR —
-// Zig-хендлер (SSE-мемсет demand-zero) КАЛЕЧИТ векторные регистры гостя
-// → фолтящий SSE-стор libc-memmove ретраится с затёртым XMM0 → 11 нулевых
-// байт в начале JIT-страницы LLVM → call мусора → #PF(0) (весь CDD #12
-// «0xAAAA-шторм» — тот же класс: порча гостевого состояния через хендлер).
-// Сохранение в .bss (пер-вхождение; исключения входят с IF=0 — вложенности
-// нет). movups = без выравнивания. Путь IRQ (вектор ≥ 32) НЕ тронут —
-// раскладка кадра на kstack не меняется ВООБЩЕ.
-var isr_xmm_buf: [32]u64 align(16) = [_]u64{0} ** 32;
+// CDD №12 p12: ПОЛНЫЙ FPU-КОНТЕКСТ ЗАДАЧИ (x87 + MXCSR + XMM + YMM).
+//
+// p11 закрыл XMM-калечение через exception/syscall-пути, НО остались ТРИ
+// ДЫРЫ (все — источники флаки-порчи guest-состояния):
+//   (1) ГЛОБАЛЬНОСТЬ буферов: паркуясь в futex/epoll hlt-loop (глубина
+//       syscall-хендлера), задача A возобновляется и восстанавливает ЧУЖОЙ
+//       XMM — syscall задачи B перезаписал общий .bss-буфер за время парка
+//       (эмпирика p11: «futex-парковки всё равно теряют XMM»).
+//   (2) schedule() НЕ сохранял FPU ВООБЩЕ: задача, вытесненная в userspace
+//       посреди векторного кода, продолжала после iretq с регистрами ДРУГОЙ
+//       задачи (AVX включён: XCR0=0x207 + QEMU -cpu max, v3-сборки CachyOS
+//       юзают YMM0-15 в горячих циклах llvmpipe!).
+//   (3) IRQ-путь (вектор >= 32) не сохранял FPU → прерывание mid-memset
+//       ядерного Zig-каскада калечило живой XMM-скретч обработчика.
+//
+// РЕШЕНИЕ — ЕДИНЫЙ fpuSave/fpuRestore с XSAVE (маска 0x7: x87|SSE|AVX,
+// область 832Б = 512 legacy + 64 header + 256 YMM, выравнивание 64):
+//   • SYSCALL-путь: СТЕК-ЛОКАЛ на kstack владельца — переживает парковку
+//     (контент лежит на стеке ЗАДАЧИ, не в глобале), per-nesting;
+//   • EXCEPTION-путь: стек-локал кадра — вложенность #PF-в-#PF безопасна
+//     (каждое вхождение = свой кадр; p11-допущение «IF=0 ⇒ нет вложенности»
+//     ошибочно: IF=0 блокирует только МАСКИРУЕМЫЕ прерывания, не #PF!);
+//   • IRQ-путь: вход — сейв в Task.fpu прерываемого (ДО любого SSE-кода
+//     хендлера, включая структурные копии), хвост — реставр Task.fpu
+//     задачи-АДРЕСАТА iretq (свич и не-свич — единая формула).
+// Нулевой слот: XSTATE_BV=0 → XRSTOR выставляет INIT-состояние (FCW=0x037F,
+// MXCSR=0x1F80, XMM/YMM=0) — каноника для новорождённых задач/glibc.
+// Fallback без XSAVE (CPU без AVX): movups XMM0-15 в первые 256Б той же
+// области (раскладка кадра kstack НЕ меняется — asm-пути не тронуты).
+// Известный остаток: Zig-вызовы R15-детекторов в asm-хвосте (редкий
+// already-poison путь) могут калечить FPU ПОСЛЕ реставра — состояние и так
+// отравлено, детокция дороже.
 
-inline fn isrSaveXmm() void {
-    asm volatile (
-        \\movups %%xmm0,  0(%[b])
-        \\movups %%xmm1,  16(%[b])
-        \\movups %%xmm2,  32(%[b])
-        \\movups %%xmm3,  48(%[b])
-        \\movups %%xmm4,  64(%[b])
-        \\movups %%xmm5,  80(%[b])
-        \\movups %%xmm6,  96(%[b])
-        \\movups %%xmm7,  112(%[b])
-        \\movups %%xmm8,  128(%[b])
-        \\movups %%xmm9,  144(%[b])
-        \\movups %%xmm10, 160(%[b])
-        \\movups %%xmm11, 176(%[b])
-        \\movups %%xmm12, 192(%[b])
-        \\movups %%xmm13, 208(%[b])
-        \\movups %%xmm14, 224(%[b])
-        \\movups %%xmm15, 240(%[b])
-        :
-        : [b] "r" (&isr_xmm_buf)
-        : "memory"
-    );
+/// Размер XSAVE-области (x87|SSE|AVX): 512 legacy + 64 header + 256 YMM.
+pub const FPU_AREA_SIZE: usize = 832;
+
+comptime {
+    // p12-ФИКС4: $104 в rep stosq (fpuSave) = FPU_AREA_SIZE/8 qword'ов.
+    if (FPU_AREA_SIZE != 832) @compileError("FPU_AREA_SIZE изменился — обнови $104 в rep stosq fpuSave!");
 }
 
-inline fn isrRestoreXmm() void {
-    asm volatile (
-        \\movups  0(%[b]), %%xmm0
-        \\movups 16(%[b]), %%xmm1
-        \\movups 32(%[b]), %%xmm2
-        \\movups 48(%[b]), %%xmm3
-        \\movups 64(%[b]), %%xmm4
-        \\movups 80(%[b]), %%xmm5
-        \\movups 96(%[b]), %%xmm6
-        \\movups 112(%[b]), %%xmm7
-        \\movups 128(%[b]), %%xmm8
-        \\movups 144(%[b]), %%xmm9
-        \\movups 160(%[b]), %%xmm10
-        \\movups 176(%[b]), %%xmm11
-        \\movups 192(%[b]), %%xmm12
-        \\movups 208(%[b]), %%xmm13
-        \\movups 224(%[b]), %%xmm14
-        \\movups 240(%[b]), %%xmm15
-        :
-        : [b] "r" (&isr_xmm_buf)
-        : "memory"
-    );
+/// XSAVE доступен (boot64.S включил OSXSAVE+XCR0=0x207 при наличии AVX).
+/// Детект в initSyscalls; false → movups-фолбэк (SSE-only).
+pub var xsave_enabled: bool = false;
+
+/// CDD №12 p12-БИСЕКТ: гейт IRQ-пути FPU (вход-сейв/хвост-реставр).
+/// true = полный p12; false = IRQ-путь выключен (изоляция подозреваемого).
+pub var p12_irq_fpu: bool = true;
+
+/// CDD №12 p12-ТРИПВАЙР: слот [top-176] задачи (ISR-кадр r15). Пишет
+/// магику арматура (registerKstack), pollит handleIRQ-вход. Появление
+/// 0xAAAA = поимка коррупции: дамп контекста прерываемого (RIP кадра =
+/// вероятный писатель!) + halt для сбора краш-лога e2e.
+pub var p12_watch_addr: u64 = 0;
+pub var p12_watch_magic: u64 = 0x5A12C0DE_5A12C0DE;
+pub var p12_watch_hits: u32 = 0;
+
+/// Сейв полного FPU-контекста (x87+MXCSR+XMM+YMM) в 832Б-область.
+/// Слот обязан быть 64Б-выровнен (xsave с AVX-компонентой).
+pub inline fn fpuSave(slot: *[FPU_AREA_SIZE]u8) void {
+    if (xsave_enabled) {
+        // CDD №12 p12-ФИКС (host-репро xsave-test): XSAVE пишет ТОЛЬКО
+        // non-init компоненты (XINUSE-оптимизация) — биты/образы init-
+        // компонент ОСТАЮТСЯ как есть в памяти (Zig-Debug 0xAA-фон /
+        // стейл прошлого вытеснения) ⇒ XRSTOR читает мусорный FCW/MXCSR/
+        // FSW → #GP(0). Зануление ДО xsave: init-компоненты получают
+        // нулевой образ + BV-бит 0 (честный INIT на реставре) — ровно
+        // дизайн XSAVE. Эмпирика без этого: #GP @ xrstor на ПЕРВОМ
+        // syscall (init-FPU) в zig_syscall_handler.
+        // p12-ФИКС4: зануление ТОЛЬКО GPR (rep stosq) — @memset
+        // компилируется в SSE-бродкаст (movd/pshufd XMM0 + movdqu) и
+        // ЗАТИРАЕТ XMM0 ДО xsave ⇒ сейв всегда нулевой ⇒ рестарт-стор
+        // #PF пишет нули на JIT-страницу (11 нулевых байт — корень
+        // p12-регрессии; эмпирика Run A/fix3: краш @989 syscall сразу
+        // после mprotect-RX; дизассембл memset @0x23f880).
+        asm volatile (
+            \\cld
+            \\xor %eax, %eax
+            \\mov $104, %ecx
+            \\mov %[p], %rdi
+            \\rep stosq
+            :
+            : [p] "r" (@as([*]u8, slot))
+            : "rax", "rcx", "rdi", "memory"
+        );
+        asm volatile (
+            \\mov $7, %eax
+            \\xor %edx, %edx
+            \\xsave (%[p])
+            :
+            : [p] "r" (@as([*]u8, slot))
+            : "rax", "rdx", "memory"
+        );
+    } else {
+        asm volatile (
+            \\movups %%xmm0,  0(%[b])
+            \\movups %%xmm1,  16(%[b])
+            \\movups %%xmm2,  32(%[b])
+            \\movups %%xmm3,  48(%[b])
+            \\movups %%xmm4,  64(%[b])
+            \\movups %%xmm5,  80(%[b])
+            \\movups %%xmm6,  96(%[b])
+            \\movups %%xmm7,  112(%[b])
+            \\movups %%xmm8,  128(%[b])
+            \\movups %%xmm9,  144(%[b])
+            \\movups %%xmm10, 160(%[b])
+            \\movups %%xmm11, 176(%[b])
+            \\movups %%xmm12, 192(%[b])
+            \\movups %%xmm13, 208(%[b])
+            \\movups %%xmm14, 224(%[b])
+            \\movups %%xmm15, 240(%[b])
+            :
+            : [b] "r" (@as([*]u8, slot))
+            : "memory"
+        );
+    }
+}
+
+/// Реставр полного FPU-контекста из 832Б-области.
+/// XSTATE_BV=0 (нулевой слот) → XRSTOR ставит INIT-состояние компонент.
+pub inline fn fpuRestore(slot: *const [FPU_AREA_SIZE]u8) void {
+    if (xsave_enabled) {
+        asm volatile (
+            \\mov $7, %eax
+            \\xor %edx, %edx
+            \\xrstor (%[p])
+            :
+            : [p] "r" (@as([*]const u8, slot))
+            : "rax", "rdx", "memory"
+        );
+    } else {
+        asm volatile (
+            \\movups  0(%[b]), %%xmm0
+            \\movups 16(%[b]), %%xmm1
+            \\movups 32(%[b]), %%xmm2
+            \\movups 48(%[b]), %%xmm3
+            \\movups 64(%[b]), %%xmm4
+            \\movups 80(%[b]), %%xmm5
+            \\movups 96(%[b]), %%xmm6
+            \\movups 112(%[b]), %%xmm7
+            \\movups 128(%[b]), %%xmm8
+            \\movups 144(%[b]), %%xmm9
+            \\movups 160(%[b]), %%xmm10
+            \\movups 176(%[b]), %%xmm11
+            \\movups 192(%[b]), %%xmm12
+            \\movups 208(%[b]), %%xmm13
+            \\movups 224(%[b]), %%xmm14
+            \\movups 240(%[b]), %%xmm15
+            :
+            : [b] "r" (@as([*]const u8, slot))
+            : "memory"
+        );
+    }
+}
+
+/// CDD №12 p12: физический владелец kstack по адресу (скан 8 слотов
+/// kstack_lo/hi_tab; task 0 — бут-стек [0x108000,0x10C000)). null = адрес
+/// вне всех kstack (IST/#DF/ранний бут — FPU-сейв пропускаем симметрично).
+fn kstackOwnerByAddr(addr: u64) ?usize {
+    const sched = @import("scheduler.zig");
+    var i: usize = 0;
+    while (i < sched.MAX_TASKS) : (i += 1) {
+        if (sched.kstack_hi_tab[i] != 0 and
+            addr >= sched.kstack_lo_tab[i] and addr < sched.kstack_hi_tab[i])
+        {
+            return i;
+        }
+    }
+    return null;
 }
 
 pub export fn isr_common_handler(frame: *InterruptFrame) callconv(.C) *InterruptFrame {
     if (frame.vector < 32) {
-        isrSaveXmm();
+        // CDD №12 p12-ФИКС5: ПЕР-ТАСК .bss-СТРОКА (глубина 2) — НЕ стек-локал!
+        // Zig-Debug ОБЯЗАН 0xAA-филлить undefined-локаль (SSE-memset:
+        // дизассембл mov $0xaa,%esi; mov $0x340,%edx; call memset) — филл
+        // затирал XMM0 ДО xsave ⇒ exception-сейв сохранял мусор ⇒ юзер
+        // получал отравленный XMM0 (рестарт-стор = яд на JIT-страницу).
+        // Строки .bss статически нулевые: филла нет, BV=0 → xrstor INIT.
+        // Вне kstack-таблиц (IST/#DF/ранний бут) — fallback-буфер.
+        const sched = @import("scheduler.zig");
+        const exc_owner = kstackOwnerByAddr(@intFromPtr(frame));
+        var exc_slot: *[FPU_AREA_SIZE]u8 = &sched.exc_fpu_fallback;
+        var exc_pushed = false;
+        if (exc_owner) |o| {
+            const d = sched.exc_fpu_depth[o];
+            if (d < 2) {
+                sched.exc_fpu_depth[o] = d + 1;
+                exc_pushed = true;
+            }
+            exc_slot = &sched.exc_fpu_frame[o][@min(d, @as(u8, 1))];
+        }
+        fpuSave(exc_slot);
         handleException(frame);
-        isrRestoreXmm();
+        fpuRestore(exc_slot);
+        if (exc_pushed) {
+            if (exc_owner) |o| {
+                sched.exc_fpu_depth[o] -= 1;
+            }
+        }
         return frame;
     } else {
         return handleIRQ(frame);
@@ -569,6 +706,59 @@ pub var tick_count: u64 = 0;
 pub var p9_guard_drops: u64 = 0;
 
 fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
+    // CDD №12 p12: FPU-СЕЙВ ПРЕРЫВАННОГО КОНТЕКСТА — самое первое заявление
+    // (ДО структурной копии `var next_frame = frame` — Zig компилирует её в
+    // SSE-movups!). Прерываемый контекст: userspace-задача с живыми XMM/YMM
+    // (векторный код v3) ИЛИ ядерный Zig-каскад посреди memset (sti-окно
+    // syscall-хендлера — закрытие дыры mid-memset). Владелец — по kstack,
+    // на котором физически лежит кадр прерывания (скан 8 слотов).
+    var exit_frame_addr: u64 = @intFromPtr(frame);
+    const irq_fpu_owner = if (p12_irq_fpu) kstackOwnerByAddr(@intFromPtr(frame)) else null;
+    if (irq_fpu_owner) |o| {
+        fpuSave(&@import("scheduler.zig").tasks[o].fpu);
+    }
+
+    // CDD №12 p12-ТРИПВАЙР: poll слота. 100Гц-гранулярность; поймали
+    // 0xAAAA → контекст прерываемого (RIP кадра) = писатель-окрестность.
+    // НЕ-магические записи = НОРМА (пуш r15 кадра при каждой преэмпции
+    // task-3 из userspace) — печатаем первые 3 (трассировка), не копим.
+    if (p12_watch_addr != 0 and p12_watch_hits < 100) {
+        const v: u64 = @as(*volatile u64, @ptrFromInt(p12_watch_addr)).*;
+        if (v == 0xAAAAAAAAAAAAAAAA) {
+            p12_watch_hits = 100; // поймано — больше не pollим
+            Serial.puts("[P12-TRIPWIRE] 0xAAAA ПОЙМАН @0x");
+            Serial.putHex(p12_watch_addr);
+            Serial.puts(" tick=");
+            Serial.putDecimal(tick_count);
+            Serial.puts(" cur=");
+            Serial.putDecimal(@import("scheduler.zig").current_task_id);
+            Serial.puts(" in_sys=");
+            Serial.putDecimal(@import("scheduler.zig").in_win32_syscall);
+            Serial.puts(" frame.rip=0x");
+            Serial.putHex(frame.rip);
+            Serial.puts(" frame.cs=0x");
+            Serial.putHex(frame.cs);
+            Serial.puts(" frame.rsp=0x");
+            Serial.putHex(frame.rsp);
+            Serial.puts(" frame.r15=0x");
+            Serial.putHex(frame.r15);
+            Serial.puts("\n");
+            // p12-ФИКС3-верификация: печатаем и ЖИВЁМ ( фикс обязан
+            // исключить появление 0xAAAA; если появился — детектор виден)
+
+        } else if (v != p12_watch_magic and p12_watch_hits < 3) {
+            p12_watch_hits += 1;
+            Serial.puts("[P12-TRIPWIRE] слот переписан (не магика): val=0x");
+            Serial.putHex(v);
+            Serial.puts(" от writer-контекста rip=0x");
+            Serial.putHex(frame.rip);
+            Serial.puts(" cs=0x");
+            Serial.putHex(frame.cs);
+            Serial.puts(" tick=");
+            Serial.putDecimal(tick_count);
+            Serial.puts("\n");
+        }
+    }
     var next_frame = frame;
 
     // CRITICAL: Send APIC EOI BEFORE scheduler callback.
@@ -656,6 +846,7 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                     // получает ядовитый регистровый поток.
                     if (@import("sched_resume.zig").frameContentValid(next_rsp)) {
                         next_frame = @ptrFromInt(next_rsp);
+                        exit_frame_addr = next_rsp;
                     } else {
                         p9_guard_drops += 1;
                         if (p9_guard_drops <= 8) {
@@ -712,6 +903,28 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
         else => {}, // Unknown interrupt — ignore for now
     }
     
+    // CDD №12 p12-ФИКС2: FPU-РЕСТАВР АДРЕСАТА IRETQ. Не-свич: владелец
+    // входа (сейв→реставр = тождество — тело хендлера могло калечить FPU).
+    // Свич: ДИСПЕТЧИРОВАННАЯ задача = schedule()-current_task_id (уже
+    // обновлён на next_id до возврата кадра — iretq-авторитет). НЕ kstack-
+    // скан кадра: RESUME-SLOT диспетчеризация (installResumeFrame) возвращает
+    // кадр из .bss sres.frameSlot — ВНЕ kstack-таблиц → скан давал null →
+    // реставр ПРОПУСКАЛСЯ → разбуженная задача продолжала с мусором FPU
+    // IRQ-хендлера (эмпирика: 11 нулевых байт в JIT-странице, краш сразу
+    // после mprotect-RX паркинга). Гружено ПОСЛЕ всего Zig-кода — после
+    // этой точки до iretq калечителей FPU нет.
+    if (p12_irq_fpu) {
+        if (exit_frame_addr != @intFromPtr(frame)) {
+            // свич: кадр сменился (в т.ч. .bss-RESUME-SLOT) — грузим слот
+            // ДИСПЕТЧИРОВАННОЙ задачи (последний вход-сейв её вытеснения /
+            // нулевой init при рождении).
+            const sched = @import("scheduler.zig");
+            fpuRestore(&sched.tasks[sched.current_task_id].fpu);
+        } else if (irq_fpu_owner) |o| {
+            // не-свич: identity — что сейвили на входе, то и грузим.
+            fpuRestore(&@import("scheduler.zig").tasks[o].fpu);
+        }
+    }
     return next_frame;
 }
 
@@ -1993,6 +2206,31 @@ pub const Serial = struct {
 };
 
 pub fn initSyscalls(handler_addr: u64) void {
+    // CDD №12 p12: XSAVE-детект (boot64.S уже включил OSXSAVE+XCR0=0x207
+    // при AVX; здесь — зеркальная проверка выбора пути fpuSave/Restore).
+    {
+        const cr4: u64 = asm volatile ("movq %%cr4, %[v]"
+            : [v] "=r" (-> u64)
+        );
+        var eax: u32 = undefined;
+        var ebx: u32 = undefined;
+        var ecx: u32 = undefined;
+        var edx: u32 = undefined;
+        asm volatile ("cpuid"
+            : [eax] "={eax}" (eax),
+              [ebx] "={ebx}" (ebx),
+              [ecx] "={ecx}" (ecx),
+              [edx] "={edx}" (edx),
+            : [leaf] "{eax}" (@as(u32, 1)),
+        );
+        // ECX[26]=XSAVE, ECX[28]=AVX, CR4[18]=OSXSAVE
+        xsave_enabled = (cr4 & (@as(u64, 1) << 18)) != 0 and
+            (ecx & (@as(u32, 1) << 26)) != 0 and
+            (ecx & (@as(u32, 1) << 28)) != 0;
+        Serial.puts("[HAL] FPU: xsave=");
+        Serial.puts(if (xsave_enabled) "ON" else "OFF");
+        Serial.puts("\n");
+    }
     // 1. Enable System Call Extensions (SCE) in EFER MSR
     const efer = readMsr(MSR.EFER);
     writeMsr(MSR.EFER, efer | EFER.SCE);
@@ -2020,11 +2258,11 @@ pub fn initSyscalls(handler_addr: u64) void {
 // callee-saved (rbx/rbp/r12-r15) обязаны быть нетронутыми здесь (наш
 // пролог корректен). Печать — ТОЛЬКО первые 4 раза (анти-спам).
 // ═══════════════════════════════════════════════════════════════════════════
-var r15_poison_count: u32 = 0;
+var r15_poison_count: u32 = 0; // p12-форензика: лимит печати поднят (см. ниже)
 
 pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.C) void {
     r15_poison_count += 1;
-    if (r15_poison_count <= 4) {
+    if (r15_poison_count <= 60) { // p12-форензика: 4 → 60 (EXIT/ENTRY не глушить)
         // ручной strlen (freestanding, std не импортирован в hal)
         var len: usize = 0;
         while (msg[len] != 0) : (len += 1) {}
@@ -2036,72 +2274,79 @@ pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.C) void
         Serial.putHex(slot - 8);
         Serial.puts(" n=");
         Serial.putDecimal(r15_poison_count);
+        // CDD №12 p12-ФОРЕНЗИКА: геометрия — чей kstack содержит слот,
+        // оффсет от топа (или «вне kstack-ов» = поля Task/другая .bss).
+        {
+            const sched = @import("scheduler.zig");
+            var found = false;
+            var i: usize = 0;
+            while (i < sched.MAX_TASKS) : (i += 1) {
+                if (sched.kstack_hi_tab[i] != 0 and slot >= sched.kstack_lo_tab[i] and slot < sched.kstack_hi_tab[i]) {
+                    found = true;
+                    Serial.puts(" [GEOM task=");
+                    Serial.putDecimal(i);
+                    Serial.puts(" top=0x");
+                    Serial.putHex(sched.kstack_hi_tab[i]);
+                    Serial.puts(" off_from_top=");
+                    Serial.putDecimal(sched.kstack_hi_tab[i] - slot);
+                    Serial.puts(" taskbase=0x");
+                    Serial.putHex(sched.kstack_lo_tab[i]);
+                    Serial.puts("]");
+                    break;
+                }
+            }
+            if (!found) {
+                Serial.puts(" [GEOM: вне kstack-таблиц!]");
+                // чей это адрес в .bss? — скан всей tasks[] (поля вокруг kstack)
+                var j: usize = 0;
+                while (j < sched.MAX_TASKS) : (j += 1) {
+                    const lo = sched.kstack_lo_tab[j];
+                    if (lo == 0) continue;
+                    const tbase = lo - 32; // id/state/priv/rsp до kernel_stack
+                    const tend = tbase + 131072 + 864; // kstack + хвост-поля (fpu)
+                    if (slot >= tbase and slot < tend) {
+                        Serial.puts(" [TASK-STRUCT task=");
+                        Serial.putDecimal(j);
+                        Serial.puts(" kstack_top=0x");
+                        Serial.putHex(lo + 131072);
+                        Serial.puts(" slot_minus_top=");
+                        Serial.putDecimal(slot - (lo + 131072));
+                        Serial.puts("]");
+                        break;
+                    }
+                }
+            }
+        }
         Serial.puts("\n");
     }
 }
 
-// CDD №12 p11-FIX(2): SYSCALL-XMM. Linux-инвариант: ядро НЕ трогает
-// XMM гостя (у Linux — kernel_fpu_begin/end). Zig-хендлер свободно
-// юзает SSE (мемсеты memcpy/memset, string-опы) → КАЖДЫЙ syscall
-// возвращал гостю затёртые XMM0-15 → gamescope падал в llvm::SelectionDAG
-// (call через мусорный указатель → 0x40). Обёртка: сейв/реставр .bss
-// (IF=0 от SYSCALL — атомарно). Побочный след: futex-парковки в
-// глубине хендлера всё равно теряют XMM (пер-таск XMM-слоты — фронт
-// p12); горячий путь (mmap/mprotect/brk/clock) закрыт.
-var sys_xmm_buf: [32]u64 align(16) = [_]u64{0} ** 32;
-
-inline fn sysSaveXmm() void {
-    asm volatile (
-        \\movups %%xmm0,  0(%[b])
-        \\movups %%xmm1,  16(%[b])
-        \\movups %%xmm2,  32(%[b])
-        \\movups %%xmm3,  48(%[b])
-        \\movups %%xmm4,  64(%[b])
-        \\movups %%xmm5,  80(%[b])
-        \\movups %%xmm6,  96(%[b])
-        \\movups %%xmm7,  112(%[b])
-        \\movups %%xmm8,  128(%[b])
-        \\movups %%xmm9,  144(%[b])
-        \\movups %%xmm10, 160(%[b])
-        \\movups %%xmm11, 176(%[b])
-        \\movups %%xmm12, 192(%[b])
-        \\movups %%xmm13, 208(%[b])
-        \\movups %%xmm14, 224(%[b])
-        \\movups %%xmm15, 240(%[b])
-        :
-        : [b] "r" (&sys_xmm_buf)
-        : "memory"
-    );
-}
-
-inline fn sysRestoreXmm() void {
-    asm volatile (
-        \\movups  0(%[b]), %%xmm0
-        \\movups 16(%[b]), %%xmm1
-        \\movups 32(%[b]), %%xmm2
-        \\movups 48(%[b]), %%xmm3
-        \\movups 64(%[b]), %%xmm4
-        \\movups 80(%[b]), %%xmm5
-        \\movups 96(%[b]), %%xmm6
-        \\movups 112(%[b]), %%xmm7
-        \\movups 128(%[b]), %%xmm8
-        \\movups 144(%[b]), %%xmm9
-        \\movups 160(%[b]), %%xmm10
-        \\movups 176(%[b]), %%xmm11
-        \\movups 192(%[b]), %%xmm12
-        \\movups 208(%[b]), %%xmm13
-        \\movups 224(%[b]), %%xmm14
-        \\movups 240(%[b]), %%xmm15
-        :
-        : [b] "r" (&sys_xmm_buf)
-        : "memory"
-    );
-}
-
+// CDD №12 p12-ФИКС3: SYSCALL-FPU — ПЕР-ТАСК .bss-СТРОКА (НЕ стек-локал!).
+// ГЕОМЕТРИЧЕСКИЙ КОРЕНЬ p12-регрессии: стек-локал 832Б (and $-64 + sub
+// $0x400 + Zig-Debug 0xAA-филлы) растянул кадр обёртки до [top-1168,
+// top-128) — верх кадра затирал [top-176, top-128) = GPR-слоты STALE-
+// кадра таймер-преэмпции из userspace (R15@top-176!). p11-обёртка была
+// тонкой ([top-168, top-128)) — 8Б-зазор хранил R15-слот нетронутым.
+// Диспетчеризация stale-кадра (frameContentValid меряет ТОЛЬКО CS/RIP —
+// их перезаписал живой каскад ТЕКУЩЕГО syscall!) доставляла юзеру
+// R15=0xAAAA → #GP (TRIPWIRE: живой frame.r15=0xAAAA, cs=0x23, in_sys=0;
+// EXIT/ENTRY-POISON молчали — доставка минуя syscall-выход).
+// СТРОКИ ПЕР-ТАСК: владелец по user_rsp (как syscall_exit_frame);
+// парк-безопасность по конструкции (чужие syscall пишут свои строки);
+// fallback для владельца вне таблиц (shell — без парковок).
 pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
-    sysSaveXmm();
-    const rc = zig_syscall_handler_inner(arg1, arg2, arg3, arg4, syscall_num, arg5);
-    sysRestoreXmm();
+    const sched = @import("scheduler.zig");
+    const owner = sched.syscallStackOwner(sched.user_rsp);
+    var rc: u64 = undefined;
+    if (owner != 255 and owner < sched.MAX_TASKS and owner != 0) {
+        fpuSave(&sched.syscall_fpu_frame[owner]);
+        rc = zig_syscall_handler_inner(arg1, arg2, arg3, arg4, syscall_num, arg5);
+        fpuRestore(&sched.syscall_fpu_frame[owner]);
+    } else {
+        fpuSave(&sched.syscall_fpu_fallback);
+        rc = zig_syscall_handler_inner(arg1, arg2, arg3, arg4, syscall_num, arg5);
+        fpuRestore(&sched.syscall_fpu_fallback);
+    }
     return rc;
 }
 
@@ -2126,7 +2371,9 @@ pub fn zig_syscall_handler_inner(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sys
                 sf[2] == 0xAAAAAAAAAAAAAAAA or sf[3] == 0xAAAAAAAAAAAAAAAA or
                 sf[4] == 0xAAAAAAAAAAAAAAAA or sf[5] == 0xAAAAAAAAAAAAAAAA)
             {
-                Serial.puts("[ENTRY-POISON] ur=0x");
+                Serial.puts("[ENTRY-POISON] syscall#=");
+                Serial.putDecimal(syscall_num);
+                Serial.puts(" ur=0x");
                 Serial.putHex(sched7.user_rsp);
                 Serial.puts(" r15=0x");
                 Serial.putHex(sf[0]);

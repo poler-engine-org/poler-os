@@ -1,13 +1,11 @@
-updated_utc: 2026-09-06T21:40:00Z
+updated_utc: 2026-09-07T13:09:49Z
 repo: poler-os
 branch: main
-commit: 48b77392 (CDD №12 p10: TEARDOWN-ИНВАРИАНТЫ + PHYS-MAP-СКАНЕР — алиасинг закрыт/верифицирован CLEAN; фронт p11: syscall-diff vs host-Linux → PAGE_FLIP)
+commit: fix(cdd12-p12) (после c641f222): R15-POISON/флаки закрыт — полный FPU-контекст per-task (xsave/xrstor)
 tag: v0.19.0 (следующий релиз — v0.20.0-rc: после первого PAGE_FLIP)
-pushed: local only (ghp-токен сессии истёк — пуш ждёт свежий токен; коммит 5cf153f5 в локальном main)
-tests: zig build 5/5; zig build test 573/573 (CDD №12 p4: +2 drm-scanout (PAGE_FLIP/SETCRTC→vring: phys/габариты/счётчик; линейный-fb/vring-fail толерантность), +1 tgkill (abort-смерть SIGABRT/SIGKILL/пойманный-без-доставки/EINVAL-ESRCH), +1 F_DUPFD/F_DUPFD_CLOEXEC (dup≥minfd/копия FdEntry/ошибки)). E2E QEMU: drm-gamescope идёт до КОМПИЛЯЦИИ ШЕЙДЕРОВ (wayland-display ✓, vulkan-instance ✓, physical-device+слой ✓, vkCreateDevice ✓✓, pipeline/ш Shader-компиляция — фронт); РЕГРЕСС-МАТРИЦА p4 (финальная): elf-run 17/17, dyn-elf 4/4, glibc-static 7/7, drm 8/8, input 11/11, ldev 12/12, gpu-scanout 11/11 — ВСЁ ЗЕЛЕНОЕ; gamescope e2e 4/6 (краш-лог = CDD-артефакт)
-current_task: CDD №12 p10 ЗАВЕРШЁН (см. git log). РЕЗУЛЬТАТ: (1) unmapPageInPML4 условный INVLPG (активный CR3) — stale-TLB между тредами CLONE_VM закрыт; (2) teardown-порядок unmap→free (ошибки не глотаются); (3) PMM double-free детектор (громкий, счётчики); (4) phys-map-сканер (монит-команда physmap: ANON/MIXED-ALIAS, strict/exempt классификация) — ЖИВАЯ ВЕРИФИКАЦИЯ p10-verify.py: CLEAN 0/0 на всём прогоне до краша ⇒ АЛИАСИНГ ОПРОВЕРГНУТ как источник 0xAA. ФОРЕНЗИКА who-ptr2 PAT (27М событий): все регистровые каналы доставки (user-load/.bss-exit-frame/pop-каскад с isr64.S чек-компараторами) ЧИСТЫ; 0xAA в heap = легитимные LLVM pattern-fill (memset_avx2 ×1152+LLVM ×408, 13 страниц скретча) + DenseMap tombstone; краш = деструктор списка 0x38-узлов следует в tombstone 0xAAAA (#GP non-canonical) — upstream-расхождение через syscall-семантику (error-ветка пропускает map-fixup). 573/573; elf-run 17/17, dyn-elf 4/4, glibc-static 7/7; gamescope e2e: фронт renderD128+llvmpipe+шейдеры. ТЕГ НЕ СТАВИТСЯ (первого PAGE_FLIP нет — дисциплина p7). ФРОНТ p11: syscall-diff [L]-трейса против host-Linux strace/vkprobe2 — первый расходящийся возврат = корень 0xAA-краша; затем DRM Master CREATE_DUMB→ADDFB2→SETCRTC→PAGE_FLIP → screendump 1024x768 → тег v0.20.0-rc. ИНСТРУМЕНТЫ p10: p10-verify.py (живой physmap), p10-launch.py (daemonize — песочница репает деревья процессов на границе bash-вызовов!), e2e extra_files нормализация (ICD-манифест), E2E_WHO выбор who-ptr/who-ptr2.
-current_task_note: CDD-итерации p4: (1) МОДУЛЬНАЯ АТРИБУЦИЯ mmap-регионов (MmapRegion.name ← fd-путь; hal.handleException [RIP]/[CR2] module+off; STACK-RET с именами+гистограмма ×N; mmapinfo-команда) — СРАБОТАЛА КРАТЧАЙШИМ ПУТЁМ: #GP по hlt в libc+0x25839 = glibc die-hard-хвост → цепочка «Failed loading SDL3 library.» → tgkill=-ENOSYS; (2) tgkill(234) реализован (фатальный-Dfl → kill_thread, self-kill=exit-паттерн, exit_code=128+sig — wait-семантика); (3) ФРОНТ СДВИНУЛСЯ: dlopen(libSDL3.so.1) ENOENT — fetch-cachyos ХОЛОДНЫЙ СТАРТ сломан (exists-гейт на пустом кэше пропускал dlopen-волны) → warm-пакеты + pkg_for_soname(); (4) vkCreateInstance=-9: libxcb-keysyms.so.1 исчез из libxcb 1.17 (split в xcb-util-keysymes); (5) wl_display_get_event_loop(NULL) #PF: КОРЕНЬ fcntl(F_DUPFD_CLOEXEC=1030)=-EINVAL в wl_os_dupfd_cloexec → РЕАЛИЗОВАН F_DUPFD/F_DUPFD_CLOEXEC; (6) vkCreateDevice NULL+0x38 #PF в lvp+0xF198 (компиляторный UB-блок): КОРЕНЬ «mmap registry full» ×159 (LLVM-арены поверх 512) → 512→2048; (7) СЕЙЧАС: vkCreateDevice ✓✓, gamescope идёт в компиляцию шейдеров → tgsi-0xAAAA + stack-smash. ГИПОТЕЗА-КАНДИДАТ: clobber регистра syscall-выхода класса p2-R8 (проверить R9/R10/R12-R15 сохранение через syscall) ИЛИ порча стек-кадра треда (clone) ИЛИ 0xAAAA (clang auto-var-init pattern) чтение неинициализированной локали из-за diff CPUID/энв. ИНСТРУМЕНТЫ: vkprobe2.c (host ground truth с реальными шейдерами), extract-gs-shaders.py, ltrace-PATH-декодер, [VFS] open-fail-диагностика.
-
+pushed: origin/main (токен файл-хранилище)
+tests: zig build OK; zig build test зелёные; E2E: sysharness (Vulkan compute, LLVM-JIT) DONE ×4 подряд (1037 syscall = база p11), elf-run 17/17; детекторы ВСЕ ЧИСТЫЕ: R15-POISON=0, EXIT/ENTRY-POISON=0, трипвайр спит
+current_task: CDD №12 p12 ЗАВЕРШЁН (см. git log + секцию ниже). РЕЗУЛЬТАТ: полный FPU-контекст (x87+MXCSR+XMM+YMM, xsave/xrstor маска 0x7, 832Б align 64) ПЕР-ТАСК во всех трёх путях: (a) syscall — syscall_fpu_frame[8][832] .bss-строки (владелец по user_rsp; парк-безопасность по конструкции — чужие syscall пишут свои строки; fallback для вне-таблиц); (b) exception — exc_fpu_frame[8][2][832] .bss-строки глубина-2 (вложенный #PF-в-#PF; владелец по kstack-адресу кадра kstackOwnerByAddr); (c) IRQ — вход-сейв tasks[o].fpu прерываемого (первое заявление, до SSE-структурных копий) + хвост-реставр адресата иретки (свич → current_task_id; не-свич → identity). ДВА ДИЗАССЕМБЛ-ДОКАЗАННЫХ КЛОУНА исходного p12-дизайна: (1) @memset(slot,0) перед xsave = SSE-бродкаст XMM0 (movd/pshufd — memset@0x23f880) — затирал гостевой XMM0 ДО сохранения ⇒ рестарт-стор #PF писал НУЛИ на JIT-страницу (11 нулей вместо endbr64+imul×2, краш @989 syscall сразу после mprotect-RX); (2) Zig-Debug 0xAA-филл undefined-стек-локали (memset $0xAA,$0x340 — SSE!) в isr_common_handler — та же порча XMM0 + 0xAA-спрей. Фикс: rep stosq GPR-only (зануление без XMM; cld DF-безопасно) + .bss-строки (статический ноль — рантайм-филла нет, BV=0 → xrstor INIT честен). ГЕОМЕТРИЯ (фикс-3): 832Б стек-локал растягивал кадр обёртки — 0xAA-спиллы в GPR-слоты STALE-кадра преэмпции [top-176,top-128) → иретка доставляла R15=0xAAAA (живой улов трипвайром: frame.r15=0xAAAA cs=0x23 in_sys=0; EXIT/ENTRY-POISON молчали — доставка минуя syscall-выход); обёртка снова тонкая + GPR-GUARD в frameContentValid (0xAAAA в r15..r12 → кадр не диспетчеризуется). ВЕРИФИКАЦИЯ: sysharness DONE ×4 (1037 syscall), elf-run 17/17, юнит-тесты зелёные, детекторы 0. ТЕГ НЕ СТАВИТСЯ (первого PAGE_FLIP нет — дисциплина p7). ФРОНТ p13: gamescope → SET_MASTER → CREATE_DUMB → ADDFB2 → SETCRTC → PAGE_FLIP → screendump 1024×768 → тег v0.20.0-rc. 
 blocked_on: —
 tmux_sessions: нет (QEMU через qemu-portable/qemu-portable.sh; e2e scripts/e2e/ + drm-gamescope-e2e.py; vkprobe2 host-прогон: ld-linux --library-path root/usr/lib + VK_ICD_FILENAMES)
 credentials: ВАЛИДЕН — файл-хранилище upload/«гитхаб токен .txt»
@@ -15,6 +13,7 @@ credentials: ВАЛИДЕН — файл-хранилище upload/«гитха�
 ## Последние сессии
 
 | Дата (UTC) | Задача | Результат |
+| 2026-09-07 | **CDD №12 p12: R15-POISON/FPU-ФЛАКИ-КИЛЛЕР (commit fix(cdd12-p12))** | Полный FPU-контекст пер-таск (xsave/xrstor 0x7: x87+MXCSR+XMM+YMM) в трёх путях: syscall-строки .bss [8][832] (парк-безопасность), exception-строки [8][2][832] (глубина-2, вложенный #PF), IRQ вход-сейв/хвост-реставр (Task.fpu). ДВА клоуна найдены дизассемблом: memset перед xsave = SSE-бродкаст XMM0 (нули на JIT-странице) и Zig-Debug 0xAA-филл undefined-локали (SSE). Фиксы: rep stosq GPR-only + .bss-строки + тонкая геометрия + GPR-GUARD. sysharness DONE ×4 (1037 syscall), elf-run 17/17, детекторы 0. |
 | 2026-09-06 | **CDD №12 p10: TEARDOWN-ИНВАРИАНТЫ + PHYS-MAP-СКАНЕР (commit 48b77392, push pending)** | Алиасинг физстраниц ЗАКРЫТ и ОПРОВЕРГНУТ как источник яда: INVLPG в unmapPageInPML4 (активный CR3; треды CLONE_VM не сбрасывали TLB), порядок unmap→free, PMM double-free детектор, physmap-сканер (живой VERIFY: CLEAN 0/0). Форензика who-ptr2 PAT 27М событий: все каналы доставки чисты; 0xAA = LLVM pattern-fill (memset ×1152) + DenseMap tombstone; краш = деструктор списка следует в tombstone → #GP. Фронт p11: syscall-diff vs host-Linux. 573/573; elf 17/17; dyn 4/4; glibc 7/7. |
 | 2026-09-06 | **CDD №12 p8: ВЫХОДНОЙ КАДР = СТРОКА ВЛАДЕЛЬЦА (commit 5cf153f5, local)** | ЭПИК: кросс-таск hijack syscall-выхода НАЙДЕН+ЗАКРЫТ — глобал syscall_exit_frame_ptr в парк-окнах пере-указывается дитятей → родитель после clone sysretq в КОНТЕКСТ ДИТЯ (glue/ThreadFunc epoll_wait) → gamescope main-поток вечно в ThreadFunc-парке (фронт 1158/1171 — «epoll без wake»). Фикс: пере-указка на строку ВЛАДЕЛЬЦА перед возвратом в asm. РЕЗУЛЬТАТ: фронт 1865, /dev/dri/card0 newfstatat ✓, opendir+getdents64 ✓ (libdrm-скан!). ИНСТРУМЕНТЫ: tasks (РЕЕСТР ПАРКОВОК: задачи/wake/fd/epoll-watches/каналы/futex), peek (page-walk чтение user-VA: имена тредов 'gamescope-eis', vtable→gamescope base 0x100000000000), [EPW]/[FXW] входной трейс паркующих syscall'ов, who-ptr range-first + WHO-PTR-STACK, p8-parkdump.py. НОВЫЙ ФРОНТ p9: 0xAAAA в brk-хипе (memset 0xAA fill из libc-loop, вызывающий неизвестен) → #GP LLVM при спискоходе полу-инициализированной структуры. 573/573. |
 |---|---|---|
@@ -73,3 +72,54 @@ shim-mprotect.c (LD_PRELOAD). Все логи: logs-p11/.
    **PAGE_FLIP** → screendump 1024×768 → tag **v0.20.0-rc**.
 
 Тулчейн: /tmp/my-project/tools/zig-0.14.0/zig (сеть в песочнице недоступна).
+
+---
+
+## CDD №12 p12 — ИТОГ: R15-POISON/FPU-ФЛАКИ-КИЛЛЕР — ПОЛНЫЙ FPU-КОНТЕКСТ PER-TASK
+
+**Двойной корень p12-регрессии (дизассембл-доказанный):**
+1. `@memset(slot,0)` перед `xsave` в fpuSave — Zig компилирует в SSE-бродкаст
+   (`movd %edi,%xmm0; pshufd $0; movdqu`) — **memset затирал гостевой XMM0 ДО
+   сохранения**: каждый fpuSave писал нулевой XMM0 ⇒ xrstor доставлял юзеру
+   XMM0=0 ⇒ рестарт-стор #PF (demand-zero first-touch) писал 11 нулей на
+   JIT-страницу LLVM вместо endbr64+imul×2 ⇒ mprotect(RX) ⇒ прыжок ⇒ #PF
+   (краш @989 syscall — p11-база 1038/DONE). Host-репро xsave-test это
+   упустил (проверял BV/#GP-семантику, не сохранность XMM0 через memset).
+2. Zig-Debug 0xAA-филл undefined-стек-локали exception-пути
+   (`memset $0xAA,$0x340` в isr_common_handler — SSE!) — та же порча XMM0
+   (паттерн 0xAA) + 0xAA-спрей в kstack-зоны.
+
+**Геометрический корень (фикс-3):** 832Б стек-локал обёртки растягивал кадр —
+спиллы/филлы писали в GPR-слоты STALE-кадра таймер-преэмпции
+[top-176,top-128) → диспетчеризация иреткой (CS/RIP «валидны» — перезаписаны
+живым каскадом) доставляла юзеру R15=0xAAAA → #GP в libstdc++ (триплата:
+живой frame.r15=0xAAAA, cs=0x23; EXIT/ENTRY-POISON молчали).
+
+**Архитектура (инвариант kernel_fpu_begin/end, AVX XCR0=0x207, v3-YMM):**
+- syscall: `syscall_fpu_frame[8][832]` .bss-строки, владелец по user_rsp
+  (парк-безопасность по конструкции), fallback для вне-таблиц;
+- exception: `exc_fpu_frame[8][2][832]` .bss-строки глубина-2 (вложенный
+  #PF-в-#PF; владелец по kstack-адресу; утечка глубины безвредна — слоты
+  симметричные пары save/restore);
+- IRQ: вход-сейв `tasks[o].fpu` (первое заявление — до SSE-структурных
+  копий), хвост-реставр адресата иретки (свич → current_task_id — FIX2;
+  не-свич → identity);
+- `fpuSave`: `cld; rep stosq` (104 qword — ТОЛЬКО GPR!) + `xsave` маска 0x7;
+  comptime-страховка $104 ↔ FPU_AREA_SIZE=832.
+
+**GPR-GUARD (sched_resume.zig):** frameContentValid + проверка 0xAAAA в
+r15..r12 (frame+0/8/16/24) — отравленный кадр НЕ диспетчеризуется.
+
+**Трипвайр (форензика-инструмент, спит):** poll слота [top-176] на каждом
+IRQ-входе; авто-арм снят (хардкод task 3 — охота закрыта); армит ручная
+запись p12_watch_addr+магика.
+
+**Результаты:** sysharness DONE ×4 (1037 syscall = база p11), elf-run 17/17,
+юнит-тесты зелёные; R15-POISON=0, EXIT/ENTRY-POISON=0, трипвайр=0.
+**ТЕГ НЕ СТАВИТСЯ** (первого PAGE_FLIP нет — дисциплина p7).
+
+**Фронт p13:** gamescope → SET_MASTER → CREATE_DUMB → ADDFB2 → SETCRTC →
+**PAGE_FLIP** → screendump 1024×768 → тег **v0.20.0-rc**.
+
+Патч-скрипты (полная история охоты): /home/z/my-project/scripts/p12-*.py;
+логи: /tmp/p12/; тулчейн: /tmp/my-project/tools/zig-0.14.0/zig.

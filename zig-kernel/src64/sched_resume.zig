@@ -89,6 +89,19 @@ pub fn frameContentValid(rsp: u64) bool {
     if (rip < 0x10000 or rip >= 0x0000_8000_0000_0000) return false;
     const usp = @as(*volatile u64, @ptrFromInt(rsp + 160)).*;
     if (usp < 0x10000 or usp >= 0x0000_8000_0000_0000) return false;
+    // CDD №12 p12-ФИКС3: GPR-GUARD — user-кадр с 0xAAAA в callee-слотах
+    // (r15/r14/r13/r12 = frame+0/8/16/24) = отравленный STALE-кадр (его
+    // GPR-зону затёр Zig-Debug 0xAA-филлами кадра обёртки syscall —
+    // CS/RIP при этом перезаписаны живым каскадом и «валидны»!). Гость
+    // не должен получать ядовитый регистровый поток.
+    const g15 = @as(*volatile u64, @ptrFromInt(rsp + 0)).*;
+    if (g15 == 0xAAAAAAAAAAAAAAAA) return false;
+    const g14 = @as(*volatile u64, @ptrFromInt(rsp + 8)).*;
+    if (g14 == 0xAAAAAAAAAAAAAAAA) return false;
+    const g13 = @as(*volatile u64, @ptrFromInt(rsp + 16)).*;
+    if (g13 == 0xAAAAAAAAAAAAAAAA) return false;
+    const g12 = @as(*volatile u64, @ptrFromInt(rsp + 24)).*;
+    if (g12 == 0xAAAAAAAAAAAAAAAA) return false;
     return true;
 }
 
