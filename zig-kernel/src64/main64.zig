@@ -2725,6 +2725,9 @@ fn linuxChannelWrite(id: u32, va: u64, count: u64) i64 {
             c.interval_ns = interval;
             if (value == 0) {
                 c.deadline_ns = 0; // disarm
+                sys_print("[TFD] DISARM id=");
+                putDecimal(id);
+                sys_print("\n");
             } else if (tflags & 1 != 0) { // TFD_TIMER_ABSTIME
                 c.deadline_ns = value; // уже монотонные нс — как есть
                 sys_print("[TFD] ARM abs id=");
@@ -2734,6 +2737,11 @@ fn linuxChannelWrite(id: u32, va: u64, count: u64) i64 {
                 sys_print("\n");
             } else {
                 c.deadline_ns = linuxTimeNsRaw() + value;
+                sys_print("[TFD] ARM rel id=");
+                putDecimal(id);
+                sys_print(" value=");
+                putDecimal(value);
+                sys_print("\n");
             }
             return @intCast(@min(count, 24));
         },
@@ -4283,6 +4291,7 @@ fn linuxKillThread(tid: u64, sig: u64) bool {
 /// v0.20.0 (CDD №11 p3): трассировка Linux-syscall'ов (команда ltrace) —
 /// crash-driven инструмент: видно ПОСЛЕДОВАТЕЛЬНОСТЬ и возвраты.
 var linux_trace: bool = false;
+var poll_diag_counter: u32 = 0; // p14: capped [PLW]-трейс (первые 30)
 
 fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
     // CDD №12 p8: ВХОДНОЙ трейс паркующих syscall'ов ([L] печатает только
@@ -4308,6 +4317,24 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
             }
             hal.Serial.puts(" rip=0x");
             hal.Serial.putHex(scheduler.syscall_frame[7]);
+            hal.Serial.puts("\n");
+        }
+    }
+    if (num == 7) { // p14: poll c timeout≠0 — кто блокируется (capped 30)
+        const ptimeout: i64 = @bitCast(a3);
+        if (ptimeout != 0 and poll_diag_counter < 30) {
+            poll_diag_counter += 1;
+            const owner = scheduler.syscallStackOwner(scheduler.user_rsp);
+            hal.Serial.puts("[PLW] tid=");
+            hal.Serial.putDecimal(owner);
+            hal.Serial.puts(" nfds=");
+            hal.Serial.putDecimal(a2);
+            hal.Serial.puts(" t=");
+            if (ptimeout < 0) {
+                hal.Serial.puts("-1");
+            } else {
+                hal.Serial.putDecimal(@as(u64, @intCast(ptimeout)));
+            }
             hal.Serial.puts("\n");
         }
     }

@@ -1291,9 +1291,8 @@ pub fn sysFutex(ops: LinuxOps, uaddr: u64, op_in: u64, val: u64, timeout_va: u64
 }
 
 /// int poll(struct pollfd *fds, nfds_t nfds, int timeout)
-pub fn sysPoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, timeout: i64) u64 {
-    _ = timeout; // v0.19: НЕБЛОКИРУЮЩИЙ опрос (блокирующее ожидание —
-    // epoll/wait-волна с реальными процессами; документировано)
+/// p14: scan-ядро poll — один проход готовности (копи-аут revents).
+fn pollScanOnce(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64) u64 {
     if (nfds > MAX_POLL_FDS) return err(EINVAL);
     if (nfds == 0) return 0;
     if (!ops.validate(fds_va, nfds * @sizeOf(PollFd), true)) return err(EFAULT);
@@ -1353,6 +1352,35 @@ pub fn sysPoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, timeout: i6
 
     if (!ops.copy_out(fds_va, std.mem.sliceAsBytes(kbuf[0..@intCast(nfds)]))) return err(EFAULT);
     return ready_count;
+}
+
+/// p14: БЛОКИРУЮЩИЙ poll (зеркало sysEpollWait: слайс-парковка 20мс +
+/// перепроверка готовности). timeout=0 — честный неблокирующий скан;
+/// timeout>0 — до дедлайна (возврат 0 = таймаут); timeout<0 — до события;
+/// nfds=0 — Linux-семантика sleep(timeout).
+/// КОРЕНЬ p14: poll НЕ блокировался (мгновенный 0) → gamescope-поток
+/// ЖЁГ TCG-эмуляцию спином весь прогон (260с), vblank-ждущий поток
+/// никогда не спал на таймере → конвейер презентаций стоял.
+pub fn sysPoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, timeout: i64) u64 {
+    if (nfds > MAX_POLL_FDS) return err(EINVAL);
+    if (nfds == 0 and timeout <= 0) return 0;
+    if (nfds != 0 and !ops.validate(fds_va, nfds * @sizeOf(PollFd), true)) return err(EFAULT);
+    if (timeout == 0) return pollScanOnce(ops, fds, fds_va, nfds);
+    const t0_ns = ops.time_ns();
+    while (true) {
+        const n = pollScanOnce(ops, fds, fds_va, nfds);
+        if (n != 0) return n;
+        const elapsed_ms: u64 = (ops.time_ns() - t0_ns) / 1_000_000;
+        if (timeout > 0) {
+            const total_ms: u64 = @intCast(timeout);
+            if (elapsed_ms >= total_ms) return 0; // таймаут (честные 0)
+        }
+        const slice_ms: u64 = if (timeout > 0)
+            @min(@as(u64, @intCast(timeout)) -| elapsed_ms, 20)
+        else
+            20;
+        ops.task_park(slice_ms);
+    }
 }
 
 /// int epoll_create1(int flags)
@@ -1507,13 +1535,15 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
 /// (pthread_join). CLONE_SETTLS принимается — FS-base в arch_prctl-волне.
 pub fn sysClone(ops: LinuxOps, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) u64 {
     const need = CLONE_VM | CLONE_SIGHAND;
-    if (flags & need != need) {
-        // p14: FAKE-FORK — glibc fork() = clone(SIGCHLD, без CLONE_VM).
-        // Реального ребёнка нет (exec-модели нет): родителю — псевдо-pid;
-        // wait4 ответит «exited 0». Иначе gamescope «fork failed» → краш.
+    // p14: FAKE-FORK — glibc fork() = clone(SIGCHLD, БЕЗ CLONE_VM).
+    // Реального ребёнка нет (exec-модели нет): родителю — псевдо-pid;
+    // wait4 ответит «exited 0». Иначе gamescope «fork failed» → краш.
+    // Ветка ТОЛЬКО для fork-подобных: CLONE_VM-без-SIGHAND — мёртвая пара
+    // (Linux EINVAL), не маскировать её псевдо-ребёнком!
+    if (flags & CLONE_VM == 0) {
         return @intCast(fakeKidAlloc());
     }
-    if (flags & CLONE_SIGHAND != 0 and flags & CLONE_VM == 0) return err(EINVAL);
+    if (flags & need != need) return err(EINVAL);
     // SETTID-указатели обязаны присутствовать (ядро пишет tid после успеха)
     if (flags & CLONE_PARENT_SETTID != 0 and parent_tid == 0) return err(EINVAL);
     if (flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 and child_tid == 0)
@@ -3556,7 +3586,13 @@ fn fakeOps() LinuxOps {
         .dir_close = fakeDirClose,
         .task_park = fakeTaskPark,
         .mkdir_tmpfs = fakeMkdirTmpfs,
+        .vfs_unlink = fakeVfsUnlink,
     };
+}
+
+fn fakeVfsUnlink(path: []const u8) i64 {
+    _ = path; // tmpfs-реестра в fake-среде нет — успех-заглушка
+    return 0;
 }
 
 fn fakeCurrentPid() u64 {
@@ -3890,8 +3926,10 @@ test "linux: p4 — F_DUPFD/F_DUPFD_CLOEXEC (libwayland wl_os_dupfd_cloexec)" {
     try testing.expect(dup2 >= 3);
     try testing.expect(dup2 != 5);
 
+    // p14: MAX_FDS 64→256 — F_DUPFD(64) теперь ЛЕГАЛЕН (слот 64 свободен)
+    try testing.expectEqual(@as(u64, 64), sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD, 64));
     // minfd ≥ MAX_FDS → EINVAL; отрицательный → EINVAL; EBADF на чужом fd
-    try testing.expectEqual(err(EINVAL), sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD, 64));
+    try testing.expectEqual(err(EINVAL), sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD, 256));
     try testing.expectEqual(err(EINVAL), sysFcntl(ops, &fds, @intCast(evfd), F_DUPFD, @bitCast(@as(i64, -1))));
     try testing.expectEqual(err(EBADF), sysFcntl(ops, &fds, 99, F_DUPFD, 3));
 
@@ -4153,8 +4191,10 @@ test "linux: sys_clone — потоковые флаги; fork (без CLONE_VM)
     try testing.expectEqual(@as(u64, 1), e.clone_calls);
     try testing.expectEqual(thr, e.last_clone_flags);
 
-    // fork (SIGCHLD, без CLONE_VM) → -EINVAL (COW вне фундамента v0.19)
-    try testing.expectEqual(err(EINVAL), sysClone(ops, 17, 0, 0, 0, 0));
+    // p14: FAKE-FORK — fork (SIGCHLD, без CLONE_VM) больше не -EINVAL:
+    // родителю — псевдо-pid (9000+), wait4 ответит «exited» (XWayland)
+    const fork_r = sysClone(ops, 17, 0, 0, 0, 0);
+    try testing.expect(fork_r >= 9000);
     // CLONE_VM без CLONE_SIGHAND → Linux требует пару → -EINVAL
     try testing.expectEqual(err(EINVAL), sysClone(ops, CLONE_VM, 0, 0, 0, 0));
 }
@@ -4948,8 +4988,8 @@ test "linux: timerfd — create/arm/read-цикл; memfd — anon RW-файл" {
     // чтение до экспирации → EAGAIN (fake-время не тикает)
     const out_va = FakeEnv.USER_BASE + 0x300;
     try testing.expectEqual(err(EAGAIN), sysRead(ops, &fds, 3, out_va, 8));
-    // ABSTIME-флаг → ENOTSUP
-    try testing.expectEqual(err(ENOTSUP), sysTimerfdSettime(ops, &fds, 3, 1, it_va, 0));
+    // p14: ABSTIME-флаг ПОДДЕРЖАН (gamescope-vblank) → 0
+    try testing.expectEqual(@as(u64, 0), sysTimerfdSettime(ops, &fds, 3, 1, it_va, 0));
 
     // memfd: anon tmpfs RW
     const mfd = sysMemfdCreate(ops, &fds, 0);
