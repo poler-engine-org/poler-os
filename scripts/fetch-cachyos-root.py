@@ -377,6 +377,16 @@ def main():
         print("FATAL: gamescope не встал")
         sys.exit(1)
 
+    # v0.20 (CDD №15): XWAYLAND — второй ELF системы: fork+execve в ядре
+    # оживает ТОЛЬКО при наличии бинарника в rootfs (wlserver spawn'ит его
+    # через fork+exec). Замыкание его либ докачает X11/xcb-стек.
+    ensure_pkg(idx_map, "xwayland")
+    xw_path = os.path.join(ROOTFS, "usr/bin/Xwayland")
+    if os.path.exists(xw_path):
+        print(f"  Xwayland: {xw_path} ({os.path.getsize(xw_path)//1024} КБ)")
+    else:
+        print("  WARN: xwayland-пакет не встал (зеркало?)")
+
     # CDD №12 p4-фикс: ХОЛОДНЫЙ СТАРТ dlopen-волны. Гейт os.path.exists()
     # на пустом кэше пропускал волну ЦЕЛИКОМ (SDL3/Vulkan/lavapipe нет в
     # DT_NEEDED-замыкании gamescope) → e2e: «Failed loading SDL3 library.» →
@@ -454,9 +464,27 @@ def main():
     if os.path.isdir(icd_dir):
         for n in os.listdir(icd_dir):
             extra_files.append(os.path.join(icd_dir, n))
+    # v0.20 (CDD №15): Xwayland-замыкание — второй ELF системы (fork+execve):
+    # его X11/xcb-стек НЕ пересекается с gamescope-замыканием полностью
+    xwayland_libs = []
+    xwayland_missing = []
+    if os.path.exists(xw_path):
+        xwayland_missing, xwayland_libs, _ = closure(xw_path)
+        if xwayland_missing:
+            for round_no in range(8):
+                for m in xwayland_missing:
+                    pkg = pkg_for_soname(m)
+                    ensure_pkg(idx_map, pkg)
+                xwayland_missing, xwayland_libs, _ = closure(xw_path)
+                if not xwayland_missing:
+                    break
+        print(f"  Xwayland-замыкание: {len(xwayland_libs)} либ, missing={xwayland_missing}")
+
     report = {"interp": interp, "libs": libs, "missing": missing,
               "binary": binpath, "total_bytes": total,
-              "rootfs": ROOTFS, "extra_files": extra_files}
+              "rootfs": ROOTFS, "extra_files": extra_files,
+              "xwayland_libs": xwayland_libs,
+              "xwayland_missing": xwayland_missing}
     with open(os.path.join(OUT, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
     print(f"  отчёт: {os.path.join(OUT, 'report.json')}")

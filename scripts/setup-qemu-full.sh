@@ -18,10 +18,10 @@ if [ -x "$OUT/usr/bin/qemu-system-x86_64" ]; then
     # PC BIOS bios-256k.bin» → VM молча умирает, monitor-socket refuse).
     # Лечение: union с прошивками qemu-portable (bios*.bin/*.rom — переносимы
     # между версиями QEMU: SeaBIOS/option-ROM не зависит от версии гипервизора).
-    if [ -d "$DIR/qemu-portable/share/qemu" ] && [ ! -f "$OUT/usr/share/qemu/bios-256k.bin" ]; then
+    if [ -d $DIR/../qemu-portable/share/qemu ] && [ ! -f "$OUT/usr/share/qemu/bios-256k.bin" ]; then
         mkdir -p "$OUT/usr/share/qemu"
-        cp "$DIR"/qemu-portable/share/qemu/*.bin "$OUT/usr/share/qemu/" 2>/dev/null || true
-        cp "$DIR"/qemu-portable/share/qemu/*.rom "$OUT/usr/share/qemu/" 2>/dev/null || true
+        cp $DIR/../qemu-portable/share/qemu/*.bin "$OUT/usr/share/qemu/" 2>/dev/null || true
+        cp $DIR/../qemu-portable/share/qemu/*.rom "$OUT/usr/share/qemu/" 2>/dev/null || true
         echo "[fix] SeaBIOS/option-ROM скопированы из qemu-portable (Debian data без них)"
     fi
 fi
@@ -46,16 +46,24 @@ cat > "$OUT/qemu-full.sh" << 'WRAP'
 #!/bin/bash
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 export QEMU_MODULE_DIR="$DIR/usr/lib/x86_64-linux-gnu/qemu"
-    echo "FAIL: virtio-gpu недоступен — проверь распаковку"
-    exit 1
+export LD_LIBRARY_PATH="$DIR/usr/lib/x86_64-linux-gnu:$DIR/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Debian qemu-system-data БЕЗ SeaBIOS: прошивки qemu-portable переносимы.
+if [ -d $DIR/../qemu-portable/share/qemu ] && [ ! -f "$DIR/usr/share/qemu/bios-256k.bin" ]; then
+    mkdir -p "$DIR/usr/share/qemu"
+    cp $DIR/../qemu-portable/share/qemu/*.bin "$DIR/usr/share/qemu/" 2>/dev/null || true
+    cp $DIR/../qemu-portable/share/qemu/*.rom "$DIR/usr/share/qemu/" 2>/dev/null || true
+    echo "[fix] SeaBIOS/option-ROM скопированы из qemu-portable" >&2
 fi
 
-# CDD №12 p4-фикс: Debian qemu-system-data БЕЗ SeaBIOS («could not load
-# PC BIOS bios-256k.bin» → VM молча умирает, monitor-socket refuse).
-# Лечение: union с прошивками qemu-portable (bios*.bin/*.rom — переносимы
-# между версиями QEMU: SeaBIOS/option-ROM не зависит от версии гипервизора).
-if [ -d "$DIR/qemu-portable/share/qemu" ]; then
-    cp -n "$DIR"/qemu-portable/share/qemu/*.bin "$OUT/usr/share/qemu/" 2>/dev/null || true
-    cp -n "$DIR"/qemu-portable/share/qemu/*.rom "$OUT/usr/share/qemu/" 2>/dev/null || true
-    echo "[fix] SeaBIOS/option-ROM скопированы из qemu-portable (Debian data без них)"
+exec "$DIR/usr/bin/qemu-system-x86_64" -L "$DIR/usr/share/qemu" "$@"
+WRAP
+chmod +x "$OUT/qemu-full.sh"
+
+echo "[3/3] Проверка: virtio-gpu"
+if "$OUT/qemu-full.sh" -device virtio-gpu-pci,help >/dev/null 2>&1; then
+    echo "OK: qemu-full готов ($("$OUT/qemu-full.sh" --version 2>/dev/null | head -1))"
+else
+    echo "FAIL: virtio-gpu недоступен — проверь распаковку"
+    exit 1
 fi

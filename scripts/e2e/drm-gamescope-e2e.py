@@ -65,6 +65,17 @@ for soname in libs:
                 files["usr/lib/" + soname] = f.read()
             break
 
+# v0.20 (CDD №15): Xwayland-замыкание — либы ВТОРОГО ELF (X11/xcb-стек:
+# libX11/libxcb/libxkbcommon/… — не полностью пересекается с gamescope)
+_xw_n = 0
+for soname in report.get("xwayland_libs", []):
+    p = os.path.join(ROOT, "usr/lib", soname)
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            files["usr/lib/" + soname] = f.read()
+        _xw_n += 1
+print(f"rootfs: + Xwayland-замыкание ({_xw_n} либ)")
+
 # CDD №12 p13: ТЁПЛЫЙ mesa-кэш из host-прогонов (LLVM-JIT-компиляция шейдеров
 # gamescope уже выполнена на host — хэши совпадают: те же бинарники/либы/ICD).
 # VFS-overlay: initrd-RO читается, новые записи идут в tmpfs-RW.
@@ -237,6 +248,7 @@ _cache_path = os.path.join(REPO, "cachyos-root", "drm-gamescope.initrd.cpio")
 _h = _hl.sha256()
 _h.update(open(__file__, "rb").read())
 for _p in [os.path.join(ROOT, "usr/bin/gamescope"),
+           os.path.join(ROOT, "usr/bin/Xwayland"),
            os.path.join(ROOT, "usr/lib/ld-linux-x86-64.so.2"),
            LAYER_SO, REPORT]:
     if os.path.exists(_p):

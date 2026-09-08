@@ -2239,10 +2239,29 @@ fn linuxMmapRollback(pml4: u64, va: u64, mapped: u64, ret: i64) i64 {
 }
 
 /// exit(status): завершение ТЕКУЩЕЙ задачи (владелец syscall-каскада).
+/// v0.20 (CDD №15): если это ПОСЛЕДНЯЯ живая задача proc-слота — процесс
+/// умирает ЦЕЛИКОМ (hello-exec зовёт сырой exit(60), не exit_group):
+/// зомби-код в слот (parent≠255) / release корневого (parent=255).
 fn linuxDoExit(code: u64) void {
     const owner = linuxOwnerTask();
     if (owner < scheduler.MAX_TASKS) {
         linuxClearWakeTid(owner);
+        // последняя живая задача слота? → смерть ПРОЦЕССА (зомби-механика)
+        const slot = linux_task_proc[owner];
+        if (slot < MAX_LINUX_PROCS and linux_procs[slot].used) {
+            var alive: usize = 0;
+            var i: usize = 0;
+            while (i < scheduler.task_count) : (i += 1) {
+                if (linux_task_proc[i] == slot and
+                    scheduler.tasks[i].state != .Killed) alive += 1;
+            }
+            if (alive <= 1) { // только сам владелец — процесс умирает
+                linux_procs[slot].exit_code = code;
+                if (linux_procs[slot].parent == 255) {
+                    linuxProcRelease(slot); // корневой — без зомби-фазы
+                }
+            }
+        }
     }
     hal.Serial.puts("[LINUX] exit(");
     hal.Serial.putDecimal(code);
@@ -2265,7 +2284,11 @@ fn linuxDoExit(code: u64) void {
 fn linuxDoExitGroup(code: u64) void {
     hal.Serial.puts("[LINUX] exit_group(");
     hal.Serial.putDecimal(code);
-    hal.Serial.puts(") — killing process threads\n");
+    hal.Serial.puts(") — killing process threads (owner=");
+    hal.Serial.putDecimal(linuxOwnerTask());
+    hal.Serial.puts(" cur=");
+    hal.Serial.putDecimal(scheduler.current_task_id);
+    hal.Serial.puts(")\n");
     const owner = linuxOwnerTask();
     if (owner < scheduler.MAX_TASKS) {
         const slot = linux_task_proc[owner];
@@ -2572,9 +2595,46 @@ fn linuxProcForkChild(parent_slot: u8) ?u8 {
     return null; // EAGAIN — слоты кончились (8 процессов)
 }
 
-/// fork(): РЕБЁНОК = задача с копией PML4 и ОБЩИМ VA-стеком родителя
-/// (RSP тот же — glibc-fork продолжает в child-ветке). Возврат в РОДИ-
-/// ТЕЛЕ — pid (1000+слот); в РЕБЁНКЕ кадр возврата — RAX=0. КРИТИЧНО:
+/// Приватная КОПИЯ диапазона для ребёнка (стек/TLS — горячие RW-зоны
+/// гонки fork: родитель И ребёнок пишут в ОДНИ страницы → затирание
+/// кадров → RIP=0/мусор). Выделяем СВОИ физ-страницы, копируем контент
+/// (через активный CR3 родителя — syscall-транзакция), ЗАМЕНЯЕМ мап-
+/// пинги в child-PML4 (walk-копия уже дала shared-записи — unmap+map).
+fn linuxForkPrivateCopy(child_cr3: u64, parent_cr3: u64, lo: u64, hi: u64) usize {
+    if (lo == 0 or hi <= lo or hi - lo > 16 * 1024 * 1024) return 0; // гард: ≤16МБ
+    const pages: u64 = (hi - lo + 4095) / 4096;
+    const base_pa = pmmAllocContig(pages) orelse return 0; // ENOMEM — остаётся shared
+    var copied: usize = 0;
+    var va = lo;
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        // контент: из родительской физ-страницы (leaf-PTE по VA)
+        if (vmm.userLeafRaw(parent_cr3, va)) |pte| {
+            if (pte & vmm.PTE_PRESENT != 0) {
+                const src_pa = pte & PTE_ADDR_MASK;
+                const src: [*]const u8 = @ptrFromInt(src_pa); // identity
+                const dst: [*]u8 = @ptrFromInt(base_pa + i * 4096);
+                @memcpy(dst[0..4096], src[0..4096]);
+            }
+        }
+        // замена маппинга: shared → приватный
+        const flags = vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER |
+            vmm.PTE_NO_EXECUTE;
+        _ = vmm.unmapPageInPML4(child_cr3, va) catch {};
+        vmm.mapPageInPML4(child_cr3, va, base_pa + i * 4096, flags) catch {
+            va += 4096;
+            continue;
+        };
+        copied += 1;
+        va += 4096;
+    }
+    return copied;
+}
+
+/// fork(): РЕБЁНОК = задача с копией PML4 и ПРИВАТНЫМ стеком (физическая
+/// копия страниц стека родителя: общий VA, СВОИ страницы — родитель и
+/// ребёнок пишут в РАЗНУЮ физику: гонка кадров исключена). Возврат в
+/// РОДИТЕЛЕ — pid (1000+слот); в РЕБЁНКЕ кадр возврата — RAX=0. КРИТично:
 /// ustack-строка ребёнка = родительская (общий VA) — коллизию скана
 /// решает cur-first (isr64.S + scheduler.syscallStackOwner).
 fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
@@ -2595,6 +2655,33 @@ fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
     // 1. Копия адресного пространства (таблицы свои, физика общая)
     const child_cr3 = vmm.createUserPML4() catch return -linux_syscalls.ENOMEM;
     const copied = linuxForkCopyAddressSpace(parent.cr3, child_cr3);
+
+    // 1b. ПРИВАТНЫЙ стек + TLS ребёнка (гончая зона fork: родитель и
+    //     ребёнок на общем стеке затирают кадры друг друга — эмпирика
+    //     forktest: RIP=0 после первого write ребёнка). Стек: ВЕРХНЕЕ
+    //     ОКНО [rsp-4МБ, hi) — активные кадры (полный стек 128МБ копи-
+    //     ровать бессмысленно:_pages=32768; ниже окна страницы untouched
+    //     до вызовов — глубина glibc-execve-хелпера ≪ 4МБ); TLS: стра-
+    //     ницы вокруг fs_base (glibc-fork пишет tid/robust-слова).
+    var stack_priv: usize = 0;
+    if (scheduler.ustack_hi_tab[owner] != 0) {
+        const s_hi = scheduler.ustack_hi_tab[owner];
+        var s_lo = scheduler.ustack_lo_tab[owner];
+        if (my_rsp > 4 * 1024 * 1024) {
+            const win_lo = (my_rsp - 4 * 1024 * 1024) & ~@as(u64, 4095);
+            if (win_lo > s_lo) s_lo = win_lo;
+        }
+        stack_priv = linuxForkPrivateCopy(child_cr3, parent.cr3, s_lo, s_hi);
+    }
+    var tls_priv: usize = 0;
+    const parent_fs = scheduler.fs_base_tab[owner];
+    if (parent_fs != 0) {
+        // struct pthread: fs_base — ДЛЯ структуры (tid/pid в первых
+        // сотнях байт); копируем [fs-8K, fs+4K) — голова + хвост
+        const tls_lo = parent_fs - 8 * 1024;
+        const tls_hi = parent_fs + 4 * 1024;
+        tls_priv = linuxForkPrivateCopy(child_cr3, parent.cr3, tls_lo & ~@as(u64, 4095), tls_hi);
+    }
 
     // 2. Кадр ребёнка — возврат из fork-syscall В ТОЧКЕ вызова
     //    (RIP после syscall; RSP = родительский user-RSP: общий стек)
@@ -2649,6 +2736,10 @@ fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
     hal.Serial.putDecimal(1000 + @as(u64, child_slot));
     hal.Serial.puts(", shared pages ");
     hal.Serial.putDecimal(copied);
+    hal.Serial.puts(", priv stack ");
+    hal.Serial.putDecimal(stack_priv);
+    hal.Serial.puts(", priv tls ");
+    hal.Serial.putDecimal(tls_priv);
     hal.Serial.puts(")\n");
 
     // 5. CHILD-RUNS-FIRST (CFS wake_up_new_task — эмпирика p6: ребёнок
@@ -2674,7 +2765,15 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
     if (slot >= MAX_LINUX_PROCS) return -linux_syscalls.ESRCH;
 
     // 1. VFS-резолв (cpioCanon съест ведущий '/')
-    const data = initrdFindFile(path) orelse return -linux_syscalls.ENOENT;
+    hal.Serial.puts("[LINUX] execve-path: ");
+    hal.Serial.puts(path);
+    hal.Serial.puts(" (len ");
+    hal.Serial.putDecimal(path.len);
+    hal.Serial.puts(")\n");
+    const data = initrdFindFile(path) orelse {
+        hal.Serial.puts("[LINUX] execve: FILE NOT FOUND in initrd\n");
+        return -linux_syscalls.ENOENT;
+    };
 
     // 2. Новый образ (+ PT_INTERP ld.so — handoff как elfload)
     const new_pml4 = vmm.createUserPML4() catch return -linux_syscalls.ENOMEM;
@@ -4774,8 +4873,11 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
         .a6 = scheduler.linux_arg6,
     });
     if (linux_trace) {
-        // CDD №12 p2: 4 аргумента (sigaction-подобные вызовы требуют a3/a4)
-        hal.Serial.puts("[L] ");
+        // CDD №15: t=<owner> — ЧЬЙ syscall (рассинхрон fork-ребёнка на
+        // общем VA-стеке ловим поимённо: asm cur-first → линейный → кс)
+        hal.Serial.puts("[L:t");
+        hal.Serial.putDecimal(linuxOwnerTask());
+        hal.Serial.puts("] ");
         hal.Serial.putDecimal(num);
         hal.Serial.puts("(0x");
         hal.Serial.putHex(a1);
@@ -6554,6 +6656,10 @@ fn cmd_elfload(args: []const u8) void {
         // (lvp+LLVM 22.1.8: шейдер-тред + main-тред; host-репро: с
         // PERTURB коррупция «corrupted size vs. prev_size» ИСЧЕЗАЕТ).
         "MALLOC_PERTURB_=170",
+        // CDD №15: однопоточный llvmpipe — p14-кванш llvmpipe worker-крана
+        // (STL list-splice, libvulkan_lvp.so+0x301A4C) — убирает сам ИСТОЧНИК
+        // (пул воркеров); рендер медленнее, но детерминированнее под TCG.
+        "LP_NUM_THREADS=0",
         // CDD №12 p14: XDG_RUNTIME_DIR — wayland-сокет wlserver'а! Без него:
         // «Unable to open wayland socket» → wlroots teardown → ассерт
         // wl_list_empty(new_input) → АБОРТ gamescope посреди рендер-цикла.
