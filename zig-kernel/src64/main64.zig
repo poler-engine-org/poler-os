@@ -2259,6 +2259,9 @@ fn linuxDoExit(code: u64) void {
 
 /// exit_group: v0.20 — завершение ВСЕХ потоков процесса (CLONE_THREAD-группа
 /// = общий proc-слот): помечаем Killed + CLEARTID-слова (pthread_join).
+/// v0.20 (CDD №15): слот с parent≠255 — ЗОМБИ (код ждёт wait4 родителя;
+/// физика/fd — живут до reap). Слот корневого процесса — освобождаем
+/// немедленно (некому reap-ить: elfload-процессы шелла).
 fn linuxDoExitGroup(code: u64) void {
     hal.Serial.puts("[LINUX] exit_group(");
     hal.Serial.putDecimal(code);
@@ -2276,6 +2279,9 @@ fn linuxDoExitGroup(code: u64) void {
                     linuxClearWakeTid(i);
                     scheduler.tasks[i].state = .Killed;
                 }
+            }
+            if (linux_procs[slot].parent == 255) {
+                linuxProcRelease(slot); // корневой — без зомби-фазы
             }
         }
     }
@@ -2432,6 +2438,394 @@ fn linuxDoClone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u6
     return @intCast(child);
 }
 
+// ══ v0.20 (CDD №15): FORK + EXECVE — ПОСЛЕДНИЙ КМ v0.20.0-rc ══════════
+// Xwayland становится РЕАЛЬНЫМ процессом: gamescope вызывает
+// fork() = clone(SIGCHLD, без CLONE_VM) → ребёнок = задача с КОПИЕЙ
+// PML4 (таблицы СВОИ, физика ОБЩАЯ — Xwayland-сценарий: ребёнок
+// немедленно execve → общая физика не мутирует) → execve() = kill-self
+// + respawn на новом ELF-образе (pid/proc-слот стабилен; fd-наследу-
+// ются — пайпы Xwayland видит). ВАЖНО: cur-first syscallStackOwner
+// (asm+Zig) — без него syscall ребёнка на общем VA-стеке исполнился
+// бы в контексте РОДИТЕЛЯ (линейный скан находит меньший task-id).
+
+/// Маска физ-адреса в PTE (52-бит физ).
+const PTE_ADDR_MASK: u64 = 0x0000_7FFF_FFFF_F000;
+
+/// Копия НИЖНЕЙ половины адресного пространства (только user-записи,
+// 4K-листья): каждой VA — ТЕ ЖЕ физ-страницы в новом PML4. Demand-zero
+/// (P=0) страницы НЕ копируются — ребёнок получит СВОИ нулевые по #PF.
+/// Huge-страницы в user-space не создаём — скип с логом-страховкой.
+/// Физика принадлежит РОДИТЕЛЮ (munmap/exit ребёнка её не трогает:
+/// регионы реестра ребёнка наследуются с phys=0).
+fn linuxForkCopyAddressSpace(parent_cr3: u64, child_cr3: u64) usize {
+    var copied: usize = 0;
+    const pml4: [*]const u64 = @ptrFromInt(parent_cr3);
+    var i: usize = 0;
+    while (i < 256) : (i += 1) { // нижняя половина (user)
+        const e4 = pml4[i];
+        if (e4 & vmm.PTE_PRESENT == 0 or e4 & vmm.PTE_USER == 0) continue;
+        const pdpt: [*]const u64 = @ptrFromInt(e4 & PTE_ADDR_MASK);
+        var j: usize = 0;
+        while (j < 512) : (j += 1) {
+            const e3 = pdpt[j];
+            if (e3 & vmm.PTE_PRESENT == 0 or e3 & vmm.PTE_USER == 0) continue;
+            if (e3 & vmm.PTE_HUGE != 0) {
+                hal.Serial.puts("[LINUX] fork-walk: 1GB-huge user-PTE — СКИП\n");
+                continue;
+            }
+            const pd: [*]const u64 = @ptrFromInt(e3 & PTE_ADDR_MASK);
+            var k: usize = 0;
+            while (k < 512) : (k += 1) {
+                const e2 = pd[k];
+                if (e2 & vmm.PTE_PRESENT == 0 or e2 & vmm.PTE_USER == 0) continue;
+                if (e2 & vmm.PTE_HUGE != 0) {
+                    hal.Serial.puts("[LINUX] fork-walk: 2MB-huge user-PTE — СКИП\n");
+                    continue;
+                }
+                const pt: [*]const u64 = @ptrFromInt(e2 & PTE_ADDR_MASK);
+                var m: usize = 0;
+                while (m < 512) : (m += 1) {
+                    const e1 = pt[m];
+                    if (e1 & vmm.PTE_PRESENT == 0) continue; // lazy — своя zero
+                    const va: u64 = (@as(u64, i) << 39) | (@as(u64, j) << 30) |
+                        (@as(u64, k) << 21) | (@as(u64, m) << 12);
+                    const pa = e1 & PTE_ADDR_MASK;
+                    const flags = (e1 & (vmm.PTE_WRITABLE | vmm.PTE_USER |
+                        vmm.PTE_WRITE_THROUGH | vmm.PTE_CACHE_DISABLE |
+                        vmm.PTE_NO_EXECUTE)) | vmm.PTE_PRESENT;
+                    vmm.mapPageInPML4(child_cr3, va, pa, flags) catch {
+                        continue; // AlreadyMapped-мусор — пропускаем страницу
+                    };
+                    copied += 1;
+                }
+            }
+        }
+    }
+    return copied;
+}
+
+/// Полное освобождение proc-слота: fd-каналы/файлы unref (refs-модель
+/// fork), регионы реестра, поля. Вызывается: wait4-reap зомби и exit
+/// корневого (parent=255) процесса.
+fn linuxProcRelease(slot: u8) void {
+    if (slot >= MAX_LINUX_PROCS) return;
+    const p = &linux_procs[slot];
+    if (!p.used) return;
+    for (&p.fds.entries) |*e| {
+        switch (e.kind) {
+            .initrd_file, .tmpfs_file => linuxReleaseFile(e.file_id),
+            .seatd => {
+                if (e.file_id < linux_syscalls.seatd_slots.len)
+                    linux_syscalls.seatd_slots[e.file_id] = .{};
+            },
+            .pipe_read, .pipe_write, .eventfd, .socket, .timerfd, .signalfd =>
+                linuxChannelUnref(e.file_id),
+            .dir => linuxDirClose(e.file_id),
+            else => {},
+        }
+    }
+    for (&linux_mmap_regions[slot]) |*r| r.* = .{};
+    p.* = .{}; // used=false + дефолты
+}
+
+/// Занять proc-слот РЕБЁНКА: копия fd-таблицы (refs++ на каналы/файлы),
+/// brk/mmap-курсор/TLS/execfn/сигналы — наследование; mmap-регионы —
+/// копия с phys=0 (физика — РОДИТЕЛЯ: munmap/exit ребёнка не освобож-
+/// дает; новые mmap ребёнка — уже его собственные).
+fn linuxProcForkChild(parent_slot: u8) ?u8 {
+    const pp = &linux_procs[parent_slot];
+    for (&linux_procs, 0..) |*cp, ci| {
+        if (cp.used) continue;
+        cp.* = .{ .used = true, .parent = parent_slot, .mmap_cursor = pp.mmap_cursor };
+        cp.brk_base = pp.brk_base;
+        cp.brk = pp.brk;
+        cp.exit_code = null;
+        cp.fs_base = pp.fs_base;
+        cp.sig_mask = pp.sig_mask;
+        cp.memfd_seq = pp.memfd_seq;
+        @memcpy(&cp.execfn_buf, &pp.execfn_buf);
+        cp.execfn_len = pp.execfn_len;
+        // fd-таблица — структурная копия + подъём refs общих объектов
+        cp.fds = pp.fds;
+        for (&cp.fds.entries) |*e| {
+            switch (e.kind) {
+                .pipe_read, .pipe_write, .eventfd, .socket, .timerfd, .signalfd => {
+                    if (e.file_id < channels.len and channels[e.file_id].used)
+                        channels[e.file_id].refs += 1;
+                },
+                .initrd_file, .tmpfs_file => {
+                    if (e.file_id < linux_files.len and linux_files[e.file_id].used)
+                        linux_files[e.file_id].refs += 1;
+                },
+                else => {}, // консоль/устройства/epoll — глобальные объекты ядра
+            }
+        }
+        // mmap-реестр — копия регионов; phys=0: физика РОДИТЕЛЯ
+        for (&linux_mmap_regions[parent_slot], 0..) |*r, ri| {
+            if (!r.used) continue;
+            var r2 = r.*;
+            r2.phys = 0; // наследуемый-общий: смерть ребёнка не тронет физику
+            linux_mmap_regions[ci][ri] = r2;
+        }
+        return @intCast(ci);
+    }
+    return null; // EAGAIN — слоты кончились (8 процессов)
+}
+
+/// fork(): РЕБЁНОК = задача с копией PML4 и ОБЩИМ VA-стеком родителя
+/// (RSP тот же — glibc-fork продолжает в child-ветке). Возврат в РОДИ-
+/// ТЕЛЕ — pid (1000+слот); в РЕБЁНКЕ кадр возврата — RAX=0. КРИТИЧНО:
+/// ustack-строка ребёнка = родительская (общий VA) — коллизию скана
+/// решает cur-first (isr64.S + scheduler.syscallStackOwner).
+fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
+    _ = flags; // fork-флаги (SIGCHLD) — контракты SETTID в семантике
+    _ = parent_tid;
+    _ = child_tid; // пишут семантическим слоя ПО pid (sysClone)
+    _ = tls; // fork не меняет TLS (общая страница до execve)
+
+    const my_rsp = scheduler.user_rsp;
+    const owner = scheduler.syscallStackOwner(my_rsp);
+    if (owner >= scheduler.MAX_TASKS) return -linux_syscalls.ESRCH;
+    const parent = &scheduler.tasks[owner];
+    if (parent.privilege != .User or parent.abi != .linux or parent.state == .Killed)
+        return -linux_syscalls.EPERM;
+    const parent_slot = linux_task_proc[owner];
+    if (parent_slot >= MAX_LINUX_PROCS) return -linux_syscalls.ESRCH;
+
+    // 1. Копия адресного пространства (таблицы свои, физика общая)
+    const child_cr3 = vmm.createUserPML4() catch return -linux_syscalls.ENOMEM;
+    const copied = linuxForkCopyAddressSpace(parent.cr3, child_cr3);
+
+    // 2. Кадр ребёнка — возврат из fork-syscall В ТОЧКЕ вызова
+    //    (RIP после syscall; RSP = родительский user-RSP: общий стек)
+    const sf = scheduler.syscall_frame;
+    var frame: hal.InterruptFrame = std.mem.zeroes(hal.InterruptFrame);
+    frame.r15 = sf[0];
+    frame.r14 = sf[1];
+    frame.r13 = sf[2];
+    frame.r12 = sf[3];
+    frame.rbp = sf[4];
+    frame.rbx = sf[5];
+    frame.rdi = 0; // volatile-arg — glibc-fork child-path не читает
+    frame.rsi = 0;
+    frame.rdx = 0;
+    frame.r10 = 0;
+    frame.r8 = 0;
+    frame.r9 = 0;
+    frame.rax = 0; // РЕБЁНОК: fork() возвращает 0
+    frame.rcx = sf[7];
+    frame.r11 = sf[6];
+    frame.rip = sf[7]; // возврат ПОСЛЕ syscall
+    frame.rflags = sf[6] | 0x200; // IF=1
+    frame.rsp = my_rsp; // ОБЩИЙ стек родителя (shared-VM до execve)
+    frame.cs = 0x23;
+    frame.ss = 0x1B;
+
+    const child = scheduler.createLinuxCloneTask(child_cr3, &frame) catch
+        return -linux_syscalls.EAGAIN;
+
+    // 3. proc-слот ребёнка (fd-копия/регионы/brk) + бинд задачи
+    const child_slot = linuxProcForkChild(parent_slot) orelse {
+        scheduler.tasks[child].state = .Killed; // откат — слотов нет
+        return -linux_syscalls.EAGAIN;
+    };
+    linux_task_proc[child] = child_slot;
+    linux_child_tid[child] = 0; // fork-ребёнок однопоточен (CLEARTID нет)
+
+    // 4. ustack-строка = родительская (общий VA); asm-скан — cur-first
+    scheduler.registerUserStack(
+        child,
+        scheduler.ustack_lo_tab[owner],
+        scheduler.ustack_hi_tab[owner],
+    );
+    // TLS общий (glibc-fork ребёнок читает pthread_self()) — до execve
+    scheduler.fs_base_tab[child] = scheduler.fs_base_tab[owner];
+
+    hal.Serial.puts("[LINUX] fork: parent task ");
+    hal.Serial.putDecimal(owner);
+    hal.Serial.puts(" → child task ");
+    hal.Serial.putDecimal(child);
+    hal.Serial.puts(" (pid ");
+    hal.Serial.putDecimal(1000 + @as(u64, child_slot));
+    hal.Serial.puts(", shared pages ");
+    hal.Serial.putDecimal(copied);
+    hal.Serial.puts(")\n");
+
+    // 5. CHILD-RUNS-FIRST (CFS wake_up_new_task — эмпирика p6: ребёнок
+    //    немедленно получает CPU на glibc-fork-эпилог + execve)
+    linuxYieldTick();
+    return @intCast(1000 + @as(i64, child_slot));
+}
+
+/// execve(path, argv, envp): kill-self + RESPAWN на новом образе.
+/// pid/proc-слот СТАБИЛЕН (1000+slot — wait4 родителя не ломается);
+/// fd-таблица наследуется (пайпы Xwayland). СТАРОЕ shared-PML4 не осво-
+/// бождаем (физика РОДИТЕЛЯ); таблицы walk-копии остаются живыми в
+/// child_cr3 (утечка ~страниц таблиц на execve — v0.21: freeUserPML4-
+/// walk). УСПЕХ НЕ ВОЗВРАЩАЕТСЯ — задача уходит в hlt (exit-паттерн).
+fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []const u8) i64 {
+    const my_rsp = scheduler.user_rsp;
+    const owner = scheduler.syscallStackOwner(my_rsp);
+    if (owner >= scheduler.MAX_TASKS) return -linux_syscalls.ESRCH;
+    const t = &scheduler.tasks[owner];
+    if (t.privilege != .User or t.abi != .linux or t.state == .Killed)
+        return -linux_syscalls.EPERM;
+    const slot = linux_task_proc[owner];
+    if (slot >= MAX_LINUX_PROCS) return -linux_syscalls.ESRCH;
+
+    // 1. VFS-резолв (cpioCanon съест ведущий '/')
+    const data = initrdFindFile(path) orelse return -linux_syscalls.ENOENT;
+
+    // 2. Новый образ (+ PT_INTERP ld.so — handoff как elfload)
+    const new_pml4 = vmm.createUserPML4() catch return -linux_syscalls.ENOMEM;
+    const ops = kernelElfOps();
+    const img = elf_loader.loadElf(ops, new_pml4, data, elf_loader.LINUX_IMAGE_BASE) catch
+        return -linux_syscalls.ENOEXEC;
+    var entry_va = img.entry_va;
+    var at_base: u64 = 0;
+    var interp_pages: u64 = 0;
+    if (img.interp) |interp_path| {
+        const interp_data = initrdFindFile(interp_path) orelse
+            return -linux_syscalls.ENOENT; // интерпретатор обязателен
+        const interp_img = elf_loader.loadElf(ops, new_pml4, interp_data, elf_loader.LINUX_INTERP_BASE) catch
+            return -linux_syscalls.ENOEXEC;
+        entry_va = interp_img.entry_va; // HANDOFF: старт с ld.so
+        at_base = interp_img.base_va;
+        interp_pages = interp_img.pages;
+    }
+
+    // 3. Стек Linux-ABI: argc/argv/envp/auxv (argv/envp уже в .bss-буферах)
+    const stack = elf_loader.buildUserStack(
+        ops,
+        new_pml4,
+        elf_loader.LINUX_STACK_TOP,
+        elf_loader.LINUX_STACK_PAGES,
+        .{ .argv = argv, .envp = envp, .execfn = path },
+        img,
+        elfRandomSeed(),
+        at_base,
+    ) catch return -linux_syscalls.ENOMEM;
+
+    // 4. proc-слот — ОБНОВЛЯЕМ (pid стабилен: execve не меняет pid)
+    const p = &linux_procs[slot];
+    p.brk_base = img.brk;
+    p.brk = img.brk;
+    p.mmap_cursor = LINUX_MMAP_BASE;
+    p.exit_code = null;
+    p.fs_base = 0; // новый образ поставит TLS (arch_prctl SET_FS)
+    @memset(&p.sig_handlers, 0); // Linux: caught-хендлеры → SIG_DFL
+    @memset(&p.sig_flags, 0);
+    @memset(&p.sig_restorers, 0);
+    {
+        var efn_buf: [96]u8 = undefined;
+        var efn_len: usize = 0;
+        if (path.len > 0 and path[0] != '/') {
+            efn_buf[0] = '/';
+            efn_len = 1;
+        }
+        const c = @min(path.len, efn_buf.len - efn_len);
+        @memcpy(efn_buf[efn_len .. efn_len + c], path[0..c]);
+        efn_len += c;
+        const n = @min(efn_len, p.execfn_buf.len);
+        @memcpy(p.execfn_buf[0..n], efn_buf[0..n]);
+        p.execfn_len = n;
+    }
+    // fd-таблица — НАСЛЕДУЕТСЯ (Linux: fd без CLOEXEC переживают exec;
+    // CLOEXEC-разметки у fd нет — все живут: пайпы Xwayland)
+    // mmap-реестр: чистка (анти-поллюция атрибуции) + новые регионы
+    for (&linux_mmap_regions[slot]) |*r| r.* = .{};
+    const reg_slot: u8 = @intCast(slot);
+    var name_buf: [48]u8 = [_]u8{0} ** 48;
+    {
+        // имя образа: последний компонент пути (атрибуция RIP→модуль)
+        var base: usize = 0;
+        for (path, 0..) |c, pi| {
+            if (c == '/') base = pi + 1;
+        }
+        const bn = path[base..];
+        const n = @min(bn.len, name_buf.len);
+        @memcpy(name_buf[0..n], bn[0..n]);
+    }
+    linuxRecordRegion(reg_slot, img.base_va, img.pages, 0, false, &name_buf);
+    if (img.interp != null) {
+        linuxRecordRegion(reg_slot, elf_loader.LINUX_INTERP_BASE, interp_pages, 0, false, "ld.so");
+    }
+    linuxRecordRegion(
+        reg_slot,
+        elf_loader.LINUX_STACK_TOP - elf_loader.LINUX_STACK_PAGES * 4096,
+        elf_loader.LINUX_STACK_PAGES,
+        0,
+        false,
+        "[stack]",
+    );
+
+    // 5. НОВАЯ задача (тот же proc-слот/pid; старую убиваем ниже)
+    const task_id = scheduler.createUserTaskAbi(entry_va, new_pml4, stack.entry_rsp, .linux) catch
+        return -linux_syscalls.EAGAIN;
+    linux_task_proc[task_id] = reg_slot;
+    scheduler.tasks[task_id].abi = .linux; // красная строка (гонка закрыта p3)
+    scheduler.registerUserStack(
+        task_id,
+        elf_loader.LINUX_STACK_TOP - elf_loader.LINUX_STACK_PAGES * 4096,
+        elf_loader.LINUX_STACK_TOP,
+    );
+    scheduler.fs_base_tab[task_id] = 0;
+
+    hal.Serial.puts("[LINUX] execve: ");
+    hal.Serial.puts(path);
+    hal.Serial.puts(" → task ");
+    hal.Serial.putDecimal(task_id);
+    hal.Serial.puts(" (pid ");
+    hal.Serial.putDecimal(1000 + @as(u64, slot));
+    hal.Serial.puts(", entry 0x");
+    hal.Serial.putHex(entry_va);
+    hal.Serial.puts(")\n");
+
+    // 6. kill-self (exit-паттерн: транзакция снята, задача Killed,
+    // hlt до диспетчеризации НОВОЙ задачи). СТАРЫЙ PML4 (shared с роди-
+    // телем) — НЕ трогаем; собственные mmap ребёнка до execve — утечены
+    // (реестр перезаписан; glibc-fork до execve mmap не делает).
+    scheduler.exitCurrentTask();
+    hal.sti();
+    while (true) {
+        asm volatile ("hlt" ::: "memory");
+    }
+}
+
+/// wait4-реестр: >0 = reap зомби (код в code_out; слот освобождается);
+/// 0 = дети живы (блокировка — парковки семантики); -ECHILD = детей нет.
+fn linuxDoWait4(pid: i64, code_out: *u64) i64 {
+    const owner = linuxOwnerTask();
+    if (owner >= scheduler.MAX_TASKS) return -linux_syscalls.ECHILD;
+    const my_slot = linux_task_proc[owner];
+    if (my_slot >= MAX_LINUX_PROCS) return -linux_syscalls.ECHILD;
+
+    if (pid > 0) { // конкретный ребёнок
+        const s: usize = @intCast(pid - 1000);
+        if (s >= MAX_LINUX_PROCS) return -linux_syscalls.ECHILD;
+        const p = &linux_procs[s];
+        if (!p.used or p.parent != my_slot) return -linux_syscalls.ECHILD;
+        if (p.exit_code) |c| {
+            code_out.* = c;
+            linuxProcRelease(@intCast(s));
+            return 1000 + @as(i64, @intCast(s));
+        }
+        return 0; // жив — блокировка семантики
+    }
+    // pid <= 0 (wait/-any): первый зомби; иначе дети живы / ECHILD
+    var have_live = false;
+    for (&linux_procs, 0..) |*p, s| {
+        if (!p.used or p.parent != my_slot) continue;
+        if (p.exit_code) |c| {
+            code_out.* = c;
+            linuxProcRelease(@intCast(s));
+            return 1000 + @as(i64, @intCast(s));
+        }
+        have_live = true;
+    }
+    return if (have_live) 0 else -linux_syscalls.ECHILD;
+}
+
 // ─── v0.20.0 (CDD №11 p1): futex-реестр парковок (честная блокировка) ──────
 
 const FutexPark = struct {
@@ -2546,6 +2940,9 @@ var linux_fds: linux_syscalls.FdTable = linux_syscalls.FdTable.init();
 
 const LinuxProc = struct {
     used: bool = false,
+    /// v0.20 (CDD №15): слот РОДИТЕЛЯ (255 = корневой/шелл-процесс;
+    /// ≠255 → зомби-семантика wait4: exit оставляет код в слоте).
+    parent: u8 = 255,
     fds: linux_syscalls.FdTable = linux_syscalls.FdTable.init(),
     mmap_cursor: u64 = 0,
     /// brk-базис (конец ELF-образа) и текущий brk (glibc-static malloc).
@@ -2876,7 +3273,7 @@ pub fn linuxDumpRegionTable(task_id: usize, max_entries: usize) usize {
     return dumped;
 }
 
-const MAX_LINUX_PROCS: usize = 2;
+const MAX_LINUX_PROCS: usize = 8; // v0.20 (CDD №15): gamescope + Xwayland + клиенты (было 2)
 /// CDD №12 p3: 512 — эмпирика run8-10: 79 либ × ~4 сегмента = 300+ регио-
 /// нов + стеки тредов + арены malloc (при 64/128 — «registry full» →
 /// untracked: munmap-деградация и МАПФИКС-ДИАПАЗОНЫ без контроля).
@@ -3402,6 +3799,9 @@ fn linuxTimeNs() u64 {
 const LinuxFile = struct {
     used: bool = false,
     kind: linux_syscalls.FdKind = .free,
+    /// v0.20 (CDD №15): счётчик дескрипторов-владельцев (fork-наследование:
+    /// копия fd-таблицы ребёнка поднимает refs; release — только последний).
+    refs: u32 = 1,
     tmp: ?*vfs.TmpFile = null, // для tmpfs_file (heap-backed)
     initrd_data: ?[]const u8 = null, // для initrd_file
     // ─── anon (memfd): PMM-блок общих страниц ───
@@ -3660,6 +4060,11 @@ fn vfsInit() void {
 /// fd открытым на всё время жизни VkDeviceMemory (эмпирика e2e).
 fn linuxReleaseFile(id: u32) void {
     if (id >= linux_files.len) return;
+    if (!linux_files[id].used) return;
+    if (linux_files[id].refs > 1) { // fork-наследованный: владелец ещё жив
+        linux_files[id].refs -= 1;
+        return;
+    }
     if (linux_files[id].anon and linux_files[id].phys != 0) {
         pmm.freeContiguousPages(linux_files[id].phys, linux_files[id].blk_pages);
     }
@@ -4057,6 +4462,9 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .do_exit = linuxDoExit,
         .do_exit_group = linuxDoExitGroup,
         .do_clone = linuxDoClone,
+        .do_fork = linuxDoFork,
+        .do_execve = linuxDoExecve,
+        .do_wait4 = linuxDoWait4,
         .futex_park = linuxFutexPark,
         .futex_wake = linuxFutexWake,
         .current_pid = linuxCurrentPid,
@@ -4244,9 +4652,9 @@ fn linuxCurrentPid() u64 {
     const owner = linuxOwnerTask();
     if (owner < scheduler.MAX_TASKS) {
         const slot = linux_task_proc[owner];
-        if (slot < MAX_LINUX_PROCS) return 100 + slot;
+        if (slot < MAX_LINUX_PROCS) return 1000 + @as(u64, slot); // v0.20: pid-базис 1000+slot (fork-контракт wait4)
     }
-    return 100; // shell-контекст
+    return 1000; // shell-контекст
 }
 
 /// tid: id задачи-владельца syscall-каскада (NPTL: уникален на тред).

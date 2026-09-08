@@ -83,7 +83,7 @@ pub const Task = struct {
 };
 
 pub var tasks: [MAX_TASKS]Task = undefined;
-pub var current_task_id: usize = 0;
+pub export var current_task_id: usize = 0; // v0.20 (CDD №15): экспорт для isr64.S cur-first-скана
 pub var task_count: usize = 0;
 pub var scheduler_ticks: u64 = 0;
 // v0.16.0-fix (CDD №7): дедупликация WARN «вне собственного стека» (раз на задачу)
@@ -193,6 +193,17 @@ pub fn registerUserStack(id: usize, lo: u64, hi: u64) void {
 /// kLaunchCallback, позванный из каскада, видел SP на ЧУЖОМ kstack).
 /// Возврат 255 = вне всех диапазонов (мусорный ur / CB-стек до моста).
 pub fn syscallStackOwner(ur: u64) usize {
+    // v0.20 (CDD №15 fork): CUR-FIRST — fork-ребёнок живёт на ОБЩЕМ
+    // VA-стеке с родителем (shared-VM до execve): линейный скан вернул
+    // бы РОДИТЕЛЯ (меньший task-id) и syscall ребёнка исполнился бы в
+    // контексте родителя. При syscall-входе cur = исполняемая задача
+    // (user-код бежит только после ЕЁ диспетчеризации — рассинхрон
+    // cks-окон парковки не влияет на этот момент).
+    if (current_task_id != 0 and current_task_id < MAX_TASKS) {
+        const c = current_task_id;
+        if (kstack_hi_tab[c] != 0 and ur >= kstack_lo_tab[c] and ur < kstack_hi_tab[c]) return c;
+        if (ustack_hi_tab[c] != 0 and ur >= ustack_lo_tab[c] and ur < ustack_hi_tab[c]) return c;
+    }
     var i: usize = 0;
     while (i < MAX_TASKS) : (i += 1) {
         // kernel-задача: syscall из Ring 0 — ur внутри её kstack

@@ -160,36 +160,8 @@ pub const SYS_readlink: u64 = 89; // 87 = unlink (!коллизия)
 pub const SYS_prlimit64: u64 = 302;
 pub const SYS_getrandom: u64 = 318;
 pub const SYS_clone: u64 = 56;
-pub const SYS_wait4: u64 = 61; // p14: fake-fork зомби
-
-/// CDD №12 p14: зомби-дети fake-fork (spawn Xwayland). Родитель получает
-/// pid; реального ребёнка НЕТ; wait4(pid) → «clean exit 0».
-pub var fake_kids: [16]u32 = [_]u32{0} ** 16;
-pub var fake_kids_n: u32 = 0;
-var fake_kid_next: u32 = 9000;
-
-fn fakeKidAlloc() u32 {
-    const pid = fake_kid_next;
-    fake_kid_next += 1;
-    if (fake_kids_n < fake_kids.len) {
-        fake_kids[fake_kids_n] = pid;
-        fake_kids_n += 1;
-    }
-    return pid;
-}
-
-fn fakeKidReap(pid: u32) bool {
-    var i: u32 = 0;
-    while (i < fake_kids_n) : (i += 1) {
-        if (fake_kids[i] == pid) {
-            var j: u32 = i + 1;
-            while (j < fake_kids_n) : (j += 1) fake_kids[j - 1] = fake_kids[j];
-            fake_kids_n -= 1;
-            return true;
-        }
-    }
-    return false;
-}
+pub const SYS_wait4: u64 = 61; // v0.20 (CDD №15): НАСТОЯЩИЕ fork-зомби
+pub const SYS_execve: u64 = 59; // v0.20 (CDD №15): замена образа процесса
 pub const SYS_getpid: u64 = 39;
 pub const SYS_fcntl: u64 = 72;
 pub const SYS_exit: u64 = 60;
@@ -214,7 +186,10 @@ pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const ESRCH: i64 = 3;
 pub const EIO: i64 = 5;
+pub const E2BIG: i64 = 7;
+pub const ENOEXEC: i64 = 8;
 pub const EBADF: i64 = 9;
+pub const ECHILD: i64 = 10;
 pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EFAULT: i64 = 14;
@@ -754,6 +729,16 @@ pub const LinuxOps = struct {
     /// его стек в таблицах asm-владельца. parent_tid/child_tid — адреса
     /// слов SETTID-контрактов (пишет СЕМАНТИЧЕСКИЙ слой после успеха).
     do_clone: *const fn (flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) i64,
+    /// v0.20 (CDD №15): fork — pid ребёнка или -errno. Runtime строит
+    /// задачу-ребёнка с КОПИЕЙ PML4 (таблицы свои, физика общая до
+    /// execve) и отдельным proc-слотом (parent = слот родителя).
+    do_fork: *const fn (flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64,
+    /// v0.20 (CDD №15): execve — УСПЕХ НЕ ВОЗВРАЩАЕТСЯ (kill-self +
+    /// respawn на новом образе; pid/proc-слот стабилен). Ошибка → -errno.
+    do_execve: *const fn (path: []const u8, argv: []const []const u8, envp: []const []const u8) i64,
+    /// v0.20 (CDD №15): wait4-реестр зомби: >0 = reap (pid; код — в
+    /// code_out); 0 = дети живы (блокировка — парковками); -ECHILD.
+    do_wait4: *const fn (pid: i64, code_out: *u64) i64,
     /// futex-WAIT: значение уже сверено; парковка. 0/EAGAIN/ETIMEDOUT.
     futex_park: *const fn (uaddr: u64, timeout_ms: u64, infinite: bool) i64,
     /// futex-WAKE: число разбуженных.
@@ -1535,13 +1520,27 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
 /// (pthread_join). CLONE_SETTLS принимается — FS-base в arch_prctl-волне.
 pub fn sysClone(ops: LinuxOps, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) u64 {
     const need = CLONE_VM | CLONE_SIGHAND;
-    // p14: FAKE-FORK — glibc fork() = clone(SIGCHLD, БЕЗ CLONE_VM).
-    // Реального ребёнка нет (exec-модели нет): родителю — псевдо-pid;
-    // wait4 ответит «exited 0». Иначе gamescope «fork failed» → краш.
-    // Ветка ТОЛЬКО для fork-подобных: CLONE_VM-без-SIGHAND — мёртвая пара
-    // (Linux EINVAL), не маскировать её псевдо-ребёнком!
+    // v0.20 (CDD №15): НАСТОЯЩИЙ fork (glibc fork() = clone(SIGCHLD, без
+    // CLONE_VM, stack=0)) — ребёнок = задача с копией PML4: таблицы
+    // адресации СВОИ, физика общая с родителем (Xwayland-сценарий:
+    // ребёнок немедленно execve → общая физика НЕ портится). SETTID-слова
+    // пишем ЗДЕСЬ по pid (как Linux — в ребёнке). Ветка ТОЛЬКО для
+    // fork-подобных: CLONE_VM без SIGHAND — мёртвая пара (Linux EINVAL).
     if (flags & CLONE_VM == 0) {
-        return @intCast(fakeKidAlloc());
+        const r = ops.do_fork(flags, parent_tid, child_tid, tls);
+        if (r < 0) return @bitCast(r);
+        const pid: u32 = @truncate(@as(u64, @intCast(r)));
+        if (flags & CLONE_PARENT_SETTID != 0 and parent_tid != 0) {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b, pid, .little);
+            if (!ops.copy_out(parent_tid, &b)) return err(EFAULT);
+        }
+        if (flags & CLONE_CHILD_SETTID != 0 and child_tid != 0) {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b, pid, .little);
+            if (!ops.copy_out(child_tid, &b)) return err(EFAULT);
+        }
+        return @intCast(r);
     }
     if (flags & need != need) return err(EINVAL);
     // SETTID-указатели обязаны присутствовать (ядро пишет tid после успеха)
@@ -1762,33 +1761,97 @@ pub fn sysGetrandom(ops: LinuxOps, buf_va: u64, count: u64, flags: u64) u64 {
 pub const CLOCK_MONOTONIC: u64 = 1;
 pub const CLOCK_REALTIME: u64 = 0;
 
-/// p14: wait4(pid, status, options, rusage) — зомби-ответ fake-fork.
-/// status: WIFEXITED + WEXITSTATUS(0) = 0. rusage не заполняем.
-const ECHILD_STUB: i64 = 10; // ECHILD (нет в фундаменте — p14)
+/// v0.20 (CDD №15): wait4(pid, status, options, rusage) — НАСТОЯЩИЕ
+/// зомби fork-детей: exit_code в proc-слоте ребёнка; reap освобождает
+/// слот (fd-каналы/файлы unref). Блокировка — паркинг-слайсами 20мс
+/// (кооперативная модель; потолок 120с — TCG-дисциплина e2e).
+/// status = (code & 0xFF) << 8 — WIFEXITED-раскладка wait(2).
 pub fn sysWait4(ops: LinuxOps, pid: i64, status_va: u64, options: u64, rusage_va: u64) u64 {
     _ = options;
     _ = rusage_va; // rusage — нулевой (не заполняем: спецификация допускает)
-    if (pid <= 0) {
-        // любой/все: пожинаем первого зомби (или ECHILD)
-        if (fake_kids_n == 0) return err(ECHILD_STUB);
-        const reaped: u32 = fake_kids[0];
-        _ = fakeKidReap(reaped);
-        if (status_va != 0) {
-            if (!ops.validate(status_va, 4, true)) return err(EFAULT);
-            var sb: [4]u8 = undefined;
-            std.mem.writeInt(u32, &sb, 0, .little); // clean exit
-            if (!ops.copy_out(status_va, &sb)) return err(EFAULT);
+    const t0 = ops.time_ns();
+    while (true) {
+        var code: u64 = 0;
+        const r = ops.do_wait4(pid, &code);
+        if (r > 0) {
+            if (status_va != 0) {
+                if (!ops.validate(status_va, 4, true)) return err(EFAULT);
+                const w: u32 = @intCast((code & 0xFF) << 8);
+                var sb: [4]u8 = undefined;
+                std.mem.writeInt(u32, &sb, w, .little);
+                if (!ops.copy_out(status_va, &sb)) return err(EFAULT);
+            }
+            return @intCast(r);
         }
-        return reaped;
+        if (r == -ECHILD) return err(ECHILD);
+        if (r != 0) return err(EINVAL);
+        // 0 = дети живы, зомби нет — парковка-слайс и повтор
+        ops.task_park(20);
+        if (ops.time_ns() - t0 > 120_000_000_000) return err(ECHILD); // анти-вечность
     }
-    if (!fakeKidReap(@intCast(pid))) return err(ECHILD_STUB);
-    if (status_va != 0) {
-        if (!ops.validate(status_va, 4, true)) return err(EFAULT);
-        var sb: [4]u8 = undefined;
-        std.mem.writeInt(u32, &sb, 0, .little);
-        if (!ops.copy_out(status_va, &sb)) return err(EFAULT);
+}
+
+// ─── v0.20 (CDD №15): execve — буферы argv/envp (.bss: транзакция длинная)
+// ─────────────────────────────────────────────────────────────────────────
+pub var execve_path_buf: [256]u8 = [_]u8{0} ** 256;
+pub var execve_argv_buf: [12][128]u8 = [_][128]u8{[_]u8{0} ** 128} ** 12;
+pub var execve_envp_buf: [16][192]u8 = [_][192]u8{[_]u8{0} ** 192} ** 16;
+
+/// execve(path, argv, envp): argv/envp — NULL-терминированные массивы
+/// указателей на C-строки; NULL argv → argv[0]=path (допустимо по спеке);
+/// envp=NULL → пустое окружение. Копируем В .bss-буферы ДО разрушения
+/// образа (runtime не может читать user после kill-self). УСПЕХ НЕ
+/// ВОЗВРАЩАЕТСЯ (runtime: kill-self + respawn на новом образе).
+pub fn sysExecve(ops: LinuxOps, path_va: u64, argv_va: u64, envp_va: u64) u64 {
+    if (path_va == 0) return err(EFAULT);
+    const path = ops.copy_in_str(path_va, 256) orelse return err(EFAULT);
+    if (path.len == 0) return err(ENOENT);
+    const pn = @min(path.len, execve_path_buf.len);
+    @memcpy(execve_path_buf[0..pn], path[0..pn]);
+
+    var argv_slices: [12][]const u8 = undefined;
+    var argc: usize = 0;
+    if (argv_va != 0) {
+        var i: usize = 0;
+        while (i < argv_slices.len) : (i += 1) {
+            var pva: [8]u8 = undefined;
+            if (!ops.copy_in(&pva, argv_va + i * 8)) return err(EFAULT);
+            const p = std.mem.readInt(u64, &pva, .little);
+            if (p == 0) break;
+            const s = ops.copy_in_str(p, 128) orelse return err(EFAULT);
+            const sn = @min(s.len, execve_argv_buf[i].len);
+            @memcpy(execve_argv_buf[i][0..sn], s[0..sn]);
+            argv_slices[i] = execve_argv_buf[i][0..sn];
+            argc = i + 1;
+        }
     }
-    return @intCast(pid);
+    if (argc == 0) { // NULL argv → argv[0] = путь (Linux-допуск)
+        const pn2 = @min(pn, execve_argv_buf[0].len);
+        @memcpy(execve_argv_buf[0][0..pn2], path[0..pn2]);
+        argv_slices[0] = execve_argv_buf[0][0..pn2];
+        argc = 1;
+    }
+
+    var envp_slices: [16][]const u8 = undefined;
+    var envc: usize = 0;
+    if (envp_va != 0) {
+        var i: usize = 0;
+        while (i < envp_slices.len) : (i += 1) {
+            var pva: [8]u8 = undefined;
+            if (!ops.copy_in(&pva, envp_va + i * 8)) return err(EFAULT);
+            const p = std.mem.readInt(u64, &pva, .little);
+            if (p == 0) break;
+            const s = ops.copy_in_str(p, 192) orelse return err(EFAULT);
+            const sn = @min(s.len, execve_envp_buf[i].len);
+            @memcpy(execve_envp_buf[i][0..sn], s[0..sn]);
+            envp_slices[i] = execve_envp_buf[i][0..sn];
+            envc = i + 1;
+        }
+    }
+
+    const r = ops.do_execve(execve_path_buf[0..pn], argv_slices[0..argc], envp_slices[0..envc]);
+    if (r < 0) return @bitCast(r);
+    return 0; // успех не возвращается (kill+respawn); страховка
 }
 
 pub fn sysClockGettime(ops: LinuxOps, clk: u64, tp_va: u64) u64 {
@@ -2804,6 +2867,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_epoll_wait => return sysEpollWait(ops, fds, @bitCast(args.a1), args.a2, args.a3, @bitCast(args.a4)),
         SYS_exit => return sysExit(ops, args.a1),
         SYS_exit_group => return sysExitGroup(ops, args.a1),
+        SYS_execve => return sysExecve(ops, args.a1, args.a2, args.a3),
         SYS_uname => return sysUname(ops, args.a1),
         SYS_gettid => return sysGettid(ops),
         SYS_tgkill => return sysTgkill(ops, @bitCast(args.a1), @bitCast(args.a2), args.a3),
@@ -2902,6 +2966,19 @@ const FakeEnv = struct {
     last_dev_mmap_off: u64 = 0,
     clone_calls: u64 = 0,
     last_clone_flags: u64 = 0,
+    // v0.20 (CDD №15): fork/execve/wait4-моки
+    fork_calls: u64 = 0,
+    last_fork_flags: u64 = 0,
+    fork_ret: i64 = 1234, // pid ребёнка по умолчанию
+    execve_calls: u64 = 0,
+    last_execve_path: [64]u8 = [_]u8{0} ** 64,
+    last_execve_path_len: usize = 0,
+    last_execve_argv_n: usize = 0,
+    last_execve_envp_n: usize = 0,
+    execve_ret: i64 = 0,
+    wait4_calls: u64 = 0,
+    wait4_zombie_pid: i64 = 0, // 0 = нет зомби (ECHILD)
+    wait4_zombie_code: u64 = 0,
     brk_calls: u64 = 0,
     last_brk_addr: u64 = 0,
     brk_value: u64 = 0x1000,
@@ -3546,6 +3623,9 @@ fn fakeOps() LinuxOps {
         .do_exit = fakeDoExit,
         .do_exit_group = fakeDoExitGroup,
         .do_clone = fakeDoClone,
+        .do_fork = fakeDoFork,
+        .do_execve = fakeDoExecve,
+        .do_wait4 = fakeDoWait4,
         .futex_park = fakeFutexPark,
         .futex_wake = fakeFutexWake,
         .current_pid = fakeCurrentPid,
@@ -3593,6 +3673,39 @@ fn fakeOps() LinuxOps {
 fn fakeVfsUnlink(path: []const u8) i64 {
     _ = path; // tmpfs-реестра в fake-среде нет — успех-заглушка
     return 0;
+}
+
+// ─── v0.20 (CDD №15): fork/execve/wait4 — моки ────────────────────────
+fn fakeDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
+    const e = g_env.?;
+    e.fork_calls += 1;
+    e.last_fork_flags = flags;
+    _ = parent_tid;
+    _ = child_tid;
+    _ = tls;
+    return e.fork_ret;
+}
+
+fn fakeDoExecve(path: []const u8, argv: []const []const u8, envp: []const []const u8) i64 {
+    const e = g_env.?;
+    e.execve_calls += 1;
+    const n = @min(path.len, e.last_execve_path.len);
+    @memcpy(e.last_execve_path[0..n], path[0..n]);
+    e.last_execve_path_len = n;
+    e.last_execve_argv_n = argv.len;
+    e.last_execve_envp_n = envp.len;
+    return e.execve_ret;
+}
+
+fn fakeDoWait4(pid: i64, code_out: *u64) i64 {
+    const e = g_env.?;
+    e.wait4_calls += 1;
+    if (e.wait4_zombie_pid == 0) return -10; // ECHILD
+    if (pid > 0 and pid != e.wait4_zombie_pid) return -10; // ECHILD
+    code_out.* = e.wait4_zombie_code;
+    const r: i64 = e.wait4_zombie_pid;
+    e.wait4_zombie_pid = 0; // reaped
+    return r;
 }
 
 fn fakeCurrentPid() u64 {
@@ -3714,6 +3827,8 @@ test "linux: syscall-числа x86_64 — ABI-контракты таблицы
     try testing.expectEqual(@as(u64, 11), SYS_munmap);
     try testing.expectEqual(@as(u64, 16), SYS_ioctl);
     try testing.expectEqual(@as(u64, 56), SYS_clone);
+    try testing.expectEqual(@as(u64, 59), SYS_execve);
+    try testing.expectEqual(@as(u64, 61), SYS_wait4);
     try testing.expectEqual(@as(u64, 60), SYS_exit);
     try testing.expectEqual(@as(u64, 63), SYS_uname);
     try testing.expectEqual(@as(u64, 72), SYS_fcntl);
@@ -4191,12 +4306,92 @@ test "linux: sys_clone — потоковые флаги; fork (без CLONE_VM)
     try testing.expectEqual(@as(u64, 1), e.clone_calls);
     try testing.expectEqual(thr, e.last_clone_flags);
 
-    // p14: FAKE-FORK — fork (SIGCHLD, без CLONE_VM) больше не -EINVAL:
-    // родителю — псевдо-pid (9000+), wait4 ответит «exited» (XWayland)
+    // v0.20 (CDD №15): fork (SIGCHLD, без CLONE_VM) — НАСТОЯЩИЙ мост
+    // do_fork: родитель получает pid ребёнка (зомби-слот + wait4)
     const fork_r = sysClone(ops, 17, 0, 0, 0, 0);
-    try testing.expect(fork_r >= 9000);
+    try testing.expectEqual(@as(u64, 1234), fork_r);
+    try testing.expectEqual(@as(u64, 1), e.fork_calls);
+    try testing.expectEqual(@as(u64, 17), e.last_fork_flags);
+    // ошибка моста → -errno (EAGAIN — слоты кончились)
+    e.fork_ret = -11;
+    try testing.expectEqual(err(EAGAIN), sysClone(ops, 17, 0, 0, 0, 0));
+    e.fork_ret = 1234;
     // CLONE_VM без CLONE_SIGHAND → Linux требует пару → -EINVAL
     try testing.expectEqual(err(EINVAL), sysClone(ops, CLONE_VM, 0, 0, 0, 0));
+}
+
+test "linux: sys_wait4 — зомби-ребёнок: WEXITSTATUS<<8, reap, ECHILD" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+
+    // зомби: pid 1234, код выхода 3 → status = 3<<8 (WIFEXITED)
+    e.wait4_zombie_pid = 1234;
+    e.wait4_zombie_code = 3;
+    const st_va = FakeEnv.USER_BASE + 0x80;
+    const r = sysWait4(ops, 1234, st_va, 0, 0);
+    try testing.expectEqual(@as(u64, 1234), r);
+    try testing.expectEqual(@as(u32, 3 << 8), std.mem.readInt(u32, e.mem[0x80..0x84], .little));
+    // reap-семантика: второй вызов — ECHILD (зомби пожат)
+    try testing.expectEqual(err(ECHILD), sysWait4(ops, 1234, 0, 0, 0));
+    // wait4(-1): любой зомби-ребёнок
+    e.wait4_zombie_pid = 1300;
+    e.wait4_zombie_code = 0;
+    try testing.expectEqual(@as(u64, 1300), sysWait4(ops, -1, 0, 0, 0));
+    // детей нет вовсе → ECHILD
+    e.wait4_zombie_pid = 0;
+    try testing.expectEqual(err(ECHILD), sysWait4(ops, -1, 0, 0, 0));
+    // status-указатель мусорный → EFAULT (зомби уже пожат)
+    e.wait4_zombie_pid = 1400;
+    try testing.expectEqual(err(EFAULT), sysWait4(ops, 1400, 0x1, 0, 0));
+}
+
+test "linux: sys_execve — мост path/argv/envp; EFAULT/ENOENT-края" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+
+    // path + argv[2] + envp[1] в fake-user
+    const path_va = putStr(e, 0x100, "/usr/bin/Xwayland");
+    const a0_va = putStr(e, 0x140, "Xwayland");
+    const a1_va = putStr(e, 0x180, "-rootless");
+    const env0_va = putStr(e, 0x1C0, "DISPLAY=:0");
+    // массив argv: [a0, a1, NULL]
+    std.mem.writeInt(u64, e.mem[0x200..0x208], a0_va, .little);
+    std.mem.writeInt(u64, e.mem[0x208..0x210], a1_va, .little);
+    std.mem.writeInt(u64, e.mem[0x210..0x218], 0, .little);
+    const argv_va = FakeEnv.USER_BASE + 0x200;
+    // массив envp: [env0, NULL]
+    std.mem.writeInt(u64, e.mem[0x220..0x228], env0_va, .little);
+    std.mem.writeInt(u64, e.mem[0x228..0x230], 0, .little);
+    const envp_va = FakeEnv.USER_BASE + 0x220;
+
+    const r = sysExecve(ops, path_va, argv_va, envp_va);
+    try testing.expectEqual(@as(u64, 0), r);
+    try testing.expectEqual(@as(u64, 1), e.execve_calls);
+    try testing.expectEqualStrings("/usr/bin/Xwayland", e.last_execve_path[0..e.last_execve_path_len]);
+    try testing.expectEqual(@as(usize, 2), e.last_execve_argv_n);
+    try testing.expectEqual(@as(usize, 1), e.last_execve_envp_n);
+
+    // мост вернул ошибку → -errno в RAX
+    e.execve_ret = -2;
+    try testing.expectEqual(err(ENOENT), sysExecve(ops, path_va, argv_va, envp_va));
+    e.execve_ret = 0;
+
+    // NULL path → EFAULT
+    try testing.expectEqual(err(EFAULT), sysExecve(ops, 0, argv_va, envp_va));
+    // битый argv-указатель → EFAULT
+    std.mem.writeInt(u64, e.mem[0x200..0x208], FakeEnv.USER_BASE + 0xFFFFF, .little);
+    try testing.expectEqual(err(EFAULT), sysExecve(ops, path_va, argv_va, 0));
+    std.mem.writeInt(u64, e.mem[0x200..0x208], a0_va, .little);
+
+    // envp NULL → пустое окружение (Linux-семантика)
+    _ = sysExecve(ops, path_va, argv_va, 0);
+    try testing.expectEqual(@as(usize, 0), e.last_execve_envp_n);
+    // argv NULL → argv[0] = путь (Linux-допуск)
+    _ = sysExecve(ops, path_va, 0, 0);
+    try testing.expectEqual(@as(usize, 1), e.last_execve_argv_n);
+    try testing.expectEqualStrings("/usr/bin/Xwayland", e.last_execve_path[0..e.last_execve_path_len]);
 }
 
 test "linux: sys_clone SETTID — NPTL-контракты parent/child_tid" {

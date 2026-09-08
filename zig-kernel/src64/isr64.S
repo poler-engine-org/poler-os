@@ -495,6 +495,7 @@ isr_stub_table:    .quad isr_stub_0
 .extern kstack_hi_tab          // [MAX_TASKS]u64 — верх kstack (сюда спускаемся)
 .extern ustack_hi_tab          // [MAX_TASKS]u64 — верх user-стека (0 = нет)
 .extern ustack_lo_tab          // [MAX_TASKS]u64 — низ user-стека
+.extern current_task_id        // v0.20 (CDD №15 fork): cur-first владелец
 .extern syscall_num_tmp        // времяянка user RAX на время скана
 .extern syscall_ret_tmp        // v0.20.0: результат Zig-обработчика (возврат в RAX)
 .extern rbx_tmp                // времяянка user RBX на время скана
@@ -536,9 +537,36 @@ syscall_entry:
     // ════════════════════════════════════════════════════════════════
     movq %rax, syscall_num_tmp(%rip)
     movq %rbx, rbx_tmp(%rip)
-    xorl %eax, %eax                      // i = 0
+    // v0.20 (CDD №15 fork): CUR-FIRST — fork-ребёнок живёт на ОБЩЕМ
+    // VA-стеке родителя (shared-VM до execve): линейный скан взял бы
+    // РОДИТЕЛЯ (меньший task-id) — каскад исполнился бы в чужом контек-
+    // сте. При syscall-входе cur = исполняемая задача (user-код бежит
+    // только после ЕЁ диспетчеризации; рассинхрон cks-окон парковки
+    // на этот момент не влияет — парковка не гоняет user-код).
+    movq current_task_id(%rip), %rax
+    testq %rax, %rax
+    jz .owner_scan_linear          // idle(0) — линейный путь
+    cmpq $16, %rax                 // MAX_TASKS
+    jae .owner_scan_linear
+    movq kstack_lo_tab(,%rax,8), %rbx
+    cmpq user_rsp(%rip), %rbx      // kstack_lo > user_rsp? → мимо cur
+    ja .cur_try_ustack
+    movq kstack_hi_tab(,%rax,8), %rbx
+    cmpq user_rsp(%rip), %rbx      // kstack_hi > user_rsp? → HIT (cur)
+    ja .owner_found
+.cur_try_ustack:
+    movq ustack_hi_tab(,%rax,8), %rbx
+    testq %rbx, %rbx
+    jz .owner_scan_linear          // у cur нет ustack-строки
+    cmpq user_rsp(%rip), %rbx
+    jbe .owner_scan_linear
+    movq ustack_lo_tab(,%rax,8), %rbx
+    cmpq %rbx, user_rsp(%rip)      // user_rsp >= ustack_lo? → HIT (cur)
+    jae .owner_found
+.owner_scan_linear:
+    xorl %eax, %eax                // i = 0 (легаси-скан)
 .owner_scan:
-    cmpq $8, %rax
+    cmpq $16, %rax                 // p13: MAX_TASKS=16 ($8 — устарел)
     jae .owner_fallback
     // 1) kernel-задача: user_rsp ∈ [kstack_lo_i, kstack_hi_i) ?
     movq kstack_lo_tab(,%rax,8), %rbx
