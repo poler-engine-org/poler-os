@@ -1,11 +1,11 @@
-updated_utc: 2026-09-08T19:30:00Z
+updated_utc: 2026-09-08T20:45:00Z
 repo: poler-os
 branch: main
-commit: 757bf82 feat(cdd12-p14): БЛОКИРУЮЩИЙ poll (слайс-парк 20мс) — TCG-спин мёртв; EXPORT-FABRIC + DRM-конвейер (ADDFB2×4=0); 434/434
+commit: 3d1530f feat(cdd15-p2): FORK+EXECVE ВЕРИФИЦИРОВАНЫ E2E (8/8) — полный Linux-цикл
 tag: v0.19.0 (следующий релиз — v0.20.0-rc: после первого PAGE_FLIP)
 pushed: origin/main
-tests: zig build OK; 434/434 юнит-тестов (12 модулей); E2E: gamescope-конвейер жив (VK/lavapipe/ADDFB2/vblank-DISARM), elf-run 17/17; детекторы ЧИСТЫЕ
-current_task: CDD №12 p14 ЗАВЕРШЁН. ФРОНТ v0.20.0-rc = fork+execve (в системе один ELF gamescope; Xwayland не процесс — execve в ядре отсутствует; см. секцию «ТЕКУЩИЙ ФРОНТ» внизу файла). Дисциплина p7: тег — только после первого PAGE_FLIP + shot-final.png 1024×768.
+tests: zig build OK; 585 юнит-тестов зелёные; E2E: fork-execve 8/8 PASS (ПОЛНЫЙ Linux-цикл); gamescope-конвейер жив (VK/lavapipe/ADDFB2 + Xwayland-спавн)
+current_task: CDD №15 p1-p3 ЗАВЕРШЁНЫ: fork+execve+wait4 работают (E2E 8/8). gamescope спавнит Xwayland (двойной fork). ФРОНТ: fd=-1 в wlserver unset_cloexec (userspace) → execve Xwayland → damage → PAGE_FLIP → тег v0.20.0-rc.
 blocked_on: —
 tmux_sessions: нет (QEMU через qemu-portable/qemu-portable.sh; e2e scripts/e2e/ + drm-gamescope-e2e.py; vkprobe2 host-прогон: ld-linux --library-path root/usr/lib + VK_ICD_FILENAMES)
 credentials: токен передаётся вне репозитория (НЕ хранить в репо)
@@ -168,3 +168,27 @@ IRQ-входе; авто-арм снят (хардкод task 3 — охота �
 Примечание по окружению: полигон разработки (bash-сессии, /tmp e2e-артефакты)
 переживает сбросы контекста — рабочая копия репо теперь клонируется по
 необходимости; ключевые артефакты фиксируются в GitHub немедленно.
+
+## CDD №15 p1–p3 — ИТОГ: FORK+EXECVE РЕАЛИЗОВАНЫ И ВЕРИФИЦИРОВАНЫ (commits b58fae2, 3d1530f)
+
+- **fork**: ребёнок = задача с копией PML4 (walk нижней половины, user-4K,
+  физика общая) + ПРИВАТНЫЙ стек ([rsp-4МБ, ustack_hi): 1025 стр) и TLS
+  ([fs-8K, fs+4K): 4 стр) — общие страницы порождали гонку кадров (RIP=0).
+- **execve(59)**: kill-self + respawn на новом ELF (pid/proc-слот СТАБИЛЕН:
+  1000+slot; fd наследуются; PT_INTERP handoff как elfload).
+- **wait4(61)**: зомби-слоты (parent≠255); exit(60) одиночной задачи =
+  смерть процесса (код в зомби); reap освобождает слот.
+- **cur-first syscallStackOwner** (isr64.S + scheduler.zig): syscall ребёнка
+  на общем VA-стеке исполняется В СВОЁМ контексте (линейный скан брал
+  родителя). + asm-граница скана 8→16 (MAX_TASKS=16 с p13).
+- **E2E 8/8 PASS** (fork-execve-e2e.py, minutes-not-hours): fork → ребёнок
+  жив → execve → HELLO-EXEC исполняется → wait4 WEXITSTATUS=42.
+- **GAMESCOPE-ПРОГОН**: gamescope СПАВНИТ Xwayland (двойной fork 1001→1002,
+  access('/usr/bin/Xwayland')=0), ребёнок доходит до unset_cloexec:
+  fcntl(fd=-1) → exit(1). ХВОСТ = userspace (wlserver pipefd-инициализация).
+- 585 юнит-тестов зелёные; Xwayland+41 либа в rootfs (fetch + ручная
+  установка из Arch: зеркало CachyOS отдавало заглушку на файл).
+
+ФРОНТ v0.20.0-rc: fd=-1 в wlserver unset_cloexec (xwayland/server.c:31 —
+trace socketpair/pipe2 семантику до fork); затем execve("/usr/bin/Xwayland")
+→ damage → PAGE_FLIP → shot-final.png 1024×768 → тег.
