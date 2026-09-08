@@ -72,6 +72,10 @@ pub const SYS_rt_sigprocmask: u64 = 14;
 pub const SYS_socketpair: u64 = 53;
 // ─── CDD №12 p13: сокетная волна (libseat/seatd — сессия DRM-бэкенда) ──────
 pub const SYS_socket: u64 = 41;
+pub const SYS_accept: u64 = 43; // p14: wayland-сокет (Xwayland-клиент)
+pub const SYS_accept4: u64 = 288;
+pub const SYS_listen: u64 = 50; // p14: wayland-сокет wlserver
+pub const SYS_unlink: u64 = 87; // p14: stale lock/socket-файлы
 pub const SYS_connect: u64 = 42;
 pub const SYS_sendto: u64 = 44;
 pub const SYS_recvfrom: u64 = 45;
@@ -88,6 +92,7 @@ pub const SYS_fallocate: u64 = 285; // mesa: пре-аллокация инде�
 
 
 pub const SYS_memfd_create: u64 = 319;
+pub const SYS_flock: u64 = 73; // p14: lockfile wayland-сокета (LOCK_EX|LOCK_NB)
 pub const SYS_ftruncate: u64 = 77; // (!не 46 — это i386-номер; x86_64 = 77)
 /// getdents64 (НЕ 220 — это старый getdents без d_type/d_ino-64)
 pub const SYS_getdents64: u64 = 217;
@@ -155,6 +160,36 @@ pub const SYS_readlink: u64 = 89; // 87 = unlink (!коллизия)
 pub const SYS_prlimit64: u64 = 302;
 pub const SYS_getrandom: u64 = 318;
 pub const SYS_clone: u64 = 56;
+pub const SYS_wait4: u64 = 61; // p14: fake-fork зомби
+
+/// CDD №12 p14: зомби-дети fake-fork (spawn Xwayland). Родитель получает
+/// pid; реального ребёнка НЕТ; wait4(pid) → «clean exit 0».
+pub var fake_kids: [16]u32 = [_]u32{0} ** 16;
+pub var fake_kids_n: u32 = 0;
+var fake_kid_next: u32 = 9000;
+
+fn fakeKidAlloc() u32 {
+    const pid = fake_kid_next;
+    fake_kid_next += 1;
+    if (fake_kids_n < fake_kids.len) {
+        fake_kids[fake_kids_n] = pid;
+        fake_kids_n += 1;
+    }
+    return pid;
+}
+
+fn fakeKidReap(pid: u32) bool {
+    var i: u32 = 0;
+    while (i < fake_kids_n) : (i += 1) {
+        if (fake_kids[i] == pid) {
+            var j: u32 = i + 1;
+            while (j < fake_kids_n) : (j += 1) fake_kids[j - 1] = fake_kids[j];
+            fake_kids_n -= 1;
+            return true;
+        }
+    }
+    return false;
+}
 pub const SYS_getpid: u64 = 39;
 pub const SYS_fcntl: u64 = 72;
 pub const SYS_exit: u64 = 60;
@@ -341,7 +376,7 @@ pub const CLONE_CHILD_SETTID: u64 = 0x10000000;
 pub const MAX_POLL_FDS: usize = 64;
 pub const MAX_EPOLL_EVENTS: usize = 1024; // CAsyncWaiter MaxEvents=1024 (gamescope)
 pub const MAX_WATCHES: usize = 32;
-pub const MAX_FDS: usize = 64;
+pub const MAX_FDS: usize = 256; // p14: wlserver-сокеты+кэши+ei (64 → EMFILE)
 
 // ─── fcntl-команды (fcntl.h) ──────────────────────────────────────────────
 
@@ -393,7 +428,8 @@ pub const FdKind = enum {
     dir,
 };
 
-pub const MAX_FILE_ID: u32 = 64; // реестр открытых файлов runtime (p2: 64 — е2е фд-фонтан)
+pub const MAX_FILE_ID: u32 = 512; // p14: глоб.реестр (ENFILE у gamescope_ei) // p14: 64 исчерпал gamescope-стек (WSI/кэш/wlserver-shm)
+    // → memfd_create=-ENFILE (фабрика poler-fb + wl_linux_dmabuf_v1 format-table)
 
 /// Один наблюдаемый fd в epoll-инстансе.
 pub const EpollWatch = struct {
@@ -435,6 +471,15 @@ pub const FdTable = struct {
         return t;
     }
 
+    /// p14: in-place инициализация (БЕЗ 8КБ стек-темпа — boot-стек мал!
+    /// Debug-Zig материализует var t + return t на стеке → переполнение).
+    pub fn initInPlace(self: *FdTable) void {
+        self.entries = [_]FdEntry{.{}} ** MAX_FDS; // comptime: memcpy-стиль
+        self.entries[0] = .{ .kind = .console_out };
+        self.entries[1] = .{ .kind = .console_out };
+        self.entries[2] = .{ .kind = .console_out };
+    }
+
     pub fn get(self: *FdTable, fd: i64) ?*FdEntry {
         if (fd < 0 or fd >= MAX_FDS) return null;
         const e = &self.entries[@intCast(fd)];
@@ -473,7 +518,7 @@ pub const SOL_SOCKET: i32 = 1;
 pub const SCM_RIGHTS: i32 = 1;
 
 const SEATD_BUF: usize = 512;
-const SEATD_SLOTS: usize = 4;
+const SEATD_SLOTS: usize = 16; // p14: wayland+ei+seatd+netlink (4 -> ENFILE)
 const MAX_MSG_IOV: usize = 8;
 
 pub const SeatdSlot = struct {
@@ -495,6 +540,30 @@ pub const SeatdSlot = struct {
 };
 
 pub var seatd_slots: [SEATD_SLOTS]SeatdSlot = [_]SeatdSlot{.{}} ** SEATD_SLOTS;
+
+/// CDD №12 p14: реестр ПРИВЯЗАННЫХ AF_UNIX-гнёзд (wayland-display).
+/// bind(path) регистрирует гнездо; connect(path) из ЛЮБОГО процесса
+/// создаёт socketpair-канал (клиентский fd сразу, серверный — pending);
+/// accept4(listen_fd) выдаёт серверный конец в fd-таблицу ВЫЗЫВАЮЩЕГО.
+pub const MAX_BOUND_SOCKS: usize = 8;
+pub const BoundSock = struct {
+    used: bool = false,
+    path: [104]u8 = [_]u8{0} ** 104,
+    path_len: usize = 0,
+    listen_slot: u32 = 0, // seatd_slots индекс слушающего fd
+    pending: [4]u32 = [_]u32{0} ** 4, // канал-иды ожидающих клиентов
+    pending_n: u8 = 0,
+};
+pub var bound_socks: [MAX_BOUND_SOCKS]BoundSock = [_]BoundSock{.{}} ** MAX_BOUND_SOCKS;
+
+fn boundFind(path: []const u8) ?*BoundSock {
+    for (&bound_socks) |*b| {
+        if (b.used and b.path_len == path.len and
+            std.mem.eql(u8, b.path[0..b.path_len], path))
+            return b;
+    }
+    return null;
+}
 
 fn seatdAlloc() ?u32 {
     for (&seatd_slots, 0..) |*s, i| {
@@ -778,6 +847,8 @@ pub const LinuxOps = struct {
     kill_thread: *const fn (tid: u64, sig: u64) bool,
     /// memfd_create: анонимный RW-файл (Wayland-shm) → file_id или -errno.
     memfd_create: *const fn () i64,
+    /// p14: unlink пути (tmpfs-слот) — 0/отриц. errno.
+    vfs_unlink: *const fn (path: []const u8) i64,
     /// v0.20.0 (CDD №12 p3): ftruncate(id, len) — размер анонимного файла
     /// (PMM-блок, нули). 0/-errno. Только anon-файлы (memfd).
     truncate_file: *const fn (id: u32, len: u64) i64,
@@ -1436,7 +1507,12 @@ pub fn sysEpollWait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, max
 /// (pthread_join). CLONE_SETTLS принимается — FS-base в arch_prctl-волне.
 pub fn sysClone(ops: LinuxOps, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) u64 {
     const need = CLONE_VM | CLONE_SIGHAND;
-    if (flags & need != need) return err(EINVAL); // fork/COW — честный EINVAL
+    if (flags & need != need) {
+        // p14: FAKE-FORK — glibc fork() = clone(SIGCHLD, без CLONE_VM).
+        // Реального ребёнка нет (exec-модели нет): родителю — псевдо-pid;
+        // wait4 ответит «exited 0». Иначе gamescope «fork failed» → краш.
+        return @intCast(fakeKidAlloc());
+    }
     if (flags & CLONE_SIGHAND != 0 and flags & CLONE_VM == 0) return err(EINVAL);
     // SETTID-указатели обязаны присутствовать (ядро пишет tid после успеха)
     if (flags & CLONE_PARENT_SETTID != 0 and parent_tid == 0) return err(EINVAL);
@@ -1655,6 +1731,35 @@ pub fn sysGetrandom(ops: LinuxOps, buf_va: u64, count: u64, flags: u64) u64 {
 /// clock_gettime(clk, tp): монотонное время (тик+TSC-микс).
 pub const CLOCK_MONOTONIC: u64 = 1;
 pub const CLOCK_REALTIME: u64 = 0;
+
+/// p14: wait4(pid, status, options, rusage) — зомби-ответ fake-fork.
+/// status: WIFEXITED + WEXITSTATUS(0) = 0. rusage не заполняем.
+const ECHILD_STUB: i64 = 10; // ECHILD (нет в фундаменте — p14)
+pub fn sysWait4(ops: LinuxOps, pid: i64, status_va: u64, options: u64, rusage_va: u64) u64 {
+    _ = options;
+    _ = rusage_va; // rusage — нулевой (не заполняем: спецификация допускает)
+    if (pid <= 0) {
+        // любой/все: пожинаем первого зомби (или ECHILD)
+        if (fake_kids_n == 0) return err(ECHILD_STUB);
+        const reaped: u32 = fake_kids[0];
+        _ = fakeKidReap(reaped);
+        if (status_va != 0) {
+            if (!ops.validate(status_va, 4, true)) return err(EFAULT);
+            var sb: [4]u8 = undefined;
+            std.mem.writeInt(u32, &sb, 0, .little); // clean exit
+            if (!ops.copy_out(status_va, &sb)) return err(EFAULT);
+        }
+        return reaped;
+    }
+    if (!fakeKidReap(@intCast(pid))) return err(ECHILD_STUB);
+    if (status_va != 0) {
+        if (!ops.validate(status_va, 4, true)) return err(EFAULT);
+        var sb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &sb, 0, .little);
+        if (!ops.copy_out(status_va, &sb)) return err(EFAULT);
+    }
+    return @intCast(pid);
+}
 
 pub fn sysClockGettime(ops: LinuxOps, clk: u64, tp_va: u64) u64 {
     if (clk != CLOCK_REALTIME and clk != CLOCK_MONOTONIC) return err(EINVAL);
@@ -1961,23 +2066,34 @@ pub fn sysTimerfdCreate(ops: LinuxOps, fds: *FdTable, clockid: u64, flags: u64) 
 pub fn sysTimerfdSettime(ops: LinuxOps, fds: *FdTable, fd_i: i64, flags: u64, new_va: u64, old_va: u64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
     if (e.kind != .timerfd) return err(EINVAL);
-    if (flags & 1 != 0) return err(ENOTSUP); // TFD_TIMER_ABSTIME
-    if (!ops.validate(new_va, 16, false)) return err(EFAULT);
-    var nb: [16]u8 = undefined;
+    // p14: TFD_TIMER_ABSTIME (flags bit0) ПОДДЕРЖАН — gamescope-vblank
+    // армит АБСОЛЮТНЫЕ дедлайны (CLOCK_MONOTONIC = наш linuxTimeNs).
+    if (flags & ~@as(u64, 3) != 0) return err(EINVAL); // прочие флаги нет
+    // p14-КОРЕНЬ: struct itimerspec = 32Б, POSIX-порядок:
+    //   it_interval{tv_sec, tv_nsec} @0..15, it_value{tv_sec, tv_nsec} @16..31
+    // (раньше читали 16Б как {value,interval} → value=it_interval.sec=0
+    //  → вечный disarm → vblank-таймер мёртв → нет презентаций!)
+    if (!ops.validate(new_va, 32, false)) return err(EFAULT);
+    var nb: [32]u8 = undefined;
     if (!ops.copy_in(&nb, new_va)) return err(EFAULT);
-    const value = std.mem.readInt(u64, nb[0..8], .little);
-    const interval = std.mem.readInt(u64, nb[8..16], .little);
+    const iv_sec = std.mem.readInt(u64, nb[0..8], .little);
+    const iv_nsec = std.mem.readInt(u64, nb[8..16], .little);
+    const v_sec = std.mem.readInt(u64, nb[16..24], .little);
+    const v_nsec = std.mem.readInt(u64, nb[24..32], .little);
+    const interval = iv_sec * 1_000_000_000 + iv_nsec;
+    const value = v_sec * 1_000_000_000 + v_nsec;
     if (old_va != 0) {
         if (!ops.validate(old_va, 16, true)) return err(EFAULT);
         var ob: [16]u8 = .{0} ** 16; // старое время — заглушка (нет хранилища prev в фундаменте)
         if (!ops.copy_out(old_va, &ob)) return err(EFAULT);
     }
-    // установка дедлайна: channel_write с kernel-VA (контракт моста:
-    // identity-map — ptr читается напрямую, как user-VA)
-    var wb: [16]u8 = undefined;
+    // установка дедлайна: channel_write 24Б {value, interval, flags}
+    // (контракт моста: identity-map — ptr читается напрямую, как user-VA)
+    var wb: [24]u8 = .{0} ** 24;
     std.mem.writeInt(u64, wb[0..8], value, .little);
     std.mem.writeInt(u64, wb[8..16], interval, .little);
-    _ = ops.channel_write(e.file_id, @intFromPtr(&wb), 16);
+    std.mem.writeInt(u64, wb[16..24], flags, .little);
+    _ = ops.channel_write(e.file_id, @intFromPtr(&wb), 24);
     return 0;
 }
 
@@ -1993,6 +2109,14 @@ pub fn sysMemfdCreate(ops: LinuxOps, fds: *FdTable, flags: u64) u64 {
     }
     fds.entries[@intCast(fd)].file_id = @intCast(id);
     return @intCast(fd);
+}
+
+/// p14: unlink(path) — удаление файла tmpfs (stale lock/socket wlserver).
+/// Прочие зоны (initrd-RO) — делегируется VFS-мосту main64.
+pub fn sysUnlink(ops: LinuxOps, path_va: u64) u64 {
+    const path = ops.copy_in_str(path_va, 4096) orelse return err(EFAULT);
+    if (path.len == 0) return err(EFAULT);
+    return @bitCast(ops.vfs_unlink(path));
 }
 
 /// rt_sigaction(sig, act, oldact, sigsetsize): ХРАНИЛИЩЕ обработчиков
@@ -2242,17 +2366,92 @@ pub fn sysConnect(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, addr_le
         s.is_seatd = true;
         return 0;
     }
+    // p14: wayland-гнездо (bind-реестр) — создаём СОКЕТ-ПАРУ:
+    // клиент (ВЫЗЫВАЮЩИЙ процесс) получает .socket-fd на канал;
+    // серверный конец ждёт в pending → accept4.
+    if (boundFind(path)) |b| {
+        if (b.pending_n >= b.pending.len) return err(EAGAIN); // backlog полон (нет ECONNREFUSED в фундаменте)
+        const chan = ops.channel_create(CHAN_SOCKETPAIR, 0);
+        if (chan < 0) return @bitCast(chan);
+        const cid: u32 = @intCast(chan);
+        // клиентский fd: тип .socket (recvmsg/sendmsg как socketpair)
+        const cfd = fds.allocFd(.socket, false);
+        if (cfd < 0) {
+            _ = ops.channel_unref(cid);
+            _ = ops.channel_unref(cid);
+            return @bitCast(cfd);
+        }
+        fds.entries[@intCast(cfd)].file_id = cid;
+        // серверный конец — в pending слушающего гнезда
+        b.pending[b.pending_n] = cid;
+        b.pending_n += 1;
+        // разбудить poll слушающего fd: rx_len-триггер (готовность accept)
+        if (b.listen_slot < seatd_slots.len) {
+            const ls = &seatd_slots[b.listen_slot];
+            if (ls.rx_len == 0) ls.rx_len = 4; // ненулевой = «есть соединение»
+        }
+        return 0;
+    }
     return err(ENOENT);
 }
 
 /// int bind(fd, sockaddr*, len): netlink-подписка udev / прочее — 0.
 pub fn sysBind(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, addr_len: u64) u64 {
-    _ = ops;
-    _ = addr_va;
-    _ = addr_len;
     const e = fds.get(fd_i) orelse return err(EBADF);
     if (e.kind != .seatd) return err(ENOTSOCK);
-    return 0;
+    // p14: регистрация wayland-гнезда (AF_UNIX путь)
+    if (addr_len < 2 or addr_len > 110) return err(EINVAL);
+    if (!ops.validate(addr_va, @intCast(addr_len), false)) return err(EFAULT);
+    var saddr: [110]u8 = undefined;
+    if (!ops.copy_in(saddr[0..@intCast(addr_len)], addr_va)) return err(EFAULT);
+    const fam = std.mem.readInt(u16, saddr[0..2], .little);
+    if (fam == AF_NETLINK) return 0; // p14-ФИКС: udev-монитор биндит netlink — принимаем
+    if (fam != AF_UNIX) return err(EAFNOSUPPORT);
+    const plen = @min(addr_len - 2, 104);
+    const path = saddr[2 .. 2 + @as(usize, @intCast(plen))];
+    if (plen == 0) return err(EINVAL);
+    if (boundFind(path) != null) return err(EINVAL); // уже привязано (нет EADDRINUSE)
+    for (&bound_socks) |*b| {
+        if (b.used) continue;
+        b.* = .{ .used = true, .listen_slot = e.file_id };
+        @memcpy(b.path[0..path.len], path);
+        b.path_len = path.len;
+        return 0;
+    }
+    return err(EINVAL); // реестр привязок полон
+}
+
+/// p14: accept4(fd, addr, addrlen, flags) — серверный конец wayland-гнезда.
+/// addr=NULL допускается (libwayland: accept4(fd, NULL, NULL, SOCK_CLOEXEC)).
+pub fn sysAccept4(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, addr_len_va: u64, flags: u64) u64 {
+    _ = addr_va;
+    _ = addr_len_va;
+    _ = flags; // SOCK_CLOEXEC/NONBLOCK — семантика не нужна
+    const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind != .seatd) return err(ENOTSOCK);
+    // ищем слушающее гнездо по slot
+    for (&bound_socks) |*b| {
+        if (!b.used or b.listen_slot != e.file_id) continue;
+        if (b.pending_n == 0) return err(EAGAIN);
+        const cid = b.pending[0];
+        // сдвиг очереди
+        var i: usize = 1;
+        while (i < b.pending.len) : (i += 1) b.pending[i - 1] = b.pending[i];
+        b.pending_n -= 1;
+        if (b.pending_n == 0) {
+            if (b.listen_slot < seatd_slots.len)
+                seatd_slots[b.listen_slot].rx_len = 0; // очередь пуста
+        }
+        const afd = fds.allocFd(.socket, false);
+        if (afd < 0) {
+            _ = ops.channel_unref(cid);
+            _ = ops.channel_unref(cid);
+            return @bitCast(afd);
+        }
+        fds.entries[@intCast(afd)].file_id = cid;
+        return @intCast(afd);
+    }
+    return err(EINVAL); // не слушающее
 }
 
 /// int shutdown(fd, how): 0 (закрытие направления — семантика не нужна).
@@ -2276,11 +2475,26 @@ pub fn sysSetsockopt(ops: LinuxOps, fds: *FdTable, fd_i: i64, level: u64, optnam
 
 /// int getsockopt(fd, level, opt, void *val, socklen_t *len): int-ответ 0.
 pub fn sysGetsockopt(ops: LinuxOps, fds: *FdTable, fd_i: i64, level: u64, optname: u64, val_va: u64, len_va: u64) u64 {
-    _ = level;
-    _ = optname;
     const e = fds.get(fd_i) orelse return err(EBADF);
-    if (e.kind != .seatd) return err(ENOTSOCK);
-    if (!ops.validate(len_va, 4, true) or !ops.validate(val_va, 4, true)) return err(EFAULT);
+    // p14: .socket (socketpair/XWM!) тоже гнездо — раньше только .seatd
+    // → ENOTSOCK → wl_client_create «Bad address» → краш композитора!
+    if (e.kind != .seatd and e.kind != .socket) return err(ENOTSOCK);
+    if (!ops.validate(len_va, 4, true)) return err(EFAULT);
+    // p14: SO_PEERCRED (optname 17, level SOL_SOCKET=1): struct ucred
+    // {pid,uid,gid} = 12Б — libwayland wl_client_create читает креды!
+    if (level == 1 and optname == 17) {
+        if (!ops.validate(val_va, 12, true)) return err(EFAULT);
+        var uc: [12]u8 = [_]u8{0} ** 12;
+        std.mem.writeInt(u32, uc[0..4], 1, .little); // pid
+        std.mem.writeInt(u32, uc[4..8], 0, .little); // uid (root)
+        std.mem.writeInt(u32, uc[8..12], 0, .little); // gid
+        if (!ops.copy_out(val_va, &uc)) return err(EFAULT);
+        var lb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lb, 12, .little);
+        if (!ops.copy_out(len_va, &lb)) return err(EFAULT);
+        return 0;
+    }
+    if (!ops.validate(val_va, 4, true)) return err(EFAULT);
     var b: [4]u8 = [_]u8{0} ** 4;
     _ = ops.copy_out(val_va, &b);
     std.mem.writeInt(u32, &b, 4, .little);
@@ -2570,13 +2784,18 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_set_tid_address => return sysSetTidAddress(ops, args.a1),
         SYS_set_robust_list => return sysSetRobustList(ops, args.a1, args.a2),
         SYS_rseq => return sysRseq(),
+        SYS_flock => return 0, // p14: wlserver lock (однопроц. мир — успех)
         SYS_pipe2 => return sysPipe2(ops, fds, args.a1, args.a2),
         SYS_socketpair => return sysSocketpair(ops, fds, args.a1, args.a2, args.a3, args.a4),
         // CDD №12 p13: сокетная волна (сессия libseat → DRM-бэкенд)
         SYS_dup => return sysDup(ops, fds, @bitCast(args.a1)),
         SYS_fallocate => return sysFallocate(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_socket => return sysSocket(ops, fds, args.a1, args.a2, args.a3),
+        SYS_listen => return 0, // p14: backlog-стаб (клиентов нет)
+        SYS_unlink => return sysUnlink(ops, args.a1),
         SYS_connect => return sysConnect(ops, fds, @bitCast(args.a1), args.a2, args.a3),
+        SYS_accept => return sysAccept4(ops, fds, @bitCast(args.a1), 0, 0, 0),
+        SYS_accept4 => return sysAccept4(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_bind => return sysBind(ops, fds, @bitCast(args.a1), args.a2, args.a3),
         SYS_sendto => return sysSendto(ops, fds, @bitCast(args.a1), args.a2, args.a3),
         SYS_recvfrom => return sysRecvfrom(ops, fds, @bitCast(args.a1), args.a2, args.a3),
@@ -2615,6 +2834,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_prlimit64 => return sysPrlimit64(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_getrandom => return sysGetrandom(ops, args.a1, args.a2, args.a3),
         SYS_clock_gettime => return sysClockGettime(ops, args.a1, args.a2),
+        SYS_wait4 => return sysWait4(ops, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_getppid => return sysGetppid(ops),
         SYS_getuid => return @intCast(KUID),
         SYS_geteuid => return @intCast(KUID),

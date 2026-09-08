@@ -2624,6 +2624,13 @@ fn linuxChannelUnref(id: u32) void {
 fn channelMaybeExpire(c: *Channel) void {
     if (c.kind != .timerfd or c.deadline_ns == 0) return;
     const now = linuxTimeNsRaw();
+    if (now >= c.deadline_ns) {
+        sys_print("[TFD] EXPIRE id=");
+        putDecimal(@intCast(@intFromPtr(c) - @intFromPtr(&channels[0])));
+        sys_print(" now=");
+        putDecimal(now);
+        sys_print("\n");
+    }
     while (now >= c.deadline_ns) {
         c.counter +%= 1;
         if (c.interval_ns == 0) {
@@ -2698,22 +2705,37 @@ fn linuxChannelWrite(id: u32, va: u64, count: u64) i64 {
             return 8;
         },
         .timerfd => {
-            // kernel-путь timerfd_settime: 16Б [value_ns, interval_ns]
+            sys_print("[TFD] WRITE id=");
+            putDecimal(id);
+            sys_print(" count=");
+            putDecimal(count);
+            sys_print("\n");
+            // kernel-путь timerfd_settime: 24Б [value_ns, interval_ns, flags]
             // (va — kernel-указатель: identity-map читается как user)
+            // p14: flags bit0 = TFD_TIMER_ABSTIME → дедлайн АБСОЛЮТНЫЙ
+            // (gamescope-vblank: следующий кадр в монотонных наносекундах).
             if (count < 16) return -linux_syscalls.EINVAL;
-            var b: [16]u8 = undefined;
+            var b: [24]u8 = .{0} ** 24;
             const s: [*]const u8 = @ptrFromInt(va);
-            @memcpy(&b, s[0..16]);
+            @memcpy(b[0..@min(count, 24)], s[0..@min(count, 24)]);
             const value = std.mem.readInt(u64, b[0..8], .little);
             const interval = std.mem.readInt(u64, b[8..16], .little);
+            const tflags = std.mem.readInt(u64, b[16..24], .little);
             c.counter = 0;
             c.interval_ns = interval;
             if (value == 0) {
                 c.deadline_ns = 0; // disarm
+            } else if (tflags & 1 != 0) { // TFD_TIMER_ABSTIME
+                c.deadline_ns = value; // уже монотонные нс — как есть
+                sys_print("[TFD] ARM abs id=");
+                putDecimal(@intCast(id));
+                sys_print(" deadline=");
+                putDecimal(value);
+                sys_print("\n");
             } else {
                 c.deadline_ns = linuxTimeNsRaw() + value;
             }
-            return 16;
+            return @intCast(@min(count, 24));
         },
     }
 }
@@ -2894,9 +2916,10 @@ fn linuxNewProc(task_id: usize) ?usize {
         if (!p.used) {
             p.* = .{
                 .used = true,
-                .fds = linux_syscalls.FdTable.init(),
                 .mmap_cursor = LINUX_MMAP_BASE,
             };
+            // p14: FdTable — 8КБ — только IN-PLACE (boot-стек мал!)
+            linux_syscalls.FdTable.initInPlace(&p.fds);
             linux_task_proc[task_id] = @intCast(i);
             // CDD №12 p4: чистые регионы нового процесса (анти-поллюция
             // атрибуции: RIP предыдущего мёртвого процесса совпадал бы
@@ -3610,7 +3633,12 @@ var kernel_vfs: vfs.Vfs = undefined;
 var kernel_vfs_ready = false;
 
 fn vfsInit() void {
-    kernel_vfs = vfs.Vfs.init(kernelVfsOps());
+    // p14-ФИКС: Vfs.init возвращал 35КБ-структуру через BOOT-стек (мал!)
+    // → переполнение → #PF → вис после initrd. Инициализация IN-PLACE
+    // глобала: поля напрямую, файловые слоты по одному (литерал ≤136Б).
+    kernel_vfs.ops = kernelVfsOps();
+    kernel_vfs.tmp.ops = kernelVfsOps();
+    for (&kernel_vfs.tmp.files) |*f| f.* = .{};
     kernel_vfs_ready = true;
     puts("[VFS] Live-mode VFS: /dev (devfs) + initrd (RO) + /tmp (tmpfs RAM overlay)\n");
 }
@@ -4055,6 +4083,7 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .get_sigaction = linuxGetSigaction,
         .set_sigmask = linuxSetSigmask,
         .memfd_create = linuxMemfdCreate,
+        .vfs_unlink = linuxVfsUnlink,
         .truncate_file = linuxTruncateFile,
         .shared_file_mmap = linuxSharedFileMmap,
         .dir_read = linuxDirRead,
@@ -4100,6 +4129,21 @@ fn linuxSetSigmask(how: u32, mask: u64) u64 {
 }
 
 /// memfd: анонимный PMM-файл (ftruncate выделяет блок общих страниц).
+/// p14: unlink для tmpfs (стейл-лок/сокеты wlserver). /tmp-пути →
+/// tmpfs.remove; несуществующее — ENOENT (POSIX); прочие зоны — EROFS.
+fn linuxVfsUnlink(path: []const u8) i64 {
+    if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
+    if (std.mem.startsWith(u8, path, "/tmp/")) {
+        const name = path["/tmp/".len..];
+        if (kernel_vfs.tmp.remove(name)) return 0;
+        return -linux_syscalls.ENOENT;
+    }
+    if (std.mem.startsWith(u8, path, "/tmp")) {
+        return -linux_syscalls.EISDIR;
+    }
+    return -linux_syscalls.EPERM; // initrd/dev — только чтение
+}
+
 fn linuxMemfdCreate() i64 {
     for (&linux_files, 0..) |*lf, i| {
         if (!lf.used) {
@@ -6075,6 +6119,14 @@ fn cmd_elfload(args: []const u8) void {
         // (lvp+LLVM 22.1.8: шейдер-тред + main-тред; host-репро: с
         // PERTURB коррупция «corrupted size vs. prev_size» ИСЧЕЗАЕТ).
         "MALLOC_PERTURB_=170",
+        // CDD №12 p14: XDG_RUNTIME_DIR — wayland-сокет wlserver'а! Без него:
+        // «Unable to open wayland socket» → wlroots teardown → ассерт
+        // wl_list_empty(new_input) → АБОРТ gamescope посреди рендер-цикла.
+        // /tmp — единственная RW-зона.
+        "XDG_RUNTIME_DIR=/tmp",
+        // CDD №12 p14: headless-композитор — без libinput-устройств
+        // (иначе wlserver: «Failed to start backend» → teardown-ассерт).
+        "WLR_LIBINPUT_NO_DEVICES=1",
         // CDD #12 p3: Vulkan-лоадер ищет ICD опендирем (getdents64 — бэклог);
         // VK_ICD_FILENAMES — штатный механизм лоадера (спека Khronos):
         // указываем lavapipe-манифест напрямую.

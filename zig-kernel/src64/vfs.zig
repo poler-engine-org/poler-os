@@ -63,10 +63,10 @@ pub const InitrdNode = struct {
 
 // ─── Tmpfs: RAM-файлы Live-сессии ──────────────────────────────────────────
 
-pub const MAX_NAME: usize = 48;
-pub const MAX_TMP_FILES: usize = 32;
+pub const MAX_NAME: usize = 96; // p14: mesa-кэш-пути длиннее 48Б
+pub const MAX_TMP_FILES: usize = 256; // p14: wlserver+кэш+locks (32 мало!)
 /// Бюджет tmpfs: 2МБ RAM (Live-сессия: конфиги, сокеты, логи — не медиа).
-pub const MAX_TMP_TOTAL: usize = 2 * 1024 * 1024;
+pub const MAX_TMP_TOTAL: usize = 16 * 1024 * 1024; // p14: кэш-записи
 /// Максимальный размер одного файла (1МБ).
 pub const MAX_TMP_FILE: usize = 1024 * 1024;
 
@@ -110,6 +110,24 @@ pub const TmpFs = struct {
             return f;
         }
         return VfsError.TooManyFiles;
+    }
+
+    /// p14: освободить буфер данных файла (через ops.free аллокатора VFS).
+    fn freeData(self: *TmpFs, d: []u8) void {
+        self.ops.free(d.ptr, d.len);
+    }
+
+    /// p14: удалить файл tmpfs (unlink устаревших lock/socket-файлов
+    /// wlserver'а). true = удалён, false = не найден.
+    pub fn remove(self: *TmpFs, name: []const u8) bool {
+        for (&self.files) |*f| {
+            if (f.used and std.mem.eql(u8, f.nameSlice(), name)) {
+                if (f.data) |d| self.freeData(d);
+                f.* = .{};
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Записать data по смещению off (расширение файла; O_APPEND-стиль —
@@ -523,8 +541,8 @@ test "vfs: tmpfs — лимиты: ENFILE ×33, имя > 48 → ENAMETOOLONG" {
     }
     // 33-й → TooManyFiles
     try testing.expectError(VfsError.TooManyFiles, fs.create("tmp/overflow"));
-    // длинное имя
-    const long = "tmp/" ++ "a" ** 60;
+    // длинное имя (p14: MAX_NAME=96 → тестовое имя удлинено)
+    const long = "tmp/" ++ "a" ** 100;
     try testing.expectError(VfsError.NameTooLong, fs.create(long));
     // find длинного → null (не паника)
     try testing.expect(fs.find(long) == null);

@@ -356,7 +356,7 @@ pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = iow(CreatePropBlob, DRM_IOCTL_BAS
 pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = iow(DestroyPropBlob, DRM_IOCTL_BASE, 0xBE);
 pub const DRM_IOCTL_MODE_ATOMIC: u32 = iowr(ModeAtomic, DRM_IOCTL_BASE, 0xBC);
 /// CDD №12 p13: GEM_CLOSE (IOW 0x09, 4Б) + PRIME (IOWR 0x2D/0x2E, 12Б)
-pub const DRM_IOCTL_GEM_CLOSE: u32 = 0x4004_6409;
+pub const DRM_IOCTL_GEM_CLOSE: u32 = 0x4008_6409; // p14: drm_gem_close{handle,pad} = 8Б (4Б-вариант не совпадал с libdrm!)
 pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C_642E;
 pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C_642D;
 pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = iowr(GetPropBlob, DRM_IOCTL_BASE, 0xAC);
@@ -571,8 +571,12 @@ pub const MAX_DRM_EVENTS: usize = 16;
 const CRTC_ID: u32 = 33;
 /// CDD №12 p13: PRIMARY-плоскость (atomic-only gamescope 3.16/libliftoff)
 const PLANE_ID: u32 = 36;
-/// DRM_FORMAT_XRGB8888 ('XR24') — единственный формат dumb/плоскости
+/// DRM_FORMAT_XRGB8888 ('XR24') — формат dumb/плоскости
 const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
+/// CDD №12 p14: DRM_FORMAT_ARGB8888 ('AR24') — формат gamescope-композита
+/// (vulkan BGRA8888 ↔ DRM ARGB8888): должен быть в форматах плоскости,
+/// иначе wlr_drm_format_set_has(AR24, MOD_INVALID) = false → import-FB отказ.
+const DRM_FORMAT_ARGB8888: u32 = 0x34325241;
 /// DRM_PLANE_TYPE_PRIMARY
 const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
 /// Проп-флаги (drm_mode.h): RANGE/IMMUTABLE/ENUM/BLOB/OBJECT/SIGNED/ATOMIC
@@ -1230,20 +1234,28 @@ fn ioGetPlaneRes(st: *DrmState, ops: DrmOps, arg: u64) i64 {
     return 0;
 }
 
-/// GETPLANE: PRIMARY, форматы [XRGB8888].
+/// GETPLANE: PRIMARY, форматы [ARGB8888, XRGB8888] (p14: AR24 — композит
+/// gamescope!). libdrm зовёт дважды: (ptr=0) счёт → (ptr,count) массив.
 fn ioGetPlane(st: *DrmState, ops: DrmOps, arg: u64) i64 {
     var p: GetPlane = undefined;
     if (!ops.copy_in(std.mem.asBytes(&p), arg)) return -linux.EFAULT;
     if (p.plane_id != 0 and p.plane_id != PLANE_ID) return -linux.ENOENT;
+    // p14: пишем до count форматов (AR24 первым — приоритет композита).
+    const plane_fmts = [2]u32{ DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 };
     if (p.format_type_ptr != 0 and p.count_format_types >= 1) {
-        if (!writeU32(ops, p.format_type_ptr, DRM_FORMAT_XRGB8888)) return -linux.EFAULT;
+        const nfmt: u32 = @min(p.count_format_types, plane_fmts.len);
+        var fi: u32 = 0;
+        while (fi < nfmt) : (fi += 1) {
+            if (!writeU32(ops, p.format_type_ptr + fi * 4, plane_fmts[fi]))
+                return -linux.EFAULT;
+        }
     }
     p.plane_id = PLANE_ID;
     p.crtc_id = if (crtcActive(st) != 0) CRTC_ID else 0;
     p.fb_id = st.crtc_fb_id;
     p.possible_crtcs = 1; // бит 0 = CRTC-0
     p.gamma_size = 0;
-    p.count_format_types = 1;
+    p.count_format_types = 2; // AR24 + XR24
     if (!ops.copy_out(arg, std.mem.asBytes(&p))) return -linux.EFAULT;
     return 0;
 }
@@ -1378,10 +1390,14 @@ fn ioDestroyPropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
 
 /// GEM_CLOSE (0x40046409, 4Б): слот dumb/prime-буфера освобождается.
 fn ioGemClose(st: *DrmState, ops: DrmOps, arg: u64) i64 {
-    var g: [4]u8 = undefined;
+    var g: [8]u8 = undefined; // p14: {handle, pad} — 8Б ABI
     if (!ops.copy_in(&g, arg)) return -linux.EFAULT;
     const handle: u32 = std.mem.readInt(u32, g[0..4], .little);
     if (findDumb(st, handle) == null) return -linux.EINVAL;
+    // p14: FB ещё держит этот буфер (GEM_CLOSE = drop-ref, НЕ destroy!)
+    for (&st.fbs) |*f| {
+        if (f.used and f.handle == handle) return 0; // живой FB — слот жив
+    }
     for (&st.dumb) |*b| {
         if (b.used and b.handle == handle) b.* = .{};
     }

@@ -49,6 +49,11 @@ files = {}
 symlinks = {}
 with open(os.path.join(ROOT, "usr/bin/gamescope"), "rb") as f:
     files["usr/bin/gamescope"] = f.read()
+# p14: Xwayland — без него gamescope-конструктор возвращает NULL → краш!
+with open(os.path.join(ROOT, "usr/bin/Xwayland"), "rb") as f:
+    if os.path.exists(os.path.join(ROOT, "usr/bin/Xwayland")):
+        files["usr/bin/Xwayland"] = f.read()
+        print("rootfs: + Xwayland (p14)")
 with open(os.path.join(ROOT, "usr/lib/ld-linux-x86-64.so.2"), "rb") as f:
     files["usr/lib/ld-linux-x86-64.so.2"] = f.read()
 symlinks["lib64/ld-linux-x86-64.so.2"] = "/usr/lib/ld-linux-x86-64.so.2"
@@ -242,6 +247,11 @@ for _soname in libs:
     if os.path.exists(_p):
         _h.update(str(os.path.getmtime(_p)).encode())
         _h.update(str(os.path.getsize(_p)).encode())
+# p14: VK-слой — в ключ кэша (иначе .so-обновление протухает в initrd!)
+if os.path.exists(LAYER_SO):
+    _h.update(b"VKLAYER")
+    _h.update(str(os.path.getmtime(LAYER_SO)).encode())
+    _h.update(str(os.path.getsize(LAYER_SO)).encode())
 _cache_key = _h.hexdigest()
 
 if os.path.exists(_cache_path) and os.path.getsize(_cache_path) > 10_000_000:
@@ -321,9 +331,16 @@ try:
     shot1_taken = False
     import time
     deadline = time.time() + int(os.environ.get("E2E_DRILL", "900"))
+    n_crashes = 0
     while time.time() < deadline:
         t = vm.text()
-        if "CPU EXCEPTION" in t or "Fatal" in t:
+        # p14: краш ОДНОГО рабочего потока НЕ убивает gamescope (render-loop
+        # жив!) — не обрываем drill, считаем и продолжаем до флипа/таймаута.
+        t_crashes = t.count("CPU EXCEPTION")
+        if t_crashes > n_crashes:
+            n_crashes = t_crashes
+            print(f"CPU-EXCEPTION #{n_crashes} (поток жив? drill продолжается)")
+        if "Kernel fault" in t or "kernel-panic" in t:
             deadline_hit = "crash"
             break
         if "page_flip" in t.lower() or "vblank" in t.lower():

@@ -22,6 +22,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <stdio.h>
 
 #define DBG(s) write(2, "[POLER-LAYER] " s "\n", sizeof("[POLER-LAYER] " s "\n") - 1)
 
@@ -165,6 +169,91 @@ static VkResult vkEnumerateInstanceExtensionProperties_shim(
     const char* pLayerName, uint32_t* pCount, void* pProperties);
 __attribute__((visibility("default")))
 void* vkEnumerateInstanceLayerProperties(uint32_t* pCount, void* pProps);
+
+// ─── CDD №12 p14: EXPORT-FABRIC (host-import memfd) ─────────────────────────
+// Host-криминалистика (memprobe4/5, CachyOS lavapipe):
+//   * alloc [EXPORT,DEDICATED,WSI] → -2;  [EXPORT,DEDICATED] → 0
+//   * vkGetMemoryFdKHR → SIGSEGV (DMA_BUF и OPAQUE_FD — ОБА!)
+//   * alloc [IMPORT(HOST_ALLOCATION,memfd-ptr), DEDICATED] → 0, bind → 0 ✓
+// РЕШЕНИЕ: подменяем EXPORT-узел на IMPORT host-ptr собственного memfd.
+// lvp рендерит прямо в memfd-страницы (MAP_SHARED = ОБЩИЕ физ-страницы —
+// ядро PRIME FD_TO_HANDLE возьмёт ТЕ ЖЕ страницы) → живой скан-аут кадра.
+// vkGetMemoryFdKHR слой отвечает сам (dup(memfd) из таблицы) — lvp-путь SEGV.
+#define STYPE_EXPORT_MEM   1000072002u // VkExportMemoryAllocateInfo
+#define STYPE_WSI_MESA     1000001003u // wsi_memory_allocate_info (MESA-private)
+#define STYPE_IMPORT_HOST  1000178000u // VkImportMemoryHostPointerInfoEXT
+#define HT_DMA_BUF_BIT     0x200u // VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT (0x2=OPAQUE_WIN32!)
+#define HT_HOST_ALLOC_BIT  0x80u
+#define MAX_EXP_MEM        16
+
+typedef struct {
+    uint32_t sType;      // @0
+    void* pNext;         // @8
+    uint32_t handleType; // @16
+    void* pHostPointer;  // @24
+} ImportHostNode;        // 32Б (VkImportMemoryHostPointerInfoEXT)
+
+static uint64_t g_expmem[MAX_EXP_MEM]; // VkDeviceMemory → memfd
+static int      g_expfd[MAX_EXP_MEM];
+static int      g_nexp = 0;
+
+static int exp_find(uint64_t mem) {
+    for (int i = 0; i < g_nexp; i++)
+        if (g_expmem[i] == mem) return i;
+    return -1;
+}
+static void exp_record(uint64_t mem, int fd) {
+    if (g_nexp < MAX_EXP_MEM) {
+        g_expmem[g_nexp] = mem;
+        g_expfd[g_nexp] = fd;
+        g_nexp++;
+    } else {
+        close(fd); // переполнение таблицы — закрываем, экспорт не сработает
+    }
+}
+
+// ─── CDD №12 p14: GENERIC VK-TRACER (рендер-путь) ───────────────────────────
+// Краш в lvp после FB-импорта — нужен след: какой вызов последний. Обёртки
+// прозрачно пропускают 6 регистров (ABI-безопасно, non-varargs) + лог.
+typedef int (*Pfn6)(void*, void*, void*, void*, void*, void*);
+static const char* g_trace_names[] = {
+    "vkQueueSubmit", "vkQueueWaitIdle", "vkCreateCommandPool",
+    "vkAllocateCommandBuffers", "vkBeginCommandBuffer", "vkEndCommandBuffer",
+    "vkCreateSemaphore", "vkWaitSemaphores", "vkSignalSemaphore",
+    "vkGetSemaphoreFdKHR", "vkImportSemaphoreFdKHR", "vkCreateFence",
+    "vkResetFences", "vkWaitForFences", "vkQueueBindSparse",
+    "vkResetCommandBuffer", "vkFreeCommandBuffers",
+    "vkDestroyCommandPool", "vkCreateQueryPool",
+};
+static Pfn6 g_trace_fns[20];
+static int g_trace_n = sizeof(g_trace_names) / sizeof(g_trace_names[0]);
+
+static int trace_call(int idx, void* a1, void* a2, void* a3,
+                      void* a4, void* a5, void* a6) {
+    char msg[160];
+    int ln = snprintf(msg, sizeof(msg),
+        "[VK-TRACE] > %s(0x%llx, 0x%llx, 0x%llx)\n",
+        g_trace_names[idx],
+        (unsigned long long)(uintptr_t)a1,
+        (unsigned long long)(uintptr_t)a2,
+        (unsigned long long)(uintptr_t)a3);
+    write(2, msg, ln);
+    Pfn6 next = g_trace_fns[idx];
+    int r = next ? next(a1, a2, a3, a4, a5, a6) : -3;
+    ln = snprintf(msg, sizeof(msg), "[VK-TRACE] < %s = %d\n",
+                  g_trace_names[idx], r);
+    write(2, msg, ln);
+    return r;
+}
+#define TR0(i) static int tr_##i(void* a, void* b, void* c, void* d, void* e, void* f) { return trace_call(i, a, b, c, d, e, f); }
+TR0(0) TR0(1) TR0(2) TR0(3) TR0(4) TR0(5) TR0(6) TR0(7) TR0(8) TR0(9) TR0(10)
+TR0(11) TR0(12) TR0(13) TR0(14) TR0(15) TR0(16) TR0(17) TR0(18) TR0(19)
+static void* g_trace_wraps[] = {
+    (void*)tr_0, (void*)tr_1, (void*)tr_2, (void*)tr_3, (void*)tr_4,
+    (void*)tr_5, (void*)tr_6, (void*)tr_7, (void*)tr_8, (void*)tr_9,
+    (void*)tr_10, (void*)tr_11, (void*)tr_12, (void*)tr_13, (void*)tr_14,
+    (void*)tr_15, (void*)tr_16, (void*)tr_17, (void*)tr_18, (void*)tr_19,
+};
 
 // ─── обёртки ────────────────────────────────────────────────────────────────
 
@@ -357,6 +446,9 @@ VkResult vkCreateDevice(VkPhysicalDevice pd, const void* pCreateInfo_v,
 static VkResult wrap_vkAllocateMemory(VkDevice dev, const void* pAllocateInfo_v,
                                       const void* pAllocator, VkDeviceMemory* pMemory)
 {
+    {   // p14-диагностика: МЫ ВОШЛИ В WRAP (до всего кода!)
+        write(2, "[POLER-LAYER][ALLOC-ENTRY]\n", 27);
+    }
     const MemAllocInfo* ai = (const MemAllocInfo*)pAllocateInfo_v;
     g_alloc_log_n++;
     g_loglen = 0;
@@ -364,8 +456,6 @@ static VkResult wrap_vkAllocateMemory(VkDevice dev, const void* pAllocateInfo_v,
     loghex(g_alloc_log_n);
     lput(" size=");
     loghex(ai->allocationSize);
-    lput(" typeIdx=");
-    loghex(ai->memoryTypeIndex);
     lput(" pNext=");
     loghex((uintptr_t)ai->pNext);
     if (ai->pNext) {
@@ -378,48 +468,134 @@ static VkResult wrap_vkAllocateMemory(VkDevice dev, const void* pAllocateInfo_v,
             if (node) lput(">");
         }
     }
-    // p13-ДИАГНОЗ: срезаем pNext (WSI-mesa/garbage) — если аллокация
-    // проходит, причина -2 в pNext-цепочке
     MemAllocInfo patched = *ai;
-    // p13-ФИНАЛ: цепь gamescope = [EXPORT, DEDICATED, WSI-MESA-implicit-sync].
-    // WSI-MESA-узел ломает аллокацию на lvp (-2); EXPORT нужен экспорту fd.
-    // Срезаем ПОСЛЕДНИЙ узел (WSI-MESA): [1]->[2]->[3]->NULL => [1]->[2]->NULL
-    if (ai->pNext) {
-        void* n1 = (void*)ai->pNext;
-        void* n2 = ((void**)n1)[1];
-        if (n2) {
-            void* n3 = ((void**)n2)[1];
-            if (n3) ((void**)n2)[1] = ((void**)n3)[1]; // вырезаем n3
+    ImportHostNode imp;
+    int fabric = 0;
+    int mfd = -1;
+
+    // p14-ФАБРИКА: EXPORT-узел(DMA_BUF/OPAQUE_FD) → memfd host-import
+    int diag_nn = 0, diag_iexp = -1; uint32_t diag_ht = 0xDEAD;
+    if (ai->pNext && ai->allocationSize >= 0x1000) {
+        void* nodes[8]; int nn = 0;
+        for (void* p = (void*)ai->pNext; p && nn < 8; p = ((void**)p)[1])
+            nodes[nn++] = p;
+        diag_nn = nn;
+        int iexp = -1;
+        for (int i = 0; i < nn; i++)
+            if (((uint32_t*)nodes[i])[0] == STYPE_EXPORT_MEM) { iexp = i; break; }
+        diag_iexp = iexp;
+        if (iexp >= 0) {
+            uint32_t ht = ((uint32_t*)nodes[iexp])[4]; // handleTypes @16
+            diag_ht = ht;
+            if (ht & (HT_DMA_BUF_BIT | 1u)) {
+                mfd = (int)syscall(319 /*memfd_create*/, "poler-fb", 0);
+                unsigned long sz = (ai->allocationSize + 0xFFFULL) & ~0xFFFULL;
+                if (mfd >= 0 && syscall(77 /*ftruncate*/, mfd, sz, 0) == 0) {
+                    void* P = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+                    if (P && P != (void*)-1) {
+                        // вырезаем EXPORT (границы! iexp+1 может не быть)
+                        void* head = (void*)ai->pNext;
+                        if (iexp == 0) head = (nn > 1) ? nodes[1] : 0;
+                        else ((void**)nodes[iexp - 1])[1] =
+                            (iexp + 1 < nn) ? nodes[iexp + 1] : 0;
+                        // вырезаем WSI-MESA-узел (p13: он даёт -2 на lvp)
+                        // p14-ФИКС OOB: cur[i+1] при i==cn-1 читал мусор
+                        // стека → lvp шёл по мусорному pNext → #GP!
+                        void* cur[8]; int cn = 0;
+                        for (void* p = head; p && cn < 8; p = ((void**)p)[1])
+                            cur[cn++] = p;
+                        for (int i = 0; i < cn; i++) {
+                            if (((uint32_t*)cur[i])[0] == STYPE_WSI_MESA) {
+                                if (i == 0) head = (cn > 1) ? cur[1] : 0;
+                                else ((void**)cur[i - 1])[1] =
+                                    (i + 1 < cn) ? cur[i + 1] : 0;
+                                break;
+                            }
+                        }
+                        imp.sType = STYPE_IMPORT_HOST;
+                        imp.pNext = head; // обычно [DEDICATED] → NULL
+                        imp.handleType = HT_HOST_ALLOC_BIT;
+                        imp.pHostPointer = P;
+                        patched.pNext = &imp;
+                        fabric = 1;
+                        lput(" FABRIC:memfd");
+                        loghex(mfd);
+                        lput(" ptr");
+                        loghex((uintptr_t)P);
+                    }
+                }
+            }
         }
-        patched.pNext = n1;
     }
+    if (!fabric) {
+        // p13-легаси: просто режем WSI-узел (без фабрики)
+        if (ai->pNext) {
+            void* n1 = (void*)ai->pNext;
+            void* n2 = ((void**)n1)[1];
+            if (n2) {
+                void* n3 = ((void**)n2)[1];
+                if (n3) ((void**)n2)[1] = ((void**)n3)[1];
+            }
+            patched.pNext = n1;
+        }
+    }
+
     PFN_vkAllocateMemory_t next = (PFN_vkAllocateMemory_t)g_next_gdpa(dev, "vkAllocateMemory");
+    {   // p14-диагностика: небуферизованный маркер ДО/ПОСЛЕ реального вызова
+        char msg[128];
+        int ln = snprintf(msg, sizeof(msg),
+            "[POLER-LAYER][ALLOC] call fabric=%d mfd=%d nn=%d iexp=%d ht=0x%x chain=%lx\n",
+            fabric, mfd, diag_nn, diag_iexp, diag_ht, (unsigned long)patched.pNext);
+        write(2, msg, ln);
+    }
     VkResult r = next ? next(dev, &patched, pAllocator, pMemory) : -3;
+    {
+        char msg[64];
+        int ln = snprintf(msg, sizeof(msg), "[POLER-LAYER][ALLOC] next-returned %d\n", (int)r);
+        write(2, msg, ln);
+    }
+    if (r == 0 && fabric && pMemory && mfd >= 0) {
+        exp_record(*pMemory, mfd);
+    } else if (mfd >= 0 && (!fabric || r != 0)) {
+        close(mfd);
+    }
     lput(" => ");
     loghex((uint32_t)(int32_t)r);
     lflush();
     return r;
 }
 
-// p13: VkMemoryGetFdInfoKHR {sType=1000003000, pNext, handleType u32}
+// p14: VkMemoryGetFdInfoKHR {sType=1000074002, pNext, memory u64, handleType u32}
 typedef struct {
     uint32_t sType;
     void* pNext;
-    uint32_t handleType;
+    uint64_t memory;    // @16 — VkDeviceMemory (в p13-версии поля НЕ БЫЛО!)
+    uint32_t handleType; // @24
 } MemGetFdInfo;
 
 static VkResult wrap_vkGetMemoryFdKHR(VkDevice dev, const MemGetFdInfo* gi,
-                                      const void* pAllocator, int* pFd)
+                                      int* pFd) // p14-ФИКС: 3-арг ABI (НЕТ pAllocator!)
 {
     g_loglen = 0;
-    lput("[POLER-LAYER] GetMemoryFd: handleType=");
-    loghex(gi ? gi->handleType : 0);
+    lput("[POLER-LAYER] GetMemoryFd mem");
+    loghex(gi ? gi->memory : 0);
+    // p14-ФАБРИКА: наша таблица → dup(memfd). lvp-путь = SEGV (host-доказано).
+    if (gi) {
+        int i = exp_find(gi->memory);
+        if (i >= 0) {
+            int fd = dup(g_expfd[i]);
+            if (pFd) *pFd = fd;
+            lput(" FABRIC-FD=");
+            loghex(fd);
+            lflush();
+            return 0; // VK_SUCCESS
+        }
+    }
+    // не наш буфер — вниз (не должно случаться для экспортных аллокаций)
     void* next = g_next_gdpa(dev, "vkGetMemoryFdKHR");
-    VkResult r = next ? ((VkResult(*)(VkDevice, const void*, const void*, int*))next)(dev, gi, pAllocator, pFd) : -3;
-    lput(" => ");
+    VkResult r = next ? ((VkResult(*)(VkDevice, const void*, int*))next)(dev, gi, pFd) : -3;
+    lput(" down=");
     loghex((uint32_t)(int32_t)r);
-    lput(" fd=");
-    loghex(pFd ? (uint64_t)(uint32_t)*pFd : 0);
     lflush();
     return r;
 }
@@ -427,13 +603,30 @@ static VkResult wrap_vkGetMemoryFdKHR(VkDevice dev, const MemGetFdInfo* gi,
 __attribute__((visibility("default")))
 void* vkGetDeviceProcAddr(VkDevice dev, const char* pName)
 {
+    // p14-диагностика: прямой небуферизованный лог запросов (≥16Б — 1 write)
+    if (pName && (strcmp(pName, "vkAllocateMemory") == 0 ||
+                  strcmp(pName, "vkGetMemoryFdKHR") == 0 ||
+                  strcmp(pName, "vkBindImageMemory") == 0)) {
+        char msg[80];
+        int ln = snprintf(msg, sizeof(msg), "[POLER-LAYER][GDPA-ASK] %s\n", pName);
+        write(2, msg, ln);
+    }
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
         return (void*)vkGetDeviceProcAddr;
     if (strcmp(pName, "vkAllocateMemory") == 0)
         return (void*)wrap_vkAllocateMemory;
-    // p13-ТЕСТ: обёртка отключена (проверка: не ломает ли она экспорт)
-    // if (strcmp(pName, "vkGetMemoryFdKHR") == 0)
-    //     return (void*)wrap_vkGetMemoryFdKHR;
+    // p14: ФАБРИКА включена — слой отвечает dup(memfd) на экспортные memory
+    if (strcmp(pName, "vkGetMemoryFdKHR") == 0)
+        return (void*)wrap_vkGetMemoryFdKHR;
+    // p14: GENERIC VK-TRACER — рендер-путь
+    for (int i = 0; i < g_trace_n; i++) {
+        if (strcmp(pName, g_trace_names[i]) == 0) {
+            if (!g_trace_fns[i])
+                g_trace_fns[i] = (Pfn6)g_next_gdpa(dev, pName);
+            if (g_trace_fns[i]) return g_trace_wraps[i];
+            break; // у ICD нет — пробрасываем вниз
+        }
+    }
     return g_next_gdpa ? g_next_gdpa(dev, pName) : 0;
 }
 
