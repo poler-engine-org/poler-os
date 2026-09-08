@@ -1,4 +1,0 @@
-libburn/xorriso_xorriso-ecma130ab.o: libburn/ecma130ab.c \
- /usr/include/stdc-predef.h libburn/../config.h
-/usr/include/stdc-predef.h:
-libburn/../config.h:

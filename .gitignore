@@ -1,13 +1,32 @@
-skills/
-node_modules/
+# Сборочные артефакты
 zig-kernel/zig-out/
 zig-kernel/.zig-cache/
+build/
 *.iso
 disk.img
-build/
-qemu-full/
+
+# Тяжёлые рантайм-выгрузки (не для git)
 cachyos-root/pkgcache/
 cachyos-root/root/
 cachyos-root/*.cpio
+qemu-full/
+
+# e2e-артефакты
 scripts/e2e/*.so
 scripts/e2e/__pycache__/
+
+# Логи и дампы (форензика остаётся в git-истории, не в worktree)
+logs*/
+*.log
+serial*.log
+core.*
+
+# Секреты и локальные файлы
+.env
+*.token
+token*.txt
+
+# Редакторы/ОС
+.vscode/
+.idea/
+.DS_Store

@@ -1,18 +1,19 @@
-updated_utc: 2026-09-07T19:30:00Z
+updated_utc: 2026-09-08T19:30:00Z
 repo: poler-os
 branch: main
-commit: feat(cdd12-p13): СИСТЕМ-ВЫЗОВНАЯ ВОЛНА host-диффа — seatd+ATOMIC-LITE+PRIME+VFS (gamescope: полный KMS-пайплайн, фронт lvp-dmabuf)
+commit: 757bf82 feat(cdd12-p14): БЛОКИРУЮЩИЙ poll (слайс-парк 20мс) — TCG-спин мёртв; EXPORT-FABRIC + DRM-конвейер (ADDFB2×4=0); 434/434
 tag: v0.19.0 (следующий релиз — v0.20.0-rc: после первого PAGE_FLIP)
-pushed: origin/main (токен файл-хранилище)
-tests: zig build OK; zig build test зелёные; E2E: sysharness (Vulkan compute, LLVM-JIT) DONE ×4 подряд (1037 syscall = база p11), elf-run 17/17; детекторы ВСЕ ЧИСТЫЕ: R15-POISON=0, EXIT/ENTRY-POISON=0, трипвайр спит
-current_task: CDD №12 p13 ЗАВЕРШЁН (см. git log). ГЛАВНОЕ: host-Linux дифференциальный анализ (strace-инструментарий поднят с нуля: strace 6.13 deb-root + unshare-namespace /sys-редирект + LD_PRELOAD-шим с /dev/dri-стат-фейком) ВЫЯВИЛ цепь syscall-дивергенций: socket(AF_UNIX)=ENOSYS (libseat-сессия!), getsockname/statx=ENOSYS (udev-монитор), dup=ENOSYS (libliftoff), fallocate=ENOSYS (mesa-кэш-индекс), GetConnector-ABI (скрамбл-раскладка → heap corruption «free(): invalid pointer»!), MAX_TASKS=8 → clone EAGAIN. ЗАКРЫТО ВСЁ: (1) встроенный seatd-сервер (AF_UNIX-сокет + протокол seatd native-LE: OPEN_SEAT→SEAT_OPENED, OPEN_DEVICE→DEVICE_OPENED+SCM_RIGHTS-fd из fd-таблицы вызывающего, PING→PONG, CLOSE→size=0!); AF_NETLINK=инертный udev-стаб; (2) ATOMIC-LITE: CLIENT_CAP_ATOMIC/UNIVERSAL_PLANES принимаются, GETPLANERESOURCES/GETPLANE(ABI-точно 32Б без пада!)/GETPROPERTY(имена!)/OBJ_GETPROPS(c текущими значениями)/CREATEPROPLOB(blob-реестр MODE_ID)/MODE_ATOMIC-ТРАНСЛЯТОР→SETCRTC/PAGE_FLIP-механизм→scanoutCrtcFb(vring); (3) PRIME FD_TO_HANDLE: fd→memfd(linux_files[].phys PMM-блок!)→GEM-слот→ADDFB2(метрики из запроса)→скан-аут ЖИВОГО lvp-рендера (план на первый кадр); (4) VFS-overlay: write-resolve БЕЗ тени (initrd-файл не затеняется пустышкой — тёплый mesa-кэш читается!), MAP_SHARED initrd/heap→COW-фолбэк; (5) dup/statx(транзит через старый stat)/getsockname(netlink pid)/GEM_CLOSE; MAX_TASKS=16; MALLOC_PERTURB_=170 (glibc-харденинг против heap-race CachyOS-стека — host-доказано!). РЕЗУЛЬТАТ: gamescope = Seat opened(seatd) → сессия OK → card0 через SCM_RIGHTS → VERSION/GETRESOURCES/плоскости/пропы(88 GETPROPERTY!) → «Virtual-1 (connected), 1024x768@60Hz» + CREATEPROPBLOB → MALLOC_PERTURB убил R15-краш (игра жива, render-loop!) → 3×PRIME import. ФРОНТ p14: lvp↔gamescope dmabug: цепь аллокации [EXPORT,DEDICATED,WSI-MESA] — EXPORT-узел даёт vkAllocateMemory=-2 на lvp (ХОСТ-РЕПРО!), без него vkGetMemoryFdKHR→fd=-1 → PRIME(EBADF) → «Cannot import FB». Это USERSPACE-несовместимость CachyOS-gamescope↔lvp (наша e2e-обёртка POLER-слоя срезает WSI-узел — аллокации прошли, но экспорт сломался). Плюс тёплый mesa-кэш вшит в initrd (host→VM перенос, overlay-RO-чтение) — кэш-lookups теперь работают. ТЕГ НЕ СТАВИТСЯ (первого PAGE_FLIP/кадра нет — дисциплина p7).
+pushed: origin/main
+tests: zig build OK; 434/434 юнит-тестов (12 модулей); E2E: gamescope-конвейер жив (VK/lavapipe/ADDFB2/vblank-DISARM), elf-run 17/17; детекторы ЧИСТЫЕ
+current_task: CDD №12 p14 ЗАВЕРШЁН. ФРОНТ v0.20.0-rc = fork+execve (в системе один ELF gamescope; Xwayland не процесс — execve в ядре отсутствует; см. секцию «ТЕКУЩИЙ ФРОНТ» внизу файла). Дисциплина p7: тег — только после первого PAGE_FLIP + shot-final.png 1024×768.
 blocked_on: —
 tmux_sessions: нет (QEMU через qemu-portable/qemu-portable.sh; e2e scripts/e2e/ + drm-gamescope-e2e.py; vkprobe2 host-прогон: ld-linux --library-path root/usr/lib + VK_ICD_FILENAMES)
-credentials: ВАЛИДЕН — файл-хранилище upload/«гитхаб токен .txt»
+credentials: токен передаётся вне репозитория (НЕ хранить в репо)
 
 ## Последние сессии
 
 | Дата (UTC) | Задача | Результат |
+| 2026-09-08 | **CDD №12 p14 ФИНАЛ + ЧИСТКА РЕПО (commits e9c97841, 757bf82, + chore)** | EXPORT-FABRIC (4×FABRIC-FD), DRM-конвейер: ADDFB2×4=0, Wayland-сокет, Vulkan/lavapipe шейдеры, vkQueueSubmit×3; vblank ARM→EXPIRE→OnPollIn→DISARM; БЛОКИРУЮЩИЙ poll (слайс-парк 20мс) — TCG-спин мёртв (лог 1.28М→400К); fake-fork фильтр CLONE_VM; 434/434. РЕПО: удалены logs-p11 (191МБ), upload (89МБ), registry-analysis, linux-arch-experiment, mini-services, bin, .env, grub-local, дубликаты («docs-с-кавычкой, poler-os/); доки в docs/; README → v0.19.x; старые релизы ISO v0.6–v0.9.3 удалены (новый ISO — с v0.20.0-rc). |
 | 2026-09-07 | **CDD №12 p13: SYSCALL-DIFF host-Linux → ATOMIC-LITE + SEATD + PRIME (commit feat(cdd12-p13))** | Host-диф: socket/getsockname/statx/dup/fallocate=ENOSYS + GetConnector-ABI-скрамбл + MAX_TASKS — ВСЁ закрыто. Встроенный seatd (SCM_RIGHTS-устройства!), atomic-lite (плоскости/пропы/blob'ы/MODE_ATOMIC-транслятор), PRIME fd→memfd→скан-аут, VFS-overlay no-shadow + COW-фолбэк. gamescope: полный KMS-пайплайн (режим 1024x768 выбран!), живой render-loop, PRIME×3. Фронт: lvp-dmabuf-экспорт (userspace). sysharness 6/6; юнит-тесты зелёные. |
 | 2026-09-07 | **CDD №12 p12: R15-POISON/FPU-ФЛАКИ-КИЛЛЕР (commit fix(cdd12-p12))** | Полный FPU-контекст пер-таск (xsave/xrstor 0x7: x87+MXCSR+XMM+YMM) в трёх путях: syscall-строки .bss [8][832] (парк-безопасность), exception-строки [8][2][832] (глубина-2, вложенный #PF), IRQ вход-сейв/хвост-реставр (Task.fpu). ДВА клоуна найдены дизассемблом: memset перед xsave = SSE-бродкаст XMM0 (нули на JIT-странице) и Zig-Debug 0xAA-филл undefined-локали (SSE). Фиксы: rep stosq GPR-only + .bss-строки + тонкая геометрия + GPR-GUARD. sysharness DONE ×4 (1037 syscall), elf-run 17/17, детекторы 0. |
 | 2026-09-06 | **CDD №12 p10: TEARDOWN-ИНВАРИАНТЫ + PHYS-MAP-СКАНЕР (commit 48b77392, push pending)** | Алиасинг физстраниц ЗАКРЫТ и ОПРОВЕРГНУТ как источник яда: INVLPG в unmapPageInPML4 (активный CR3; треды CLONE_VM не сбрасывали TLB), порядок unmap→free, PMM double-free детектор, physmap-сканер (живой VERIFY: CLEAN 0/0). Форензика who-ptr2 PAT 27М событий: все каналы доставки чисты; 0xAA = LLVM pattern-fill (memset ×1152) + DenseMap tombstone; краш = деструктор списка следует в tombstone → #GP. Фронт p11: syscall-diff vs host-Linux. 573/573; elf 17/17; dyn 4/4; glibc 7/7. |
@@ -124,3 +125,46 @@ IRQ-входе; авто-арм снят (хардкод task 3 — охота �
 
 Патч-скрипты (полная история охоты): /home/z/my-project/scripts/p12-*.py;
 логи: /tmp/p12/; тулчейн: /tmp/my-project/tools/zig-0.14.0/zig.
+
+## CDD №12 p13 — ИТОГ: SYSCALL-DIFF host-Linux → SEATD + ATOMIC-LITE + PRIME + VFS
+
+Дифференциальное тестирование syscall-поведения POLER-OS против настоящего host-Linux
+(один и тот же gamescope на обоих): расхождения закрыты пакетом p13 — SEATD (сессии
+девайсов /dev/dri/card0), ATOMIC-LITE (DRM_MODE_ATOMIC минимальный сет), PRIME
+(dmabuf-fd мосты), VFS-достройка. gamescope проходит seatd-handshake и открывает
+карту.
+
+## CDD №12 p14 — ИТОГ: EXPORT-FABRIC + полный DRM-конвейер; 434/434
+
+- **EXPORT-FABRIC**: Vulkan implicit-layer `libvklayer_poler_drm.so`
+  (vkCreateInstance/B2B FD) — экспорт буферов в DRM (4×FABRIC-FD в логе).
+- **DRM-конвейер gamescope**: ADDFB2×4=0, wlserver поднял Wayland-сокет, Vulkan
+  заходит в lavapipe/LLVM, компиляция реальных шейдеров gamescope, vkQueueSubmit×3.
+- **timerfd vblank**: ARM → EXPIRE → OnPollIn → DISARM (DISARM — норма re-arm).
+- **БЛОКИРУЮЩИЙ poll**: sysPoll слайс-парк 20мс (зеркало epoll_wait) — TCG-спин
+  мёртв, лог 1.28М→400К, потоки реально паркуются.
+- **Тесты: 434/434** (12 модулей); fake-fork отфильтрован от CLONE_VM-тредов.
+
+## ТЕКУЩИЙ ФРОНТ: v0.20.0-rc — ПОСЛЕДНИЙ КИЛОМЕТР = fork+execve
+
+ФОНАД РАСКРЫТ: в системе ровно ОДИН ELF — gamescope. Xwayland НИКОГДА не запускался
+(«/tmp/.X11-unix» в логе — это wlserver сам создаёт каталог). execve в ядре
+отсутствует полностью; fork — fake (pid из реестра, wait4 из zombie-реестра).
+Без клиента damage нет → hasRepaint не взводится → PAGE_FLIP/SETCRTC/ATOMIC = 0.
+
+**План v0.20:**
+1. MAX_LINUX_PROCS 2→8 (gamescope + Xwayland + клиенты);
+2. настоящий fork: адрес-пространво копировать через createUserPML4/mapPageInPML4/
+   userLeafRaw (механика VMM уже есть);
+3. execve (номер 59): ELF-загрузчик уже умеет static+dynamic;
+4. Xwayland как реальный процесс → damage → hasRepaint → PAGE_FLIP →
+   screendump 1024×768 (shot-final.png) → тег v0.20.0-rc.
+
+Известные несгоревшие хвосты: lvp worker crash (STL list-splice, libvulkan_lvp.so
++0x301A4C, LLVMPipe worker) — эксперимент LP_NUM_THREADS=0 в envp e2e уже вписан,
+не проверен; wlserver «shm file for format table» (wlr_linux_dmabuf_v1) —
+предварительно не блокирует.
+
+Примечание по окружению: полигон разработки (bash-сессии, /tmp e2e-артефакты)
+переживает сбросы контекста — рабочая копия репо теперь клонируется по
+необходимости; ключевые артефакты фиксируются в GitHub немедленно.

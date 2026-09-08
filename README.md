@@ -1,6 +1,6 @@
 # POLER-OS
 
-**Универсальная операционная система нового поколения. x86_64, монолитное ядро, Zig 0.14.0.**
+**Универсальная операционная система нового поколения. x86_64, монолитное ядро, Zig 0.14.0. Двойной ABI-сабстрат в Ring 3: Windows PE64 + Linux ELF (glibc / CachyOS).**
 
 POLER-OS — это не дистрибутив Linux и не надстройка над ним. Это независимая операционная система, спроектированная с нуля для решения фундаментальной проблемы: insecurity by design. Linux уязвим архитектурно — ядро открыто для модификации после загрузки, root-процесс является богом системы, а защита строится как надстройка поверх ОС. POLER-OS меняет парадигму: безопасность не добавляется — она является архитектурным свойством ядра.
 
@@ -44,30 +44,31 @@ Linux-программы работают нативно — POLER-OS реали
 
 ---
 
-## Текущая версия: v0.15.0
+## Текущая версия: v0.19.x (CDD-цикл №12 — графический стек)
+
+**Готовим релиз v0.20.0-rc — ПЕРВЫЙ КАДР (DRM PAGE_FLIP 1024×768).**
 
 | Подсистема | Статус | Описание |
 |---|---|---|
-| Boot | Готово | Multiboot2 → 32→64 transition → identity paging (4GB, 2MB pages) |
-| HAL | Готово | GDT, IDT, PIC remap, Local APIC timer (vector 48), IO-APIC, TSS IST1 |
-| ACPI | Готово | RSDP/RSDT/MADT/HPET parsing |
-| Memory | Готово | PMM (bitmap), VMM (4-level paging + OOM rollback), kernel heap (free-list + SipHash-2-4) |
-| Scheduler | Готово | Round-robin с APIC timer preemption (8 задач, 32КБ kernel-стеки, атомарное переключение, структурная валидация кадров, кооперативная парковка сна — wake_tick) |
-| Ring 3 | Готово | User mode: ELF64 loader, per-process CR3, syscall/sysretq, TSS IST, транзакции syscall (in_win32_syscall — многотредовая безопасность) |
-| Framebuffer | Готово | Linear framebuffer (1024x768x32bpp) + bitmap font |
-| Keyboard | Готово | PS/2 Set 2 → Set 1 translation через i8042 controller (bit 6) |
-| Serial | Готово | COM1 (115200 baud, 8N1) |
-| Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
-| VirtIO-Net | Готово | PCI legacy-драйвер, RX/TX VirtQueue, ARP/IPv4/TCP (окно/ретрансмиты/keepalive)/ICMP/DNS мини-стек (SLIRP, реальный интернет) |
-| PUF | Готово | Привязка аппаратной энтропии: TSC-джиттер → сид PRNG ядра + identity; анти-клон enrollment (спека POST_QUANTUM_HARDWARE_ENTROPY) |
-| Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen, win32_call (#6), cb_done (#7) |
-| **Win32 PE Runtime** | **CDD-циклы 1–6** | **curl.exe в Ring 3 — ПОЛНЫЙ HTTPS-ОБМЕН (TLS 1.3)**: CRT-init → main() → 2 Win64-треда (Happy Eyeballs) → getaddrinfo → socket() → connect() → select → **send(«GET / HTTP/1.1…», 75Б)** → recv(HTTP/1.1 200 OK, 52Б) → **«Hello POLER!» в консоли ОС** → штатный exit(0). 128 имплементаций + 6 native-стабов, SocketState-движок (опции/события FD_*/loopback-I/O), мультиплексор select с перезаписью fd_set, мост колбэка InitOnce, Enrollment-Gate |
+| Boot / HAL / ACPI | Готово | Multiboot2 + PVH, 32→64, GDT/IDT/PIC/APIC/IO-APIC/HPET, TSS IST |
+| Memory | Готово | PMM (bitmap), VMM 4-level paging + demand-zero (Linux-семантика анонимной памяти), physmap-сканер, kernel heap (SipHash-2-4) |
+| Scheduler | Готово | Round-robin preempt + кооперативная парковка сна, полный FPU/AVX-контекст per-task (xsave/xrstor, XCR0=0x207, фреймы 832Б), GPR-GUARD диспетчеризации |
+| Ring 3 — Win64 (PE32+) | Готово | PE/COFF парсер + загрузчик, IAT-стабы, .reloc DIR64 (DYNAMIC_BASE), Win64-треды, SocketState-движок, select; curl.exe — HTTPS TLS 1.3; 7-Zip LZMA-бенчмарк (МОМЕНТЫ ИСТИНЫ №4–№8) |
+| Ring 3 — Linux (ELF) | Готово | ELF64 loader (static + dynamic: ld.so + glibc PT_INTERP handoff), Linux syscall layer (clone/futex/epoll/poll/mmap/timerfd/wait4/exit_group…), CachyOS rootfs — конвейер из 79 либ в Ring 3 |
+| Криптография | Готово | PND v8, RSA-OAEP, POLER-CTR AEAD, PUF-энтропия (анти-клон), верифицированный HTTPS (CA-бандл, без -k) |
+| Сеть | Готово | VirtIO-Net, ARP/IPv4/TCP (окно/ретрансмиты/keepalive)/ICMP/DNS, TLS 1.3 (X25519 / ML-KEM-768) |
+| Драйверы | Готово | VirtIO-BLK/NET/GPU (vring scan-out), PCI, FAT32 RW, CPIO, evdev (/dev/input), PS/2, serial, CMOS-RTC |
+| **DRM-KMS / графконвейер** | **98% — CDD №12 p1–p14** | **gamescope в Ring 3**: Vulkan в ядре (lavapipe/LLVM компилирует реальные шейдеры gamescope), ADDFB2×4=0, libliftoff (GETPROPERTY ×64), timerfd vblank ARM→EXPIRE→OnPollIn→DISARM, Wayland-сокет, EXPORT-FABRIC (4×FABRIC-FD), блокирующий poll (слайс-парк 20мс — TCG-спин мёртв, лог 1.28М→400К) |
+| **Первый кадр (PAGE_FLIP)** | **финишная прямая** | Осталось: fork+execve (Xwayland как реальный процесс) → damage → PAGE_FLIP → скриншот 1024×768 → тег v0.20.0-rc |
 | SMP | Планируется | Многоядерность |
-| Networking | Планируется | virtio-net (реальный стек вместо loopback-штора) |
-| VFS | Планируется | Виртуальная файловая система |
-| Package verifier | Планируется | Криптографическая верификация пакетов на уровне ядра |
+| VFS / верификатор пакетов | Планируется | Единая виртуальная ФС, крипто-верификация пакетов |
 
 ---
+
+## Тесты
+
+- **434/434 юнит-тестов** (12 модулей) — Linux syscall-семантика (poll/epoll/timerfd/fork-ABI), FPU-контекст, VFS, DRM-слой
+- E2E-харнессы в `scripts/e2e/`: drm-gamescope-e2e.py (полный конвейер gamescope + Vulkan + DRM + vblank), dyn-elf-e2e.py (ld.so/glibc), pe-run-серия (Win64-регрессии)
 
 ## Сборка
 
@@ -129,98 +130,119 @@ qemu-system-x86_64 -cdrom poler-os64.iso -m 256M -serial stdio -no-reboot
 ## Структура проекта
 
 ```
-zig-kernel/
-├── src64/                    # 64-bit ядро (POLER-OS v0.7.0)
-│   ├── boot64.S              # Multiboot2 header, 32→64 переход, page tables
-│   ├── isr64.S               # ISR/IRQ stubs + syscall entry
-│   ├── main64.zig            # Точка входа, boot sequence, shell
-│   ├── hal.zig               # HAL: GDT/IDT/PIC/APIC/IOAPIC/keyboard/serial
-│   ├── acpi.zig              # RSDP/RSDT/MADT/HPET парсинг
-│   ├── pmm64.zig             # Physical Memory Manager (bitmap)
-│   ├── vmm64.zig             # Virtual Memory Manager (4-level paging)
-│   ├── heap64.zig            # Kernel heap (free-list + SipHash-2-4)
-│   ├── scheduler.zig         # Round-robin scheduler (APIC preempt)
-│   ├── elf_loader.zig        # ELF64 loader (Ring 3 user mode)
-│   ├── framebuffer.zig       # Linear framebuffer + bitmap font
-│   ├── multiboot2.zig        # Multiboot2 info parser
-│   ├── cpio.zig              # CPIO initrd parser
-│   ├── poler_core.zig        # PND v8 tensor algebra
-│   ├── rsa_oaep.zig          # RSA-OAEP + POLER-CTR AEAD
-│   └── linker64.ld           # Linker script
-├── src/                      # Legacy 32-bit ядро
-│   ├── boot32.S              # 16-bit real → 32-bit protected mode
-│   ├── isr32.S               # 32-bit ISR stubs
-│   ├── main32.zig            # 32-bit kernel entry
-│   └── ...
-├── drivers/                  # Общие драйверы
-├── arch/                     # Архитектурно-зависимый код
-├── boot/                     # Boot logic
-├── mm/                       # Memory management helpers
-├── iso/                      # GRUB ISO структура (BIOS boot)
-├── iso-efi/                  # GRUB ISO структура (UEFI boot)
-├── iso-minimal/              # Минимальная ISO структура
-├── build.zig                 # Конфигурация сборки Zig
-├── build-iso.sh              # Скрипт сборки ISO (auto-detect BIOS/UEFI)
-├── build-minimal-iso.sh      # Минимальная ISO сборка
-├── run-qemu.sh               # Скрипт запуска QEMU
-└── run-qemu-iso.sh           # Скрипт запуска QEMU с ISO
-```
+zig-kernel/                  # Ядро POLER-OS (Zig 0.14.0)
+├── src64/                   # 64-bit ядро
+│   ├── main64.zig           # Точка входа, boot sequence, shell, таймеры
+│   ├── hal.zig              # GDT/IDT/PIC/APIC/IOAPIC/keyboard/serial
+│   ├── acpi.zig / pmm64.zig / vmm64.zig / heap64.zig
+│   ├── scheduler.zig        # Планировщик + FPU/AVX-контекст per-task
+│   ├── sched_resume.zig     # GPR-GUARD диспетчеризации кадров задач
+│   ├── elf_loader.zig       # ELF64 (static + dynamic ld.so/glibc)
+│   ├── pe.zig / pe_loader.zig          # PE/COFF PE32+ парсер и загрузчик
+│   ├── win32_api.zig / win32_crt.zig / win32_stubs.zig   # Win32 ABI-слой
+│   ├── linux_syscalls.zig   # Linux syscall layer (clone/futex/epoll/poll/
+│   │                        #  mmap/timerfd/wait4/exit_group…)
+│   ├── drm_kms.zig          # DRM-KMS: ADDFB2, ATOMIC, seatd, libliftoff
+│   ├── virtio_gpu.zig       # VirtIO-GPU VRING scan-out
+│   ├── virtio_blk.zig / virtio_net.zig / pci.zig / evdev.zig
+│   ├── vfs.zig / fat32.zig / cpio.zig
+│   ├── puf.zig / rsa_oaep.zig / poler_core.zig    # Криптография
+│   ├── enroll_gate.zig / framebuffer.zig / smp.zig / multiboot2.zig
+│   └── boot64.S / isr64.S / boot_smp.S / linker64.ld
+├── src/                     # Legacy 32-bit ядро
+└── build.zig / build-iso.sh
 
----
+scripts/                     # E2E-стенд и тулинг
+├── e2e/                     # e2e-харнессы (drm-gamescope-e2e.py,
+│   │                        #  dyn-elf-e2e.py, e2e_lib.py, …)
+├── build-live-iso.sh        # Live-USB/ISO сборка
+├── fetch-cachyos-root.py    # Пакеты CachyOS → rootfs (79 либ, mesa, gamescope)
+├── setup-qemu-full.sh       # Развёртывание боевого QEMU-стенда
+├── vklayer_poler_drm.c      # Vulkan EXPORT-FABRIC слой (FABRIC-FD)
+└── vkprobe2.c / gs_shaders.h / extract-gs-shaders.py / …
+
+cachyos-root/                # CachyOS rootfs: glibc, Mesa (lavapipe),
+│                            #  gamescope, wayland-либы — сабстрат Ring 3
+qemu-portable/               # Портативный QEMU — тесты без системных зависимостей
+docs/                        # Архитектурная документация и анализ
+│                            #  (DRM-KMS-Wayland syscall analysis, ARCHITECTURE,
+│                            #   math-sources, pe-reference, …)
+iso/                         # GRUB-шаблон загрузочного ISO (BIOS/UEFI)
+```
 
 ## Дорожная карта
 
-### Этап 1 — Ядро (текущий)
+### Этап 1 — Ядро — ✅ ЗАКРЫТ
 - [x] Загрузка в 64-bit long mode через Multiboot2/GRUB и Xen/QEMU PVH (`.note.gnu.pvh`)
 - [x] HAL: GDT, IDT, PIC, APIC, IO-APIC, TSS
-- [x] Управление памятью: PMM + VMM + kernel heap
-- [x] Preemptive multitasking: round-robin scheduler
-- [x] Ring 3: user mode, ELF64 loader, per-process CR3
-- [x] Криптография: PND v8, RSA-OAEP, POLER-CTR AEAD
-- [x] Framebuffer, PS/2 клавиатура, serial console
+- [x] PMM + VMM (demand-zero) + kernel heap + physmap-сканер
+- [x] Preemptive multitasking + кооперативная парковка сна
+- [x] Полный FPU/AVX-контекст per-task (xsave/xrstor — фиксы 0xAAAA-шторма и R15-POISON)
+- [x] Framebuffer, PS/2, serial, CMOS-RTC
 - [x] Мульти-пуловый хаб аппаратной энтропии: PUF/TSC + Bus + IRQ + Bio
-- [ ] SMP — многоядерность
+- [ ] SMP — многоядерность (backlog)
 
-### Этап 2 — Файловая система и драйверы
-- [x] VirtIO-BLK драйвер диска (split virtqueues, DMA identity-map)
-- [x] FAT32 файловая система (чтение, запись, создание, удаление файлов и папок)
-- [x] CPIO Initrd парсер для загрузки образов и утилит
-- [ ] VFS (виртуальная файловая система)
-- [ ] Драйвер AHCI/SATA
-- [ ] Драйвер сети (virtio-net / e1000)
-- [ ] USB stack
+### Этап 2 — Файловая система и драйверы — ✅ ЗАКРЫТ
+- [x] VirtIO-BLK (split virtqueues, DMA identity-map)
+- [x] FAT32 (чтение/запись/создание/удаление)
+- [x] CPIO Initrd-парсер
+- [x] VirtIO-Net + мини-стек ARP/IPv4/TCP/ICMP/DNS
+- [x] VirtIO-GPU VRING scan-out (пиксельная верификация кадра)
+- [ ] VFS-унификация поверх FAT32/cpio/CachyOS-rootfs (частично в vfs.zig)
 
-### Этап 3 — Безопасность
+### Этап 3 — Безопасность — ✅ ЗАКРЫТ (v0.16–v0.18)
 - [x] Аппаратная привязка энтропии кремния (PUF Anti-Clone)
-- [ ] Криптографическая блокировка ядра после загрузки
-- [ ] Верификация целостности системных файлов (FIM)
-- [ ] Сигнатурный сканер (userspace + kernel hooks)
-- [ ] Поведенческий мониторинг на уровне ядра
-- [ ] Верификатор пакетов (kernel gatekeeper)
+- [x] Верифицированный HTTPS без `-k` (CA-бандл через VFS/FILE-API)
+- [x] Постквантовые группы X25519 / ML-KEM-768 в TLS 1.3
+- [x] Per-Task Syscall State + хардинг-волна (heap IF-фикс, SCAN-SAVE, FRAME-HEAL)
+- [ ] Криптоблокировка ядра после загрузки / FIM / сигнатурный сканер (backlog)
 
-### Этап 4 — Совместимость (Win64 / PE32+ & Linux)
-- [x] PE/COFF (PE32+) парсер заголовков (DOS, File, Optional64, Sections, DataDirectories)
-- [x] Парсинг Import Directory Table (IAT / OriginalFirstThunk / FirstThunk)
-- [x] Генератор динамических Win32-заглушек (Stub Dispatcher) с int3 контролируемым остановом (Crash-Driven Development)
-- [x] Интерактивные команды шелла `peinfo`, `pestubs` и `peload` (загрузка + запуск)
-- [x] VMM-маппинг секций PE64 в Ring 3 по ImageBase с посекционными правами (RW/NX/USER)
-- [x] Запуск EntryPoint реального приложения (curl.exe): CRT-init → main() → аргументы → крипто/SSPI-init → Dns-треды → socket() → connect() → select → send() → recv() → печать тела → exit(0) (v0.10–v0.13, CDD-циклы 1–4)
-- [x] Реализация базовых API kernel32/UCRT/WS2_32 «по мере запросов» (CDD): 138 syscall-трамплинов + 6 native-стабов + native-bsearch + native-qsort (175Б), block-heap, GetProcAddress, QPF/QPC (TSC), НАСТОЯЩИЕ Win64-треды, Enrollment-Gate, SocketState-движок с событиями FD_* и loopback-HTTP
-- [x] **CDD-цикл №5 (v0.14.0): РЕАЛЬНЫЙ СЕТЕВОЙ ОБМЕН** — драйвер VirtIO-Net (PCI legacy, RX/TX VirtQueue, 10Б-виртуальный-заголовок) + мини-стек ARP/IPv4/TCP (трёхстороннее рукопожатие, отложенные ACKи)/DNS (UDP→SLIRP): `curl.exe http://example.com` в Ring 3 получил НАСТОЯЩИЙ HTML из интернета и напечатал его в консоли ОС, штатный exit(0). SSPI/SChannel SYNTHETIC-TLS-движок построен (таблица + QuerySecurityPackageInfo/AcquireCredentialsHandle/InitializeSecurityContext/EncryptMessage/DecryptMessage); настоящий TLS-ClientHello (1539Б, OpenSSL внутри curl) отправлен на example.com
-- [x] **CDD-цикл №6 (v0.15.0): ПОЛНОЕ ЗАМЫКАНИЕ HTTPS** — TCP-hardening (скользящее окно приёма, ретрансмиты с экспоненциальным бэкоффом, keep-alive, честный FIN-кланг fin_wait_1/2/time_wait), ICMP/ping + ifconfig/netstat в шелле, strerror_s/_wcserror_s, **кооперативная парковка сна задач** (диагноз HTTPS-разведки: CV-треды жгли CPU → крипто-треду не хватало слайсов → серверный FIN): `curl.exe -k --curves X25519 https://example.com` — TLS 1.3 handshake → зашифрованный GET → **расшифрованный HTML «Example Domain» напечатан в консоли ОС** → graceful FIN → штатный exit(0)
-- [ ] Следующие CDD-циклы: MLKEM768-расследование (bad decrypt на X25519MLKEM768-гибриде у curl-OpenSSL; чистый X25519 работает), IRQ-служба сети (таймерные тики → pollRx: ACKи/keepalive при Ring-3 паузах), .reloc для DYNAMIC_BASE, FILE-семья (initrd-VFS)
-- [ ] Подмножество Linux system call interface
-- [ ] POSIX compatibility layer
+### Этап 4 — Совместимость (Win64 PE32+ & Linux ELF) — ✅ ЗАКРЫТ (CDD №1–№12)
+- [x] **Windows**: PE32+ загрузка, IAT-стабы, Win64-треды, select, SocketState;
+       curl.exe: HTTP → HTTPS TLS 1.3 (МОМЕНТ ИСТИНЫ №4–№6); 7-Zip LZMA (№8)
+- [x] **Linux**: ELF static + dynamic (ld.so + glibc PT_INTERP), clone/futex/epoll,
+       VMA-семантика Linux, demand-zero, tgkill/abort-путь glibc
+- [x] **CachyOS-сабстрат**: 79 либ rootfs в Ring 3 (usr-merge VFS + симлинки)
 
-### Этап 5 — Графическая среда
-- [ ] GPU driver (минимальный)
-- [ ] Wayland / собственный display server
-- [ ] Qt портирование / нативная поддержка
-- [ ] KDE Plasma или собственная DE
+### Этап 5 — Графическая среда — 🔥 ТЕКУЩИЙ (98%)
+- [x] DRM-KMS в ядре (ADDFB2, SETCRTC, ATOMIC, libliftoff: резолв по именам проперти)
+- [x] Vulkan в ядре — lavapipe/LLVM компилирует реальные шейдеры gamescope
+- [x] gamescope композитор жив в Ring 3 (баннер, VK-инициализация, llvmpipe, wlserver)
+- [x] timerfd vblank: ARM → EXPIRE → OnPollIn → DISARM (полный цикл)
+- [x] EXPORT-FABRIC: Vulkan-слой libvklayer_poler_drm (4×FABRIC-FD)
+- [x] Блокирующий poll (слайс-парк 20мс) — TCG-спин мёртв, лог 1.28М→400К
+- [ ] **fork+execve** — Xwayland как реальный процесс (последний километр v0.20)
+- [ ] Первый damage → PAGE_FLIP → скриншот 1024×768 → тег **v0.20.0-rc**
 
----
+### Этап 6 — KDE Plasma 6 — СЛЕДУЮЩИЙ (CDD №13)
+- [ ] Qt6 / KWin / Dolphin из CachyOS-пакетов поверх gamescope/Wayland
+- [ ] Полноценная сессия рабочего стола в QEMU
 
 ## История версий
+
+### v0.19.x — CDD-циклы №11–№12: Linux-сабстрат и gamescope в Ring 3 (текущая ветка)
+- **CDD №11 — ДИНАМИЧЕСКИЙ ELF**: Linux-ABI ELF loader (clone-треды, futex park/wake, pthread_join), РЕАЛЬНАЯ glibc static → dynamic (ld.so, PT_INTERP handoff, file-backed сегменты), VirtIO-GPU VRING scan-out с пиксельной верификацией кадра.
+- **CDD №12 (p1–p14) — gamescope из CachyOS rootfs в Ring 3**:
+  - p1–p2: конвейер либ ld.so (usr-merge VFS + симлинки, AVX/XCR0), syscall-волна, корень isr64 R8-clobber;
+  - p3–p4: **Vulkan в ядре** — vkCreateDevice входит в lavapipe/LLVM; mmap-реестр 512→2048; F_DUPFD (корень wl_display_create=NULL); tgkill; vkprobe2 — host ground-truth;
+  - p5–p7: demand-zero paging, VMA-семантика Linux, CFS-wakeup-yield, .bss-выходной кадр + clone-TLS/SETTID;
+  - p8–p10: кросс-таск hijack закрыт (выходной кадр = строка владельца), 0xAA-шторм (mesa-cache→tmpfs), teardown-инварианты + physmap-сканер (CLEAN);
+  - p11–p12: **XMM-КОРЕНЬ 0xAAAA-ШТОРМА** + **R15-POISON/ФЛАКИ-КИЛЛЕР** — полный FPU/AVX-контекст per-task (xsave/xrstor 832Б, syscall/exception/IRQ-фреймы, GPR-GUARD);
+  - p13: **SYSCALL-DIFF host-Linux** — дифференциация поведения против настоящего Linux: SEATD, ATOMIC-LITE, PRIME, VFS;
+  - p14: **EXPORT-FABRIC + полный DRM-конвейер** — Vulkan-слой (4×FABRIC-FD), ADDFB2×4=0, Wayland-сокет, fake-fork (только fork-подобных clone), timerfd vblank-диагностика (DISARM = норма), **блокирующий poll** (слайс-парк 20мс — TCG-спин мёртв). Тесты: **434/434** (12 модулей).
+- **Фронт v0.20.0-rc (финальный столп):** в системе сейчас один ELF (gamescope) — Xwayland ещё не является процессом, ядро не реализует execve. Последний километр — **fork+execve** → Xwayland → damage → **PAGE_FLIP** → первый кадр 1024×768.
+
+### v0.19.0 — CDD-цикл №10: графический фундамент + Live-USB
+- Framebuffer & DRM-KMS kernel foundation, evdev + /dev/input, Linux POSIX graphics syscalls (ioctl/futex/epoll/mmap), Live-USB boot infrastructure, CachyOS userspace init.
+
+### v0.18.0 — CDD-цикл №9: Per-Task Syscall State + хардинг
+- asm-вход syscall по владельцу user-RSP (kstack/ustack-таблицы), Linux POSIX-фундамент, e2e-харнессы — 329/329, все E2E PASS.
+
+### v0.17.0 — CDD-цикл №8: МОМЕНТ ИСТИНЫ №8 — 7-Zip LZMA в Ring 3
+- .reloc DIR64-движок (DYNAMIC_BASE), Win32 RW-слой, msvcrt-нативы, cks-хардинг (heap IF-фикс, SCAN-SAVE, FRAME-HEAL) — 311/311.
+
+### v0.16.0 — CDD-цикл №7: МОМЕНТ ИСТИНЫ №7 — ВЕРИФИЦИРОВАННЫЙ постквант HTTPS
+- PUF-энтропия, VFS/FILE-API (CA-бандл — HTTPS без `-k`), IRQ-сетворкер, CMOS-RTC: curl.exe по https с верификацией сертификатов.
 
 ### v0.15.0 — CDD-цикл №6: МОМЕНТ ИСТИНЫ №6 — ПОЛНОЕ ЗАМЫКАНИЕ HTTPS (TLS 1.3 в Ring 3)
 - **МОМЕНТ ИСТИНЫ №6 — ЗАШИФРОВАННЫЙ ИНТЕРНЕТ В RING 3**: `peload curl.exe -k --curves X25519 https://example.com` в QEMU SLIRP: DNS (104.20.23.154) → TCP-рукопожатие → **настоящий TLS 1.3 handshake** (ClientHello 311Б → ServerHello+Certificate flight 4846Б/16 сегментов → CCS+client Finished 6+58Б) → **зашифрованный HTTP GET (123Б)** через наш virtio-net → **расшифрованный curl-OpenSSL HTML «Example Domain» (585Б тело) напечатан в консоли ОС** → TLS close_notify (31/48/24Б) → graceful FIN → **штатный ExitProcess(0x0)**. Бэклог трапов ПУСТ. TLS-крипто (X25519 + AES-256-GCM + SHA-384, шифр 0x1303) считался самим curl — мы доставили поток бит-в-бит.
