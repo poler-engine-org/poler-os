@@ -14,6 +14,12 @@ var bitmap: [MAX_PAGES / 8]u8 = undefined;
 var total_ram_bytes: u64 = 0;
 var usable_pages: u64 = 0;
 pub var allocated_pages: u64 = 0;
+/// CDD №15 p5-FORENSICS: физ-ловушка. pageWatch/demand-zero выставляют
+/// phys краш-В-страницы (bump-слаб); ЛЮБОЙ free/alloc этого кадра печатается
+/// с таском: poisoner-free (кто отдал живой кадр в PMM) + reissue-alloc
+/// (кто получил его повторно → memset → вайп на месте). Ответ на главный
+/// вопрос run15: WHO freed 0x199E000 между BORN (t=362) и ZEROED (t=363).
+pub var watch_pa: u64 = 0;
 var next_free_hint: u64 = 0; // Next-fit hint to avoid O(n) scan from 0
 
 // CDD №12 p10: ТИХИЕ УБИЙЦЫ АЛИАСИНГА → ГРОМКИЕ. freePage молча глотал
@@ -121,6 +127,14 @@ pub fn allocPage() ?u64 {
         const byte_idx = i / 8;
         const bit_idx: u3 = @intCast(i % 8);
         if ((bitmap[byte_idx] & (@as(u8, 1) << bit_idx)) == 0) {
+            if (watch_pa != 0 and i * PAGE_SIZE == watch_pa) {
+                const sched = @import("scheduler.zig");
+                hal.Serial.puts("[PM-REISSUE] pa=0x");
+                hal.Serial.putHex(watch_pa);
+                hal.Serial.puts(" task=");
+                hal.Serial.putDecimal(@as(u64, sched.current_task_id));
+                hal.Serial.puts("\n");
+            }
             setPageInternal(i * PAGE_SIZE);
             allocated_pages += 1;
             next_free_hint = i + 1; // Next scan starts after this page
@@ -138,6 +152,15 @@ pub fn allocPage() ?u64 {
 
 pub fn freePage(addr: u64) void {
     pmm_free_calls += 1;
+    // p5-forensics: ловушка poisoner-free (живой кадр уходит в PMM)
+    if (watch_pa != 0 and addr == watch_pa) {
+        const sched = @import("scheduler.zig");
+        hal.Serial.puts("[PM-FREE] pa=0x");
+        hal.Serial.putHex(addr);
+        hal.Serial.puts(" task=");
+        hal.Serial.putDecimal(@as(u64, sched.current_task_id));
+        hal.Serial.puts("\n");
+    }
     // v6 FIX (Bug #7): Boundary check — addr >= 4GB causes OOB bitmap access
     if (addr >= MAX_MEM_SUPPORTED) {
         hal.Serial.puts("[PMM] ERROR: freePage addr out of range: 0x");
@@ -213,6 +236,20 @@ pub fn allocContiguousPages(count: u64) ?u64 {
             run_len += 1;
             if (run_len >= count) {
                 // Found a contiguous run — mark all as allocated
+                if (watch_pa != 0 and watch_pa >= run_start * PAGE_SIZE and
+                    watch_pa < (run_start + count) * PAGE_SIZE)
+                {
+                    const sched = @import("scheduler.zig");
+                    hal.Serial.puts("[PM-REISSUE-C] pa=0x");
+                    hal.Serial.putHex(watch_pa);
+                    hal.Serial.puts(" base=0x");
+                    hal.Serial.putHex(run_start * PAGE_SIZE);
+                    hal.Serial.puts(" n=");
+                    hal.Serial.putDecimal(count);
+                    hal.Serial.puts(" task=");
+                    hal.Serial.putDecimal(@as(u64, sched.current_task_id));
+                    hal.Serial.puts("\n");
+                }
                 var j: u64 = run_start;
                 while (j < run_start + count) : (j += 1) {
                     setPageInternal(j * PAGE_SIZE);

@@ -1093,6 +1093,11 @@ fn pageWatch() void {
     }.go;
     const a = walk(gcr3, 0x200024003000, 0x230);
     const b = walk(gcr3, 0x200024079000, 0xAC8);
+    // p5-forensics: физ-ловушка PMM — вооружаем phys B-страницы (каждый
+    // free/alloc этого кадра печатается — poisoner-free + reissue-alloc)
+    if (b.e1 & 0x1 != 0) {
+        @import("pmm64.zig").watch_pa = b.e1 & 0x000FFFFFFFFFF000;
+    }
     // p5-forensics v4: СЛЕПАЯ ЗОНА v3 — pw_q* обновлялись ТОЛЬКО при принте;
     // bump мог ЖИТЬ и УМЕРЕТЬ между сэмплами МОЛЧА (print-условия не
     // срабатывали: лист стабилен, zeroed-детектор сравнивал с последним

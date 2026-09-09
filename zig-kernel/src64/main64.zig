@@ -3987,6 +3987,9 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         return false;
     };
     if (dz_watch) {
+        // p5-forensics: физ-ловушка PMM — вооружить немедленно (не ждать
+        // сэмпла pageWatch): poisoner-free/reissue-alloc с первой секунды
+        pmm.watch_pa = phys;
         hal.Serial.puts("[DZ-MAT] NEW va=0x");
         hal.Serial.putHex(page);
         hal.Serial.puts(" phys=0x");
