@@ -3947,6 +3947,8 @@ pub fn linuxDemandZero(faulter_task: usize, va: u64) bool {
 /// Выделить НУЛЕВУЮ страницу и замапить (active-CR3 — работаем с таблицами
 /// задачи; P=0-страницы не кэшируются TLB → invlpg не обязателен, но даём).
 fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
+    // p5-forensics [DZ-MAT]: материализация watch-страниц (кто/когда/phys)
+    const dz_watch = vmm.diagWatchOn(page);
     // страница УЖЕ замаплена (гонка/P=1-фолт) — не выделяем вторую.
     // CDD №15 p4: invlpg-страховка — лист мог остаться в TLB с чужими
     // правами (мутации mprotect-волны): перезапуск инструкции с чистой
@@ -3962,6 +3964,13 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         // ЗАПРЕЩЁН: замена кадра нулевой страницей СТИРАЛА данные
         // (окно гонки mprotect: реестр уже обновлён, страницы ещё скрыты).
         if ((leaf & 0x000FFFFFFFFFF000) != 0) {
+            if (dz_watch) {
+                hal.Serial.puts("[DZ-MAT] RESTORE va=0x");
+                hal.Serial.putHex(page);
+                hal.Serial.puts(" leaf=0x");
+                hal.Serial.putHex(leaf);
+                hal.Serial.puts("\n");
+            }
             if (vmm.userLeafApplyProtEx(pml4, page, pte, true)) return true;
         }
     }
@@ -3977,6 +3986,15 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         pmm.freePage(phys);
         return false;
     };
+    if (dz_watch) {
+        hal.Serial.puts("[DZ-MAT] NEW va=0x");
+        hal.Serial.putHex(page);
+        hal.Serial.puts(" phys=0x");
+        hal.Serial.putHex(phys);
+        hal.Serial.puts(" pte=0x");
+        hal.Serial.putHex(pte);
+        hal.Serial.puts("\n");
+    }
     // активный CR3 задачи — сброс TLB-строки
     asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
     return true;

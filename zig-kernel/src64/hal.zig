@@ -1032,6 +1032,11 @@ var pw_q0a: u64 = 0xDEAD_BEE1;
 var pw_pte1: u64 = 0xDEAD_BEE2;
 var pw_q1a: u64 = 0xDEAD_BEE3;
 var pw_first: bool = true;
+// p5-forensics v4: сэмплы КАЖДЫЙ вызов (не только при принте) — см. pageWatch
+var pw_s0: u64 = 0; // последний СЭМПЛ B/bump
+var pw_s1: u64 = 0; // последний СЭМПЛ A/q320
+var pw_last: u64 = 0; // тик последнего принта (троттл прогресса)
+var pw_dump_last: u64 = 0; // тик последнего [B-DUMP]
 
 fn pageWatch() void {
     const sched = @import("scheduler.zig");
@@ -1088,23 +1093,23 @@ fn pageWatch() void {
     }.go;
     const a = walk(gcr3, 0x200024003000, 0x230);
     const b = walk(gcr3, 0x200024079000, 0xAC8);
-    if (pw_first or a.e3 != pw_pte0 or a.e2 != pw_q0a or a.e1 != pw_pte1 or a.q != pw_q1a or
-        b.e3 != pw_pte0 or b.e2 != pw_q0a or b.e1 != pw_pte1 or b.q != pw_q1a)
-    {
-        // упрощённо: печатаем при любом изменении ключевых полей
-    }
-    // p4-forensics: печатаем ТОЛЬКО значимые события — pte-переход
-    // (материализация/снятие) и ОБНУЛЕНИЕ (bump nonzero→0 — коррупция!).
-    // Движение bump — НЕ событие (10 принтов/с = serial-live-lock: тик-
-    // хендлер дольше тика → user-space голодает — эмпирика run7).
-    const zeroed = (pw_q0a != 0 and pw_q0a != 0xFFFF_FFFF_FFFF_FFFF and b.q == 0) or
-        (pw_q1a != 0 and pw_q1a != 0xFFFF_FFFF_FFFF_FFFF and a.q == 0);
-    if (pw_first or a.e1 != pw_pte1 or b.e1 != pw_pte0 or zeroed) {
+    // p5-forensics v4: СЛЕПАЯ ЗОНА v3 — pw_q* обновлялись ТОЛЬКО при принте;
+    // bump мог ЖИТЬ и УМЕРЕТЬ между сэмплами МОЛЧА (print-условия не
+    // срабатывали: лист стабилен, zeroed-детектор сравнивал с последним
+    // НАПЕЧАТАННЫМ значением = 0). Теперь сэмпл КАЖДЫЙ вызов → pw_s*;
+    // деньги-события: лист-переход, 0→живо (рождение), живо→0 (ВАЙП).
+    const a_alive = a.q != 0 and a.q != 0xFFFF_FFFF_FFFF_FFFF;
+    const b_alive = b.q != 0 and b.q != 0xFFFF_FFFF_FFFF_FFFF;
+    const b_born = b_alive and (pw_s0 == 0 or pw_s0 == 0xFFFF_FFFF_FFFF_FFFF);
+    const b_dead = !b_alive and (pw_s0 != 0 and pw_s0 != 0xFFFF_FFFF_FFFF_FFFF);
+    const a_born = a_alive and (pw_s1 == 0 or pw_s1 == 0xFFFF_FFFF_FFFF_FFFF);
+    const a_dead = !a_alive and (pw_s1 != 0 and pw_s1 != 0xFFFF_FFFF_FFFF_FFFF);
+    const leaf_change = (a.e1 != pw_pte1) or (b.e1 != pw_pte0);
+    const money = leaf_change or b_born or b_dead or a_born or a_dead;
+    if (pw_first or money) {
         pw_first = false;
         pw_pte0 = b.e1;
-        pw_q0a = b.q;
         pw_pte1 = a.e1;
-        pw_q1a = a.q;
         Serial.puts("[PW] A:pd=0x");
         Serial.putHex(a.e1);
         Serial.puts(" q320=0x");
@@ -1113,9 +1118,40 @@ fn pageWatch() void {
         Serial.putHex(b.e1);
         Serial.puts(" bump=0x");
         Serial.putHex(b.q);
-        if (zeroed) Serial.puts(" <<< ZEROED");
+        if (b_born) Serial.puts(" <<< BORN");
+        if (b_dead) Serial.puts(" <<< ZEROED");
+        if (a_dead) Serial.puts(" <<< A-DIED");
         Serial.puts(" t=");
         Serial.putDecimal(tick_count / 100);
+        Serial.puts("\n");
+    }
+    // троттл-прогресс живого bump (движение ≠ событие, но видеть жизнь надо)
+    if (b_alive and b.q != pw_s0 and !money and tick_count - pw_last >= 20000) {
+        Serial.puts("[PW-PROG] bump=0x");
+        Serial.putHex(b.q);
+        Serial.puts(" t=");
+        Serial.putDecimal(tick_count / 100);
+        Serial.puts("\n");
+    }
+    pw_s0 = b.q;
+    pw_s1 = a.q;
+    pw_last = tick_count;
+    // p5-forensics [B-DUMP]: контент-таймлайн структуры slab-аллокатора
+    // (base 0x2000_2407_9AC0: +0x00 ?, +0x08 bump, +0x10 freelist, ...)
+    // каждые 5000 тиков, если лист жив — рождение/смерть данных по факту.
+    if (b.e1 & 0x1 != 0 and tick_count - pw_dump_last >= 5000) {
+        pw_dump_last = tick_count;
+        const bp = (b.e1 & 0x000FFFFFFFFFF000) + (0xAC8 - 0x8); // base=watch-0x8
+        Serial.puts("[B-DUMP] t=");
+        Serial.putDecimal(tick_count / 100);
+        var qi: usize = 0;
+        while (qi < 5) : (qi += 1) {
+            const p: *const volatile u64 = @ptrFromInt(bp + qi * 8);
+            Serial.puts(" +0x");
+            Serial.putHex(@as(u64, qi * 8));
+            Serial.puts("=0x");
+            Serial.putHex(p.*);
+        }
         Serial.puts("\n");
     }
 }

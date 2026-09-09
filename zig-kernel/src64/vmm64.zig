@@ -30,8 +30,11 @@ pub const PAGE_SIZE: u64 = 4096;
 // выбранных VA (креш-страницы 0x4002EED000 и 0x400F21C000 — детерминированы).
 // Серийный лог покажет полный PTE-цикл: phys1 → drop → phys2 (порча!).
 pub var diag_watch: [2]struct { va: u64, len: u64 } = .{
-    .{ .va = 0x4002_EED0_00, .len = 0x1000 }, // 0xAAAA-структура (gamescope+0xC2FB1)
-    .{ .va = 0x400F_21C0_00, .len = 0x1000 }, // header Rb_tree (_Rb_tree_decrement)
+    // CDD №15 p5: краш-VA run13 (lvp slab-аллокатор, t8, детерминирован):
+    // A = 0x2000_2400_3000+0x230 (R12-struct, живая), B = 0x2000_2407_9000
+    // +0xAC8 (bump-поле, мертворождённая). PTE-DIAG: HIDE/PROT/RESTORE.
+    .{ .va = 0x2000_2400_3000, .len = 0x1000 },
+    .{ .va = 0x2000_2407_9000, .len = 0x1000 },
 };
 
 pub fn diagWatchOn(va: u64) bool {
