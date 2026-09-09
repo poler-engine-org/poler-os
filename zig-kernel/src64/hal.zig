@@ -1200,6 +1200,19 @@ fn handleException(frame: *InterruptFrame) void {
         );
         const dz_faulter = halFaulterTask(@intFromPtr(frame));
         pfLoopWatch(dz_faulter, cr2_dz); // CDD №15 p4: тихий цикл?
+        // p5-forensics: [DZ-FAULT] — первая запись/чтение watch-страницы:
+        // task + ФОЛТЯЩИЙ RIP (какой код тронул страницу) + write-бит.
+        if (@import("vmm64.zig").diagWatchOn(cr2_dz & ~@as(u64, 4095))) {
+            Serial.puts("[DZ-FAULT] task=");
+            Serial.putDecimal(dz_faulter);
+            Serial.puts(" rip=0x");
+            Serial.putHex(frame.rip);
+            Serial.puts(" va=0x");
+            Serial.putHex(cr2_dz);
+            Serial.puts(" err=0x");
+            Serial.putHex(frame.error_code);
+            Serial.puts("\n");
+        }
         if (@import("main64.zig").linuxDemandZero(dz_faulter, cr2_dz)) {
             return; // гость продолжает — фолта «не было»
         }
