@@ -1037,6 +1037,29 @@ var pw_s0: u64 = 0; // последний СЭМПЛ B/bump
 var pw_s1: u64 = 0; // последний СЭМПЛ A/q320
 var pw_last: u64 = 0; // тик последнего принта (троттл прогресса)
 var pw_dump_last: u64 = 0; // тик последнего [B-DUMP]
+/// p5-forensics: счётчик DR0-watchpoint триггеров (до 8, потом разряжение)
+var db_events: u64 = 0;
+
+/// p5-forensics: вооруить АППАРАТНЫЙ write-watchpoint (DR0, 8 байт) на
+/// addr. Ловит записи из ЛЮБОГО режима (юзер-VA + kernel identity).
+pub fn drArmWriteWatch(addr: u64) void {
+    db_events = 0;
+    asm volatile ("movq %[a], %%dr0"
+        :
+        : [a] "r" (addr),
+    );
+    // DR7: L0=1 (local enable), RW0=01 (write), LEN0=11 (8 байт)
+    asm volatile ("movq $0xD0001, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory");
+    asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: "rax", "memory");
+}
+
+/// p5-forensics: DR0-вооружён? (перевооружение только после разряжения)
+pub fn drWatchArmed() bool {
+    const dr7: u64 = asm volatile ("movq %%dr7, %[v]"
+        : [v] "=r" (-> u64),
+    );
+    return (dr7 & 0x1) != 0;
+}
 
 fn pageWatch() void {
     const sched = @import("scheduler.zig");
@@ -1097,6 +1120,9 @@ fn pageWatch() void {
     // free/alloc этого кадра печатается — poisoner-free + reissue-alloc)
     if (b.e1 & 0x1 != 0) {
         @import("pmm64.zig").watch_pa = b.e1 & 0x000FFFFFFFFFF000;
+        // DR0-watchpoint на bump-qword — если ещё не вооружён (DZ-MAT мог
+        // успеть раньше — тогда НЕ сбрасываем счётчик триггеров)
+        if (!drWatchArmed()) drArmWriteWatch((b.e1 & 0x000FFFFFFFFFF000) + 0xAC8);
     }
     // p5-forensics v4: СЛЕПАЯ ЗОНА v3 — pw_q* обновлялись ТОЛЬКО при принте;
     // bump мог ЖИТЬ и УМЕРЕТЬ между сэмплами МОЛЧА (print-условия не
@@ -1182,6 +1208,43 @@ fn pfLoopWatch(faulter: usize, cr2: u64) void {
 }
 
 fn handleException(frame: *InterruptFrame) void {
+    // p5-forensics [DB-WRITE]: АППАРАТНЫЙ watchpoint (DR0, write, 8Б) на
+    // bump-qword краш-страницы. Ловит ЛЮБУЮ запись — юзер-VA И kernel-
+    // identity (PMM-ловушка слепа к identity-записям!). Каждый триггер:
+    // RIP писца + записанное значение. write#1 = BORN (bump живой),
+    // write#2 = КАЗНЬ (вайп) — и её RIP = ИМЯ УБИЙЦЫ.
+    if (frame.vector == 1) {
+        const dr6: u64 = asm volatile ("movq %%dr6, %[v]"
+            : [v] "=r" (-> u64),
+        );
+        if (dr6 & 0x1 != 0) { // B0 = DR0 hit
+            const ft0 = halFaulterTask(@intFromPtr(frame));
+            const dr0: u64 = asm volatile ("movq %%dr0, %[v]"
+                : [v] "=r" (-> u64),
+            );
+            const nv: *const volatile u64 = @ptrFromInt(dr0);
+            Serial.puts("[DB-WRITE] task=");
+            Serial.putDecimal(ft0);
+            Serial.puts(" rip=0x");
+            Serial.putHex(frame.rip);
+            Serial.puts(" val=0x");
+            Serial.putHex(nv.*);
+            Serial.puts(" from_user=");
+            Serial.putDecimal(@as(u64, if ((frame.cs & 0x3) != 0) 1 else 0));
+            Serial.puts("\n");
+            // сброс DR6 + ПЕРЕВООРУЖЕНИЕ (ждём следующую запись — до 8)
+            asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: "rax", "memory");
+            if (db_events < 8) {
+                db_events += 1;
+                asm volatile ("movq $0xD0001, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory"); // rearm
+            } else {
+                asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory");
+            }
+            return; // trap: инструкция уже завершилась — продолжаем
+        }
+        // чужой #DB (single-step и пр.) — общий путь ниже
+    }
+
     // v0.10.0 (CDD №1): int3 из стаба импорта — обрабатываем ПЕРВЫМ.
     // Стаб: xor rax,rax; int3; ret — RIP после int3 указывает внутрь стаба;
     // колбэк находит entry по RIP, логирует dll!func, RIP+=1 (skip int3),

@@ -3990,6 +3990,9 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         // p5-forensics: физ-ловушка PMM — вооружить немедленно (не ждать
         // сэмпла pageWatch): poisoner-free/reissue-alloc с первой секунды
         pmm.watch_pa = phys;
+        // DR0-watchpoint НА bump-qword — во время МАТЕРИАЛИЗАЦИИ B-страницы
+        // (до возврата из фолта → первая запись заголовка уже под колпаком)
+        if (page == 0x2000_2407_9000) hal.drArmWriteWatch(phys + 0xAC8);
         hal.Serial.puts("[DZ-MAT] NEW va=0x");
         hal.Serial.putHex(page);
         hal.Serial.puts(" phys=0x");
