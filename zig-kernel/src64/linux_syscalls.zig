@@ -60,7 +60,8 @@ pub const SYS_signalfd4: u64 = 289;
 pub const SYS_timerfd_create: u64 = 283;
 pub const SYS_timerfd_settime: u64 = 286;
 pub const SYS_epoll_pwait: u64 = 281;
-pub const SYS_ppoll: u64 = 270;
+pub const SYS_pselect6: u64 = 270;
+pub const SYS_ppoll: u64 = 271; // CDD №15 p5-КОРЕНЬ: было 270 (=pselect6!) → настоящий ppoll(271) = ENOSYS → Xwayland «could not connect to wayland server»
 pub const SYS_statfs: u64 = 137;
 pub const SYS_time: u64 = 201;
 pub const SYS_fstatfs: u64 = 138;
@@ -2429,13 +2430,23 @@ pub fn sysGetcwd(ops: LinuxOps, buf_va: u64, size: u64) u64 {
     return 2; // записано байт: «/» + NUL
 }
 
-/// ppoll(fds, nfds, tmo, sigmask, size): poll + сигмаска (игнор) + timeout
-/// (v0.19: неблокирующий — WAIT-эпоха добавит парковку).
+/// ppoll(fds, nfds, tmo, sigmask, size): poll + сигмаска (игнор) + ЧЕСТНЫЙ
+/// таймаут (v0.19 игнорировал → неблокирующий). CDD №15 p5: Xwayland
+/// поллит сокет wl-сервера c tmo=NULL (бесконечно) — блок обязателен.
 pub fn sysPpoll(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64, tmo_va: u64, sigmask_va: u64, size: u64) u64 {
-    _ = tmo_va;
     _ = sigmask_va;
     _ = size;
-    return sysPoll(ops, fds, fds_va, nfds, 0);
+    // timespec {i64 sec, i64 nsec}: NULL → бесконечность (блок до готовности)
+    if (tmo_va == 0) return sysPoll(ops, fds, fds_va, nfds, -1);
+    if (!ops.validate(tmo_va, 16, false)) return err(EFAULT);
+    var ts_buf: [16]u8 = undefined;
+    if (!ops.copy_in(&ts_buf, tmo_va)) return err(EFAULT);
+    const sec = std.mem.readInt(i64, ts_buf[0..8], .little);
+    const nsec = std.mem.readInt(i64, ts_buf[8..16], .little);
+    if (nsec < 0 or nsec >= 1_000_000_000) return err(EINVAL);
+    if (sec < 0) return err(EINVAL); // Linux: отрицательный tv_sec → EINVAL
+    const ms: i64 = sec * 1000 + @divTrunc(nsec, 1_000_000);
+    return sysPoll(ops, fds, fds_va, nfds, ms);
 }
 
 /// epoll_pwait(epfd, events, maxevents, timeout, sigmask): = epoll_wait
@@ -2963,6 +2974,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_fstatfs => return sysFstatfs(ops, fds, @bitCast(args.a1), args.a2),
         SYS_getcwd => return sysGetcwd(ops, args.a1, args.a2),
         SYS_ppoll => return sysPpoll(ops, fds, args.a1, args.a2, args.a3, args.a4, args.a5),
+        SYS_pselect6 => return sysPpoll(ops, fds, args.a1, args.a2, args.a3, args.a4, args.a5), // тот же layout (fds,nfds,tsp,sigmask,size)
         SYS_epoll_pwait => return sysEpollPwait(ops, fds, @bitCast(args.a1), args.a2, args.a3, @bitCast(args.a4), args.a5),
         SYS_readlinkat => return sysReadlinkat(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_readlink => return sysReadlinkat(ops, @bitCast(@as(i64, -100)), args.a1, args.a2, args.a3),
@@ -5377,7 +5389,8 @@ test "linux: ppoll/epoll_pwait — маршрутизация dispatch (якор
     try testing.expectEqual(@as(u64, 283), SYS_timerfd_create);
     try testing.expectEqual(@as(u64, 286), SYS_timerfd_settime);
     try testing.expectEqual(@as(u64, 281), SYS_epoll_pwait);
-    try testing.expectEqual(@as(u64, 270), SYS_ppoll);
+    try testing.expectEqual(@as(u64, 271), SYS_ppoll); // x86_64: 270=pselect6, 271=ppoll
+    try testing.expectEqual(@as(u64, 270), SYS_pselect6);
     try testing.expectEqual(@as(u64, 138), SYS_fstatfs);
     try testing.expectEqual(@as(u64, 79), SYS_getcwd);
     try testing.expectEqual(@as(u64, 157), SYS_prctl);
