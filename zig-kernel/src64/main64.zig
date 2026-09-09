@@ -3994,9 +3994,9 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         // p5-forensics: физ-ловушка PMM — вооружить немедленно (не ждать
         // сэмпла pageWatch): poisoner-free/reissue-alloc с первой секунды
         pmm.watch_pa = phys;
-        // p5-forensics: нож на A-STRUCT (0x24003230 — RBX/RDI во ВСЕХ крашах,
-        // общий VK-объект): материализация A-страницы → колпак до первой записи
-        if (page == 0x2000_2400_3000) hal.drArmWriteWatch(page + 0x230);
+        // p5: КОНФИГУРАЦИЯ ВЫЖИВАНИЯ (runs 19/21!): нож на B-слабе — t8
+        // замедляется трапами → гонка закрывается → Xwayland-спавн живёт
+        if (page == 0x2000_2407_9000) hal.drArmWriteWatch(page + 0xAC0);
         hal.Serial.puts("[DZ-MAT] NEW va=0x");
         hal.Serial.putHex(page);
         hal.Serial.puts(" phys=0x");
