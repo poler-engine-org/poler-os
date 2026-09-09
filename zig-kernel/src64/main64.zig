@@ -3734,6 +3734,18 @@ fn linuxFreeAuditUnref(pml4: u64, va_pg: u64) void {
     if (fr < FREE_LIVE_FRAMES and free_live_counts[fr] > 0) free_live_counts[fr] -= 1;
 }
 
+
+/// CDD №15 p5-NUCLEAR: полный TLB-flush (CR3-reload — non-global записи).
+/// Зонд stale-TLB-гипотезы: записи «в пустоту» при неизменном PTE (run20
+/// B-DUMP=нули при живых трап-ридах) = CPU транслировал через устаревший
+/// кэш. Если семья NULL-крашей (lvp) умрёт с этим флешем — бисекция пути.
+fn tlbFullFlush() void {
+    asm volatile (
+        \\movq %%cr3, %%rax
+        \\movq %%rax, %%cr3
+        ::: "rax", "memory");
+}
+
 fn linuxRangeDrop(va: u64, pages: u64) void {
     const pml4 = linuxTaskPml4();
     const owner = linuxOwnerTask();
@@ -3793,6 +3805,7 @@ fn linuxRangeDrop(va: u64, pages: u64) void {
         linux_mmap_drops_freed += freed;
     }
     linuxRegionMerge(slot);
+    tlbFullFlush(); // p5-NUCLEAR: stale-TLB зонд
 }
 
 /// CDD №12 p6: madvise(MADV_DONTNEED) — честная Linux-семантика анонимной
@@ -3815,6 +3828,7 @@ fn linuxDoDontneed(va: u64, len: u64) i64 {
 
     linuxFreeAuditBuild(pml4); // p5-forensics: ДО снятия первого PTE вызова
     linuxRegionSplit(slot, qva, pages);
+    tlbFullFlush(); // p5-NUCLEAR: DONTNEED тоже мутирует PTE
     var i: usize = 0;
     while (i < linux_mmap_regions[slot].len) : (i += 1) {
         const r = &linux_mmap_regions[slot][i];
@@ -4061,6 +4075,7 @@ fn linuxDoMprotect(va: u64, len: u64, prot: u64) i64 {
         }
     }
     linuxRegionMerge(slot);
+    tlbFullFlush(); // p5-NUCLEAR: stale-TLB зонд
     return 0;
 }
 
@@ -4609,6 +4624,7 @@ fn linuxFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
             return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
         };
     }
+    tlbFullFlush(); // p5-NUCLEAR: mapPageInPML4 не инвалит — а CR3 АКТИВЕН
     // копия файловых байт чанками (identity: kernel пишет в физблок)
     var copied: u64 = 0;
     var f_off = off;
@@ -4999,6 +5015,7 @@ fn linuxSharedFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i6
             return linuxMmapRollback(pml4, va, i, -linux_syscalls.ENOMEM);
         };
     }
+    tlbFullFlush(); // p5-NUCLEAR: shared-мап без инвала на АКТИВНОМ CR3
     linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false, fdRegionName(id)); // phys общий — НЕ освобождаем
     // CDD №15 p5: МАППИНГ ПИН-ИТ ФАЙЛ (refs++): close(fd) при живом мапе —
     // легален в Linux — больше НЕ освобождает физику. Пара — unpin в
