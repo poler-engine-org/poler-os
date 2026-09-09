@@ -13,7 +13,7 @@ const MAX_PAGES: u64 = MAX_MEM_SUPPORTED / PAGE_SIZE;
 var bitmap: [MAX_PAGES / 8]u8 = undefined;
 var total_ram_bytes: u64 = 0;
 var usable_pages: u64 = 0;
-var allocated_pages: u64 = 0;
+pub var allocated_pages: u64 = 0;
 var next_free_hint: u64 = 0; // Next-fit hint to avoid O(n) scan from 0
 
 // CDD №12 p10: ТИХИЕ УБИЙЦЫ АЛИАСИНГА → ГРОМКИЕ. freePage молча глотал

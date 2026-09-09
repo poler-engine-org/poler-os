@@ -791,6 +791,19 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
             if (tick_count == 1) {
                 Serial.puts("[HAL] First APIC timer tick received!\n");
             }
+            // CDD №15 p4: [URIP] — сэмпл user-RIP прерываемого контекста
+            // (каждый 100-й тик; только user-кадры cs&3≠0). Ловит СПИН-
+            // петли в user-коде БЕЗ syscall'ов: эмпирика p4 — Xwayland
+            // 41/41 сэмплов на ld.so+0xF41E = вечный тихий #PF-цикл
+            // (demand-zero клал карту в чужое PML4); без URIP фронт
+            // невидим (syscall-трейс чист — «процесс работает»).
+            if (tick_count % 100 == 0 and (frame.cs & 0x3) != 0) {
+                Serial.puts("[URIP] cur=");
+                Serial.putDecimal(@import("scheduler.zig").current_task_id);
+                Serial.puts(" rip=0x");
+                Serial.putHex(frame.rip);
+                Serial.puts("\n");
+            }
             if (timerTickCallback) |cb| {
                 // v0.13.0-fix (КРИТИЧНО, CDD №4): переключение задач —
                 // АТОМАРНАЯ секция. Раньше cb() (schedule) исполнялся с IF=1
@@ -994,6 +1007,36 @@ fn dumpContainer(label: []const u8, addr: u64, faulter: usize) void {
     Serial.puts("\n");
 }
 
+// CDD №15 p4: [PF-LOOP] — детектор ТИХОГО вечного #PF-цикла. Эмпирика:
+// demand-zero клал карту в ЧУЖОЕ PML4 (реестр по faulter, таблицы по
+// current) → страница не появлялась у виновника → фолт молча повторял-
+// ся, гость крутился на ОДНОЙ инструкции (URIP 41/41 одного RIP).
+// 30 подряд одинаковых (task, cr2) → печать (далее каждая 500-я).
+var pfloop_task: usize = 0;
+var pfloop_cr2: u64 = 0;
+var pfloop_run: u64 = 0;
+var pfloop_seen: bool = false;
+
+fn pfLoopWatch(faulter: usize, cr2: u64) void {
+    if (pfloop_seen and faulter == pfloop_task and cr2 == pfloop_cr2) {
+        pfloop_run += 1;
+    } else {
+        pfloop_task = faulter;
+        pfloop_cr2 = cr2;
+        pfloop_run = 1;
+        pfloop_seen = true;
+    }
+    if (pfloop_run == 30 or (pfloop_run > 30 and pfloop_run % 500 == 0)) {
+        Serial.puts("[PF-LOOP] task=");
+        Serial.putDecimal(faulter);
+        Serial.puts(" cr2=0x");
+        Serial.putHex(cr2);
+        Serial.puts(" run=");
+        Serial.putDecimal(pfloop_run);
+        Serial.puts("\n");
+    }
+}
+
 fn handleException(frame: *InterruptFrame) void {
     // v0.10.0 (CDD №1): int3 из стаба импорта — обрабатываем ПЕРВЫМ.
     // Стаб: xor rax,rax; int3; ret — RIP после int3 указывает внутрь стаба;
@@ -1016,8 +1059,9 @@ fn handleException(frame: *InterruptFrame) void {
         const cr2_dz: u64 = asm volatile ("movq %%cr2, %[v]"
             : [v] "=r" (-> u64),
         );
-        if (@import("main64.zig").linuxDemandZero(
-                halFaulterTask(@intFromPtr(frame)), cr2_dz)) {
+        const dz_faulter = halFaulterTask(@intFromPtr(frame));
+        pfLoopWatch(dz_faulter, cr2_dz); // CDD №15 p4: тихий цикл?
+        if (@import("main64.zig").linuxDemandZero(dz_faulter, cr2_dz)) {
             return; // гость продолжает — фолта «не было»
         }
     }

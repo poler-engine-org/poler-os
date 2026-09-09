@@ -502,7 +502,7 @@ pub fn buildUserStack(
     if (!h.writeBytesAt(platform_va, platform_str ++ [_]u8{0})) return ElfError.StackOverflow;
 
     // env-строки (снизу вверх по списку = сверху вниз по памяти)
-    var env_ptrs_buf: [32]u64 = .{0} ** 32;
+    var env_ptrs_buf: [64]u64 = .{0} ** 64; // CDD №15 p4: 32 → 64 (envp)
     var env_n: usize = 0;
     var e = strings.envp.len;
     while (e > 0) {
@@ -516,11 +516,11 @@ pub fn buildUserStack(
         env_n += 1;
     }
     // прямой порядок указателей
-    var env_ptrs: [32]u64 = .{0} ** 32;
+    var env_ptrs: [64]u64 = .{0} ** 64;
     for (0..env_n) |k| env_ptrs[k] = env_ptrs_buf[env_n - 1 - k];
 
     // argv-строки (в обратном порядке записи, адреса разворачиваем)
-    var argv_ptrs_buf: [32]u64 = .{0} ** 32;
+    var argv_ptrs_buf: [64]u64 = .{0} ** 64; // CDD №15 p4: 32 → 64
     var argv_n: usize = 0;
     var a = strings.argv.len;
     while (a > 0) {
@@ -533,7 +533,7 @@ pub fn buildUserStack(
         argv_ptrs_buf[argv_n] = cursor;
         argv_n += 1;
     }
-    var argv_ptrs: [32]u64 = .{0} ** 32;
+    var argv_ptrs: [64]u64 = .{0} ** 64;
     for (0..argv_n) |k| argv_ptrs[k] = argv_ptrs_buf[argv_n - 1 - k];
 
     // execfn-строка (AT_EXECFN = argv[0]-копия выше всех)

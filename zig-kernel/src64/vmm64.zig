@@ -16,6 +16,13 @@ pub const PTE_HUGE: u64 = 0x80;
 pub const PTE_GLOBAL: u64 = 0x100;
 pub const PTE_NO_EXECUTE: u64 = @as(u64, 1) << 63;
 
+/// CDD №15 p4: software-бит 52 — «физика листа принадлежит ЭТОМУ процес-
+/// су» (eager-снапшот fork). Железо биты 52-58 игнорирует (reserved-для-
+/// software); PTE_ADDR_MASK (биты 12-50) исключает его из физ-адреса;
+/// mapPageInPML4 пишет phys|flags КАК ЕСТЬ → бит проходит в PTE.
+/// linuxFreeForkPrivate (execve) возвращает такие страницы в PMM.
+pub const PTE_PRIVATE: u64 = @as(u64, 1) << 52;
+
 pub const PAGE_SIZE: u64 = 4096;
 
 // ─── CDD №12 p6-DIAG: трекер PTE-жизни страницы (кросс-маппинг-охота) ───────

@@ -1864,10 +1864,16 @@ fn kernelLoaderOps() pe_loader.LoaderOps {
 
 // ─── v0.18.0 (CDD №9): Linux POSIX-слой — kernel-runtime (LinuxOps) ────────
 
-/// Регион mmap для Linux-задач: 16ГБ, вне Win32-планировки (image 5ГБ,
-/// стабы 8ГБ, TEB/PEB 0x21…, стек 0x22…, heap 0x30…). Бюджет — 1ГБ.
+/// Регион mmap для Linux-задач. CDD №15 p4-КОРЕНЬ «failed to map segment»
+/// (mmap(NULL,0x151158) libpixman → ENOMEM): старая база 0x40_0000_0000
+/// (256ГБ) жила ВНУТРИ PML4[0]-поддерева — ОБЩЕГО для всех процессов
+/// (createUserPML4 копирует kernel-записи; getOrCreateTable открывает
+/// PTE_USER в ОБЩИХ таблицах при user-маппинге) → курсоры mmap'ов
+/// Xwayland и gamescope КОЛЛИДИРОВАЛИ в общих PT → AlreadyMapped.
+/// Новая база 0x200_0000_0000 (PML4[4]) — ПРИВАТНОЕ поддерево (kernel-
+/// записи [1..255] нулевые): таблицы по-процессные, коллизий нет.
 const PAGE_SIZE = vmm.PAGE_SIZE;
-const LINUX_MMAP_BASE: u64 = 0x40_0000_0000;
+const LINUX_MMAP_BASE: u64 = 0x200_0000_0000;
 /// CDD №12 p5: 1ГБ → 48ГБ VA-бюджет: LLVM резервирует 10.7ГБ JIT-арен
 /// (mmap(0, 0x2AAAAB000)×2) — с demand-zero физика не резервируется, VA
 /// дёшев; USER_VA_CEILING (0x7FFF_FFFF_FFFF) вмещает с запасом.
@@ -2474,17 +2480,74 @@ fn linuxDoClone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u6
 /// Маска физ-адреса в PTE (52-бит физ).
 const PTE_ADDR_MASK: u64 = 0x0000_7FFF_FFFF_F000;
 
-/// Копия НИЖНЕЙ половины адресного пространства (только user-записи,
-// 4K-листья): каждой VA — ТЕ ЖЕ физ-страницы в новом PML4. Demand-zero
-/// (P=0) страницы НЕ копируются — ребёнок получит СВОИ нулевые по #PF.
-/// Huge-страницы в user-space не создаём — скип с логом-страховкой.
-/// Физика принадлежит РОДИТЕЛЮ (munmap/exit ребёнка её не трогает:
-/// регионы реестра ребёнка наследуются с phys=0).
-fn linuxForkCopyAddressSpace(parent_cr3: u64, child_cr3: u64) usize {
+/// CDD №15 p4: EAGER-СНАПШОТ fork — НАСТОЯЩАЯ семантика fork: ребёнок
+/// видит СНАПШОТ памяти родителя НА МОМЕНТ вызова (в Linux это COW).
+/// КОРЕНЬ pipefd-бага wlroots: server_start ПОСЛЕ fork пишет
+/// wl_fd[1] = -1 в heap-поле; при ОБЩЕЙ физике (walk-копия PML4 p1-p3)
+/// ребёнок читал уже ПЕРЕЗАПИСАННОЕ значение → fcntl(-1) → EBADF →
+/// _exit(1) — Xwayland умирал ДО exec. Здесь ВСЕ present user-листы
+/// РОДИТЕЛЯ копируются в ПРИВАТНЫЕ страницы ребёнка: 1-й проход — счёт
+/// (пул ОДНИМ contiguous-блоком: 40К одиночных allocPage дробили PMM-
+/// битмап → contiguous-ран под file-mmap падал ENOMEM — «failed to
+/// map segment» libpixman); 2-й — копия контента (identity-доступ к
+/// обеим физ-страницам) + маппинг с PTE_PRIVATE (бит 52) — метка
+/// «физика принадлежит ребёнку» (linuxFreeForkPrivate на execve).
+/// PML4[0] (kernel identity [0..4ГБ)) НЕ ходим: после переноса mmap-
+/// базы в PML4[4] user-маппингов ниже 512ГБ нет; identity-таблицы
+/// ОБЩИЕ для всех CR3. Demand-zero (P=0) листья не копируются —
+/// ребёнок получит СВОИ нулевые по #PF. Huge-листьев в user-зоне нет
+/// (лоадер создаёт только 4K) — скип-страховка.
+const ForkSnapStats = struct { pages: usize = 0, ro: usize = 0, pooled: bool = false };
+
+fn linuxForkSnapshot(parent_cr3: u64, child_cr3: u64) ForkSnapStats {
+    var stats = ForkSnapStats{};
+    // 1) счёт present user-листьев (PML4[1..255]; [0] — kernel identity)
+    {
+        const pml4: [*]const u64 = @ptrFromInt(parent_cr3);
+        var i: usize = 1;
+        while (i < 256) : (i += 1) {
+            const e4 = pml4[i];
+            if (e4 & vmm.PTE_PRESENT == 0 or e4 & vmm.PTE_USER == 0) continue;
+            const pdpt: [*]const u64 = @ptrFromInt(e4 & PTE_ADDR_MASK);
+            var j: usize = 0;
+            while (j < 512) : (j += 1) {
+                const e3 = pdpt[j];
+                if (e3 & vmm.PTE_PRESENT == 0 or e3 & vmm.PTE_USER == 0) continue;
+                if (e3 & vmm.PTE_HUGE != 0) continue;
+                const pd: [*]const u64 = @ptrFromInt(e3 & PTE_ADDR_MASK);
+                var k: usize = 0;
+                while (k < 512) : (k += 1) {
+                    const e2 = pd[k];
+                    if (e2 & vmm.PTE_PRESENT == 0 or e2 & vmm.PTE_USER == 0) continue;
+                    if (e2 & vmm.PTE_HUGE != 0) continue;
+                    const pt: [*]const u64 = @ptrFromInt(e2 & PTE_ADDR_MASK);
+                    var m: usize = 0;
+                    while (m < 512) : (m += 1) {
+                        const e1 = pt[m];
+                        if (e1 & vmm.PTE_PRESENT == 0) continue; // lazy — своя zero
+                        stats.pages += 1;
+                        if (e1 & vmm.PTE_WRITABLE == 0) stats.ro += 1;
+                    }
+                }
+            }
+        }
+    }
+    if (stats.pages == 0) return stats;
+
+    // 2) пул одним contiguous-блоком (анти-фрагментация); фолбэк per-page
+    stats.pooled = true;
+    var pool_base: u64 = 0;
+    if (pmmAllocContig(@intCast(stats.pages))) |pb| {
+        pool_base = pb;
+    } else {
+        stats.pooled = false; // PMM-фрагментация: медленный, но живой путь
+    }
+
+    // 3) копия контента + приватные маппинги ребёнка
     var copied: usize = 0;
     const pml4: [*]const u64 = @ptrFromInt(parent_cr3);
-    var i: usize = 0;
-    while (i < 256) : (i += 1) { // нижняя половина (user)
+    var i: usize = 1;
+    while (i < 256) : (i += 1) {
         const e4 = pml4[i];
         if (e4 & vmm.PTE_PRESENT == 0 or e4 & vmm.PTE_USER == 0) continue;
         const pdpt: [*]const u64 = @ptrFromInt(e4 & PTE_ADDR_MASK);
@@ -2492,39 +2555,92 @@ fn linuxForkCopyAddressSpace(parent_cr3: u64, child_cr3: u64) usize {
         while (j < 512) : (j += 1) {
             const e3 = pdpt[j];
             if (e3 & vmm.PTE_PRESENT == 0 or e3 & vmm.PTE_USER == 0) continue;
-            if (e3 & vmm.PTE_HUGE != 0) {
-                hal.Serial.puts("[LINUX] fork-walk: 1GB-huge user-PTE — СКИП\n");
-                continue;
-            }
+            if (e3 & vmm.PTE_HUGE != 0) continue;
             const pd: [*]const u64 = @ptrFromInt(e3 & PTE_ADDR_MASK);
             var k: usize = 0;
             while (k < 512) : (k += 1) {
                 const e2 = pd[k];
                 if (e2 & vmm.PTE_PRESENT == 0 or e2 & vmm.PTE_USER == 0) continue;
-                if (e2 & vmm.PTE_HUGE != 0) {
-                    hal.Serial.puts("[LINUX] fork-walk: 2MB-huge user-PTE — СКИП\n");
-                    continue;
-                }
+                if (e2 & vmm.PTE_HUGE != 0) continue;
                 const pt: [*]const u64 = @ptrFromInt(e2 & PTE_ADDR_MASK);
                 var m: usize = 0;
                 while (m < 512) : (m += 1) {
                     const e1 = pt[m];
-                    if (e1 & vmm.PTE_PRESENT == 0) continue; // lazy — своя zero
+                    if (e1 & vmm.PTE_PRESENT == 0) continue;
                     const va: u64 = (@as(u64, i) << 39) | (@as(u64, j) << 30) |
                         (@as(u64, k) << 21) | (@as(u64, m) << 12);
-                    const pa = e1 & PTE_ADDR_MASK;
+                    const src_pa = e1 & PTE_ADDR_MASK;
+                    var dst_pa: u64 = 0;
+                    if (stats.pooled) {
+                        dst_pa = pool_base + @as(u64, copied) * 4096;
+                    } else {
+                        dst_pa = pmm.allocPage() orelse continue;
+                    }
+                    // контент: identity-копия 4К (родитель → ребёнок)
+                    {
+                        const src: [*]const u8 = @ptrFromInt(src_pa);
+                        const dst: [*]u8 = @ptrFromInt(dst_pa);
+                        @memcpy(dst[0..4096], src[0..4096]);
+                    }
                     const flags = (e1 & (vmm.PTE_WRITABLE | vmm.PTE_USER |
                         vmm.PTE_WRITE_THROUGH | vmm.PTE_CACHE_DISABLE |
-                        vmm.PTE_NO_EXECUTE)) | vmm.PTE_PRESENT;
-                    vmm.mapPageInPML4(child_cr3, va, pa, flags) catch {
-                        continue; // AlreadyMapped-мусор — пропускаем страницу
+                        vmm.PTE_NO_EXECUTE)) | vmm.PTE_PRESENT | vmm.PTE_PRIVATE;
+                    vmm.mapPageInPML4(child_cr3, va, dst_pa, flags) catch {
+                        pmm.freePage(dst_pa); // откат (OOM таблиц) — скип
+                        continue;
                     };
                     copied += 1;
                 }
             }
         }
     }
-    return copied;
+    stats.pages = copied;
+    return stats;
+}
+
+/// CDD №15 p4: освобождение ПРИВАТНЫХ листьев процесса (PTE_PRIVATE бит
+/// 52 = снапшот-fork). Вызывает execve ПЕРЕД отлётом на новом образе:
+/// страницы снапшота (физика РЕБЁНКА) возвращаются PMM. КОРЕНЬ p4-
+/// замерзания: walk-версия дошла до ОБЩИХ identity-таблиц PML4[0]
+/// (kernel [0..4ГБ); getOrCreateTable открывал PTE_USER в общем подде-
+/// реве) и ОСВОБОДИЛА их → kernel-#PF-шторм → полное замерзание.
+/// ИНВАРИАНТЫ: (1) PML4[0] не ходим; (2) таблицы НЕ освобождаем ВООБЩЕ
+/// (утечка ~90 стр/процесс — принятая v0.21-деградация); (3) только
+/// листья с битом 52 (лодер-страницы родителя и demand-zero без бита
+/// НЕ трогаем — чужая физика).
+fn linuxFreeForkPrivate(pml4: u64) usize {
+    if (pml4 == 0) return 0;
+    var freed: usize = 0;
+    const pml4t: [*]volatile u64 = @ptrFromInt(pml4);
+    var i: usize = 1; // [0] — kernel identity (ОБЩИЙ) — не трогаем
+    while (i < 256) : (i += 1) {
+        const e4 = pml4t[i];
+        if (e4 & vmm.PTE_PRESENT == 0) continue;
+        const pdpt: [*]volatile u64 = @ptrFromInt(e4 & PTE_ADDR_MASK);
+        var j: usize = 0;
+        while (j < 512) : (j += 1) {
+            const e3 = pdpt[j];
+            if (e3 & vmm.PTE_PRESENT == 0 or e3 & vmm.PTE_HUGE != 0) continue;
+            const pd: [*]volatile u64 = @ptrFromInt(e3 & PTE_ADDR_MASK);
+            var k: usize = 0;
+            while (k < 512) : (k += 1) {
+                const e2 = pd[k];
+                if (e2 & vmm.PTE_PRESENT == 0 or e2 & vmm.PTE_HUGE != 0) continue;
+                const pt: [*]volatile u64 = @ptrFromInt(e2 & PTE_ADDR_MASK);
+                var m: usize = 0;
+                while (m < 512) : (m += 1) {
+                    const e1 = pt[m];
+                    if (e1 & vmm.PTE_PRESENT == 0) continue;
+                    if (e1 & vmm.PTE_PRIVATE == 0) continue; // только СВОИ
+                    const pa = e1 & PTE_ADDR_MASK;
+                    pt[m] = 0; // лист снят (таблицы ребёнка — приватные)
+                    pmm.freePage(pa);
+                    freed += 1;
+                }
+            }
+        }
+    }
+    return freed;
 }
 
 /// Полное освобождение proc-слота: fd-каналы/файлы unref (refs-модель
@@ -2595,45 +2711,9 @@ fn linuxProcForkChild(parent_slot: u8) ?u8 {
     return null; // EAGAIN — слоты кончились (8 процессов)
 }
 
-/// Приватная КОПИЯ диапазона для ребёнка (стек/TLS — горячие RW-зоны
-/// гонки fork: родитель И ребёнок пишут в ОДНИ страницы → затирание
-/// кадров → RIP=0/мусор). Выделяем СВОИ физ-страницы, копируем контент
-/// (через активный CR3 родителя — syscall-транзакция), ЗАМЕНЯЕМ мап-
-/// пинги в child-PML4 (walk-копия уже дала shared-записи — unmap+map).
-fn linuxForkPrivateCopy(child_cr3: u64, parent_cr3: u64, lo: u64, hi: u64) usize {
-    if (lo == 0 or hi <= lo or hi - lo > 16 * 1024 * 1024) return 0; // гард: ≤16МБ
-    const pages: u64 = (hi - lo + 4095) / 4096;
-    const base_pa = pmmAllocContig(pages) orelse return 0; // ENOMEM — остаётся shared
-    var copied: usize = 0;
-    var va = lo;
-    var i: u64 = 0;
-    while (i < pages) : (i += 1) {
-        // контент: из родительской физ-страницы (leaf-PTE по VA)
-        if (vmm.userLeafRaw(parent_cr3, va)) |pte| {
-            if (pte & vmm.PTE_PRESENT != 0) {
-                const src_pa = pte & PTE_ADDR_MASK;
-                const src: [*]const u8 = @ptrFromInt(src_pa); // identity
-                const dst: [*]u8 = @ptrFromInt(base_pa + i * 4096);
-                @memcpy(dst[0..4096], src[0..4096]);
-            }
-        }
-        // замена маппинга: shared → приватный
-        const flags = vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER |
-            vmm.PTE_NO_EXECUTE;
-        _ = vmm.unmapPageInPML4(child_cr3, va) catch {};
-        vmm.mapPageInPML4(child_cr3, va, base_pa + i * 4096, flags) catch {
-            va += 4096;
-            continue;
-        };
-        copied += 1;
-        va += 4096;
-    }
-    return copied;
-}
-
-/// fork(): РЕБЁНОК = задача с копией PML4 и ПРИВАТНЫМ стеком (физическая
-/// копия страниц стека родителя: общий VA, СВОИ страницы — родитель и
-/// ребёнок пишут в РАЗНУЮ физику: гонка кадров исключена). Возврат в
+/// fork(): РЕБЁНОК = задача с ПРИВАТНЫМ СНАПШОТОМ памяти родителя
+/// (linuxForkSnapshot: ВСЕ present user-страницы — копии; семантика
+/// fork — родитель пишет ПОСЛЕ fork, ребёнок НЕ видит). Возврат в
 /// РОДИТЕЛЕ — pid (1000+слот); в РЕБЁНКЕ кадр возврата — RAX=0. КРИТично:
 /// ustack-строка ребёнка = родительская (общий VA) — коллизию скана
 /// решает cur-first (isr64.S + scheduler.syscallStackOwner).
@@ -2652,39 +2732,16 @@ fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
     const parent_slot = linux_task_proc[owner];
     if (parent_slot >= MAX_LINUX_PROCS) return -linux_syscalls.ESRCH;
 
-    // 1. Копия адресного пространства (таблицы свои, физика общая)
+    // 1. EAGER-СНАПШОТ: все present user-страницы — ПРИВАТНЫЕ копии
+    //    ребёнка (p1-p3 «shared phys» сломался на wlroots server_start:
+    //    родитель пишет wl_fd[1] = -1 в heap ПОСЛЕ fork → ребёнок читал
+    //    перезаписанное → fcntl(-1) EBADF → _exit(1) до exec)
     const child_cr3 = vmm.createUserPML4() catch return -linux_syscalls.ENOMEM;
-    const copied = linuxForkCopyAddressSpace(parent.cr3, child_cr3);
-
-    // 1b. ПРИВАТНЫЙ стек + TLS ребёнка (гончая зона fork: родитель и
-    //     ребёнок на общем стеке затирают кадры друг друга — эмпирика
-    //     forktest: RIP=0 после первого write ребёнка). Стек: ВЕРХНЕЕ
-    //     ОКНО [rsp-4МБ, hi) — активные кадры (полный стек 128МБ копи-
-    //     ровать бессмысленно:_pages=32768; ниже окна страницы untouched
-    //     до вызовов — глубина glibc-execve-хелпера ≪ 4МБ); TLS: стра-
-    //     ницы вокруг fs_base (glibc-fork пишет tid/robust-слова).
-    var stack_priv: usize = 0;
-    if (scheduler.ustack_hi_tab[owner] != 0) {
-        const s_hi = scheduler.ustack_hi_tab[owner];
-        var s_lo = scheduler.ustack_lo_tab[owner];
-        if (my_rsp > 4 * 1024 * 1024) {
-            const win_lo = (my_rsp - 4 * 1024 * 1024) & ~@as(u64, 4095);
-            if (win_lo > s_lo) s_lo = win_lo;
-        }
-        stack_priv = linuxForkPrivateCopy(child_cr3, parent.cr3, s_lo, s_hi);
-    }
-    var tls_priv: usize = 0;
-    const parent_fs = scheduler.fs_base_tab[owner];
-    if (parent_fs != 0) {
-        // struct pthread: fs_base — ДЛЯ структуры (tid/pid в первых
-        // сотнях байт); копируем [fs-8K, fs+4K) — голова + хвост
-        const tls_lo = parent_fs - 8 * 1024;
-        const tls_hi = parent_fs + 4 * 1024;
-        tls_priv = linuxForkPrivateCopy(child_cr3, parent.cr3, tls_lo & ~@as(u64, 4095), tls_hi);
-    }
+    const snap = linuxForkSnapshot(parent.cr3, child_cr3);
 
     // 2. Кадр ребёнка — возврат из fork-syscall В ТОЧКЕ вызова
-    //    (RIP после syscall; RSP = родительский user-RSP: общий стек)
+    //    (RIP после syscall; RSP = родительский user-RSP: снапшот-копия
+    //    тех же страниц — кадры идентичны на момент fork)
     const sf = scheduler.syscall_frame;
     var frame: hal.InterruptFrame = std.mem.zeroes(hal.InterruptFrame);
     frame.r15 = sf[0];
@@ -2704,7 +2761,7 @@ fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
     frame.r11 = sf[6];
     frame.rip = sf[7]; // возврат ПОСЛЕ syscall
     frame.rflags = sf[6] | 0x200; // IF=1
-    frame.rsp = my_rsp; // ОБЩИЙ стек родителя (shared-VM до execve)
+    frame.rsp = my_rsp; // снапшот-стек (те же VA, СВОИ страницы)
     frame.cs = 0x23;
     frame.ss = 0x1B;
 
@@ -2725,7 +2782,8 @@ fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
         scheduler.ustack_lo_tab[owner],
         scheduler.ustack_hi_tab[owner],
     );
-    // TLS общий (glibc-fork ребёнок читает pthread_self()) — до execve
+    // TLS — снапшот-копия (те же VA, свои страницы; glibc-fork-ребёнок
+    // пишет tid/robust-слова в СВОЮ копию — родитель не видит)
     scheduler.fs_base_tab[child] = scheduler.fs_base_tab[owner];
 
     hal.Serial.puts("[LINUX] fork: parent task ");
@@ -2734,12 +2792,12 @@ fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
     hal.Serial.putDecimal(child);
     hal.Serial.puts(" (pid ");
     hal.Serial.putDecimal(1000 + @as(u64, child_slot));
-    hal.Serial.puts(", shared pages ");
-    hal.Serial.putDecimal(copied);
-    hal.Serial.puts(", priv stack ");
-    hal.Serial.putDecimal(stack_priv);
-    hal.Serial.puts(", priv tls ");
-    hal.Serial.putDecimal(tls_priv);
+    hal.Serial.puts(", snapshot pages ");
+    hal.Serial.putDecimal(snap.pages);
+    hal.Serial.puts(", ro ");
+    hal.Serial.putDecimal(snap.ro);
+    hal.Serial.puts(", pool ");
+    hal.Serial.puts(if (snap.pooled) "contiguous" else "per-page");
     hal.Serial.puts(")\n");
 
     // 5. CHILD-RUNS-FIRST (CFS wake_up_new_task — эмпирика p6: ребёнок
@@ -2750,10 +2808,11 @@ fn linuxDoFork(flags: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
 
 /// execve(path, argv, envp): kill-self + RESPAWN на новом образе.
 /// pid/proc-слот СТАБИЛЕН (1000+slot — wait4 родителя не ломается);
-/// fd-таблица наследуется (пайпы Xwayland). СТАРОЕ shared-PML4 не осво-
-/// бождаем (физика РОДИТЕЛЯ); таблицы walk-копии остаются живыми в
-/// child_cr3 (утечка ~страниц таблиц на execve — v0.21: freeUserPML4-
-/// walk). УСПЕХ НЕ ВОЗВРАЩАЕТСЯ — задача уходит в hlt (exit-паттерн).
+/// fd-таблица наследуется (пайпы Xwayland). CDD №15 p4: ПРИВАТНЫЕ
+/// (снапшот-fork, бит 52) страницы старого образа освобождаются
+/// (linuxFreeForkPrivate); родительские/лодер-страницы и таблицы —
+/// остаются (утечка ~90 стр/процесс — v0.21: freeUserPML4-walk).
+/// УСПЕХ НЕ ВОЗВРАЩАЕТСЯ — задача уходит в hlt (exit-паттерн).
 fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []const u8) i64 {
     const my_rsp = scheduler.user_rsp;
     const owner = scheduler.syscallStackOwner(my_rsp);
@@ -2804,6 +2863,18 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
         elfRandomSeed(),
         at_base,
     ) catch return -linux_syscalls.ENOMEM;
+
+    // 3b. CDD №15 p4: снапшот-страницы (PTE_PRIVATE) СТАРОГО образа — в
+    //     PMM (физика РЕБЁНКА; лодер/родительские — НЕ трогаем). Вызов
+    //     ПОСЛЕ загрузки нового образа/стека: argv/envp уже в .bss,
+    //     файловые байты — в новых страницах; старый user-контекст боль-
+    //     не читается. Таблицы не освобождаем (см. linuxFreeForkPrivate).
+    const freed_priv = linuxFreeForkPrivate(t.cr3);
+    if (freed_priv > 0) {
+        hal.Serial.puts("[LINUX] execve: freed ");
+        hal.Serial.putDecimal(freed_priv);
+        hal.Serial.puts(" fork-private pages\n");
+    }
 
     // 4. proc-слот — ОБНОВЛЯЕМ (pid стабилен: execve не меняет pid)
     const p = &linux_procs[slot];
@@ -2881,9 +2952,9 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
     hal.Serial.puts(")\n");
 
     // 6. kill-self (exit-паттерн: транзакция снята, задача Killed,
-    // hlt до диспетчеризации НОВОЙ задачи). СТАРЫЙ PML4 (shared с роди-
-    // телем) — НЕ трогаем; собственные mmap ребёнка до execve — утечены
-    // (реестр перезаписан; glibc-fork до execve mmap не делает).
+    //    hlt до диспетчеризации НОВОЙ задачи). Снапшот-страницы уже в PMM
+    //    (3b); demand-zero страницы glibc-fork-ребёнка (без бита 52) —
+    //    утечены (реестр перезаписан; мало страниц — v0.21).
     scheduler.exitCurrentTask();
     hal.sti();
     while (true) {
@@ -3718,7 +3789,17 @@ pub fn linuxDemandZero(faulter_task: usize, va: u64) bool {
     const slot = linux_task_proc[faulter_task];
     if (slot >= MAX_LINUX_PROCS) return false;
     const proc = &linux_procs[slot];
-    const pml4 = linuxTaskPml4();
+    // CDD №15 p4-КОРЕНЬ ТИХОГО FAULT-ЦИКЛА (41/41 URIP-сэмплов на
+    // ld.so+0xF41E): таблицы — ВИНОВНИКА фолта (tasks[faulter].cr3), а
+    // НЕ «текущего» (linuxTaskPml4() = linuxOwnerTask() по user_rsp — в
+    // парк-окнах рассинхрона возвращает ЧУЖУЮ задачу). Реестр — по
+    // faulter'у, таблицы — по current'у: карта ложилась в ЧУЖОЕ PML4 →
+    // страница оставалась незамапленной у виновника → вечный беззвуч-
+    // ный #PF-цикл + МЕЖПРОЦЕССНАЯ ПОРЧА (объясняет и lvp-краши p4).
+    const ft = &scheduler.tasks[faulter_task];
+    if (ft.privilege != .User or ft.abi != .linux or ft.state == .Killed)
+        return false;
+    const pml4 = ft.cr3;
     if (pml4 == 0) return false;
     const page = va & ~@as(u64, PAGE_SIZE - 1);
 
@@ -3749,9 +3830,15 @@ pub fn linuxDemandZero(faulter_task: usize, va: u64) bool {
 /// Выделить НУЛЕВУЮ страницу и замапить (active-CR3 — работаем с таблицами
 /// задачи; P=0-страницы не кэшируются TLB → invlpg не обязателен, но даём).
 fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
-    // страница УЖЕ замаплена (гонка/P=1-фолт) — не выделяем вторую
+    // страница УЖЕ замаплена (гонка/P=1-фолт) — не выделяем вторую.
+    // CDD №15 p4: invlpg-страховка — лист мог остаться в TLB с чужими
+    // правами (мутации mprotect-волны): перезапуск инструкции с чистой
+    // трансляцией, а не с закэшированной.
     if (vmm.userLeafFlags(pml4, page)) |leaf| {
-        if (leaf & vmm.PTE_PRESENT != 0) return true;
+        if (leaf & vmm.PTE_PRESENT != 0) {
+            asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
+            return true;
+        }
     }
     const phys = pmm.allocPage() orelse {
         hal.Serial.puts("[LINUX] demand-zero: PMM исчерпан (OOM гостья)\n");
@@ -4343,8 +4430,16 @@ fn linuxFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i64 {
     var pte: u64 = vmm.PTE_USER | vmm.PTE_WRITABLE;
     if (prot & linux_syscalls.PROT_EXEC == 0) pte |= vmm.PTE_NO_EXECUTE;
     if (prot & linux_syscalls.PROT_WRITE == 0) pte &= ~vmm.PTE_WRITABLE; // RO-копия
-    const base = pmm.allocContiguousZeroed(@intCast(pages)) orelse
+    const base = pmm.allocContiguousZeroed(@intCast(pages)) orelse {
+        // CDD №15 p4: причина ENOMEM в лог (эмпирика: per-page снапшот
+        // дробил PMM-битмап — contiguous-ран для libpixman не находился)
+        hal.Serial.puts("[MMAP] file-ENOMEM: pages=");
+        hal.Serial.putDecimal(pages);
+        hal.Serial.puts(" pmm-allocated=");
+        hal.Serial.putDecimal(pmm.allocated_pages);
+        hal.Serial.puts("\n");
         return -linux_syscalls.ENOMEM;
+    };
     var i: u64 = 0;
     while (i < pages) : (i += 1) {
         vmm.mapPageInPML4(pml4, va + i * PAGE_SIZE, base + i * PAGE_SIZE, pte) catch {
@@ -6239,6 +6334,7 @@ fn fdKindName(k: linux_syscalls.FdKind) void {
         .timerfd => sys_print("timerfd"),
         .signalfd => sys_print("signalfd"),
         .dir => sys_print("dir"),
+        .devnull => sys_print("devnull"),
     }
 }
 
@@ -6652,10 +6748,12 @@ fn cmd_elfload(args: []const u8) void {
         // XDG_CACHE_HOME -> $HOME/.cache) -> кеш живёт в /tmp (RAM).
         "XDG_CACHE_HOME=/tmp",
         "MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache",
-        // CDD №12 p13: glibc-харденинг против heap-race CachyOS-стека
-        // (lvp+LLVM 22.1.8: шейдер-тред + main-тред; host-репро: с
-        // PERTURB коррупция «corrupted size vs. prev_size» ИСЧЕЗАЕТ).
-        "MALLOC_PERTURB_=170",
+        // CDD №15 p4: MALLOC_PERTURB_ УДАЛЁН. Host-репро p13 врал для
+        // POLER-OS: PMM-страницы всегда ЗАНУЛЕНЫ — perturb=0xAA не
+        // «ловил» коррупцию, а СОЗДАВАЛ её: lvp читал неинициализиро-
+        // ванные malloc-зоны как МУСОРНЫЕ указатели → NULL-листы STL
+        // list-splice → CPU-EXCEPTION × N за прогон (libvulkan_lvp.so
+        // +0x301A4C). Без perturb: ноль CPU-крашей (эмпирика p4).
         // CDD №15: однопоточный llvmpipe — p14-кванш llvmpipe worker-крана
         // (STL list-splice, libvulkan_lvp.so+0x301A4C) — убирает сам ИСТОЧНИК
         // (пул воркеров); рендер медленнее, но детерминированнее под TCG.

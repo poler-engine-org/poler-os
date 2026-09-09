@@ -118,6 +118,7 @@ pub fn encodeDev(major: u64, minor: u64) u64 {
 /// minor devfs-узла по ПУТИ (fstat st_rdev: card0=0, renderD128=128 —
 /// libdrm drmGetNodeTypeFromFd различает primary/render по minor!)
 pub fn devMinor(path: []const u8) u32 {
+    if (std.mem.eql(u8, path, "/dev/null")) return 3; // p4: mem/null
     if (std.mem.eql(u8, path, "/dev/dri/renderD128")) return 128;
     if (std.mem.eql(u8, path, "/dev/input/event1")) return 65;
     if (std.mem.eql(u8, path, "/dev/input/event0")) return 64;
@@ -129,6 +130,7 @@ pub fn devMajorOf(kind: FdKind) u64 {
         .dri_card0 => DRM_MAJOR,
         .fb0 => 29,
         .input_event0, .input_event1 => 13,
+        .devnull => 1, // p4: /dev/null — mem major 1, minor 3
         else => 5, // console_out (tty)
     };
 }
@@ -401,6 +403,10 @@ pub const FdKind = enum {
     signalfd,
     /// CDD №12 p3: поток каталога (opendir → getdents64; file_id = DirStream).
     dir,
+    /// CDD №15 p4: /dev/null — wlroots exec_xwayland открывает его
+    /// (O_WRONLY, xwayland/server.c:111) до execve; write = свалка,
+    /// read = EOF(0), poll = всегда готов. major 1 / minor 3.
+    devnull,
 };
 
 pub const MAX_FILE_ID: u32 = 512; // p14: глоб.реестр (ENFILE у gamescope_ei) // p14: 64 исчерпал gamescope-стек (WSI/кэш/wlserver-shm)
@@ -689,6 +695,7 @@ pub fn resolveDevKind(path: []const u8) ?FdKind {
     if (std.mem.eql(u8, path, "/dev/input/event0")) return .input_event0;
     if (std.mem.eql(u8, path, "/dev/input/event1")) return .input_event1;
     if (std.mem.eql(u8, path, "/dev/tty") or std.mem.eql(u8, path, "/dev/console")) return .console_out;
+    if (std.mem.eql(u8, path, "/dev/null")) return .devnull;
     return null;
 }
 
@@ -889,6 +896,12 @@ pub fn sysWrite(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64
         },
         else => {},
     }
+    // CDD №15 p4: /dev/null — свалка (валидируем буфер как Linux; байты
+    // никуда не идут — Xwayland-stderr после exec пишет сюда)
+    if (e.kind == .devnull) {
+        if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
+        return @intCast(count);
+    }
     if (e.kind != .console_out) return err(EBADF); // initrd: RO; файлы — только tmpfs
     // ядро ЧИТАЕТ user-буфер: want_write=false
     if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
@@ -927,6 +940,8 @@ pub fn sysRead(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64)
             return @intCast(r);
         },
         .signalfd => return err(EAGAIN), // сигналов нет — пусто (NB-путь glibc)
+        // CDD №15 p4: /dev/null — вечный EOF (Linux: read = 0)
+        .devnull => return 0,
         .initrd_file, .tmpfs_file => {
             // файл VFS: последовательное чтение (offset ведёт слой)
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
@@ -1326,6 +1341,9 @@ fn pollScanOnce(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64) u64 {
                 if (ops.channel_ready(e.file_id) & EPOLLIN != 0) rdy |= POLLIN;
             },
             .signalfd => {}, // сигналов нет — не готов
+            // CDD №15 p4: /dev/null — read даёт EOF (готов), write всегда
+            // готов: poll на нём НИКОГДА не блокирует
+            .devnull => rdy = POLLIN | POLLOUT,
             .initrd_file => rdy = POLLIN, // RO-файл: читаем
             .tmpfs_file => rdy = POLLIN | POLLOUT, // RAM-файл: RW
             .dir => {}, // каталог: read недоступен (EISDIR) — не готов
@@ -1459,6 +1477,7 @@ fn epollScanOnce(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, maxeve
             .seatd => rdy = (if (e.file_id < seatd_slots.len and seatd_slots[e.file_id].rx_len > 0) EPOLLIN else 0) | EPOLLOUT,
             .pipe_write, .socket, .eventfd => rdy = ops.channel_ready(e.file_id) | EPOLLOUT,
             .signalfd => rdy = 0, // сигналов нет
+            .devnull => rdy = EPOLLIN | EPOLLOUT, // p4: EOF+свалка — всегда
             .free => unreachable,
         }
         // CDD №12 p3: HUP/ERR ТОЛЬКО из реальной готовности (channel_ready
@@ -1795,7 +1814,12 @@ pub fn sysWait4(ops: LinuxOps, pid: i64, status_va: u64, options: u64, rusage_va
 // ─────────────────────────────────────────────────────────────────────────
 pub var execve_path_buf: [256]u8 = [_]u8{0} ** 256;
 pub var execve_argv_buf: [12][128]u8 = [_][128]u8{[_]u8{0} ** 128} ** 12;
-pub var execve_envp_buf: [16][192]u8 = [_][192]u8{[_]u8{0} ** 192} ** 16;
+/// CDD №15 p4: 16 → 64 переменных. КОРЕНЬ «Fatal server error: Couldn't
+/// add screen»: env Xwayland = kernel-дефолты (~11) + setenv'ы gamescope
+/// (~10) + WAYLAND_SOCKET=N (wlroots добавляет ПОСЛЕДНИМ) → переменная
+/// срезалась на 16-й → wl_display_connect уходил в fallback-connect →
+/// ENOENT → смерть. sysExecve теперь пропускает до 64.
+pub var execve_envp_buf: [64][192]u8 = [_][192]u8{[_]u8{0} ** 192} ** 64;
 
 /// execve(path, argv, envp): argv/envp — NULL-терминированные массивы
 /// указателей на C-строки; NULL argv → argv[0]=path (допустимо по спеке);
@@ -1832,7 +1856,7 @@ pub fn sysExecve(ops: LinuxOps, path_va: u64, argv_va: u64, envp_va: u64) u64 {
         argc = 1;
     }
 
-    var envp_slices: [16][]const u8 = undefined;
+    var envp_slices: [64][]const u8 = undefined; // CDD №15 p4: 16 → 64
     var envc: usize = 0;
     if (envp_va != 0) {
         var i: usize = 0;
@@ -1909,7 +1933,8 @@ pub fn sysFstat(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64) u64 {
         // CDD №12 p3: st_rdev — (major<<8)|minor (libdrm drmGetNodeTypeFromFd:
         // minor ≥ 128 = render-узел; sysfs-путь /sys/dev/char/226:128 тоже)
         if (e.kind == .dri_card0 or e.kind == .fb0 or
-            e.kind == .input_event0 or e.kind == .input_event1)
+            e.kind == .input_event0 or e.kind == .input_event1 or
+            e.kind == .devnull) // p4: /dev/null = 1:3 (mem major)
         {
             const rdev = encodeDev(devMajorOf(e.kind), e.file_id);
             std.mem.writeInt(u64, st[40..48], rdev, .little); // st_rdev
