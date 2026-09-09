@@ -3151,7 +3151,7 @@ const CHAN_BUF: usize = 1024; // p5: откат 8К — .bss-сдвиг пере
 
 const Channel = struct {
     used: bool = false,
-    refs: u8 = 0, // pipe/socketpair=2 (оба конца), eventfd/timerfd=1
+    refs: u8 = 0, // pipe=2 (оба конца), socketpair=1 (свой fd) + клоны, eventfd/timerfd=1
     kind: ChanKind = .pipe,
     buf: [CHAN_BUF]u8 = [_]u8{0} ** CHAN_BUF,
     len: usize = 0, // FIFO: байт в буфере
@@ -3159,6 +3159,13 @@ const Channel = struct {
     semaphore: bool = false, // EFD_SEMAPHORE
     deadline_ns: u64 = 0, // timerfd: 0 = не взведён
     interval_ns: u64 = 0,
+    // CDD №15 p5-ФИНАЛ (эхо-баг): socketpair = НАПРАВЛЕННАЯ пара каналов.
+    // Раньше ОБА конца сидели на одном канале: писец видел свой же буфер
+    // в POLLIN → ЧИТАЛ СВОЙ ЗАПРОС ОБРАТНО → libwayland «message too
+    // short» → «could not connect to wayland server». Теперь: write(fd)
+    // → буфер ПИРА (peer); read(fd) → свой буфер; HUP = peer закрыт.
+    peer: u32 = 0, // socketpair: id встречного канала
+    peer_closed: bool = false,
 };
 
 var channels: [MAX_CHANNELS]Channel = [_]Channel{.{}} ** MAX_CHANNELS;
@@ -3182,17 +3189,50 @@ fn linuxChannelCreate(kind: u32, arg: u64) i64 {
             linux_syscalls.CHAN_TIMERFD => .timerfd,
             else => return -linux_syscalls.EINVAL,
         };
-        c.* = .{ .used = true, .refs = if (k == .pipe or k == .socketpair) 2 else 1, .kind = k };
+        c.* = .{ .used = true, .refs = if (k == .pipe) 2 else 1, .kind = k };
         if (k == .eventfd) c.counter = arg;
         return @intCast(i);
     }
     return -linux_syscalls.ENFILE;
 }
 
-fn linuxChannelUnref(id: u32) void {
+/// Создать НАПРАВЛЕННУЮ пару socketpair-каналов (A↔B): write(fdA) → B,
+/// write(fdB) → A. Возвращает (a_id, b_id) или (-err, 0).
+fn linuxSocketPairCreate() struct { a: i64, b: i64 } {
+    const a = linuxChannelCreate(linux_syscalls.CHAN_SOCKETPAIR, 0);
+    if (a < 0) return .{ .a = a, .b = 0 };
+    const b = linuxChannelCreate(linux_syscalls.CHAN_SOCKETPAIR, 0);
+    if (b < 0) {
+        _ = linuxChannelUnrefImpl(@intCast(a));
+        return .{ .a = b, .b = 0 };
+    }
+    channels[@intCast(a)].peer = @intCast(b);
+    channels[@intCast(b)].peer = @intCast(a);
+    return .{ .a = a, .b = b };
+}
+
+fn linuxChannelUnrefImpl(id: u32) void {
     if (id >= channels.len) return;
-    if (channels[id].refs > 0) channels[id].refs -= 1;
-    if (channels[id].refs == 0) channels[id].used = false;
+    const c = &channels[id];
+    if (c.refs > 0) c.refs -= 1;
+    if (c.refs == 0) {
+        // встречный канал узнаёт о закрытии ПИРА (EPOLLHUP/полловская семантика)
+        if (c.kind == .socketpair and c.peer < channels.len and channels[c.peer].used) {
+            channels[c.peer].peer_closed = true;
+        }
+        c.used = false;
+    }
+}
+
+fn linuxChannelUnref(id: u32) void {
+    linuxChannelUnrefImpl(id);
+}
+
+/// CDD №15 p5: связать A↔B направленной парой socketpair.
+fn linuxChannelLink(a: u32, b: u32) void {
+    if (a >= channels.len or b >= channels.len) return;
+    channels[a].peer = b;
+    channels[b].peer = a;
 }
 
 /// timerfd: ленивое продвижение экспираций (deadline прошёл → counter+1,
@@ -3262,11 +3302,18 @@ fn linuxChannelWrite(id: u32, va: u64, count: u64) i64 {
     const c = &channels[id];
     switch (c.kind) {
         .pipe, .socketpair => {
+            // CDD №15 p5-ФИНАЛ: socketpair пишет в БУФЕР ПИРА (write→peer,
+            // read→self) — эхо-баг (писец читал свой запрос обратно).
+            const tid: u32 = if (c.kind == .socketpair) c.peer else id;
+            if (tid >= channels.len or !channels[tid].used) return -linux_syscalls.EPIPE;
+            const t = &channels[tid];
+            if (c.kind == .socketpair and (c.peer_closed or t.peer_closed))
+                return -linux_syscalls.EPIPE;
             const n: usize = @intCast(count);
-            if (c.len + n > c.buf.len) return -linux_syscalls.EAGAIN; // буфер полон
+            if (t.len + n > t.buf.len) return -linux_syscalls.EAGAIN; // буфер полон
             const s: [*]const u8 = @ptrFromInt(va);
-            @memcpy(c.buf[c.len .. c.len + n], s[0..n]);
-            c.len += n;
+            @memcpy(t.buf[t.len .. t.len + n], s[0..n]);
+            t.len += n;
             return @intCast(n);
         },
         .eventfd => {
@@ -3337,14 +3384,21 @@ fn linuxChannelReady(id: u32) u32 {
             return r;
         },
         .socketpair, .eventfd => {
-            // CDD №15 p5: socketpair-POLLOUT ТОЛЬКО при месте в буфере
-            // (EAGAIN-писатель по poll-первой дисциплине не спинит CPU)
+            // p5: socketpair-POLLOUT = место в БУФЕРЕ ПИРА + peer жив;
+            // EPOLLIN = свой буфер; EPOLLHUP = peer закрыт
             var r: u32 = 0;
             if (c.kind == .eventfd) r |= linux_syscalls.EPOLLOUT;
-            if (c.kind == .socketpair and c.len < c.buf.len) r |= linux_syscalls.EPOLLOUT;
+            if (c.kind == .socketpair) {
+                if (c.peer_closed) {
+                    r |= linux_syscalls.EPOLLHUP;
+                } else {
+                    if (c.peer < channels.len and channels[c.peer].used and
+                        channels[c.peer].len < channels[c.peer].buf.len)
+                        r |= linux_syscalls.EPOLLOUT;
+                }
+            }
             if (c.kind == .eventfd and c.counter > 0) r |= linux_syscalls.EPOLLIN;
             if (c.kind == .socketpair and c.len > 0) r |= linux_syscalls.EPOLLIN;
-            if (c.kind == .socketpair and c.refs == 1) r |= linux_syscalls.EPOLLHUP;
             return r;
         },
         .timerfd => {
@@ -4868,6 +4922,7 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .channel_write = linuxChannelWrite,
         .channel_ready = linuxChannelReady,
         .channel_unref = linuxChannelUnref,
+        .channel_link = linuxChannelLink,
         .set_sigaction = linuxSetSigaction,
         .get_sigaction = linuxGetSigaction,
         .set_sigmask = linuxSetSigmask,

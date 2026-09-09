@@ -824,9 +824,12 @@ pub const LinuxOps = struct {
     channel_write: *const fn (id: u32, va: u64, count: u64) i64,
     /// Готовность канала: биты POLLIN/POLLOUT (для poll/epoll).
     channel_ready: *const fn (id: u32) u32,
-    /// Снять ОДНУ ссылку канала (pipe/socketpair создаются с refs=2,
-    /// eventfd/timerfd с refs=1); refs=0 → слот свободен.
+    /// Снять ОДНУ ссылку канала (pipe refs=2; socketpair refs=1 у СВОЕГО
+    /// fd + клоны); refs=0 → слот свободен + встречному peer_closed.
     channel_unref: *const fn (id: u32) void,
+    /// CDD №15 p5: связать ДВА socketpair-канала направленной парой
+    /// (write(fdA)→буфер B, write(fdB)→буфер A — эхо-баг!).
+    channel_link: *const fn (a: u32, b: u32) void,
     // ─── CDD №12 p2: сигнальное состояние glibc ───────────────────────────
     /// rt_sigaction: сохранить (sig, handler, flags, restorer); вернуть СТАРЫЙ
     /// handler или -errno (EINVAL: SIGKILL/SIGSTOP/диапазон).
@@ -2118,25 +2121,33 @@ pub fn sysSocketpair(ops: LinuxOps, fds: *FdTable, domain: u64, stype: u64, prot
     if (stype & 0xFF != 1) return err(ESOCKTNOSUPPORT); // SOCK_STREAM
     if (stype & ~(0xFF | O_CLOEXEC | O_NONBLOCK) != 0) return err(EINVAL);
     if (!ops.validate(sv_va, 8, true)) return err(EFAULT);
-    const chan = ops.channel_create(CHAN_SOCKETPAIR, 0);
-    if (chan < 0) return @bitCast(chan);
-    const cid: u32 = @intCast(chan);
+    // CDD №15 p5-ФИНАЛ: НАПРАВЛЕННАЯ пара (эхо-баг: оба конца на одном
+    // канале → писец читал СВОЙ запрос обратно → libwayland «message
+    // too short»/«could not connect»)
+    const ca = ops.channel_create(CHAN_SOCKETPAIR, 0);
+    if (ca < 0) return @bitCast(ca);
+    const cb = ops.channel_create(CHAN_SOCKETPAIR, 0);
+    if (cb < 0) {
+        _ = ops.channel_unref(@intCast(ca));
+        return @bitCast(cb);
+    }
+    ops.channel_link(@intCast(ca), @intCast(cb));
     const nonblock = (stype & O_NONBLOCK) != 0;
     const fd0 = fds.allocFd(.socket, nonblock);
     if (fd0 < 0) {
-        _ = ops.channel_unref(cid);
-        _ = ops.channel_unref(cid);
+        _ = ops.channel_unref(@intCast(ca));
+        _ = ops.channel_unref(@intCast(cb));
         return @bitCast(fd0);
     }
-    fds.entries[@intCast(fd0)].file_id = cid;
+    fds.entries[@intCast(fd0)].file_id = @intCast(ca);
     const fd1 = fds.allocFd(.socket, nonblock);
     if (fd1 < 0) {
         fds.entries[@intCast(fd0)] = .{};
-        _ = ops.channel_unref(cid);
-        _ = ops.channel_unref(cid);
+        _ = ops.channel_unref(@intCast(ca));
+        _ = ops.channel_unref(@intCast(cb));
         return @bitCast(fd1);
     }
-    fds.entries[@intCast(fd1)].file_id = cid;
+    fds.entries[@intCast(fd1)].file_id = @intCast(cb);
     var b: [8]u8 = undefined;
     std.mem.writeInt(u32, b[0..4], @intCast(fd0), .little);
     std.mem.writeInt(u32, b[4..8], @intCast(fd1), .little);
@@ -2514,17 +2525,24 @@ pub fn sysConnect(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, addr_le
     // серверный конец ждёт в pending → accept4.
     if (boundFind(path)) |b| {
         if (b.pending_n >= b.pending.len) return err(EAGAIN); // backlog полон (нет ECONNREFUSED в фундаменте)
-        const chan = ops.channel_create(CHAN_SOCKETPAIR, 0);
-        if (chan < 0) return @bitCast(chan);
-        const cid: u32 = @intCast(chan);
+        // p5-ФИНАЛ: НАПРАВЛЕННАЯ пара: клиент → A, сервер (accept4) → B
+        const ca = ops.channel_create(CHAN_SOCKETPAIR, 0);
+        if (ca < 0) return @bitCast(ca);
+        const cb = ops.channel_create(CHAN_SOCKETPAIR, 0);
+        if (cb < 0) {
+            _ = ops.channel_unref(@intCast(ca));
+            return @bitCast(cb);
+        }
+        ops.channel_link(@intCast(ca), @intCast(cb));
+        const cid: u32 = @intCast(cb); // серверный конец ждёт в pending
         // клиентский fd: тип .socket (recvmsg/sendmsg как socketpair)
         const cfd = fds.allocFd(.socket, false);
         if (cfd < 0) {
-            _ = ops.channel_unref(cid);
+            _ = ops.channel_unref(@intCast(ca));
             _ = ops.channel_unref(cid);
             return @bitCast(cfd);
         }
-        fds.entries[@intCast(cfd)].file_id = cid;
+        fds.entries[@intCast(cfd)].file_id = @intCast(ca);
         // серверный конец — в pending слушающего гнезда
         b.pending[b.pending_n] = cid;
         b.pending_n += 1;
@@ -3512,13 +3530,14 @@ const FakeChan = struct {
     counter: u64 = 0,
     deadline_ns: u64 = 0,
     interval_ns: u64 = 0,
+    peer: u32 = 0, // p5: socketpair направленная пара
 };
 var g_chans: [8]FakeChan = [_]FakeChan{.{}} ** 8;
 
 fn fakeChannelCreate(kind: u32, arg: u64) i64 {
     for (&g_chans, 0..) |*c, i| {
         if (c.used) continue;
-        c.* = .{ .used = true, .refs = if (kind == 0 or kind == 2) 2 else 1, .kind = kind, .counter = arg };
+        c.* = .{ .used = true, .refs = if (kind == 0) 2 else 1, .kind = kind, .counter = arg };
         if (g_env) |e| e.mmap_calls += 0; // наблюдаемость при необходимости
         return @intCast(i);
     }
@@ -3578,11 +3597,14 @@ fn fakeChannelWrite(id: u32, va: u64, count: u64) i64 {
             c.counter = 0;
             return 16;
         },
-        else => { // pipe/socketpair: FIFO append
+        else => { // pipe/socketpair: FIFO append (socketpair → буфер ПИРА)
+            const tid: u32 = if (c.kind == 2) c.peer else id;
+            if (tid >= g_chans.len or !g_chans[tid].used) return -EPIPE;
+            const t = &g_chans[tid];
             const n: usize = @intCast(count);
-            if (c.len + n > c.buf.len) return -EAGAIN;
-            if (!fakeCopyIn(c.buf[c.len .. c.len + n], va)) return -EFAULT;
-            c.len += n;
+            if (t.len + n > t.buf.len) return -EAGAIN;
+            if (!fakeCopyIn(t.buf[t.len .. t.len + n], va)) return -EFAULT;
+            t.len += n;
             return @intCast(n);
         },
     }
@@ -3595,6 +3617,12 @@ fn fakeChannelReady(id: u32) u32 {
         else => if (c.len > 0) EPOLLIN else 0,
     };
 }
+fn fakeChannelLink(a: u32, b: u32) void {
+    if (a >= g_chans.len or b >= g_chans.len) return;
+    g_chans[a].peer = b;
+    g_chans[b].peer = a;
+}
+
 fn fakeChannelUnref(id: u32) void {
     if (id >= g_chans.len) return;
     if (g_chans[id].refs > 0) g_chans[id].refs -= 1;
@@ -3754,6 +3782,7 @@ fn fakeOps() LinuxOps {
         .channel_write = fakeChannelWrite,
         .channel_ready = fakeChannelReady,
         .channel_unref = fakeChannelUnref,
+        .channel_link = fakeChannelLink,
         .set_sigaction = fakeSetSigaction,
         .get_sigaction = fakeGetSigaction,
         .set_sigmask = fakeSetSigmask,
