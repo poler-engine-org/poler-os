@@ -1242,6 +1242,16 @@ fn handleException(frame: *InterruptFrame) void {
                 else => asm volatile ("movq %%dr3, %[v]" : [v] "=r" (-> u64)),
             };
             const nv: *const volatile u64 = @ptrFromInt(drvar);
+            // p5-forensics v6: КОНТРОЛЬНЫЙ ВЫСТРЕЛ — прочитать ДО/ПОСЛЕ
+            // invlpg: если значения РАЗНЫЕ → CPU работал через STALE-TLB
+            // (PTE говорит P_new, кэш — P_old): источник «записи в пустоту».
+            const before_invlpg = nv.*;
+            asm volatile ("invlpg (%[virt])"
+                :
+                : [virt] "r" (drvar & ~@as(u64, 4095)),
+                : "memory"
+            );
+            const after_invlpg = nv.*;
             Serial.puts("[DB-WRITE] task=");
             Serial.putDecimal(ft0);
             Serial.puts(" rip=0x");
@@ -1249,7 +1259,11 @@ fn handleException(frame: *InterruptFrame) void {
             Serial.puts(" q+");
             Serial.putDecimal(@as(u64, @as(u64, slot) * 8));
             Serial.puts("=0x");
-            Serial.putHex(nv.*);
+            Serial.putHex(after_invlpg);
+            if (before_invlpg != after_invlpg) {
+                Serial.puts(" <<< STALE-TLB! was=0x");
+                Serial.putHex(before_invlpg);
+            }
             Serial.puts(" from_user=");
             Serial.putDecimal(@as(u64, if ((frame.cs & 0x3) != 0) 1 else 0));
             Serial.puts("\n");
