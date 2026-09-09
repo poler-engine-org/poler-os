@@ -727,6 +727,9 @@ pub const LinuxOps = struct {
     do_mmap: *const fn (hint: u64, len: u64, prot: u64, flags: u64) i64,
     /// munmap: 0 или -errno.
     do_munmap: *const fn (va: u64, len: u64) i64,
+    /// CDD №15 p5: файл-пин (refs++) — dup/F_DUPFD/MAP_SHARED. Пара к
+    /// release_file. Без него fabric (dup→close) освобождал живой физблок.
+    retain_file: *const fn (id: u32) void,
     /// exit(code): завершение задачи (ядро — kill; тесты — запись кода).
     do_exit: *const fn (code: u64) void,
     /// exit_group(code): завершение процесса (все потоки).
@@ -1005,7 +1008,6 @@ pub fn sysClose(ops: LinuxOps, fds: *FdTable, fd_i: i64) u64 {
 
 /// int fcntl(int fd, int cmd, ...): F_GETFL/F_SETFL (O_NONBLOCK) фундамент.
 pub fn sysFcntl(ops: LinuxOps, fds: *FdTable, fd_i: i64, cmd: u64, arg: u64) u64 {
-    _ = ops;
     const e = fds.get(fd_i) orelse return err(EBADF);
     switch (cmd) {
         F_GETFL => {
@@ -1034,6 +1036,12 @@ pub fn sysFcntl(ops: LinuxOps, fds: *FdTable, fd_i: i64, cmd: u64, arg: u64) u64
                     fds.entries[i] = e.*;
                     fds.entries[i].watches = [_]EpollWatch{.{}} ** MAX_WATCHES;
                     fds.entries[i].watch_count = 0;
+                    // CDD №15 p5: F_DUPFD пинит файл (как sysDup) —
+                    // wl_os_dupfd_cloexec(memfd) + close → UAF-вайп
+                    switch (e.kind) {
+                        .initrd_file, .tmpfs_file => ops.retain_file(e.file_id),
+                        else => {},
+                    }
                     return @intCast(i);
                 }
             }
@@ -2750,7 +2758,6 @@ pub fn sysRecvmsg(ops: LinuxOps, fds: *FdTable, fd_i: i64, msg_va: u64, flags: u
 /// int dup(int oldfd) — копия FdEntry (как F_DUPFD: реестры runtime БЕЗ
 /// refcount — семантика p4; epoll-watches не наследуются).
 pub fn sysDup(ops: LinuxOps, fds: *FdTable, oldfd: i64) u64 {
-    _ = ops;
     const e = fds.get(oldfd) orelse return err(EBADF);
     var i: usize = 0;
     while (i < MAX_FDS) : (i += 1) {
@@ -2758,6 +2765,15 @@ pub fn sysDup(ops: LinuxOps, fds: *FdTable, oldfd: i64) u64 {
             fds.entries[i] = e.*;
             fds.entries[i].watches = [_]EpollWatch{.{}} ** MAX_WATCHES;
             fds.entries[i].watch_count = 0;
+            // CDD №15 p5-КОРЕНЬ: dup ОБЯЗАН пинить файл-реестр (refs++).
+            // VK-слой gamescope: memfd→ftruncate→dup→close(ориг) — refs
+            // оставался 1 → close освобождал ФИЗИКУ при живом втором fd
+            // и маппинге → PMM перевыдача живых страниц → вайп структур
+            // lvp ([PW] ZEROED при P=1 — run8/run10 краши t8).
+            switch (e.kind) {
+                .initrd_file, .tmpfs_file => ops.retain_file(e.file_id),
+                else => {},
+            }
             return @intCast(i);
         }
     }
@@ -3430,6 +3446,12 @@ fn fakeReleaseFile(id: u32) void {
     g_files[id].used = false;
 }
 
+/// CDD №15 p5: пин файла в тестовом окружении (refs не нужен — файлы
+/// глобальные, close в тестах не разбирает маппинги).
+fn fakeRetainFile(id: u32) void {
+    _ = id;
+}
+
 // ─── CDD №12 p2: фейк-каналы (pipe/eventfd/socketpair/timerfd) ──────────────
 const FakeChan = struct {
     used: bool = false,
@@ -3676,6 +3698,7 @@ fn fakeOps() LinuxOps {
         .stat_by_path = fakeStatByPath,
         .readlink_path = fakeReadlinkPath,
         .release_file = fakeReleaseFile,
+        .retain_file = fakeRetainFile,
         .channel_create = fakeChannelCreate,
         .channel_read = fakeChannelRead,
         .channel_write = fakeChannelWrite,

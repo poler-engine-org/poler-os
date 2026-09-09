@@ -2663,6 +2663,15 @@ fn linuxProcRelease(slot: u8) void {
             else => {},
         }
     }
+    // CDD №15 p5: shared-мапы отпускают файл-пины ДО fd-close (пары к
+    // retain в linuxSharedFileMmap): последний refs падает в fd-цикле
+    // выше → физика memfd освобождается ровно один раз.
+    for (&linux_mmap_regions[slot]) |*r| {
+        if (r.used and r.file_id != NO_REGION_FILE) {
+            linuxReleaseFile(r.file_id);
+            r.file_id = NO_REGION_FILE;
+        }
+    }
     for (&linux_mmap_regions[slot]) |*r| r.* = .{};
     p.* = .{}; // used=false + дефолты
 }
@@ -3345,6 +3354,9 @@ fn linuxTimeNsRaw() u64 {
     return linuxTimeNs();
 }
 
+/// CDD №15 p5: маркер «регион НЕ держит файл» (file_id-пин MAP_SHARED).
+const NO_REGION_FILE: u32 = 0xFFFF_FFFF;
+
 const MmapRegion = struct {
     used: bool = false,
     va: u64 = 0,
@@ -3352,6 +3364,12 @@ const MmapRegion = struct {
     /// Базис физблока (munmap-free; dev-мапы — 0, физику НЕ освобождаем).
     phys: u64 = 0,
     anon: bool = true,
+    /// CDD №15 p5: file_id для shared-мапов (MAP_SHARED memfd) — маппинг
+    /// ДЕРЖИТ файл (refs): close(fd) при живом маппинге больше НЕ освобождает
+    /// физику (UAF: PMM перевыдача живых страниц → demand-zero memset →
+    /// вайп [PW] ZEROED при неизменном PTE — lvp NULL-краши run8/10).
+    /// NO_FILE = нет файла (anon/dev/brk).
+    file_id: u32 = NO_REGION_FILE,
     /// CDD №12 p5: LAZY-регион — VA-резервация без физики (анон-mmap/brk).
     /// Касание страницы → #PF (P=0) → demand-zero: НУЛЕВАЯ физ-страница.
     /// Linux-семантика mmap: гигантские резервы (LLVM JIT-арена 10.7ГБ)
@@ -3643,6 +3661,13 @@ fn linuxRangeDrop(va: u64, pages: u64) void {
         const r = &linux_mmap_regions[slot][i];
         if (!r.used) continue;
         if (r.va < va or r.va + r.pages * PAGE_SIZE > hi) continue; // не целиком внутри
+        // CDD №15 p5: shared-мап отпускает свой файл-пин (пара к retain в
+        // linuxSharedFileMmap) — физика файла умирает только когда НИ fd,
+        // НИ маппинга не осталось (Linux page-refcount-семантика, лайт-версия)
+        if (r.file_id != NO_REGION_FILE) {
+            linuxReleaseFile(r.file_id);
+            r.file_id = NO_REGION_FILE;
+        }
         var p: u64 = 0;
         var freed: u64 = 0;
         while (p < r.pages) : (p += 1) {
@@ -3838,6 +3863,14 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         if (leaf & vmm.PTE_PRESENT != 0) {
             asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
             return true;
+        }
+        // CDD №15 p5-ФИКС ВАЙПА: СКРЫТЫЙ лист (PROT_NONE-мутация: P=0,
+        // phys≠0) — это ЖИВАЯ страница с ДАННЫМИ. Восстановить PRESENT
+        // с правами pte (restore-ветка ApplyProtEx) — allocPage+memset
+        // ЗАПРЕЩЁН: замена кадра нулевой страницей СТИРАЛА данные
+        // (окно гонки mprotect: реестр уже обновлён, страницы ещё скрыты).
+        if ((leaf & 0x000FFFFFFFFFF000) != 0) {
+            if (vmm.userLeafApplyProtEx(pml4, page, pte, true)) return true;
         }
     }
     const phys = pmm.allocPage() orelse {
@@ -4241,13 +4274,13 @@ fn vfsInit() void {
 /// CDD №12 p3: memfd — PMM-блок общих страниц освобождается ЗДЕСЬ (послед-
 /// ний владелец = fd). Регионы shared-мапов записаны как phys=0/anon=false —
 /// munmap/exit физику НЕ трогают → close = единственная точка освобождения
-/// (анти-утечка при churn буферов wl_shm/lavapipe). Оговорка: close при
-/// живом маппинге (легален в Linux) оставит висячие PTE — lavapipe держит
-/// fd открытым на всё время жизни VkDeviceMemory (эмпирика e2e).
+/// (анти-утечка при churn буферов wl_shm/lavapipe). CDD №15 p5: close при
+/// живом маппинге (легален в Linux) больше НЕ оставляет висячие PTE —
+/// маппинг пинит файл (refs), физика живёт до ПОСЛЕДНЕЙ ссылки.
 fn linuxReleaseFile(id: u32) void {
     if (id >= linux_files.len) return;
     if (!linux_files[id].used) return;
-    if (linux_files[id].refs > 1) { // fork-наследованный: владелец ещё жив
+    if (linux_files[id].refs > 1) { // dup/маппинг/fork держат — владелец жив
         linux_files[id].refs -= 1;
         return;
     }
@@ -4255,6 +4288,15 @@ fn linuxReleaseFile(id: u32) void {
         pmm.freeContiguousPages(linux_files[id].phys, linux_files[id].blk_pages);
     }
     linux_files[id] = .{};
+}
+
+/// CDD №15 p5: файл-пин (refs++) — ВЗЯТЬ ссылку: dup/F_DUPFD/MAP_SHARED.
+/// Пара к release_file. До фикса dup не пинал: fabric (dup→close)
+/// освобождал физблок при живом втором fd И маппинге → PMM-отравление.
+fn linuxRetainFile(id: u32) void {
+    if (id >= linux_files.len) return;
+    if (!linux_files[id].used) return;
+    linux_files[id].refs += 1;
 }
 
 /// open_file: VFS-резолв пути (normalizePath + overlay) → file_id.
@@ -4684,6 +4726,7 @@ fn kernelLinuxOps() linux_syscalls.LinuxOps {
         .stat_by_path = linuxStatByPath,
         .readlink_path = linuxReadlinkPath,
         .release_file = linuxReleaseFile,
+        .retain_file = linuxRetainFile,
         .channel_create = linuxChannelCreate,
         .channel_read = linuxChannelRead,
         .channel_write = linuxChannelWrite,
@@ -4837,6 +4880,24 @@ fn linuxSharedFileMmap(id: u32, off: u64, len: u64, prot: u64, fixed_va: u64) i6
         };
     }
     linuxRecordRegion(linux_task_proc[linuxOwnerTask()], va, pages, 0, false, fdRegionName(id)); // phys общий — НЕ освобождаем
+    // CDD №15 p5: МАППИНГ ПИН-ИТ ФАЙЛ (refs++): close(fd) при живом мапе —
+    // легален в Linux — больше НЕ освобождает физику. Пара — unpin в
+    // linuxRangeDrop (munmap/MAP_FIXED-замещение). Иначе: fabric-цикл lvp
+    // (memfd→ftruncate→mmap SHARED→dup→close) освобождал ЖИВОЙ физблок
+    // → PMM выдавал его страницы demand-zero → memset(0) → вайп структур
+    // (эмпирика: [PW] ZEROED при P=1, lvp NULL+0x2/+0x30 краши t8).
+    {
+        const rslot = linux_task_proc[linuxOwnerTask()];
+        if (rslot < MAX_LINUX_PROCS) {
+            for (&linux_mmap_regions[rslot]) |*r| {
+                if (r.used and r.va == va and r.pages == pages) {
+                    r.file_id = id;
+                    break;
+                }
+            }
+        }
+        linuxRetainFile(id);
+    }
     if (fixed_va == 0) proc.mmap_cursor += pages * PAGE_SIZE;
     return @intCast(va);
 }

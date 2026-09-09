@@ -76,10 +76,17 @@ for soname in report.get("xwayland_libs", []):
         _xw_n += 1
 print(f"rootfs: + Xwayland-замыкание ({_xw_n} либ)")
 
-# CDD №15 p4: Xwayland DLOPEN-волна (НЕ DT_NEEDED — холодный старт, как
-# SDL3-фикс gamescope p4): glamor/EGL. libEGL.so.1 (mesa) в rootfs ЕСТЬ,
-# но в замыкание не попадает → open-fail × 4 → glamor-путь умирает.
-for warm_xw in ("libEGL.so.1", "libEGL_mesa.so.0", "libGLESv2.so.2"):
+# CDD №15 p5: Xwayland DLOPEN-волна (НЕ DT_NEEDED — холодный старт, как
+# SDL3-фикс gamescope p4): glamor/EGL. libepoxy dlopen'ит libEGL.so.1
+# (run8: abort «Couldn't open libEGL.so.1»); glvnd → libEGL_mesa →
+# libgallium (54МБ) → libdrm_amdgpu/intel → libpciaccess/libelf/sensors.
+# ХВОСТ p5-fix: 3 либы-зависима libdrm_intel/amdgpu + glvnd-JSON — иначе
+# dlopen(libEGL_mesa) фейлится НА ТРАНЗИТИВНОМ DT_NEEDED (лениво — только
+# символы, а либы грузятся все).
+for warm_xw in ("libEGL.so.1", "libEGL_mesa.so.0", "libGLESv2.so.2",
+                "libOpenGL.so.0", "libdrm_amdgpu.so.1", "libdrm_intel.so.1",
+                "libgallium-26.2.2-arch3.2.so",
+                "libpciaccess.so.0", "libelf.so.1", "libsensors.so.5"):
     p = os.path.join(ROOT, "usr/lib", warm_xw)
     if os.path.exists(p) and ("usr/lib/" + warm_xw) not in files:
         with open(p, "rb") as f:
@@ -124,6 +131,17 @@ if os.path.isdir(XKB_ROOT):
             xkb_count += 1
 print(f"rootfs: {len(files)} файлов ({xkb_count} xkb) + {len(symlinks)} симлинка, "
       f"{sum(len(v) for v in files.values())/1024/1024:.1f} МБ")
+
+# CDD №15 p5: glvnd EGL-vendor манифест (libEGL.so.1 ищет вендора по
+# /usr/share/glvnd/egl_vendor.d/*.json; без него eglInitialize = "Unable
+# to find any EGL vendor" → glamor не поднимется). library_path уже
+# относительный «libEGL_mesa.so.0» — ld.so резолвит по системным путям.
+_glvnd_json = os.path.join(ROOT, "usr", "share", "glvnd",
+                           "egl_vendor.d", "50_mesa.json")
+if os.path.exists(_glvnd_json):
+    with open(_glvnd_json, "rb") as _f:
+        files["usr/share/glvnd/egl_vendor.d/50_mesa.json"] = _f.read()
+    print("rootfs: + glvnd 50_mesa.json (EGL vendor)")
 
 # ICD-манифесты Vulkan (libvulkan → lavapipe). library_path ПЕРЕПИСЫВАЕМ
 # в АБСОЛЮТНЫЙ путь: Khronos-лоадер резолвит относительный путь ОТНОСИТЕЛЬНО
@@ -326,6 +344,14 @@ vm = VM("drm-gamescope", initrd=INITRD, mem=os.environ.get("E2E_MEM", "2G"), qem
                           os.environ["E2E_PTR"])]
                       if os.environ.get("E2E_PTR") else [])])
 del INITRD  # VM держит только путь к файлу — 258МБ больше не нужны в RAM
+
+# CDD №15 p5: E2E_INITRD_ONLY=1 — пересобрать initrd-кэш + /tmp-копию и
+# выйти (для автономного gs-launch.py: он стартует QEMU с /tmp-initrd;
+# без этого режима пришлось бы гонять полный e2e ради пересборки).
+if os.environ.get("E2E_INITRD_ONLY"):
+    print("INITRD-ONLY: /tmp/poler-e2e-drm-gamescope/initrd.cpio",
+          os.path.getsize(vm.initrd_path) // (1024 * 1024), "МБ")
+    sys.exit(0)
 try:
     vm.start()
     # CDD №12 p7: TCG-плагины (who-ptr/who-aaaa) замедляют бут в 10-50× —
