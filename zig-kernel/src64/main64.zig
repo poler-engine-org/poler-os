@@ -3147,7 +3147,7 @@ const LinuxProc = struct {
 // ─── CDD №12 p2: каналы (pipe/eventfd/socketpair/timerfd) ─────────────────
 const MAX_CHANNELS: usize = 48;
 const ChanKind = enum { pipe, eventfd, socketpair, timerfd };
-const CHAN_BUF: usize = 1024; // FIFO pipe/socketpair (wakeup-трафик мал)
+const CHAN_BUF: usize = 8192; // CDD №15 p5: wayland-поток (registry-burst+X11) 1К был тесен
 
 const Channel = struct {
     used: bool = false,
@@ -3337,7 +3337,11 @@ fn linuxChannelReady(id: u32) u32 {
             return r;
         },
         .socketpair, .eventfd => {
-            var r: u32 = linux_syscalls.EPOLLOUT;
+            // CDD №15 p5: socketpair-POLLOUT ТОЛЬКО при месте в буфере
+            // (EAGAIN-писатель по poll-первой дисциплине не спинит CPU)
+            var r: u32 = 0;
+            if (c.kind == .eventfd) r |= linux_syscalls.EPOLLOUT;
+            if (c.kind == .socketpair and c.len < c.buf.len) r |= linux_syscalls.EPOLLOUT;
             if (c.kind == .eventfd and c.counter > 0) r |= linux_syscalls.EPOLLIN;
             if (c.kind == .socketpair and c.len > 0) r |= linux_syscalls.EPOLLIN;
             if (c.kind == .socketpair and c.refs == 1) r |= linux_syscalls.EPOLLHUP;

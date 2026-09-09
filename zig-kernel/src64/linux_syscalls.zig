@@ -174,6 +174,7 @@ pub const SYS_getgid: u64 = 104;
 pub const SYS_geteuid: u64 = 107;
 pub const SYS_getegid: u64 = 108;
 pub const SYS_getppid: u64 = 110;
+pub const SYS_getpgrp: u64 = 111; // CDD №15 p5: Xwayland exit-путь (ENOSYS не нужен)
 pub const SYS_gettid: u64 = 186;
 pub const SYS_tgkill: u64 = 234;
 pub const SYS_epoll_wait: u64 = 232;
@@ -1625,6 +1626,11 @@ pub fn sysGetppid(ops: LinuxOps) u64 {
     return 1;
 }
 
+/// pid_t getpgrp(void): группа = собственный pid (session-leader-модель).
+pub fn sysGetpgrp(ops: LinuxOps) u64 {
+    return ops.current_pid();
+}
+
 /// unsigned long brk(unsigned long addr) — Linux-семантика:
 ///   addr=0 → текущий brk; рост/спад — runtime; отказ → старый brk.
 /// glibc-static malloc стартует с sbrk(0) (получить базис).
@@ -2659,18 +2665,34 @@ pub fn sysSendmsg(ops: LinuxOps, fds: *FdTable, fd_i: i64, msg_va: u64, flags: u
     _ = flags;
     const e = fds.get(fd_i) orelse return err(EBADF);
     if (e.kind == .socket) {
-        // socketpair: данные первого iov → канал (cmsg-часть игнорируется —
-        // fd-passing между тредами одного процесса — bridge вне p13)
+        // socketpair: ВСЕ iov → канал (CDD №15 p5-КОРЕНЬ «message too
+        // short»: libwayland-flush пишет кольцевой буфер ДВУМЯ iov
+        // (хвост+голова) — раньше уходил ТОЛЬКО первый → обрезка
+        // сообщения посередине → peer-парсер ловил мусор).
+        // Частичная запись честная: libwayland досылает остаток по
+        // POLLOUT (кольцевой буфер сдвигается) — Linux-семантика.
         const m = msghdrIn(ops, msg_va) orelse return err(EFAULT);
-        if (m.iovlen == 0) return 0;
-        if (!ops.validate(m.iov, 16, false)) return err(EFAULT);
-        var iov: [16]u8 = undefined;
-        if (!ops.copy_in(&iov, m.iov)) return err(EFAULT);
-        const base = std.mem.readInt(u64, iov[0..8], .little);
-        const len = std.mem.readInt(u64, iov[8..16], .little);
-        if (len == 0) return 0;
-        const w = sysWrite(ops, fds, fd_i, base, len);
-        return w;
+        const n_iov: usize = @intCast(@min(m.iovlen, MAX_MSG_IOV));
+        if (n_iov == 0) return 0;
+        if (!ops.validate(m.iov, n_iov * 16, false)) return err(EFAULT);
+        var iovbuf: [MAX_MSG_IOV * 16]u8 = undefined;
+        if (!ops.copy_in(iovbuf[0 .. n_iov * 16], m.iov)) return err(EFAULT);
+        var total: usize = 0;
+        var i: usize = 0;
+        while (i < n_iov) : (i += 1) {
+            const base = std.mem.readInt(u64, iovbuf[i * 16 ..][0..8], .little);
+            const len = std.mem.readInt(u64, iovbuf[i * 16 + 8 ..][0..8], .little);
+            if (len == 0) continue;
+            const w = sysWrite(ops, fds, fd_i, base, len);
+            const wi: i64 = @bitCast(w);
+            if (wi < 0) {
+                if (total > 0) return @intCast(total); // частичная запись — уже записанное честно отдаём
+                return w; // ничего не записали — ошибку наружу
+            }
+            total += @intCast(wi);
+            if (wi < @as(i64, @intCast(len))) break; // iov записан частично — конец
+        }
+        return @intCast(total);
     }
     if (e.kind != .seatd) return err(ENOTSOCK);
     const s = &seatd_slots[e.file_id];
@@ -2703,16 +2725,31 @@ pub fn sysRecvmsg(ops: LinuxOps, fds: *FdTable, fd_i: i64, msg_va: u64, flags: u
     _ = flags; // MSG_CMSG_CLOEXEC: exec-модели нет; MSG_DONTWAIT: poll-первая дисциплина
     const e = fds.get(fd_i) orelse return err(EBADF);
     if (e.kind == .socket) {
-        // socketpair: чтение первого iov (совместимость libwayland)
+        // socketpair: чтение во ВСЕ iov (зеркало sendmsg-фикса: частичное
+        // чтение честно — libwayland дочитает по POLLIN)
         const m = msghdrIn(ops, msg_va) orelse return err(EFAULT);
-        if (m.iovlen == 0) return 0;
-        if (!ops.validate(m.iov, 16, false)) return err(EFAULT);
-        var iov: [16]u8 = undefined;
-        if (!ops.copy_in(&iov, m.iov)) return err(EFAULT);
-        const base = std.mem.readInt(u64, iov[0..8], .little);
-        const len = std.mem.readInt(u64, iov[8..16], .little);
-        if (len == 0) return 0;
-        return sysRead(ops, fds, fd_i, base, len);
+        const n_iov: usize = @intCast(@min(m.iovlen, MAX_MSG_IOV));
+        if (n_iov == 0) return 0;
+        if (!ops.validate(m.iov, n_iov * 16, false)) return err(EFAULT);
+        var iovbuf: [MAX_MSG_IOV * 16]u8 = undefined;
+        if (!ops.copy_in(iovbuf[0 .. n_iov * 16], m.iov)) return err(EFAULT);
+        var total: usize = 0;
+        var i: usize = 0;
+        while (i < n_iov) : (i += 1) {
+            const base = std.mem.readInt(u64, iovbuf[i * 16 ..][0..8], .little);
+            const len = std.mem.readInt(u64, iovbuf[i * 16 + 8 ..][0..8], .little);
+            if (len == 0) continue;
+            const r = sysRead(ops, fds, fd_i, base, len);
+            const ri: i64 = @bitCast(r);
+            if (ri < 0) {
+                if (total > 0) return @intCast(total);
+                return r;
+            }
+            total += @intCast(ri);
+            if (ri == 0) break; // канал пуст
+            if (ri < @as(i64, @intCast(len))) break; // iov заполнен частично — больше нет
+        }
+        return @intCast(total);
     }
     if (e.kind != .seatd) return err(ENOTSOCK);
     const s = &seatd_slots[e.file_id];
@@ -2983,6 +3020,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_clock_gettime => return sysClockGettime(ops, args.a1, args.a2),
         SYS_wait4 => return sysWait4(ops, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_getppid => return sysGetppid(ops),
+        SYS_getpgrp => return sysGetpgrp(ops),
         SYS_getuid => return @intCast(KUID),
         SYS_geteuid => return @intCast(KUID),
         SYS_getgid => return @intCast(KUID),
