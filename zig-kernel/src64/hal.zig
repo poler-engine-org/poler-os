@@ -1040,16 +1040,31 @@ var pw_dump_last: u64 = 0; // тик последнего [B-DUMP]
 /// p5-forensics: счётчик DR0-watchpoint триггеров (до 8, потом разряжение)
 var db_events: u64 = 0;
 
-/// p5-forensics: вооруить АППАРАТНЫЙ write-watchpoint (DR0, 8 байт) на
-/// addr. Ловит записи из ЛЮБОГО режима (юзер-VA + kernel identity).
+/// p5-forensics: вооруить АППАРАТНЫЕ write-watchpoint'ы (DR0-DR3, 8Б каждый)
+/// на 4 qword заголовка чанка slab-аллокатора (base..base+0x20).
+/// Ловит записи из ЛЮБОГО режима (юзер-VA + kernel identity) и ЛЮБОГО
+/// треда — гонка инициализации/обнуления заголовка станет видимой.
 pub fn drArmWriteWatch(addr: u64) void {
     db_events = 0;
     asm volatile ("movq %[a], %%dr0"
         :
         : [a] "r" (addr),
     );
-    // DR7: L0=1 (local enable), RW0=01 (write), LEN0=11 (8 байт)
-    asm volatile ("movq $0xD0001, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory");
+    asm volatile ("movq %[a], %%dr1"
+        :
+        : [a] "r" (addr + 8),
+    );
+    asm volatile ("movq %[a], %%dr2"
+        :
+        : [a] "r" (addr + 16),
+    );
+    asm volatile ("movq %[a], %%dr3"
+        :
+        : [a] "r" (addr + 24),
+    );
+    // DR7: L0-L3=1, RW=01 (write), LEN=11 (8Б) на каждый слот
+    // slot i: RW@(16+4i), LEN@(18+4i) → 0xDDDD000F
+    asm volatile ("movq $0xDDDD000F, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory");
     asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: "rax", "memory");
 }
 
@@ -1122,7 +1137,7 @@ fn pageWatch() void {
         @import("pmm64.zig").watch_pa = b.e1 & 0x000FFFFFFFFFF000;
         // DR0-watchpoint на bump-qword — если ещё не вооружён (DZ-MAT мог
         // успеть раньше — тогда НЕ сбрасываем счётчик триггеров)
-        if (!drWatchArmed()) drArmWriteWatch((b.e1 & 0x000FFFFFFFFFF000) + 0xAC8);
+        if (!drWatchArmed()) drArmWriteWatch((b.e1 & 0x000FFFFFFFFFF000) + 0xAC0);
     }
     // p5-forensics v4: СЛЕПАЯ ЗОНА v3 — pw_q* обновлялись ТОЛЬКО при принте;
     // bump мог ЖИТЬ и УМЕРЕТЬ между сэмплами МОЛЧА (print-условия не
@@ -1217,26 +1232,32 @@ fn handleException(frame: *InterruptFrame) void {
         const dr6: u64 = asm volatile ("movq %%dr6, %[v]"
             : [v] "=r" (-> u64),
         );
-        if (dr6 & 0x1 != 0) { // B0 = DR0 hit
+        if (dr6 & 0xF != 0) { // B0-B3 = DR0-DR3 hit
             const ft0 = halFaulterTask(@intFromPtr(frame));
-            const dr0: u64 = asm volatile ("movq %%dr0, %[v]"
-                : [v] "=r" (-> u64),
-            );
-            const nv: *const volatile u64 = @ptrFromInt(dr0);
+            const slot: u6 = @intCast(@ctz(dr6 & 0xF)); // первый сработавший DR
+            const drvar: u64 = switch (slot) {
+                0 => asm volatile ("movq %%dr0, %[v]" : [v] "=r" (-> u64)),
+                1 => asm volatile ("movq %%dr1, %[v]" : [v] "=r" (-> u64)),
+                2 => asm volatile ("movq %%dr2, %[v]" : [v] "=r" (-> u64)),
+                else => asm volatile ("movq %%dr3, %[v]" : [v] "=r" (-> u64)),
+            };
+            const nv: *const volatile u64 = @ptrFromInt(drvar);
             Serial.puts("[DB-WRITE] task=");
             Serial.putDecimal(ft0);
             Serial.puts(" rip=0x");
             Serial.putHex(frame.rip);
-            Serial.puts(" val=0x");
+            Serial.puts(" q+");
+            Serial.putDecimal(@as(u64, @as(u64, slot) * 8));
+            Serial.puts("=0x");
             Serial.putHex(nv.*);
             Serial.puts(" from_user=");
             Serial.putDecimal(@as(u64, if ((frame.cs & 0x3) != 0) 1 else 0));
             Serial.puts("\n");
-            // сброс DR6 + ПЕРЕВООРУЖЕНИЕ (ждём следующую запись — до 8)
+            // сброс DR6 + ПЕРЕВООРУЖЕНИЕ (до 16 событий)
             asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: "rax", "memory");
-            if (db_events < 8) {
+            if (db_events < 16) {
                 db_events += 1;
-                asm volatile ("movq $0xD0001, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory"); // rearm
+                asm volatile ("movq $0xDDDD000F, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory"); // rearm
             } else {
                 asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory");
             }
