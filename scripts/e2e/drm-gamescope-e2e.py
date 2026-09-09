@@ -76,6 +76,16 @@ for soname in report.get("xwayland_libs", []):
         _xw_n += 1
 print(f"rootfs: + Xwayland-замыкание ({_xw_n} либ)")
 
+# CDD №15 p4: Xwayland DLOPEN-волна (НЕ DT_NEEDED — холодный старт, как
+# SDL3-фикс gamescope p4): glamor/EGL. libEGL.so.1 (mesa) в rootfs ЕСТЬ,
+# но в замыкание не попадает → open-fail × 4 → glamor-путь умирает.
+for warm_xw in ("libEGL.so.1", "libEGL_mesa.so.0", "libGLESv2.so.2"):
+    p = os.path.join(ROOT, "usr/lib", warm_xw)
+    if os.path.exists(p) and ("usr/lib/" + warm_xw) not in files:
+        with open(p, "rb") as f:
+            files["usr/lib/" + warm_xw] = f.read()
+        print(f"rootfs: + Xwayland-dlopen {warm_xw}")
+
 # CDD №12 p13: ТЁПЛЫЙ mesa-кэш из host-прогонов (LLVM-JIT-компиляция шейдеров
 # gamescope уже выполнена на host — хэши совпадают: те же бинарники/либы/ICD).
 # VFS-overlay: initrd-RO читается, новые записи идут в tmpfs-RW.

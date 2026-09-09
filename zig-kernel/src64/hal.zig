@@ -797,6 +797,9 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
             // 41/41 сэмплов на ld.so+0xF41E = вечный тихий #PF-цикл
             // (demand-zero клал карту в чужое PML4); без URIP фронт
             // невидим (syscall-трейс чист — «процесс работает»).
+            if (tick_count % 50 == 0) {
+                pageWatch(); // p4-forensics (тротл: 2Гц, только переходы)
+            }
             if (tick_count % 100 == 0 and (frame.cs & 0x3) != 0) {
                 Serial.puts("[URIP] cur=");
                 Serial.putDecimal(@import("scheduler.zig").current_task_id);
@@ -1017,6 +1020,106 @@ var pfloop_cr2: u64 = 0;
 var pfloop_run: u64 = 0;
 var pfloop_seen: bool = false;
 
+// ─── CDD №15 p4-forensics: [PAGEWATCH] — хронограф краш-страниц lvp ────────
+// Эмпирика run1/run2: пул-заголовок Mesa-слаб-аллокатора (r11≈0x20024079AE8)
+// к моменту краша = ЧИСТЫЕ НУЛИ при живом PTE (bump [r11-0x20]=0 → rax=0 →
+// #PF [rax+2]); соседний struct (0x2002400320) частично жив (+0x38 рандом).
+// Гипотеза: страница ренe-materialized нулём (PTE-drop → demand-zero) ПОСЛЕ
+// записи живых данных. Сэмпл 10Гц: pte + 2 ключевых qword КАЖДОЙ страницы;
+// печать ТОЛЬКО на изменение (момент обнуления = улика).
+var pw_pte0: u64 = 0xDEAD_BEE0;
+var pw_q0a: u64 = 0xDEAD_BEE1;
+var pw_pte1: u64 = 0xDEAD_BEE2;
+var pw_q1a: u64 = 0xDEAD_BEE3;
+var pw_first: bool = true;
+
+fn pageWatch() void {
+    const sched = @import("scheduler.zig");
+    var gcr3: u64 = 0;
+    var gi: usize = 0;
+    while (gi < sched.task_count) : (gi += 1) {
+        const t2 = &sched.tasks[gi];
+        if (t2.privilege == .User and t2.abi == .linux and
+            t2.state != .Killed and t2.cr3 != 0)
+        {
+            gcr3 = t2.cr3;
+            break;
+        }
+    }
+    if (gcr3 == 0) return;
+    // p4-forensics: ПОЛНЫЙ raw-walk двух краш-VA (записи всех уровней —
+    // huge-детект; qword через huge-aware обходчик)
+    const PWV = struct {
+        e3: u64 = 0,
+        e2: u64 = 0,
+        e1: u64 = 0,
+        q: u64 = 0xFFFF_FFFF_FFFF_FFFF,
+    };
+    const walk = struct {
+        fn go(cr3: u64, va: u64, qw_off: u64) PWV {
+            var r = PWV{};
+            const pml4: [*]const volatile u64 = @ptrFromInt(cr3);
+            r.e3 = @as(*const volatile u64, &pml4[(va >> 39) & 0x1FF]).*;
+            if (r.e3 & 0x1 == 0) return r;
+            const pdpt: [*]const volatile u64 = @ptrFromInt(r.e3 & 0x000FFFFFFFFFF000);
+            r.e2 = @as(*const volatile u64, &pdpt[(va >> 30) & 0x1FF]).*;
+            if (r.e2 & 0x1 == 0) return r;
+            if (r.e2 & 0x80 != 0) { // 1GB-huge
+                const p: *volatile u64 = @ptrFromInt((r.e2 & 0xFFFFC0000000) + (va & 0x3FFFFFFF) + qw_off);
+                r.q = p.*;
+                return r;
+            }
+            const pd: [*]const volatile u64 = @ptrFromInt(r.e2 & 0x000FFFFFFFFFF000);
+            r.e1 = @as(*const volatile u64, &pd[(va >> 21) & 0x1FF]).*;
+            if (r.e1 & 0x1 == 0) return r;
+            if (r.e1 & 0x80 != 0) { // 2MB-huge
+                const p: *volatile u64 = @ptrFromInt((r.e1 & 0xFFFFFFE00000) + (va & 0x1FFFFF) + qw_off);
+                r.q = p.*;
+                return r;
+            }
+            const pt: [*]const volatile u64 = @ptrFromInt(r.e1 & 0x000FFFFFFFFFF000);
+            const leaf = @as(*const volatile u64, &pt[(va >> 12) & 0x1FF]).*;
+            r.e1 = leaf; // лист 4K поверх записи PD — печатаем обе? лист тут
+            if (leaf & 0x1 == 0) return r;
+            const p: *volatile u64 = @ptrFromInt((leaf & 0x000FFFFFFFFFF000) + (va & 0xFFF) + qw_off);
+            r.q = p.*;
+            return r;
+        }
+    }.go;
+    const a = walk(gcr3, 0x20002403000, 0x320);
+    const b = walk(gcr3, 0x200024079000, 0xAC8);
+    if (pw_first or a.e3 != pw_pte0 or a.e2 != pw_q0a or a.e1 != pw_pte1 or a.q != pw_q1a or
+        b.e3 != pw_pte0 or b.e2 != pw_q0a or b.e1 != pw_pte1 or b.q != pw_q1a)
+    {
+        // упрощённо: печатаем при любом изменении ключевых полей
+    }
+    // p4-forensics: печатаем ТОЛЬКО значимые события — pte-переход
+    // (материализация/снятие) и ОБНУЛЕНИЕ (bump nonzero→0 — коррупция!).
+    // Движение bump — НЕ событие (10 принтов/с = serial-live-lock: тик-
+    // хендлер дольше тика → user-space голодает — эмпирика run7).
+    const zeroed = (pw_q0a != 0 and pw_q0a != 0xFFFF_FFFF_FFFF_FFFF and b.q == 0) or
+        (pw_q1a != 0 and pw_q1a != 0xFFFF_FFFF_FFFF_FFFF and a.q == 0);
+    if (pw_first or a.e1 != pw_pte1 or b.e1 != pw_pte0 or zeroed) {
+        pw_first = false;
+        pw_pte0 = b.e1;
+        pw_q0a = b.q;
+        pw_pte1 = a.e1;
+        pw_q1a = a.q;
+        Serial.puts("[PW] A:pd=0x");
+        Serial.putHex(a.e1);
+        Serial.puts(" q320=0x");
+        Serial.putHex(a.q);
+        Serial.puts(" B:leaf=0x");
+        Serial.putHex(b.e1);
+        Serial.puts(" bump=0x");
+        Serial.putHex(b.q);
+        if (zeroed) Serial.puts(" <<< ZEROED");
+        Serial.puts(" t=");
+        Serial.putDecimal(tick_count / 100);
+        Serial.puts("\n");
+    }
+}
+
 fn pfLoopWatch(faulter: usize, cr2: u64) void {
     if (pfloop_seen and faulter == pfloop_task and cr2 == pfloop_cr2) {
         pfloop_run += 1;
@@ -1077,6 +1180,16 @@ fn handleException(frame: *InterruptFrame) void {
     }
 
     Serial.puts("\n!!! CPU EXCEPTION !!!\n");
+    // CDD №15 p4-forensics: КТО крашит и на КАКОМ CR3 (гипотеза: тред с
+    // отдельным PML4 — снапшот-фолбэк? — общая физика сломана)
+    {
+        const ft = halFaulterTask(@intFromPtr(frame));
+        Serial.puts("[EXC] task=");
+        Serial.putDecimal(ft);
+        Serial.puts(" cr3=0x");
+        Serial.putHex(readCr3() & 0x000FFFFFFFFFF000);
+        Serial.puts("\n");
+    }
     Serial.puts("Vector: ");
     Serial.putHex(frame.vector);
     Serial.puts("\nError Code: ");

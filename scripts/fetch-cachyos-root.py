@@ -248,7 +248,35 @@ def pkg_for_soname(m):
         return "vulkan-icd-loader"
     if m.startswith("libSDL3"):
         return "sdl3"
+    # CDD №15 p4-restore: хвост XWAYLAND-замыкания (эмпирика: 4 MISSING —
+    # имена пакетов не выводятся из сонамов)
+    if m.startswith("libXfont2"):
+        return "libxfont2"
+    if m.startswith("libnettle"):
+        return "nettle"
+    if m == "libGL.so.1" or m.startswith("libGL.so"):
+        return "libglvnd"
+    if m.startswith("libgssapi_krb5"):
+        return "krb5"
+    if m.startswith("libcom_err"):
+        return "e2fsprogs" # com_err живёт в e2fsprogs (core)
+    if m.startswith("libkeyutils"):
+        return "keyutils"
+    if m.startswith("libfreetype"):
+        return "freetype2" # Arch/CachyOS имя пакета
+    if m.startswith("libbrotli"):
+        return "brotli"
     return m.split(".so")[0] if ".so" in m else m
+
+
+def _pkg_filter(member, path):
+    """data-семантика, но АБСОЛЮТНЫЕ симлинки пакетов (usr/lib/libX.so →
+    /usr/lib/libX.so.1) перекодируем в ОТНОСИТЕЛЬНЫЕ: Python 3.12
+    tarfile.data_filter их отвергает (AbsoluteLinkError), а usr-merge
+    пакеты CachyOS/Arch ими полны. Ядро/VFS разрешает только относительные."""
+    if member.issym() and member.linkname.startswith("/"):
+        member.linkname = member.linkname.rsplit("/", 1)[-1]
+    return tarfile.data_filter(member, path)
 
 
 def ensure_pkg(idx_map, pkgname):
@@ -275,7 +303,7 @@ def ensure_pkg(idx_map, pkgname):
             dctx = zstandard.ZstdDecompressor()
             raw = dctx.stream_reader(io.BytesIO(raw)).read()
         tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:tar")
-        tf.extractall(ROOTFS, filter="data")
+        tf.extractall(ROOTFS, filter=_pkg_filter)
         return fname
     return None
 
@@ -380,8 +408,23 @@ def main():
     # v0.20 (CDD №15): XWAYLAND — второй ELF системы: fork+execve в ядре
     # оживает ТОЛЬКО при наличии бинарника в rootfs (wlserver spawn'ит его
     # через fork+exec). Замыкание его либ докачает X11/xcb-стек.
-    ensure_pkg(idx_map, "xwayland")
+    # CDD №15 p4-restore: в CachyOS/Arch пакет переименован xwayland →
+    # xorg-xwayland; бинарник с ~v22 ставится в usr/lib/Xwayland (upstream
+    # переезд из usr/bin) — копируем в usr/bin/Xwayland: путь, который
+    # ждут wlroots execve и e2e-инициализация initrd.
+    if not ensure_pkg(idx_map, "xorg-xwayland"):
+        ensure_pkg(idx_map, "xwayland") # старое имя (фолбэк)
+    xw_lib = os.path.join(ROOTFS, "usr/lib/Xwayland")
     xw_path = os.path.join(ROOTFS, "usr/bin/Xwayland")
+    if os.path.exists(xw_lib) and not os.path.exists(xw_path):
+        os.makedirs(os.path.dirname(xw_path), exist_ok=True)
+        with open(xw_lib, "rb") as f_in, open(xw_path, "wb") as f_out:
+            while True:
+                chunk = f_in.read(1 << 20)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+        print(f"  Xwayland: {xw_lib} -> {xw_path} (переезд пакета в usr/lib)")
     if os.path.exists(xw_path):
         print(f"  Xwayland: {xw_path} ({os.path.getsize(xw_path)//1024} КБ)")
     else:

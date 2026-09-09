@@ -1870,10 +1870,10 @@ fn kernelLoaderOps() pe_loader.LoaderOps {
 /// (createUserPML4 копирует kernel-записи; getOrCreateTable открывает
 /// PTE_USER в ОБЩИХ таблицах при user-маппинге) → курсоры mmap'ов
 /// Xwayland и gamescope КОЛЛИДИРОВАЛИ в общих PT → AlreadyMapped.
-/// Новая база 0x200_0000_0000 (PML4[4]) — ПРИВАТНОЕ поддерево (kernel-
+/// Новая база 0x2000_0000_0000 (2.2ТБ, PML4[4]) — ПРИВАТНОЕ поддерево (kernel-
 /// записи [1..255] нулевые): таблицы по-процессные, коллизий нет.
 const PAGE_SIZE = vmm.PAGE_SIZE;
-const LINUX_MMAP_BASE: u64 = 0x200_0000_0000;
+const LINUX_MMAP_BASE: u64 = 0x2000_0000_0000;
 /// CDD №12 p5: 1ГБ → 48ГБ VA-бюджет: LLVM резервирует 10.7ГБ JIT-арен
 /// (mmap(0, 0x2AAAAB000)×2) — с demand-zero физика не резервируется, VA
 /// дёшев; USER_VA_CEILING (0x7FFF_FFFF_FFFF) вмещает с запасом.
