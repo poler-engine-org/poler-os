@@ -3147,7 +3147,7 @@ const LinuxProc = struct {
 // ─── CDD №12 p2: каналы (pipe/eventfd/socketpair/timerfd) ─────────────────
 const MAX_CHANNELS: usize = 48;
 const ChanKind = enum { pipe, eventfd, socketpair, timerfd };
-const CHAN_BUF: usize = 8192; // CDD №15 p5: wayland-поток (registry-burst+X11) 1К был тесен
+const CHAN_BUF: usize = 1024; // p5: откат 8К — .bss-сдвиг перевёл кости (смерть t8 стабилизировалась на аллокации 5); 1К+EAGAIN+POLLOUT достаточно
 
 const Channel = struct {
     used: bool = false,
