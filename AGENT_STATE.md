@@ -1,11 +1,11 @@
-updated_utc: 2026-09-08T20:45:00Z
+updated_utc: 2026-09-09T11:05:00Z
 repo: poler-os
 branch: main
-commit: 3d1530f feat(cdd15-p2): FORK+EXECVE ВЕРИФИЦИРОВАНЫ E2E (8/8) — полный Linux-цикл
+commit: dff8605 feat(cdd15-p4): EAGER-СНАПШОТ FORK + 6 корневых фиксов — Xwayland доходит до main()
 tag: v0.19.0 (следующий релиз — v0.20.0-rc: после первого PAGE_FLIP)
 pushed: origin/main
-tests: zig build OK; 585 юнит-тестов зелёные; E2E: fork-execve 8/8 PASS (ПОЛНЫЙ Linux-цикл); gamescope-конвейер жив (VK/lavapipe/ADDFB2 + Xwayland-спавн)
-current_task: CDD №15 p1-p3 ЗАВЕРШЁНЫ: fork+execve+wait4 работают (E2E 8/8). gamescope спавнит Xwayland (двойной fork). ФРОНТ: fd=-1 в wlserver unset_cloexec (userspace) → execve Xwayland → damage → PAGE_FLIP → тег v0.20.0-rc.
+tests: zig build OK; 585 юнит-тестов зелёные; E2E: fork-execve 8/8 (SNAPSHOT 32956 стр, pool contiguous, execve freed 32956); dyn-elf 4/4; glibc-static 7/7; elf-run 17/17
+current_task: CDD №15 p4 ЗАВЕРШЁН (восстановлен после потери песочницы — коммит прошлой сессии не доехал до push; восстановлен по следу и РЕ-верифицирован). 8 фиксов: eager-снапшот fork, leaf-only free (PTE_PRIVATE бит 52), /dev/null, LINUX_MMAP_BASE → PML4[4], MALLOC_PERTURB_ удалён, demand-zero по faulter (корень тихих #PF-циклов), envp 16→64, [URIP]/[PF-LOOP] диагностика. ФРОНТ: e2e gamescope-прогон с новым ядром → Xwayland exec (WAYLAND_SOCKET теперь доезжает) → wl-handshake → dix → damage → PAGE_FLIP → первый кадр → тег v0.20.0-rc.
 blocked_on: —
 tmux_sessions: нет (QEMU через qemu-portable/qemu-portable.sh; e2e scripts/e2e/ + drm-gamescope-e2e.py; vkprobe2 host-прогон: ld-linux --library-path root/usr/lib + VK_ICD_FILENAMES)
 credentials: токен передаётся вне репозитория (НЕ хранить в репо)
