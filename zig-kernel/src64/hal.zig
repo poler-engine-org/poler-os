@@ -1086,7 +1086,7 @@ fn pageWatch() void {
             return r;
         }
     }.go;
-    const a = walk(gcr3, 0x20002403000, 0x320);
+    const a = walk(gcr3, 0x200024003000, 0x230);
     const b = walk(gcr3, 0x200024079000, 0xAC8);
     if (pw_first or a.e3 != pw_pte0 or a.e2 != pw_q0a or a.e1 != pw_pte1 or a.q != pw_q1a or
         b.e3 != pw_pte0 or b.e2 != pw_q0a or b.e1 != pw_pte1 or b.q != pw_q1a)

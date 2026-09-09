@@ -3648,12 +3648,95 @@ fn linuxRegionMerge(slot: u8) void {
 ///     PTE — страницы НЕ освобождаются (p5-баг: PTE-скан munmap'а возвращал
 ///     ОБЩИЕ страницы wl_shm/dumb в PMM → PMM выдавал их demand-zero под
 ///     чужие данные → кросс-маппинг-порча деревьев).
+/// CDD №15 p5-FORENSICS: [FREE-LIVE] — аудит «free при живом мапе».
+/// Linux page-refcount-семантика (лайт): ОДИН raw-walk user-PML4 на вызов
+/// munmap/DONTNEED строит per-frame СЧЁТЧИК живых лист-маппингов (u8,
+/// 1МБ на 4ГБ физики — весь PMM-кэп); каждый unmap (anon/shared) ДЕКРЕ-
+/// МЕНТИРУЕТ свой кадр. Отдавать кадр PMM можно ⇔ после декремента счёт-
+/// чик = 0 — последняя ссылка снята именно нами. Чужой живой лист:
+/// [FREE-LIVE] лог + отказ free (диагностический режим — намеренная
+/// утечка вместо порчи): PMM не выдаст живую страницу demand-zero
+/// (перевыдача → memset(0) → вайп структур lvp/LLVM, [PW] ZEROED).
+/// Битмап-вариант (v1) имел self-match: ленивый build ПОСЛЕ снятия пер-
+/// вого PTE → все последующие страницы вызова находили СЕБЯ → ложные
+/// отказы. Refcount-декремент потребляет self-ссылку ровно один раз.
+/// Кадр со счётчиком 0 на момент декремента = не был user-листом при
+/// walk (PML4[0]/не-арена) — пропускаем без шума (ложных блоков нет).
+const FREE_LIVE_FRAMES: usize = 0x1_0000_0000 / PAGE_SIZE;
+var free_live_counts: [FREE_LIVE_FRAMES]u8 = undefined;
+var free_live_events: u64 = 0;
+
+fn linuxFreeAuditBuild(pml4: u64) void {
+    @memset(&free_live_counts, 0);
+    const pml4a: [*]const volatile u64 = @ptrFromInt(pml4);
+    var iw4: usize = 1; // [0] — kernel identity, user-листьев нет
+    while (iw4 < 512) : (iw4 += 1) {
+        const e3 = pml4a[iw4];
+        if (e3 & 0x1 == 0 or e3 & vmm.PTE_USER == 0) continue;
+        const pdpt: [*]const volatile u64 = @ptrFromInt(e3 & PTE_ADDR_MASK);
+        var iw3: usize = 0;
+        while (iw3 < 512) : (iw3 += 1) {
+            const e2 = pdpt[iw3];
+            if (e2 & 0x1 == 0) continue;
+            if (e2 & 0x80 != 0) continue; // huge-листьев в user-арене нет
+            const pd: [*]const volatile u64 = @ptrFromInt(e2 & PTE_ADDR_MASK);
+            var iw2: usize = 0;
+            while (iw2 < 512) : (iw2 += 1) {
+                const e1 = pd[iw2];
+                if (e1 & 0x1 == 0) continue;
+                if (e1 & 0x80 != 0) continue;
+                const pt: [*]const volatile u64 = @ptrFromInt(e1 & PTE_ADDR_MASK);
+                var iw1: usize = 0;
+                while (iw1 < 512) : (iw1 += 1) {
+                    const leaf = pt[iw1];
+                    if (leaf & 0x1 == 0) continue;
+                    const fr = (leaf & PTE_ADDR_MASK) / PAGE_SIZE;
+                    if (fr < FREE_LIVE_FRAMES) {
+                        if (free_live_counts[fr] < 255) free_live_counts[fr] += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Unmap уже сделан: декремент кадра. true → кадр осиротел, free безопа-
+/// сен; false → живой алиас в ДРУГОМ VA (лог + отказ).
+fn linuxFreeAuditConsume(pa: u64, va_pg: u64) bool {
+    const fr = pa / PAGE_SIZE;
+    if (fr >= FREE_LIVE_FRAMES) return true;
+    const c = free_live_counts[fr];
+    if (c == 0) return true; // кадр вне user-арены walk-а — не аудируем
+    free_live_counts[fr] = c - 1;
+    if (c == 1) return true;
+    if (free_live_events < 64) {
+        free_live_events += 1;
+        hal.Serial.puts("[FREE-LIVE] pa=0x");
+        hal.Serial.putHex(pa);
+        hal.Serial.puts(" из va=0x");
+        hal.Serial.putHex(va_pg);
+        hal.Serial.puts(" — живых алиасов ещё ");
+        hal.Serial.putDecimal(@as(u64, c - 1));
+        hal.Serial.puts(", НЕ freed\n");
+    }
+    return false;
+}
+
+/// Shared-unmap: поддержать точность счётчика БЕЗ решения о free
+/// (физика принадлежит memfd/dumb — аудит только фиксирует снятие листа).
+fn linuxFreeAuditUnref(pml4: u64, va_pg: u64) void {
+    const pte0 = vmm.userLeafRaw(pml4, va_pg) orelse return;
+    const fr = (pte0 & PTE_ADDR_MASK) / PAGE_SIZE;
+    if (fr < FREE_LIVE_FRAMES and free_live_counts[fr] > 0) free_live_counts[fr] -= 1;
+}
+
 fn linuxRangeDrop(va: u64, pages: u64) void {
     const pml4 = linuxTaskPml4();
     const owner = linuxOwnerTask();
     if (pml4 == 0 or owner >= scheduler.MAX_TASKS) return;
     const slot = linux_task_proc[owner];
     if (slot >= MAX_LINUX_PROCS) return;
+    linuxFreeAuditBuild(pml4); // p5-forensics: ДО снятия первого PTE вызова
     const hi = va + pages * PAGE_SIZE;
     linuxRegionSplit(slot, va, pages);
     var i: usize = 0;
@@ -3687,12 +3770,17 @@ fn linuxRangeDrop(va: u64, pages: u64) void {
                     // PTE снят + TLB-строка сброшена (активный CR3):
                     // только ТЕПЕРЬ кадр можно возвращать PMM.
                     if (pa_to_free != 0) {
-                        pmm.freePage(pa_to_free);
-                        freed += 1;
+                        // CDD №15 p5-FORENSICS: отказ free при живом алиасе
+                        if (linuxFreeAuditConsume(pa_to_free, va_pg)) {
+                            pmm.freePage(pa_to_free);
+                            freed += 1;
+                        }
                     }
                 } else |_| {}
             } else {
-                // shared/dev: физика принадлежит memfd/dumb — только unmap.
+                // shared/dev: физика принадлежит memfd/dumb — только unmap
+                // (+ декремент счётчика аудита, без решения о free).
+                linuxFreeAuditUnref(pml4, va_pg);
                 _ = vmm.unmapPageInPML4(pml4, va_pg) catch {};
             }
         }
@@ -3721,6 +3809,7 @@ fn linuxDoDontneed(va: u64, len: u64) i64 {
     const pages = (va + len - qva + PAGE_SIZE - 1) / PAGE_SIZE;
     const hi = qva + pages * PAGE_SIZE;
 
+    linuxFreeAuditBuild(pml4); // p5-forensics: ДО снятия первого PTE вызова
     linuxRegionSplit(slot, qva, pages);
     var i: usize = 0;
     while (i < linux_mmap_regions[slot].len) : (i += 1) {
@@ -3743,8 +3832,11 @@ fn linuxDoDontneed(va: u64, len: u64) i64 {
                 }
                 if (vmm.unmapPageInPML4(pml4, va_pg)) |_| {
                     if (pa_to_free != 0) {
-                        pmm.freePage(pa_to_free);
-                        linux_dontneed_zaps += 1;
+                        // p5-forensics: живой алиас → отказ free (см. [FREE-LIVE])
+                        if (linuxFreeAuditConsume(pa_to_free, va_pg)) {
+                            pmm.freePage(pa_to_free);
+                            linux_dontneed_zaps += 1;
+                        }
                     }
                 } else |_| {}
             }
