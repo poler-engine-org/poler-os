@@ -1137,7 +1137,7 @@ fn pageWatch() void {
         @import("pmm64.zig").watch_pa = b.e1 & 0x000FFFFFFFFFF000;
         // DR0-watchpoint на bump-qword — если ещё не вооружён (DZ-MAT мог
         // успеть раньше — тогда НЕ сбрасываем счётчик триггеров)
-        if (!drWatchArmed()) drArmWriteWatch(0x2000_2407_9000 + 0xAC0); // юзер-VA — линейный адрес!
+        if (!drWatchArmed()) drArmWriteWatch(0x2000_2400_3000 + 0x230); // A-struct
     }
     // p5-forensics v4: СЛЕПАЯ ЗОНА v3 — pw_q* обновлялись ТОЛЬКО при принте;
     // bump мог ЖИТЬ и УМЕРЕТЬ между сэмплами МОЛЧА (print-условия не
