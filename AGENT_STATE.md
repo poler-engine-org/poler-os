@@ -1,11 +1,11 @@
-updated_utc: 2026-09-09T11:05:00Z
+updated_utc: 2026-09-09T13:20:00Z
 repo: poler-os
 branch: main
-commit: dff8605 feat(cdd15-p4): EAGER-СНАПШОТ FORK + 6 корневых фиксов — Xwayland доходит до main()
+commit: 5272e64 feat(cdd15-p4b): MMAP-БАЗА 2.2ТБ (оф-бай-зеро!) + forensics + rootfs/e2e-фиксы
 tag: v0.19.0 (следующий релиз — v0.20.0-rc: после первого PAGE_FLIP)
 pushed: origin/main
 tests: zig build OK; 585 юнит-тестов зелёные; E2E: fork-execve 8/8 (SNAPSHOT 32956 стр, pool contiguous, execve freed 32956); dyn-elf 4/4; glibc-static 7/7; elf-run 17/17
-current_task: CDD №15 p4 ЗАВЕРШЁН (восстановлен после потери песочницы — коммит прошлой сессии не доехал до push; восстановлен по следу и РЕ-верифицирован). 8 фиксов: eager-снапшот fork, leaf-only free (PTE_PRIVATE бит 52), /dev/null, LINUX_MMAP_BASE → PML4[4], MALLOC_PERTURB_ удалён, demand-zero по faulter (корень тихих #PF-циклов), envp 16→64, [URIP]/[PF-LOOP] диагностика. ФРОНТ: e2e gamescope-прогон с новым ядром → Xwayland exec (WAYLAND_SOCKET теперь доезжает) → wl-handshake → dix → damage → PAGE_FLIP → первый кадр → тег v0.20.0-rc.
+current_task: CDD №15 p4+p4b ЗАВЕРШЕНЫ И ЗАПУШЕНЫ (dff8605, 5272e64). ЖИВОЙ ПРОГОН run8: снапшот-fork 105612 стр ×2 (двойной fork wlroots!) → «Starting Xwayland on :0» (pipefd мёртв!) → execve /usr/bin/Xwayland = РЕАЛЬНЫЙ процесс (task 12, pid 1002) → WAYLAND_SOCKET (fcntl 45) доставлен → 41-либ замыкание ld.so. НАЙДЕН оф-бай-зеро: восстановленная база 0x200_0000_0000 = 128ГБ = ОБЩЕЕ PML4[0]-поддерево (фикс был no-op) → 0x2000_0000_0000 (2.2ТБ, PML4[4]) — АРЕНЫ/ЛИБЫ В ПРИВАТНОМ РЕГИОНЕ. ФРОНТ p5: obstack-спин libc+0xC0ADB (gamescope-треды жгут слайсы → t12 голодает 3/900 тиков) + lvp-коррупция (рандом +0x38, ZEROED-страницы, NULL+0x2 краши) → WL-handshake → dix → damage → PAGE_FLIP → первый кадр → тег v0.20.0-rc. Инструменты на месте: [PW] хронограф, [EXC] task+cr3, gs-launch.py (автономный QEMU + sendkey), qemu-full настроен, rootfs полный (Xwayland+41).
 blocked_on: —
 tmux_sessions: нет (QEMU через qemu-portable/qemu-portable.sh; e2e scripts/e2e/ + drm-gamescope-e2e.py; vkprobe2 host-прогон: ld-linux --library-path root/usr/lib + VK_ICD_FILENAMES)
 credentials: токен передаётся вне репозитория (НЕ хранить в репо)
