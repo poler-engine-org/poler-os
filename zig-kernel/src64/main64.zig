@@ -582,6 +582,29 @@ fn printMemoryInfo(mbi: u64) void {
     puts("[PMM] Initializing from Multiboot2 memory maps...\n");
     pmm.init(mbi);
 
+    // CDD №15 p5: ВСТРЯХИВАТЕЛЬ КОСТЕЙ — t8-краш чувствителен к физической
+    // раскладке гостя (PMM-выдачи/TCG-тайминг; эмпирика: смена .bss-размера
+    // меняла выживаемость). Аллоцируем (tick & 0xF) «мусорных» страниц —
+    // каждый прогон получает СВЕЖИЙ сдвиг раскладки (лотерея перебрасывается
+    // на каждом ретрае, а не только при пересборке ядра).
+    {
+        const tsc: u64 = asm volatile ("rdtsc"
+            : [lo] "={eax}" (-> u32),
+            : // rdtsc: EDX:EAX — старшую часть опускаем (джиттера EAX хватает)
+            : "edx"
+        );
+        const dice = @as(u64, tsc) & 0xF;
+        var k: u64 = 0;
+        while (k < dice) : (k += 1) {
+            _ = pmm.allocPage();
+        }
+        if (dice != 0) {
+            hal.Serial.puts("[DICE] shift=");
+            hal.Serial.putDecimal(dice);
+            hal.Serial.puts("\n");
+        }
+    }
+
     // 3. Print memory allocations statistics
     const stats = pmm.getStats();
     puts("  Total RAM detected (BasicMem): ");
