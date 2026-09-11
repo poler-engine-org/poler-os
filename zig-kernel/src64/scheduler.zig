@@ -230,7 +230,7 @@ pub export var rbx_tmp: u64 = 0;
 /// (hal.zig): linux → linux_syscalls.dispatch (RAX-ABI), иначе Win32 #6/#7.
 /// Read-only эвристика: рассинк current_task_id не паникует — худший случай
 /// неверный маршрутиз (=-ENOSYS), а не kernel-halt (инвариант CDD №9).
-pub fn ownerAbiIsLinux() callconv(.C) bool {
+pub fn ownerAbiIsLinux() callconv(.c) bool {
     if (current_task_id >= MAX_TASKS) return false;
     return tasks[current_task_id].abi == .linux;
 }
@@ -412,7 +412,7 @@ pub fn init() void {
 
 /// Called by HAL when a user process invokes syscall 4 (exit).
 /// Kills the current task. The scheduler will skip it on the next tick.
-pub fn exitCurrentTask() callconv(.C) void {
+pub fn exitCurrentTask() callconv(.c) void {
     // v0.13.0-fix: путь завершения уходит в hlt-цикл ИЗНУТРИ syscall-
     // транзакции — сбросить флаг, иначе таймер не сможет вытеснить задачу
     // (schedule видит in_win32_syscall=1 и не переключает — deadlock).
@@ -785,7 +785,7 @@ fn canaryOk(id: usize) bool {
     return true;
 }
 
-pub fn schedule(current_rsp: u64) callconv(.C) u64 {
+pub fn schedule(current_rsp: u64) callconv(.c) u64 {
     if (task_count <= 1) return current_rsp; // Only idle/kernel task exists
     // v0.13.0-fix: syscall-транзакция активна — НЕ трогаем контекст задачи
     // (user_rsp/current_kernel_stack глобальны — свитч между Ring-3

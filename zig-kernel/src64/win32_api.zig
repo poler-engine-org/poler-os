@@ -352,7 +352,7 @@ fn kSleepTask(ms: u64) void {
     // повторную выдачу слайса до дедлайна). Возврат — когда дедлайн прошёл.
     var guard: u64 = 0;
     while (@as(i64, @bitCast(deadline -% hal.tick_count)) > 0) {
-        asm volatile ("hlt" ::: "memory");
+        asm volatile ("hlt" ::: .{ .memory = true });
         guard += 1;
         if (guard > 60_000) break; // 600с страховка от зависшего таймера
     }

@@ -506,8 +506,16 @@ pub fn buildUserContext(
 
 const testing = std.testing;
 
-fn loadFixture(comptime name: []const u8) ![]u8 {
-    return std.fs.cwd().readFileAlloc(testing.allocator, name, 64 << 20);
+fn loadFixture(comptime name: []const u8) ![]const u8 {
+    if (comptime std.mem.eql(u8, name, "testdata/curl.exe")) {
+        return @embedFile("testdata/curl.exe");
+    } else if (comptime std.mem.eql(u8, name, "testdata/7za.exe")) {
+        return @embedFile("testdata/7za.exe");
+    } else if (comptime std.mem.eql(u8, name, "testdata/7zr.exe")) {
+        return @embedFile("testdata/7zr.exe");
+    } else {
+        return error.FileNotFound;
+    }
 }
 
 /// Фейковое «физическое» пространство: bump-аллокатор + логер маппингов.
@@ -534,12 +542,12 @@ const FakePhys = struct {
             // старт с 1МБ: как реальный PMM (первый мегабайт — BIOS/VGA),
             // и pa=0 невозможен (@ptrFromInt(0) = null-паника Zig)
             .cursor = 0x100000,
-            .maps = std.ArrayList(MapRec).init(testing.allocator),
+            .maps = std.ArrayList(MapRec).empty,
         };
     }
     fn deinit(self: *FakePhys) void {
         testing.allocator.free(self.mem);
-        self.maps.deinit();
+        self.maps.deinit(testing.allocator);
     }
     fn allocContig(self: *FakePhys, count: u64) ?u64 {
         const bytes = count * PAGE_SIZE;
@@ -556,7 +564,7 @@ const FakePhys = struct {
         if (self.fail_map_after) |thr| {
             if (self.maps.items.len >= thr) return false;
         }
-        self.maps.append(.{ .va = va, .pa = pa, .flags = flags }) catch return false;
+        self.maps.append(testing.allocator, .{ .va = va, .pa = pa, .flags = flags }) catch return false;
         _ = pml4;
         return true;
     }
@@ -642,7 +650,7 @@ fn findMap(fp: *FakePhys, va: u64) ?FakePhys.MapRec {
 
 test "flags: sectionFlags по характеристикам секций curl.exe" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     const text = image.sectionByName(".text").?;
@@ -675,7 +683,7 @@ test "validateImageBase: canonical user, ≥4ГБ, выравнивание" {
 
 test "loadImage: полный маппинг curl.exe — секции, флаги, entry" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     const fp = try fakeSetup(64 << 20);
@@ -727,7 +735,7 @@ test "loadImage: полный маппинг curl.exe — секции, флаг
 
 test "loadImage: BSS-хвост (VirtualSize > RawData) нулевой" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     // ищем секцию с BSS-хвостом (mingw: .bss или .data с VSize>Raw)
@@ -752,7 +760,7 @@ test "loadImage: BSS-хвост (VirtualSize > RawData) нулевой" {
 
 test "loadImage: BadImageBase отклоняется" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     const fp = try fakeSetup(64 << 20);
@@ -794,7 +802,7 @@ test "initTeb/initPeb/initParams: поля Win64-структур" {
 
 test "buildUserContext: стек, TEB-страницы, cmdline, фейковый ret" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     const fp = try fakeSetup(64 << 20);
@@ -866,7 +874,7 @@ fn countDir64InFile(image: *const pe.Pe) u64 {
 
 test "cdd8-reloc: 7za.exe x64 — 2258 DIR64 применены, значения = файл + delta" {
     const data = try loadFixture("testdata/7za.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     // 7za.exe: ImageBase=0x400000 (ниже identity 4ГБ!) — грузим высоко.
@@ -916,7 +924,7 @@ test "cdd8-reloc: 7za.exe x64 — 2258 DIR64 применены, значени�
 
 test "cdd8-reloc: curl.exe — таблица DYNAMIC_BASE применяется при сдвиге базиса" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     // curl.exe грузится по предпочтённому 0x140000000 обычно; сдвинем базис —
@@ -959,7 +967,7 @@ test "cdd8-reloc: синтетика — ABSOLUTE-паддинг пропуск�
     std.mem.writeInt(u16, buf[0x16..][0..2], (10 << 12) | 0xF00, .little);
 
     const data = try loadFixture("testdata/7za.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
     const fp = try fakeSetup(64 << 20);
     defer fakeTeardown(fp);
@@ -1004,7 +1012,7 @@ test "rollback: mapRegion при сбое маппинга — unmap + free, PMM
 
 test "rollback: loadImage при сбое маппинга посреди образа — полный откат" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
     const fp = try fakeSetup(64 << 20);
     defer fakeTeardown(fp);
@@ -1028,12 +1036,13 @@ test "rollback: битый PE (SectionOverflow) — блок PMM освобож�
     // Собираем битый образ в памяти: валидные заголовки + секция ВНЕ
     // SizeOfImage → loadImage обязан откатить выделенный блок.
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
 
     // Мутируем копию секции .text: virtual_address за пределы образа.
     // pe.Pe парсит поверх того же буфера — берём мутабельную копию данных.
-    var bad = data;
+    const bad = try testing.allocator.dupe(u8, data);
+    defer testing.allocator.free(bad);
     const text = image.sectionByName(".text").?;
     const sec_hdr_off = @intFromPtr(text) - @intFromPtr(image.data.ptr);
     std.mem.writeInt(u32, bad[sec_hdr_off + 12..][0..4], 0x7F000000, .little); // VA за SOI
@@ -1055,7 +1064,7 @@ test "rollback: битый PE (SectionOverflow) — блок PMM освобож�
 
 test "rollback: успешная загрузка НЕ трогает free-путь (нулевые счётчики)" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try pe.Pe.parse(data);
     const fp = try fakeSetup(64 << 20);
     defer fakeTeardown(fp);

@@ -1067,7 +1067,7 @@ pub fn activeDispatcher() ?*Dispatcher {
     return dispatcher;
 }
 
-fn stubCommon(entry_id: usize) callconv(.C) void {
+fn stubCommon(entry_id: usize) callconv(.c) void {
     const d = dispatcher orelse {
         asm volatile ("int3");
         return;
@@ -1093,8 +1093,16 @@ pub fn fmtEntryName(entry: *const StubEntry, buf: []u8) []const u8 {
 
 const testing = std.testing;
 
-fn loadFixture(comptime name: []const u8) ![]u8 {
-    return std.fs.cwd().readFileAlloc(testing.allocator, name, 64 << 20);
+fn loadFixture(comptime name: []const u8) ![]const u8 {
+    if (comptime std.mem.eql(u8, name, "testdata/curl.exe")) {
+        return @embedFile("testdata/curl.exe");
+    } else if (comptime std.mem.eql(u8, name, "testdata/7za.exe")) {
+        return @embedFile("testdata/7za.exe");
+    } else if (comptime std.mem.eql(u8, name, "testdata/7zr.exe")) {
+        return @embedFile("testdata/7zr.exe");
+    } else {
+        return error.FileNotFound;
+    }
 }
 
 var test_log_buf: [4096]u8 = undefined;
@@ -1115,7 +1123,7 @@ fn mmapImage(image: *const Pe, data: []const u8) ![]align(4096) u8 {
     const img_mem = try std.posix.mmap(
         null,
         image.sizeOfImage() + 0x1000,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -1134,7 +1142,7 @@ fn mmapImage(image: *const Pe, data: []const u8) ![]align(4096) u8 {
 
 test "record-стабы: полный CDD-цикл на curl.exe" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
 
     const image = try Pe.parse(data);
     const counts = image.countImports();
@@ -1146,7 +1154,7 @@ test "record-стабы: полный CDD-цикл на curl.exe" {
     const code_mem = try std.posix.mmap(
         null,
         code_len,
-        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .READ = true, .WRITE = true, .EXEC = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -1191,7 +1199,7 @@ test "record-стабы: полный CDD-цикл на curl.exe" {
     try testing.expect(create_file_a_addr != null);
     try testing.expect(disp.findByAddress(create_file_a_addr.?) != null);
 
-    const CreateFileA: *const fn () callconv(.C) usize = @ptrFromInt(create_file_a_addr.?);
+    const CreateFileA: *const fn () callconv(.c) usize = @ptrFromInt(create_file_a_addr.?);
     _ = CreateFileA();
 
     try testing.expectEqual(@as(usize, 1), disp.call_count);
@@ -1217,7 +1225,7 @@ test "record-стабы: полный CDD-цикл на curl.exe" {
         }
     }
     try testing.expect(wsa_addr != null);
-    const WSAStartup: *const fn () callconv(.C) usize = @ptrFromInt(wsa_addr.?);
+    const WSAStartup: *const fn () callconv(.c) usize = @ptrFromInt(wsa_addr.?);
     _ = WSAStartup();
     try testing.expectEqual(@as(usize, 2), disp.call_count);
     try testing.expect(testLogContains("WS2_32.dll!WSAStartup"));
@@ -1225,7 +1233,7 @@ test "record-стабы: полный CDD-цикл на curl.exe" {
 
 test "trap-стаб: байты xor rax,rax / int3 / ret (kernel .int3-режим)" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
     const counts = image.countImports();
     const n = @min(counts.functions, 8);
@@ -1259,7 +1267,7 @@ test "trap-стаб: байты xor rax,rax / int3 / ret (kernel .int3-режи�
 
 test "impl-стаб: syscall-трамплин Win64→SysV и findByRip" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
 
     const entries = try testing.allocator.alloc(StubEntry, 274);
@@ -1353,7 +1361,7 @@ fn win64Call3(fn_addr: u64, a1: u64, a2: u64, a3: u64) u64 {
           [a1] "{rcx}" (a1),
           [a2] "{rdx}" (a2),
           [a3] "{r8}" (a3),
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "rax", "rsi", "rdi", "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -1362,7 +1370,7 @@ fn win64Call1(fn_addr: u64, a1: u64) u64 {
         : [ret] "={rax}" (-> u64),
         : [f] "{r11}" (fn_addr),
           [a1] "{rcx}" (a1),
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "rax", "rsi", "rdi", "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -1387,7 +1395,7 @@ fn win64Call5(fn_addr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) u64 {
           [a3] "{r8}" (a3),
           [a4] "{r9}" (a4),
           [a5] "r" (a5),
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "rax", "rsi", "rdi", "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -1395,7 +1403,7 @@ test "native-стабы: memset/memcpy/memmove/strlen на реальном curl
     if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
 
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
     const counts = image.countImports();
 
@@ -1406,7 +1414,7 @@ test "native-стабы: memset/memcpy/memmove/strlen на реальном curl
     const code_mem = try std.posix.mmap(
         null,
         code_len + 4096,
-        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .READ = true, .WRITE = true, .EXEC = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -1559,7 +1567,7 @@ test "native-bsearch: бинарный поиск с КОМПАРАТОРОМ п
     // «не найдено» → «curl: option http://…: is unknown». Native-стаб
     // вызывает КОД ПРИЛОЖЕНИЯ (компаратор) с привилегиями Ring 3.
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
     const counts = image.countImports();
     // запас: мост 3 + bsearch 3 + компаратор 1 + 1
@@ -1571,7 +1579,7 @@ test "native-bsearch: бинарный поиск с КОМПАРАТОРОМ п
     const code_buf = try std.posix.mmap(
         null,
         code_len,
-        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .READ = true, .WRITE = true, .EXEC = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -1696,7 +1704,7 @@ test "native-qsort: insertion-sort с КОМПАРАТОРОМ приложен�
     // в v0.12). Native 175Б (scripts/qsort-native.s) вызывает компаратор
     // приложения из Ring 3 по Win64-контракту.
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
     const counts = image.countImports();
     // запас: мост 3 + bsearch 3 + qsort 4 + компаратор 1 + 1
@@ -1706,7 +1714,7 @@ test "native-qsort: insertion-sort с КОМПАРАТОРОМ приложен�
     const code_buf = try std.posix.mmap(
         null,
         code_len,
-        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .READ = true, .WRITE = true, .EXEC = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -1758,7 +1766,7 @@ test "native-qsort: insertion-sort с КОМПАРАТОРОМ приложен�
 
 test "findByNameAnyDll: case-insensitive, все DLL" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
     const counts = image.countImports();
     const entries = try testing.allocator.alloc(StubEntry, counts.functions);
@@ -1780,7 +1788,7 @@ test "findByNameAnyDll: case-insensitive, все DLL" {
 
 test "addExtraStub: записи вне PE-импортов (SSPI-таблица) — impl/trap" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
     const counts = image.countImports();
     const total = counts.functions + 8;
@@ -1832,7 +1840,7 @@ test "callback-мост: launcher/trampoline/mailbox — байты + РЕАЛЬ
     const code_mem = try std.posix.mmap(
         null,
         code_len,
-        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .READ = true, .WRITE = true, .EXEC = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -1900,7 +1908,7 @@ test "callback-мост: launcher/trampoline/mailbox — байты + РЕАЛЬ
     // ── ИСПОЛНЕНИЕ моста: вызываем launcher как обычную функцию ──
     // (launcher игнорирует входные регистры — всё берёт из mailbox; для
     // кернеля вход через sysretq, для теста — call; RSP-семантика общая)
-    const Launcher = *const fn () callconv(.C) void;
+    const Launcher = *const fn () callconv(.c) void;
     const launcher: Launcher = @ptrFromInt(br.launcher_va);
     launcher();
 
@@ -1916,7 +1924,7 @@ test "callback-мост: launcher/trampoline/mailbox — байты + РЕАЛЬ
     const code2_mem = try std.posix.mmap(
         null,
         code_len,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -1945,21 +1953,21 @@ test "callback-мост: launcher/trampoline/mailbox — байты + РЕАЛЬ
 // ═══════════════════════════════════════════════════════════════════════════
 
 var t_initterm_calls: u64 = 0;
-fn tInitA() callconv(.C) void {
+fn tInitA() callconv(.c) void {
     t_initterm_calls = t_initterm_calls * 10 + 1;
 }
-fn tInitB() callconv(.C) void {
+fn tInitB() callconv(.c) void {
     t_initterm_calls = t_initterm_calls * 10 + 2;
 }
-fn tInitC() callconv(.C) i32 {
+fn tInitC() callconv(.c) i32 {
     t_initterm_calls = t_initterm_calls * 10 + 3;
     return 0; // успех
 }
-fn tInitFail() callconv(.C) i32 {
+fn tInitFail() callconv(.c) i32 {
     t_initterm_calls = t_initterm_calls * 10 + 4;
     return 42; // ПРОВАЛ: _initterm_e обязан вернуть 42 немедленно
 }
-fn tInitAfterFail() callconv(.C) i32 {
+fn tInitAfterFail() callconv(.c) i32 {
     t_initterm_calls = t_initterm_calls * 10 + 5;
     return 0;
 }
@@ -1969,7 +1977,7 @@ test "native-initterm: цикл C++-инициализаторов msvcrt (7za-�
     // 7za.exe импортирует msvcrt!_initterm (MSVC /MD CRT): native-стаб
     // вызывает таблицу [start, end) инициализаторов, NULL пропускается.
     const data = try loadFixture("testdata/7za.exe");
-    defer testing.allocator.free(data);
+
     const image = try Pe.parse(data);
     const counts = image.countImports();
 
@@ -1979,7 +1987,7 @@ test "native-initterm: цикл C++-инициализаторов msvcrt (7za-�
     const code_buf = try std.posix.mmap(
         null,
         code_len,
-        std.posix.PROT.READ | std.posix.PROT.WRITE | std.posix.PROT.EXEC,
+        .{ .READ = true, .WRITE = true, .EXEC = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,

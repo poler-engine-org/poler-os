@@ -139,6 +139,7 @@ pub fn devMajorOf(kind: FdKind) u64 {
 pub const DT_CHR: u8 = 2;
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
 
 /// O_CLOEXEC/O_NONBLOCK (pipe2/socketpair/eventfd2/timerfd/signalfd4).
 pub const O_CLOEXEC: u64 = 0o2000000;
@@ -230,6 +231,8 @@ pub const USER_VA_CEILING: u64 = 0x0000_7FFF_FFFF_FFFF;
 
 /// AT_FDCWD (-100): openat относительно cwd процесса.
 pub const AT_FDCWD: i64 = -100;
+pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const AT_EMPTY_PATH: u64 = 0x1000;
 
 // ─── Utsname (asm/utsname.h: 6 полей × 65 байт) ────────────────────────────
 
@@ -1230,14 +1233,21 @@ pub fn sysAccess(ops: LinuxOps, path_va: u64, mode: u64) u64 {
     return err(EFAULT);
 }
 
-/// int newfstatat(dirfd, path, statbuf, flags): stat по ПУТИ (ld.so:
-/// размер библиотеки для mmap-планировки). struct stat x86_64 = 144Б.
-pub fn sysNewfstatat(ops: LinuxOps, dirfd_i: i64, path_va: u64, buf_va: u64, flags: u64) u64 {
-    _ = dirfd_i; // AT_FDCWD/абсолютные пути — cwd-слоя нет (фундамент)
-    _ = flags; // AT_EMPTY_PATH-модель вне фундамента
+/// int newfstatat(dirfd, path, statbuf, flags): stat по ПУТИ или по fd (AT_EMPTY_PATH).
+pub fn sysNewfstatat(ops: LinuxOps, fds: *FdTable, dirfd_i: i64, path_va: u64, buf_va: u64, flags: u64) u64 {
     if (!ops.validate(buf_va, STAT_SIZE, true)) return err(EFAULT);
+    if ((flags & AT_EMPTY_PATH != 0) or path_va == 0) {
+        if (dirfd_i != AT_FDCWD and dirfd_i >= 0) {
+            return sysFstat(ops, fds, dirfd_i, buf_va);
+        }
+    }
     if (ops.validate(path_va, 1, false)) {
         if (ops.copy_in_str(path_va, 4096)) |path| {
+            if (path.len == 0 and (flags & AT_EMPTY_PATH != 0)) {
+                if (dirfd_i != AT_FDCWD and dirfd_i >= 0) {
+                    return sysFstat(ops, fds, dirfd_i, buf_va);
+                }
+            }
             const r = ops.stat_by_path(path, buf_va);
             if (r < 0) return @bitCast(r);
             return 0;
@@ -2878,39 +2888,57 @@ pub fn sysFallocate(ops: LinuxOps, fds: *FdTable, fd_i: i64, mode: u64, off: u64
 
 pub const STATX_SIZE: usize = 256;
 
-/// int statx(dirfd, path, flags, mask, struct statx *buf) — libudev-волна
-/// (udev_monitor_new_from_netlink: контроль /run/udev/*). 144Б struct stat
-/// (старый путь ops.stat_by_path) транслируется в 256Б statx: буфер statx
-/// (256Б) ≥ old-stat (144Б) → пишем old-stat прямо в него, читаем назад,
-/// конвертируем и перезаписываем (транзиент невидим — один syscall).
-pub fn sysStatx(ops: LinuxOps, dirfd_i: i64, path_va: u64, flags: u64, mask: u64, buf_va: u64) u64 {
-    _ = dirfd_i; // AT_FDCWD/абсолютные пути — cwd-слоя нет
-    _ = flags; // AT_SYMLINK_NOFOLLOW и пр. — семантика вне фундамента
+/// int statx(dirfd, path, flags, mask, struct statx *buf) — libudev-волна.
+pub fn sysStatx(ops: LinuxOps, fds: *FdTable, dirfd_i: i64, path_va: u64, flags: u64, mask: u64, buf_va: u64) u64 {
     _ = mask; // маска запрошенных полей — отдаём BASIC_STATS всегда
     if (!ops.validate(buf_va, STATX_SIZE, true)) return err(EFAULT);
-    if (ops.validate(path_va, 1, false)) {
-        if (ops.copy_in_str(path_va, 4096)) |path| {
-            const r = ops.stat_by_path(path, buf_va);
-            if (r < 0) return @bitCast(r);
-            var old: [144]u8 = undefined;
+    var old: [144]u8 = undefined;
+
+    var have_stat = false;
+    if ((flags & AT_EMPTY_PATH != 0) or path_va == 0) {
+        if (dirfd_i != AT_FDCWD and dirfd_i >= 0) {
+            const fstat_res = sysFstat(ops, fds, dirfd_i, buf_va);
+            if (fstat_res != 0) return fstat_res;
             if (!ops.copy_in(&old, buf_va)) return err(EFAULT);
-            var sx: [STATX_SIZE]u8 = [_]u8{0} ** STATX_SIZE;
-            const mode = std.mem.readInt(u32, old[24..28], .little);
-            const ino = std.mem.readInt(u64, old[8..16], .little);
-            const nlink = std.mem.readInt(u64, old[16..24], .little);
-            const size = std.mem.readInt(u64, old[48..56], .little);
-            std.mem.writeInt(u32, sx[0..4], 0x7FF, .little); // stx_mask
-            std.mem.writeInt(u32, sx[4..8], 4096, .little); // stx_blksize
-            std.mem.writeInt(u32, sx[16..20], @truncate(nlink), .little); // stx_nlink
-            std.mem.writeInt(u16, sx[28..30], @truncate(mode), .little); // stx_mode
-            std.mem.writeInt(u64, sx[32..40], ino, .little); // stx_ino
-            std.mem.writeInt(u64, sx[40..48], size, .little); // stx_size
-            std.mem.writeInt(u64, sx[48..56], (size + 511) / 512, .little); // stx_blocks
-            if (!ops.copy_out(buf_va, &sx)) return err(EFAULT);
-            return 0;
+            have_stat = true;
         }
     }
-    return err(EFAULT);
+
+    if (!have_stat and ops.validate(path_va, 1, false)) {
+        if (ops.copy_in_str(path_va, 4096)) |path| {
+            if (path.len == 0 and (flags & AT_EMPTY_PATH != 0)) {
+                if (dirfd_i != AT_FDCWD and dirfd_i >= 0) {
+                    const fstat_res = sysFstat(ops, fds, dirfd_i, buf_va);
+                    if (fstat_res != 0) return fstat_res;
+                    if (!ops.copy_in(&old, buf_va)) return err(EFAULT);
+                    have_stat = true;
+                }
+            }
+            if (!have_stat) {
+                const r = ops.stat_by_path(path, buf_va);
+                if (r < 0) return @bitCast(r);
+                if (!ops.copy_in(&old, buf_va)) return err(EFAULT);
+                have_stat = true;
+            }
+        }
+    }
+
+    if (!have_stat) return err(EFAULT);
+
+    var sx: [STATX_SIZE]u8 = [_]u8{0} ** STATX_SIZE;
+    const mode = std.mem.readInt(u32, old[24..28], .little);
+    const ino = std.mem.readInt(u64, old[8..16], .little);
+    const nlink = std.mem.readInt(u64, old[16..24], .little);
+    const size = std.mem.readInt(u64, old[48..56], .little);
+    std.mem.writeInt(u32, sx[0..4], 0x7FF, .little); // stx_mask
+    std.mem.writeInt(u32, sx[4..8], 4096, .little); // stx_blksize
+    std.mem.writeInt(u32, sx[16..20], @truncate(nlink), .little); // stx_nlink
+    std.mem.writeInt(u16, sx[28..30], @truncate(mode), .little); // stx_mode
+    std.mem.writeInt(u64, sx[32..40], ino, .little); // stx_ino
+    std.mem.writeInt(u64, sx[40..48], size, .little); // stx_size
+    std.mem.writeInt(u64, sx[48..56], (size + 511) / 512, .little); // stx_blocks
+    if (!ops.copy_out(buf_va, &sx)) return err(EFAULT);
+    return 0;
 }
 
 /// int getsockname(fd, sockaddr *addr, socklen_t *addrlen) — udev-монитор
@@ -2962,7 +2990,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_pread64 => return sysPread64(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_writev => return sysWritev(ops, fds, @bitCast(args.a1), args.a2, args.a3),
         SYS_access => return sysAccess(ops, args.a1, args.a2),
-        SYS_newfstatat => return sysNewfstatat(ops, @bitCast(args.a1), args.a2, args.a3, args.a4),
+        SYS_newfstatat => return sysNewfstatat(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_munmap => return sysMunmap(ops, args.a1, args.a2),
         SYS_ioctl => return sysIoctl(ops, fds, @bitCast(args.a1), @truncate(args.a2), args.a3),
         SYS_fcntl => return sysFcntl(ops, fds, @bitCast(args.a1), args.a2, args.a3),
@@ -3006,7 +3034,7 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_setsockopt => return sysSetsockopt(ops, fds, @bitCast(args.a1), args.a2, args.a3),
         SYS_getsockopt => return sysGetsockopt(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4, args.a5),
         SYS_getsockname => return sysGetsockname(ops, fds, @bitCast(args.a1), args.a2, args.a3),
-        SYS_statx => return sysStatx(ops, @bitCast(args.a1), args.a2, args.a3, args.a4, args.a5),
+        SYS_statx => return sysStatx(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4, args.a5),
         SYS_eventfd2 => return sysEventfd2(ops, fds, args.a1, args.a2),
         SYS_signalfd4 => return sysSignalfd4(ops, fds, @bitCast(args.a1), args.a2, args.a3, args.a4),
         SYS_timerfd_create => return sysTimerfdCreate(ops, fds, args.a1, args.a2),
@@ -4899,7 +4927,7 @@ test "linux: newfstatat — stat-раскладка 144Б: S_IFREG/st_size/st_bl
     const buf_va = FakeEnv.USER_BASE;
 
     const p = putStr(e, 0, "/lib/x86_64-linux-gnu/libc.so.6");
-    try testing.expectEqual(@as(u64, 0), sysNewfstatat(ops, AT_FDCWD, p, buf_va, 0));
+    try testing.expectEqual(@as(u64, 0), sysNewfstatat(ops, &fds, AT_FDCWD, p, buf_va, 0));
     // раскладка struct stat x86_64: st_dev@0, st_ino@8, st_nlink@16,
     // st_mode@24 (S_IFREG|0444=0x8124), st_size@48 (fake 8192), st_blksize@56
     const q = e.vaPtr(buf_va).?;
@@ -4913,10 +4941,10 @@ test "linux: newfstatat — stat-раскладка 144Б: S_IFREG/st_size/st_bl
 
     // несуществующий путь → ENOENT (fake: ld.so.cache)
     const p404 = putStr(e, 0x80, "/etc/ld.so.cache");
-    try testing.expectEqual(err(ENOENT), sysNewfstatat(ops, AT_FDCWD, p404, buf_va, 0));
+    try testing.expectEqual(err(ENOENT), sysNewfstatat(ops, &fds, AT_FDCWD, p404, buf_va, 0));
     // битый statbuf → EFAULT; битый путь → EFAULT
-    try testing.expectEqual(err(EFAULT), sysNewfstatat(ops, AT_FDCWD, p, 0x10_0000, 0));
-    try testing.expectEqual(err(EFAULT), sysNewfstatat(ops, AT_FDCWD, 0x10_0000, buf_va, 0));
+    try testing.expectEqual(err(EFAULT), sysNewfstatat(ops, &fds, AT_FDCWD, p, 0x10_0000, 0));
+    try testing.expectEqual(err(EFAULT), sysNewfstatat(ops, &fds, AT_FDCWD, 0x10_0000, buf_va, 0));
     // dispatch-маршрут + якорь номера (262)
     try testing.expectEqual(@as(u64, 262), SYS_newfstatat);
     try testing.expectEqual(err(ENOENT), dispatch(ops, &fds, SYS_newfstatat, .{

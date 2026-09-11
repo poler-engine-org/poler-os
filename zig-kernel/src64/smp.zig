@@ -337,7 +337,7 @@ fn microDelay(us: u32) void {
 
 /// This function is called by each AP after the trampoline switches to
 /// 64-bit long mode. It runs on the AP's own stack.
-pub export fn ap_entry_zig() callconv(.C) void {
+pub export fn ap_entry_zig() callconv(.c) void {
     // Read our CPU ID from the trampoline data
     const data: *volatile ApTrampolineData = @ptrFromInt(AP_TRAMPOLINE_ADDR + AP_DATA_OFFSET);
     const cpu_id = data.cpu_id;

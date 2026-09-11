@@ -1628,7 +1628,7 @@ fn fb_puts_hex64(value: u64) void {
 
 // ─── Kernel Entry ──────────────────────────────────────────────────────────
 
-export fn kernel_main(magic_arg: u32, info_ptr: u32) callconv(.C) noreturn {
+export fn kernel_main(magic_arg: u32, info_ptr: u32) callconv(.c) noreturn {
     serial_init();
     // Use raw u32 for magic (avoid alignment issues with multiboot info)
     const magic = magic_arg;

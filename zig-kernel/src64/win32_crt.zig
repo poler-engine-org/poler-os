@@ -8467,7 +8467,7 @@ test "thread: CreateThread — стек vheap, exit-трамплин, хэндл
     tReset();
     tCtx("");
     // vheap-регион 256КБ под стек треда (реальная память — mmap)
-    const vh = try std.posix.mmap(null, 0x40000, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    const vh = try std.posix.mmap(null, 0x40000, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     defer std.posix.munmap(vh);
     if (ctx) |*c| {
         c.vheap_base = @intFromPtr(vh.ptr);
@@ -8475,7 +8475,7 @@ test "thread: CreateThread — стек vheap, exit-трамплин, хэндл
         c.vheap_cursor = @intFromPtr(vh.ptr);
     }
     // код-регион для динамического ExitThread-стаба
-    const cb = try std.posix.mmap(null, 4096, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    const cb = try std.posix.mmap(null, 4096, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     defer std.posix.munmap(cb);
 
     var reg = FakeRegistry{ .entries = undefined, .disp = undefined };

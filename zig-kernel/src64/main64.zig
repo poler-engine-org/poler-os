@@ -166,6 +166,7 @@ fn cpioCanon(name: []const u8) []const u8 {
     while (n.len >= 2 and n[0] == '.' and n[1] == '/') n = n[2..];
     if (n.len > 0 and n[0] == '/') n = n[1..];
     while (n.len >= 2 and n[0] == '.' and n[1] == '/') n = n[2..];
+    while (n.len > 0 and n[n.len - 1] == '/') n = n[0 .. n.len - 1];
     return n;
 }
 
@@ -596,7 +597,7 @@ fn printMemoryInfo(mbi: u64) void {
         const tsc: u64 = asm volatile ("rdtsc"
             : [lo] "={eax}" (-> u32),
             : // rdtsc: EDX:EAX — старшую часть опускаем (джиттера EAX хватает)
-            : "edx"
+            : .{ .edx = true }
         );
         const dice = @as(u64, tsc) & 0xF;
         var k: u64 = 0;
@@ -863,19 +864,17 @@ fn pufBootInit() void {
 // Вызывается из boot64.S после перехода в 64-bit mode
 // ============================================================================
 
-export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(.C) void {
+export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(.c) void {
     const have_mb2 = multiboot_magic == 0x36D76289;
 
     // 0a. v0.18.1 (CRITICAL, CDD №9 residual): занулить первую физическую
     // страницу (реально-режимный BIOS IVT + BDA). Zig-механизм error-return
     // (builtin.returnError) при отсутствии trace-контекста читает поля по
     // адресу NULL = физ.0: мусор IVT (классика F000:FF53) превращался в
-    // «index/буфер трассы» → неканоническая запись → #GP при ЛЮБОМ
-    // error-return в kernel-цепочке (эмпирика pe-run8: второй peload,
-    // mapPageInPML4.AlreadyMapped — пойман vmmMapUser-ретраем, но сам
-    // возврат ошибки убивал ядро). С нулевой страницей: index=0 < cap=0
-    // → запись в буфер пропускается, ошибка штатно возвращается catch'у.
-    // IVT/BDA после ухода из реального режима не читает никто (клавиатура
+    // 0.0 ПЕРВЫЙ АКТ — ОБНУЛЕНИЕ СТРАНИЦЫ 0 (0x0000..0x0FFF).
+    // Полноэкранный лог показал: BIOS/QEMU оставляют мусор в нулевой странице
+    // (векторы прерываний Real Mode 0x0000..0x03FF, BDA 0x0400..0x04FF, EBDA/мусор
+    // до 0x1000). Мы в 64-битном Long Mode (IDT живёт по адресу idt64, клавиатура
     // — порты 0x60/0x64, AP-трамплин — 0x8000, VGA-буфер — 0xB8000).
     // (Zig запрещает указатель на адрес 0 — чистим через rep stosb.)
     asm volatile (
@@ -883,7 +882,7 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         \\xor %%rdi, %%rdi
         \\mov $4096, %%ecx
         \\rep stosb
-        ::: "rax", "rcx", "rdi", "memory"
+        ::: .{ .memory = true }
     );
 
     // 0. Detect and Initialize Framebuffer if available from Multiboot2
@@ -2308,7 +2307,7 @@ fn linuxDoExit(code: u64) void {
     // sti + hlt — тик вытесняет Killed-задачу, остальные живут.
     hal.sti();
     while (true) {
-        asm volatile ("hlt" ::: "memory");
+        asm volatile ("hlt" ::: .{ .memory = true });
     }
 }
 
@@ -2380,7 +2379,7 @@ fn linuxYieldTick() void {
     scheduler.in_win32_syscall = 0;
     hal.sti();
     while (hal.tick_count < deadline) {
-        asm volatile ("hlt" ::: "memory");
+        asm volatile ("hlt" ::: .{ .memory = true });
     }
     // эпилог транзакции: вернуть свой user_rsp + резюм-кадр
     hal.cli();
@@ -2997,7 +2996,7 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
     scheduler.exitCurrentTask();
     hal.sti();
     while (true) {
-        asm volatile ("hlt" ::: "memory");
+        asm volatile ("hlt" ::: .{ .memory = true });
     }
 }
 
@@ -3102,7 +3101,7 @@ fn linuxFutexPark(uaddr: u64, timeout_ms: u64, infinite: bool) i64 {
             }
             break; // таймаут
         }
-        asm volatile ("hlt" ::: "memory");
+        asm volatile ("hlt" ::: .{ .memory = true });
     }
     const was_woken = futex_parks[owner].woken;
     futex_parks[owner].active = false;
@@ -3827,7 +3826,7 @@ fn tlbFullFlush() void {
     asm volatile (
         \\movq %%cr3, %%rax
         \\movq %%rax, %%cr3
-        ::: "rax", "memory");
+        ::: .{ .memory = true });
 }
 
 fn linuxRangeDrop(va: u64, pages: u64) void {
@@ -4057,7 +4056,7 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
     // трансляцией, а не с закэшированной.
     if (vmm.userLeafFlags(pml4, page)) |leaf| {
         if (leaf & vmm.PTE_PRESENT != 0) {
-            asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
+            asm volatile ("invlpg (%[va])" :: [va] "r" (page) : .{ .memory = true });
             return true;
         }
         // CDD №15 p5-ФИКС ВАЙПА: СКРЫТЫЙ лист (PROT_NONE-мутация: P=0,
@@ -4104,7 +4103,7 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         hal.Serial.puts("\n");
     }
     // активный CR3 задачи — сброс TLB-строки
-    asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
+    asm volatile ("invlpg (%[va])" :: [va] "r" (page) : .{ .memory = true });
     return true;
 }
 
@@ -4320,7 +4319,7 @@ fn initrdDirFill(path: []const u8, d: *DirStream) void {
             dirPush(d, rest[0..s], linux_syscalls.DT_DIR);
         } else {
             const dt: u8 = if (file.mode & 0o170000 == 0o120000)
-                linux_syscalls.DT_REG // симлинк → DT_LNK=10 (реализуем когда понадобится)
+                linux_syscalls.DT_LNK
             else if (file.mode & 0o170000 == 0o040000)
                 linux_syscalls.DT_DIR
             else
@@ -4448,7 +4447,7 @@ fn linuxTaskPark(ms: u64) void {
     hal.sti();
     // парк: hlt до прерывания (тик 100Гц)
     while (hal.tick_count < deadline) {
-        asm volatile ("hlt" ::: "memory");
+        asm volatile ("hlt" ::: .{ .memory = true });
     }
     // эпилог транзакции: вернуть user_rsp, резюм-указатель — .bss-слот
     hal.cli();

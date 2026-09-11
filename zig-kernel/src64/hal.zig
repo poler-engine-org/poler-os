@@ -5,7 +5,7 @@
 
 // Timer tick callback — registered by scheduler at init
 // Breaks circular dependency: hal.zig ↔ scheduler.zig
-pub var timerTickCallback: ?*const fn (u64) callconv(.C) u64 = null;
+pub var timerTickCallback: ?*const fn (u64) callconv(.c) u64 = null;
 
 // Multi-pool hardware entropy callbacks (Spec §1-2)
 pub var irq_entropy_sink: ?*const fn (u64) void = null; // IRQ pool (APIC timer / hardware interrupt intervals)
@@ -16,7 +16,7 @@ pub var bio_entropy_sink: ?*const fn (u64) void = null; // Bio pool (keystroke i
 pub var net_irq_sink: ?*const fn () void = null;
 /// v0.17.0 (CDD №8): virtio-blk IRQ (вектор 49) — пробуждение ждущих запросов
 /// (поллинг в waitForCompletion остаётся как fallback — IRQ ускоряет обмен).
-pub var blk_irq_sink: ?*const fn () callconv(.C) void = null;
+pub var blk_irq_sink: ?*const fn () callconv(.c) void = null;
 
 // Simple spinlock for protecting shared resources (e.g. serial output)
 pub var serial_lock: u32 = 0;
@@ -236,7 +236,7 @@ pub fn writeCr3(val: u64) void {
     asm volatile ("mov %[val], %%cr3"
         :
         : [val] "r" (val),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -484,7 +484,7 @@ pub const IDT = struct {
 /// the exception handler kills the task and redirects IRETQ here.
 /// This function simply halts the CPU and waits for the next interrupt
 /// (APIC timer tick), which will trigger the scheduler to pick a Ready task.
-pub fn idle_after_fault() callconv(.C) noreturn {
+pub fn idle_after_fault() callconv(.c) noreturn {
     while (true) {
         hlt();
     }
@@ -577,7 +577,7 @@ pub inline fn fpuSave(slot: *[FPU_AREA_SIZE]u8) void {
             \\rep stosq
             :
             : [p] "r" (@as([*]u8, slot))
-            : "rax", "rcx", "rdi", "memory"
+            : .{ .memory = true }
         );
         asm volatile (
             \\mov $7, %eax
@@ -585,7 +585,7 @@ pub inline fn fpuSave(slot: *[FPU_AREA_SIZE]u8) void {
             \\xsave (%[p])
             :
             : [p] "r" (@as([*]u8, slot))
-            : "rax", "rdx", "memory"
+            : .{ .memory = true }
         );
     } else {
         asm volatile (
@@ -607,7 +607,7 @@ pub inline fn fpuSave(slot: *[FPU_AREA_SIZE]u8) void {
             \\movups %%xmm15, 240(%[b])
             :
             : [b] "r" (@as([*]u8, slot))
-            : "memory"
+            : .{ .memory = true }
         );
     }
 }
@@ -622,7 +622,7 @@ pub inline fn fpuRestore(slot: *const [FPU_AREA_SIZE]u8) void {
             \\xrstor (%[p])
             :
             : [p] "r" (@as([*]const u8, slot))
-            : "rax", "rdx", "memory"
+            : .{ .memory = true }
         );
     } else {
         asm volatile (
@@ -644,7 +644,7 @@ pub inline fn fpuRestore(slot: *const [FPU_AREA_SIZE]u8) void {
             \\movups 240(%[b]), %%xmm15
             :
             : [b] "r" (@as([*]const u8, slot))
-            : "memory"
+            : .{ .memory = true }
         );
     }
 }
@@ -665,7 +665,7 @@ fn kstackOwnerByAddr(addr: u64) ?usize {
     return null;
 }
 
-pub export fn isr_common_handler(frame: *InterruptFrame) callconv(.C) *InterruptFrame {
+pub export fn isr_common_handler(frame: *InterruptFrame) callconv(.c) *InterruptFrame {
     if (frame.vector < 32) {
         // CDD №12 p12-ФИКС5: ПЕР-ТАСК .bss-СТРОКА (глубина 2) — НЕ стек-локал!
         // Zig-Debug ОБЯЗАН 0xAA-филлить undefined-локаль (SSE-memset:
@@ -1064,8 +1064,8 @@ pub fn drArmWriteWatch(addr: u64) void {
     );
     // DR7: L0-L3=1, RW=01 (write), LEN=11 (8Б) на каждый слот
     // slot i: RW@(16+4i), LEN@(18+4i) → 0xDDDD000F
-    asm volatile ("movq $0xDDDD000F, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory");
-    asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: "rax", "memory");
+    asm volatile ("movq $0xDDDD000F, %%rax\n\tmovq %%rax, %%dr7" ::: .{ .memory = true });
+    asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: .{ .memory = true });
 }
 
 /// p5-forensics: DR0-вооружён? (перевооружение только после разряжения)
@@ -1249,7 +1249,7 @@ fn handleException(frame: *InterruptFrame) void {
             asm volatile ("invlpg (%[virt])"
                 :
                 : [virt] "r" (drvar & ~@as(u64, 4095)),
-                : "memory"
+                : .{ .memory = true }
             );
             const after_invlpg = nv.*;
             Serial.puts("[DB-WRITE] task=");
@@ -1268,12 +1268,12 @@ fn handleException(frame: *InterruptFrame) void {
             Serial.putDecimal(@as(u64, if ((frame.cs & 0x3) != 0) 1 else 0));
             Serial.puts("\n");
             // сброс DR6 + ПЕРЕВООРУЖЕНИЕ (до 16 событий)
-            asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: "rax", "memory");
+            asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr6" ::: .{ .memory = true });
             if (db_events < 16) {
                 db_events += 1;
-                asm volatile ("movq $0xDDDD000F, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory"); // rearm
+                asm volatile ("movq $0xDDDD000F, %%rax\n\tmovq %%rax, %%dr7" ::: .{ .memory = true }); // rearm
             } else {
-                asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr7" ::: "rax", "memory");
+                asm volatile ("xorq %%rax, %%rax\n\tmovq %%rax, %%dr7" ::: .{ .memory = true });
             }
             return; // trap: инструкция уже завершилась — продолжаем
         }
@@ -1915,9 +1915,9 @@ fn flushObf() void {
 fn irqSave() u64 {
     var flags: u64 = undefined;
     asm volatile ("pushfq; popq %[f]"
-        : [f] "=r" (flags)
-        ::
-        "memory");
+        : [f] "=r" (flags),
+        :
+        : .{ .memory = true });
     cli();
     return flags;
 }
@@ -2569,7 +2569,7 @@ pub fn initSyscalls(handler_addr: u64) void {
 // ═══════════════════════════════════════════════════════════════════════════
 var r15_poison_count: u32 = 0; // p12-форензика: лимит печати поднят (см. ниже)
 
-pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.C) void {
+pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.c) void {
     r15_poison_count += 1;
     if (r15_poison_count <= 60) { // p12-форензика: 4 → 60 (EXIT/ENTRY не глушить)
         // ручной strlen (freestanding, std не импортирован в hal)
@@ -2643,7 +2643,7 @@ pub export fn r15_poison_report(msg: [*:0]const u8, slot: u64) callconv(.C) void
 // СТРОКИ ПЕР-ТАСК: владелец по user_rsp (как syscall_exit_frame);
 // парк-безопасность по конструкции (чужие syscall пишут свои строки);
 // fallback для владельца вне таблиц (shell — без парковок).
-pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
+pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.c) u64 {
     const sched = @import("scheduler.zig");
     const owner = sched.syscallStackOwner(sched.user_rsp);
     var rc: u64 = undefined;
@@ -2659,7 +2659,7 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
     return rc;
 }
 
-pub fn zig_syscall_handler_inner(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.C) u64 {
+pub fn zig_syscall_handler_inner(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64, arg5: u64) callconv(.c) u64 {
 
     // CDD №12 p7: ВЫХОДНОЙ КАДР В .BSS — СНАПШОТ ПЕРВОЙ ОПЕРАЦИЕЙ (каскад
     // asm уже построен на kstack-топе владельца; транзакция IF=0 — никто
@@ -2865,7 +2865,7 @@ pub fn zig_syscall_handler_inner(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sys
 }
 
 // Exit callback — registered by scheduler at init to break circular dependency
-pub var exitCallback: ?*const fn () callconv(.C) void = null;
+pub var exitCallback: ?*const fn () callconv(.c) void = null;
 
 // Win32 syscall dispatch — registered by main64 (hal ↔ win32_api circular-dep breaker).
 // arg-порядок = syscall-конвенция трамплина: (entry_id, w64arg1, w64arg2, w64arg3, w64arg4).
@@ -2879,7 +2879,7 @@ pub var win32CbDoneCallback: ?*const fn (cookie: u64, result: u64) u64 = null;
 /// (ELF, Starnix-модель) шлют номер syscall в RAX: hal решает АБИ ДО
 /// легаси-свич (Linux SYS_write=1 коллидит с легаси-вектором «print»).
 /// Регистрируется из main64 (разрывает цикл hal↔main64/scheduler).
-pub var taskAbiLinuxCallback: ?*const fn () callconv(.C) bool = null;
+pub var taskAbiLinuxCallback: ?*const fn () callconv(.c) bool = null;
 pub var linuxSyscallCallback: ?*const fn (num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 = null;
 
 // int3 CDD callback — registered by main64. Вызывается из handleException

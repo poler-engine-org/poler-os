@@ -521,19 +521,18 @@ pub const Pe = struct {
 
 const testing = std.testing;
 
-fn loadFixture(comptime name: []const u8) ![]u8 {
-    return std.fs.cwd().readFileAlloc(testing.allocator, name, 64 << 20) catch |err| switch (err) {
-        error.FileNotFound => {
-            std.debug.print("FIXTURE MISSING: {s} — запусти из корня zig-kernel/\n", .{name});
-            return error.FileNotFound;
-        },
-        else => return err,
-    };
+fn loadFixture(comptime name: []const u8) ![]const u8 {
+    if (comptime std.mem.eql(u8, name, "testdata/curl.exe")) {
+        return @embedFile("testdata/curl.exe");
+    } else if (comptime std.mem.eql(u8, name, "testdata/7zr.exe")) {
+        return @embedFile("testdata/7zr.exe");
+    } else {
+        return error.FileNotFound;
+    }
 }
 
 test "parse: curl.exe — PE32+/AMD64, 9 секций, консоль" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
 
     const pe = try Pe.parse(data);
     try testing.expectEqual(MACHINE_AMD64, pe.machine());
@@ -550,7 +549,6 @@ test "parse: curl.exe — PE32+/AMD64, 9 секций, консоль" {
 
 test "parse: 7zr.exe (i386) отклоняется как UnsupportedMachine" {
     const data = try loadFixture("testdata/7zr.exe");
-    defer testing.allocator.free(data);
 
     try testing.expectError(ParseError.UnsupportedMachine, Pe.parse(data));
 }
@@ -575,7 +573,6 @@ test "parse: мусор и невыровненный буфер отклоня�
 
 test "sections: имена, флаги, rvaToOffset round-trip" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
     const pe = try Pe.parse(data);
 
     // .text обязан существовать и быть исполняемым
@@ -598,7 +595,6 @@ test "sections: имена, флаги, rvaToOffset round-trip" {
 
 test "imports: curl.exe — 22 DLL, 274 функции, KERNEL32=80" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
     const pe = try Pe.parse(data);
 
     const counts = pe.countImports();
@@ -620,7 +616,6 @@ test "imports: curl.exe — 22 DLL, 274 функции, KERNEL32=80" {
 
 test "imports: итератор выдаёт имена DLL и IAT RVA" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
     const pe = try Pe.parse(data);
 
     var dlls = try pe.importDlls();
@@ -643,7 +638,6 @@ test "imports: итератор выдаёт имена DLL и IAT RVA" {
 
 test "imports: функция с известным именем читается из ILT" {
     const data = try loadFixture("testdata/curl.exe");
-    defer testing.allocator.free(data);
     const pe = try Pe.parse(data);
 
     var dlls = try pe.importDlls();

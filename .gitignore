@@ -1,6 +1,8 @@
 # Сборочные артефакты
 zig-kernel/zig-out/
 zig-kernel/.zig-cache/
+zig-kernel/iso/boot/poler-os64
+zig-kernel/src64/testdata
 build/
 *.iso
 disk.img

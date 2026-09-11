@@ -10,17 +10,22 @@ pub fn build(b: *std.Build) void {
         .abi = .none,
     });
 
-    const kernel32 = b.addExecutable(.{
-        .name = "poler-os32",
+    const kernel32_mod = b.createModule(.{
         .root_source_file = b.path("src/main32.zig"),
         .target = kernel32_target,
         .optimize = optimize,
     });
+    kernel32_mod.addAssemblyFile(b.path("src/boot32.S"));
+    kernel32_mod.addAssemblyFile(b.path("src/isr32.S"));
+
+    const kernel32 = b.addExecutable(.{
+        .name = "poler-os32",
+        .root_module = kernel32_mod,
+        .use_llvm = true,
+    });
 
     kernel32.setLinkerScript(b.path("src/linker32.ld"));
     kernel32.link_gc_sections = false;
-    kernel32.addAssemblyFile(b.path("src/boot32.S"));
-    kernel32.addAssemblyFile(b.path("src/isr32.S"));
     b.installArtifact(kernel32);
 
     // ═══ 64-bit Kernel Build (POLER-OS v0.6.0) ═════════════════════════
@@ -30,17 +35,22 @@ pub fn build(b: *std.Build) void {
         .abi = .none,
     });
 
-    const kernel64 = b.addExecutable(.{
-        .name = "poler-os64",
+    const kernel64_mod = b.createModule(.{
         .root_source_file = b.path("src64/main64.zig"),
         .target = kernel64_target,
         .optimize = optimize,
     });
+    kernel64_mod.addAssemblyFile(b.path("src64/boot64.S"));
+    kernel64_mod.addAssemblyFile(b.path("src64/isr64.S"));
+
+    const kernel64 = b.addExecutable(.{
+        .name = "poler-os64",
+        .root_module = kernel64_mod,
+        .use_llvm = true,
+    });
 
     kernel64.setLinkerScript(b.path("src64/linker64.ld"));
     kernel64.link_gc_sections = false;
-    kernel64.addAssemblyFile(b.path("src64/boot64.S"));
-    kernel64.addAssemblyFile(b.path("src64/isr64.S"));
     b.installArtifact(kernel64);
 
     // ═══ Run 32-bit kernel in QEMU ═══════════════════════════════════════
@@ -155,147 +165,93 @@ pub fn build(b: *std.Build) void {
         .abi = .gnu,
     });
 
+    const addPolerTest = struct {
+        fn make(build_ctx: *std.Build, path: []const u8, t_target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+            const mod = build_ctx.createModule(.{
+                .root_source_file = build_ctx.path(path),
+                .target = t_target,
+                .optimize = .Debug,
+            });
+            return build_ctx.addTest(.{
+                .root_module = mod,
+                .use_llvm = true,
+            });
+        }
+    }.make;
+
     // 32-bit (legacy) POLER core tests
-    const poler_core32_tests = b.addTest(.{
-        .root_source_file = b.path("src/poler_core.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const poler_core32_tests = addPolerTest(b, "src/poler_core.zig", test_target);
 
     // 64-bit POLER core tests (v8.1)
-    const poler_core64_tests = b.addTest(.{
-        .root_source_file = b.path("src64/poler_core.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const poler_core64_tests = addPolerTest(b, "src64/poler_core.zig", test_target);
 
     // 64-bit RSA-OAEP tests (BigInt, SHA-256, MGF1, OAEP, CascadeCipher)
-    const rsa_oaep64_tests = b.addTest(.{
-        .root_source_file = b.path("src64/rsa_oaep.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const rsa_oaep64_tests = addPolerTest(b, "src64/rsa_oaep.zig", test_target);
 
     // 64-bit PUF tests (hardware entropy binding: extractor, enrollment,
     // anti-clone, live pool — см. docs/POLER_OS_POST_QUANTUM_HARDWARE_ENTROPY_SPEC.md)
-    const puf64_tests = b.addTest(.{
-        .root_source_file = b.path("src64/puf.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const puf64_tests = addPolerTest(b, "src64/puf.zig", test_target);
 
     // 64-bit PE/COFF parser tests (Crash-Driven Development, v0.9.0):
     // парсинг реального PE64 (testdata/curl.exe — 274 импорта из 22 DLL)
-    const pe64_tests = b.addTest(.{
-        .root_source_file = b.path("src64/pe.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const pe64_tests = addPolerTest(b, "src64/pe.zig", test_target);
 
     // 64-bit Win32 stub dispatcher tests: полный CDD-цикл — генерация стабов,
     // патч IAT, вызов импорта через слот, фиксация имени функции
-    const win32_stubs_tests = b.addTest(.{
-        .root_source_file = b.path("src64/win32_stubs.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const win32_stubs_tests = addPolerTest(b, "src64/win32_stubs.zig", test_target);
 
     // 64-bit PE loader tests (v0.10.0, CDD №1): посекционный Ring-3 маппинг
     // curl.exe на фейковом физ-аллокаторе (LoaderOps-инъекция) + TEB/PEB
-    const pe_loader_tests = b.addTest(.{
-        .root_source_file = b.path("src64/pe_loader.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const pe_loader_tests = addPolerTest(b, "src64/pe_loader.zig", test_target);
 
     // 64-bit Win32/CRT semantic core tests (v0.11.0, CDD №2): block-heap
     // (malloc/calloc/realloc), GetProcAddress-резолв, QPF/QPC, консольные
     // структуры, ленивые argc/argv/iob — всё через Ops-инъекцию
-    const win32_crt_tests = b.addTest(.{
-        .root_source_file = b.path("src64/win32_crt.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const win32_crt_tests = addPolerTest(b, "src64/win32_crt.zig", test_target);
 
     // 64-bit Enrollment-Gate tests (v0.12.0, CDD №3): CPUID-отпечаток,
     // identity-свёртка (puf.extractIdentity), вердикты anti-clone (спека §4)
-    const enroll_gate_tests = b.addTest(.{
-        .root_source_file = b.path("src64/enroll_gate.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const enroll_gate_tests = addPolerTest(b, "src64/enroll_gate.zig", test_target);
 
     // 64-bit VirtIO-Net tests (v0.14.0, CDD №5): Ethernet/ARP/IPv4/TCP/DNS
     // билдеры + чексуммы RFC 1071 + парсеры — байтовая семантика стека
-    const virtio_net_tests = b.addTest(.{
-        .root_source_file = b.path("src64/virtio_net.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const virtio_net_tests = addPolerTest(b, "src64/virtio_net.zig", test_target);
 
     // 64-bit Linux POSIX syscall-layer tests (v0.18.0, CDD №9): syscall-
     // таблица x86_64, errno-ABI, uname/utsname, валидация враждебных
     // user-VA (EFAULT-инвариант: ноль паник) — LinuxOps-инъекция
-    const linux_syscalls_tests = b.addTest(.{
-        .root_source_file = b.path("src64/linux_syscalls.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const linux_syscalls_tests = addPolerTest(b, "src64/linux_syscalls.zig", test_target);
 
     // 64-bit sched-resume tests (v0.18.1, CDD №9 residual-fix): пер-таск
     // резюм-кадры syscall в .bss — раскладка InterruptFrame из каскада,
     // frameContentValid (перенос из scheduler.zig), иммунитет к каскадам,
     // no-op-гарды (мусорный топ/id вне таблиц) — чистый модуль, нативный
     // запуск (инвариант v0.9.0: тесты ЗАПУСКАЮТСЯ, а не компилируются)
-    const sched_resume_tests = b.addTest(.{
-        .root_source_file = b.path("src64/sched_resume.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const sched_resume_tests = addPolerTest(b, "src64/sched_resume.zig", test_target);
 
     // 64-bit DRM/KMS tests (v0.19.0, CDD №10 p1): UAPI-совместимость ioctl-
     // номеров/раскладок (якоря libdrm), dumb-буферный жизненный цикл,
     // fbdev, апертура mmap, WC/PAT-семантика — DrmOps-инъекция
-    const drm_kms_tests = b.addTest(.{
-        .root_source_file = b.path("src64/drm_kms.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const drm_kms_tests = addPolerTest(b, "src64/drm_kms.zig", test_target);
 
     // 64-bit VirtIO-GPU tests (v0.19.0, CDD №10 p1): PCI-probe (modern/
     // legacy), virtio-1.0 capability-парсинг (гостильные листы), 2D-команды
     // байт-в-байт — PciCfg-инъекция с fake конфиг-пространством
-    const virtio_gpu_tests = b.addTest(.{
-        .root_source_file = b.path("src64/virtio_gpu.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const virtio_gpu_tests = addPolerTest(b, "src64/virtio_gpu.zig", test_target);
 
     // 64-bit Evdev tests (v0.19.0, CDD №10 p2): UAPI input_event 24Б,
     // ioctl-якоря libevdev, FIFO-очередь, read-семантика (EAGAIN/EINVAL),
     // переполнение-дроп, PS/2 Set1→KEY-таблица, мышиные пакеты
-    const evdev_tests = b.addTest(.{
-        .root_source_file = b.path("src64/evdev.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const evdev_tests = addPolerTest(b, "src64/evdev.zig", test_target);
 
     // 64-bit VFS tests (v0.19.0, CDD №10 p4): нормализация путей, tmpfs
     // CRUD + лимиты, overlay-резолв (dev/RO-initrd/RW-tmpfs) — VfsOps-инъекция
-    const vfs_tests = b.addTest(.{
-        .root_source_file = b.path("src64/vfs.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const vfs_tests = addPolerTest(b, "src64/vfs.zig", test_target);
 
     // 64-bit ELF loader tests (v0.20.0, CDD №11 p1): Linux-ABI ELF64 —
     // ET_EXEC/ET_DYN-PIE, PTE-флаги по сегментам, BSS, откат при мусорных
     // заголовках, первичный стек argc/argv/envp/auxv (glibc-раскладка)
-    const elf_loader_tests = b.addTest(.{
-        .root_source_file = b.path("src64/elf_loader.zig"),
-        .target = test_target,
-        .optimize = .Debug,
-    });
+    const elf_loader_tests = addPolerTest(b, "src64/elf_loader.zig", test_target);
 
     // ЗАПУСК тестов (не только компиляция!): паника/сигнал бинарника = красный build
     const run_poler_core32_tests = b.addRunArtifact(poler_core32_tests);

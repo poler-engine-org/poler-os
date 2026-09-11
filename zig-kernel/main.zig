@@ -8,7 +8,7 @@ const idt = @import("arch/x86_64/idt.zig");
 const mm = @import("mm/pmm.zig");
 
 // Kernel entry point — called from boot.zig in 64-bit long mode
-pub export fn kernel_main() callconv(.C) noreturn {
+pub export fn kernel_main() callconv(.c) noreturn {
     // 1. Initialize VGA text buffer (0xB8000)
     vga.init();
     vga.setColor(vga.Color.White, vga.Color.Black);
@@ -36,7 +36,7 @@ pub export fn kernel_main() callconv(.C) noreturn {
     // 5. Hand off to Rust safety core
     vga.print("[BOOT] Loading Rust safety core...\n");
     // rust_core_entry() is defined in Rust and linked via Zig
-    // const rust_entry = @extern(*const fn() callconv(.C) void, .{ .name = "rust_core_entry" });
+    // const rust_entry = @extern(*const fn() callconv(.c) void, .{ .name = "rust_core_entry" });
     // rust_entry();
     
     vga.print("[BOOT] POLER-OS kernel idle\n");
