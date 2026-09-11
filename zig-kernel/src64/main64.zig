@@ -1169,17 +1169,17 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
 
     // 9. Ready!
     vga_setcolor(0x0B);
-    puts("\n╔══════════════════════════════════════════════════════╗\n");
-    puts("║         POLER-OS v0.15.0 — BOOT COMPLETE             ║\n");
-    puts("║  HAL+PUF+Enrollment-Gate+PE Runtime — all systems GO║\n");
-    puts("╚══════════════════════════════════════════════════════╝\n");
+    puts("\n+------------------------------------------------------+\n");
+    puts("|         POLER-OS v0.20.0-rc — BOOT COMPLETE          |\n");
+    puts("|  HAL+PUF+Enrollment-Gate+DRM/KMS — all systems GO    |\n");
+    puts("+------------------------------------------------------+\n");
     vga_setcolor(0x07);
 
-    // v0.18.0 (CDD №9): протокольная бут-печать цикла — свидетельствует в
+    // v0.20.0 (CDD №12): протокольная бут-печать цикла — свидетельствует в
     // serial-логе, что образ собран с волной харденинга + Linux POSIX-слоем.
-    puts("[CDD9] v0.18.0: RX-bounds · validateRange ceiling · PMM rollback · Linux POSIX\n");
+    puts("[CDD12] v0.20.0-rc: VirtIO-GPU DRM · Sysfs Tree · Linux POSIX ABI\n");
 
-    puts("\nNext steps: Memory Manager (PMM/VMM) → Process Service → Intent Layer\n");
+    puts("\nNext steps: Memory Manager (PMM/VMM) -> Wayland/Gamescope -> RootFS\n");
     puts("Timer: APIC periodic, tick count will increment in idle loop\n");
 
     // 8.55. Initialize Syscalls
@@ -1238,7 +1238,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.18.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.20.0-rc Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
