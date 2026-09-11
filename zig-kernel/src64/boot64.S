@@ -288,7 +288,7 @@ _start:
     orq $(1 << 18), %rax          // OSXSAVE
     movq %rax, %cr4
     xor %ecx, %ecx                // XCR0
-    mov $0x207, %eax              // x87(0) | SSE(1) | YMM(2)
+    mov $0x7, %eax                // x87(bit 0) | SSE(bit 1) | AVX/YMM(bit 2) = 7
     xor %edx, %edx
     xsetbv
 1:
