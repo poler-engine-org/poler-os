@@ -386,14 +386,19 @@ fn clear_screen() void {
 fn putHex(val: u64) void {
     hal.Serial.putHex(val);
     const hex = "0123456789ABCDEF";
-    puts_vga_or_fb("0x");
+    var buf: [18]u8 = undefined;
+    buf[0] = '0';
+    buf[1] = 'x';
     var i: usize = 60;
+    var idx: usize = 2;
     while (true) {
         const nibble = (val >> @intCast(i)) & 0xF;
-        puts_vga_or_fb(&.{hex[@intCast(nibble)]});
+        buf[idx] = hex[@intCast(nibble)];
+        idx += 1;
         if (i == 0) break;
         i -= 4;
     }
+    puts_vga_or_fb(buf[0..18]);
 }
 
 fn putDecimal(val: u64) void {
@@ -419,12 +424,12 @@ fn putDecimal(val: u64) void {
 fn print_banner() void {
     vga_setcolor(0x0B); // Cyan
     puts(
-        \\╔══════════════════════════════════════════════════════╗
-        \\║           POLER-OS v0.18.0 (64-bit)                ║
-        \\║          Semantic Runtime Architecture              ║
-        \\║                                                      ║
-        \\║  Zig Kernel · VirtIO-BLK/NET · Linux POSIX (CDD №9) ║
-        \\╚══════════════════════════════════════════════════════╝
+        \\+------------------------------------------------------+
+        \\|           POLER-OS v0.20.0-rc (64-bit)               |
+        \\|          Semantic Runtime Architecture               |
+        \\|                                                      |
+        \\|  Zig Kernel * VirtIO-GPU/DRM * Arch/CachyOS Substrate |
+        \\+------------------------------------------------------+
         \\
     );
     vga_setcolor(0x07);
@@ -2002,12 +2007,14 @@ fn linuxCopyInStr(src_va: u64, max_len: u64) ?[]const u8 {
     return null; // терминатора в границах max_len нет
 }
 
-/// write(fd, buf, count): консоль — Serial ОС (зеркало kWriteConsole
-/// Win32-слоя). Семантический слой уже проверил fd = консоль.
+/// write(fd, buf, count): консоль — экран (Framebuffer/VGA) + Serial ОС.
+/// Семантический слой уже проверил fd = консоль.
 fn linuxDevWrite(va: u64, count: u64) i64 {
     // буфер уже валидирован syscall-слоем; CR3 задачи активен
     const p: [*]const u8 = @ptrFromInt(va);
-    hal.Serial.puts(p[0..@intCast(count)]);
+    const slice = p[0..@intCast(count)];
+    puts_vga_or_fb(slice);
+    hal.Serial.puts(slice);
     return @intCast(count);
 }
 

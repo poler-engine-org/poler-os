@@ -40,17 +40,15 @@ mb2_header_start:
     .long mb2_header_end - mb2_header_start            // header length
     .long -(MB2_MAGIC + MB2_ARCHITECTURE + (mb2_header_end - mb2_header_start))  // checksum
 
-    // Framebuffer Request Tag (type = 5) — DISABLED for v0.7.x
-    // Using VGA text mode (80x25) for reliable terminal output.
-    // Graphical framebuffer will be re-enabled in v0.8.0 with proper rendering.
-    //
-    // .balign 8
-    // .word 5                  // type
-    // .word 0                  // flags (0 = required)
-    // .long 20                 // size
-    // .long 1024               // preferred width
-    // .long 768                // preferred height
-    // .long 32                 // preferred depth
+    // Framebuffer Request Tag (type = 5) — ENABLED for physical screen TTY
+    // Requests GOP/VBE 1024x768x32 linear framebuffer from GRUB/BIOS/UEFI.
+    .balign 8
+    .word 5                  // type = framebuffer request
+    .word 0                  // flags (0 = required)
+    .long 20                 // size
+    .long 1024               // preferred width
+    .long 768                // preferred height
+    .long 32                 // preferred depth
 
     // End tag
     .balign 8

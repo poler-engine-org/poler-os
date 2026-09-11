@@ -696,7 +696,7 @@ pub fn resolveDevKind(path: []const u8) ?FdKind {
     if (std.mem.eql(u8, path, "/dev/dri/renderD128")) return .dri_card0;
     if (std.mem.eql(u8, path, "/dev/input/event0")) return .input_event0;
     if (std.mem.eql(u8, path, "/dev/input/event1")) return .input_event1;
-    if (std.mem.eql(u8, path, "/dev/tty") or std.mem.eql(u8, path, "/dev/console")) return .console_out;
+    if (std.mem.eql(u8, path, "/dev/tty") or std.mem.eql(u8, path, "/dev/console") or std.mem.eql(u8, path, "/dev/tty0") or std.mem.eql(u8, path, "/dev/tty1")) return .console_out;
     if (std.mem.eql(u8, path, "/dev/null")) return .devnull;
     return null;
 }
