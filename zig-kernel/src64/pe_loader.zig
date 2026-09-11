@@ -542,12 +542,12 @@ const FakePhys = struct {
             // старт с 1МБ: как реальный PMM (первый мегабайт — BIOS/VGA),
             // и pa=0 невозможен (@ptrFromInt(0) = null-паника Zig)
             .cursor = 0x100000,
-            .maps = std.ArrayList(MapRec).empty,
+            .maps = std.ArrayList(MapRec).init(testing.allocator),
         };
     }
     fn deinit(self: *FakePhys) void {
         testing.allocator.free(self.mem);
-        self.maps.deinit(testing.allocator);
+        self.maps.deinit();
     }
     fn allocContig(self: *FakePhys, count: u64) ?u64 {
         const bytes = count * PAGE_SIZE;
@@ -564,7 +564,7 @@ const FakePhys = struct {
         if (self.fail_map_after) |thr| {
             if (self.maps.items.len >= thr) return false;
         }
-        self.maps.append(testing.allocator, .{ .va = va, .pa = pa, .flags = flags }) catch return false;
+        self.maps.append(.{ .va = va, .pa = pa, .flags = flags }) catch return false;
         _ = pml4;
         return true;
     }

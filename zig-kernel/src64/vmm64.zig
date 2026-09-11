@@ -207,7 +207,7 @@ pub fn mapPage(virt: u64, phys: u64, flags: u64) !void {
     asm volatile ("invlpg (%[virt])"
         :
         : [virt] "r" (virt),
-        : .{ .memory = true }
+        : "memory"
     );
 }
 
@@ -278,7 +278,7 @@ pub fn unmapPage(virt: u64) VmmError!void {
     asm volatile ("invlpg (%[virt])"
         :
         : [virt] "r" (virt),
-        : .{ .memory = true }
+        : "memory"
     );
 
     // Free empty page tables back to PMM (walk up from PT → PD → PDPT)
@@ -392,7 +392,7 @@ pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!void {
             asm volatile ("invlpg (%[virt])"
                 :
                 : [virt] "r" (virt),
-                : .{ .memory = true }
+                : "memory"
             );
         }
     }
@@ -473,7 +473,7 @@ pub fn userLeafApplyProt(target_pml4: u64, va: u64, want: u64) bool {
     asm volatile ("invlpg (%[virt])"
         :
         : [virt] "r" (va),
-        : .{ .memory = true }
+        : "memory"
     );
     return true;
 }
@@ -521,7 +521,7 @@ pub fn userLeafClearPresent(target_pml4: u64, va: u64) bool {
     asm volatile ("invlpg (%[virt])"
         :
         : [virt] "r" (va),
-        : .{ .memory = true }
+        : "memory"
     );
     return true;
 }
@@ -558,7 +558,7 @@ pub fn userLeafApplyProtEx(target_pml4: u64, va: u64, want: u64, restore_hidden:
     asm volatile ("invlpg (%[virt])"
         :
         : [virt] "r" (va),
-        : .{ .memory = true }
+        : "memory"
     );
     return true;
 }

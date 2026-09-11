@@ -281,7 +281,7 @@ fn usedRingPtr(base: u64) [*]volatile VirtQueueUsedElem {
 }
 
 fn memBarrier() void {
-    asm volatile ("" ::: .{ .memory = true });
+    asm volatile ("" ::: "memory");
 }
 
 // ============================================================================

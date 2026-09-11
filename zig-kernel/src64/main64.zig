@@ -597,7 +597,7 @@ fn printMemoryInfo(mbi: u64) void {
         const tsc: u64 = asm volatile ("rdtsc"
             : [lo] "={eax}" (-> u32),
             : // rdtsc: EDX:EAX — старшую часть опускаем (джиттера EAX хватает)
-            : .{ .edx = true }
+            : "edx"
         );
         const dice = @as(u64, tsc) & 0xF;
         var k: u64 = 0;
@@ -882,7 +882,7 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         \\xor %%rdi, %%rdi
         \\mov $4096, %%ecx
         \\rep stosb
-        ::: .{ .memory = true }
+        ::: "rax", "rdi", "rcx", "memory"
     );
 
     // 0. Detect and Initialize Framebuffer if available from Multiboot2
@@ -2307,7 +2307,7 @@ fn linuxDoExit(code: u64) void {
     // sti + hlt — тик вытесняет Killed-задачу, остальные живут.
     hal.sti();
     while (true) {
-        asm volatile ("hlt" ::: .{ .memory = true });
+        asm volatile ("hlt" ::: "memory");
     }
 }
 
@@ -2379,7 +2379,7 @@ fn linuxYieldTick() void {
     scheduler.in_win32_syscall = 0;
     hal.sti();
     while (hal.tick_count < deadline) {
-        asm volatile ("hlt" ::: .{ .memory = true });
+        asm volatile ("hlt" ::: "memory");
     }
     // эпилог транзакции: вернуть свой user_rsp + резюм-кадр
     hal.cli();
@@ -2996,7 +2996,7 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
     scheduler.exitCurrentTask();
     hal.sti();
     while (true) {
-        asm volatile ("hlt" ::: .{ .memory = true });
+        asm volatile ("hlt" ::: "memory");
     }
 }
 
@@ -3101,7 +3101,7 @@ fn linuxFutexPark(uaddr: u64, timeout_ms: u64, infinite: bool) i64 {
             }
             break; // таймаут
         }
-        asm volatile ("hlt" ::: .{ .memory = true });
+        asm volatile ("hlt" ::: "memory");
     }
     const was_woken = futex_parks[owner].woken;
     futex_parks[owner].active = false;
@@ -3826,7 +3826,7 @@ fn tlbFullFlush() void {
     asm volatile (
         \\movq %%cr3, %%rax
         \\movq %%rax, %%cr3
-        ::: .{ .memory = true });
+        ::: "rax", "memory");
 }
 
 fn linuxRangeDrop(va: u64, pages: u64) void {
@@ -4056,7 +4056,7 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
     // трансляцией, а не с закэшированной.
     if (vmm.userLeafFlags(pml4, page)) |leaf| {
         if (leaf & vmm.PTE_PRESENT != 0) {
-            asm volatile ("invlpg (%[va])" :: [va] "r" (page) : .{ .memory = true });
+            asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
             return true;
         }
         // CDD №15 p5-ФИКС ВАЙПА: СКРЫТЫЙ лист (PROT_NONE-мутация: P=0,
@@ -4103,7 +4103,7 @@ fn linuxDemandMapPage(pml4: u64, page: u64, pte: u64) bool {
         hal.Serial.puts("\n");
     }
     // активный CR3 задачи — сброс TLB-строки
-    asm volatile ("invlpg (%[va])" :: [va] "r" (page) : .{ .memory = true });
+    asm volatile ("invlpg (%[va])" :: [va] "r" (page) : "memory");
     return true;
 }
 
@@ -4329,8 +4329,139 @@ fn initrdDirFill(path: []const u8, d: *DirStream) void {
     }
 }
 
+fn sysfsContent(path: []const u8) ?[]const u8 {
+    const p = cpioCanon(path);
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/card0/uevent") or
+        std.mem.eql(u8, p, "sys/class/drm/card0/uevent"))
+    {
+        return "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n";
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/card0/dev") or
+        std.mem.eql(u8, p, "sys/class/drm/card0/dev"))
+    {
+        return "226:0\n";
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/uevent") or
+        std.mem.eql(u8, p, "sys/class/drm/renderD128/uevent"))
+    {
+        return "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n";
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/dev") or
+        std.mem.eql(u8, p, "sys/class/drm/renderD128/dev"))
+    {
+        return "226:128\n";
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/uevent")) {
+        return "DRIVER=virtio-pci\nPCI_CLASS=30000\nPCI_ID=1AF4:1050\nPCI_SUBSYS_ID=1AF4:1100\nPCI_SLOT_NAME=0000:00:02.0\nMODALIAS=pci:v00001AF4d00001050sv00001AF4sd00001100bc03sc00i00\n";
+    }
+    if (std.mem.eql(u8, p, "sys/class/drm/version")) {
+        return "drm 1.1.0 20060810\n";
+    }
+    return null;
+}
+
+fn sysfsSymlinkTarget(path: []const u8) ?[]const u8 {
+    const p = cpioCanon(path);
+    if (std.mem.eql(u8, p, "sys/class/drm/card0")) {
+        return "../../devices/pci0000:00/0000:00:02.0/drm/card0";
+    }
+    if (std.mem.eql(u8, p, "sys/class/drm/renderD128")) {
+        return "../../devices/pci0000:00/0000:00:02.0/drm/renderD128";
+    }
+    if (std.mem.eql(u8, p, "sys/dev/char/226:0")) {
+        return "../../devices/pci0000:00/0000:00:02.0/drm/card0";
+    }
+    if (std.mem.eql(u8, p, "sys/dev/char/226:128")) {
+        return "../../devices/pci0000:00/0000:00:02.0/drm/renderD128";
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/card0/device") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/device"))
+    {
+        return "../../../0000:00:02.0";
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/card0/subsystem") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/subsystem"))
+    {
+        return "../../../../class/drm";
+    }
+    return null;
+}
+
+fn isSysfsDir(path: []const u8) bool {
+    const p = cpioCanon(path);
+    return std.mem.eql(u8, p, "sys") or
+        std.mem.eql(u8, p, "sys/class") or
+        std.mem.eql(u8, p, "sys/class/drm") or
+        std.mem.eql(u8, p, "sys/dev") or
+        std.mem.eql(u8, p, "sys/dev/char") or
+        std.mem.eql(u8, p, "sys/devices") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/card0") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/renderD128");
+}
+
+fn sysfsDirFill(path: []const u8, d: *DirStream) bool {
+    const p = cpioCanon(path);
+    if (std.mem.eql(u8, p, "sys")) {
+        dirPush(d, "class", linux_syscalls.DT_DIR);
+        dirPush(d, "dev", linux_syscalls.DT_DIR);
+        dirPush(d, "devices", linux_syscalls.DT_DIR);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/class")) {
+        dirPush(d, "drm", linux_syscalls.DT_DIR);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/class/drm")) {
+        dirPush(d, "card0", linux_syscalls.DT_LNK);
+        dirPush(d, "renderD128", linux_syscalls.DT_LNK);
+        dirPush(d, "version", linux_syscalls.DT_REG);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/dev")) {
+        dirPush(d, "char", linux_syscalls.DT_DIR);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/dev/char")) {
+        dirPush(d, "226:0", linux_syscalls.DT_LNK);
+        dirPush(d, "226:128", linux_syscalls.DT_LNK);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/devices")) {
+        dirPush(d, "pci0000:00", linux_syscalls.DT_DIR);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00")) {
+        dirPush(d, "0000:00:02.0", linux_syscalls.DT_DIR);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0")) {
+        dirPush(d, "drm", linux_syscalls.DT_DIR);
+        dirPush(d, "uevent", linux_syscalls.DT_REG);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm")) {
+        dirPush(d, "card0", linux_syscalls.DT_DIR);
+        dirPush(d, "renderD128", linux_syscalls.DT_DIR);
+        return true;
+    }
+    if (std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/card0") or
+        std.mem.eql(u8, p, "sys/devices/pci0000:00/0000:00:02.0/drm/renderD128"))
+    {
+        dirPush(d, "dev", linux_syscalls.DT_REG);
+        dirPush(d, "uevent", linux_syscalls.DT_REG);
+        dirPush(d, "device", linux_syscalls.DT_LNK);
+        dirPush(d, "subsystem", linux_syscalls.DT_LNK);
+        return true;
+    }
+    return false;
+}
+
 /// Является ли путь каталогом (devfs-спец + явные/неявные CPIO-дир)?
 fn isDirPath(path: []const u8) bool {
+    if (isSysfsDir(path)) return true;
     if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/dev") or
         std.mem.eql(u8, path, "/dev/dri") or std.mem.eql(u8, path, "/dev/input")) return true;
     if (initrdIsDir(path)) return true;
@@ -4354,6 +4485,7 @@ fn linuxOpenDir(path: []const u8) i64 {
     // "." и ".." — ядро Linux выдаёт их первым (readdir-инвариант glibc)
     dirPush(d, ".", linux_syscalls.DT_DIR);
     dirPush(d, "..", linux_syscalls.DT_DIR);
+    if (sysfsDirFill(path, d)) return @intCast(s);
     if (std.mem.eql(u8, path, "/dev/dri")) {
         dirPush(d, "card0", linux_syscalls.DT_CHR);
         dirPush(d, "renderD128", linux_syscalls.DT_CHR);
@@ -4367,6 +4499,7 @@ fn linuxOpenDir(path: []const u8) i64 {
         dirPush(d, "input", linux_syscalls.DT_DIR);
     } else if (std.mem.eql(u8, path, "/")) {
         dirPush(d, "dev", linux_syscalls.DT_DIR);
+        dirPush(d, "sys", linux_syscalls.DT_DIR);
         dirPush(d, "tmp", linux_syscalls.DT_DIR);
         initrdDirFill("/", d);
     } else {
@@ -4447,7 +4580,7 @@ fn linuxTaskPark(ms: u64) void {
     hal.sti();
     // парк: hlt до прерывания (тик 100Гц)
     while (hal.tick_count < deadline) {
-        asm volatile ("hlt" ::: .{ .memory = true });
+        asm volatile ("hlt" ::: "memory");
     }
     // эпилог транзакции: вернуть user_rsp, резюм-указатель — .bss-слот
     hal.cli();
@@ -4529,6 +4662,22 @@ fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind)
             out_kind.* = .dir;
             return id;
         }
+    }
+    if (sysfsContent(path)) |content| {
+        var slot: ?usize = null;
+        for (&linux_files, 0..) |*f, i| {
+            if (!f.used) {
+                slot = i;
+                break;
+            }
+        }
+        const s = slot orelse return -linux_syscalls.EMFILE;
+        linux_files[s] = .{ .used = true, .kind = .initrd_file, .initrd_data = content };
+        out_kind.* = .initrd_file;
+        const f = &linux_files[s];
+        const n = @min(path.len, f.name.len);
+        @memcpy(f.name[0..n], path[0..n]);
+        return @intCast(s);
     }
     const write_mode = (flags & linux_syscalls.O_ACCMODE) != linux_syscalls.O_RDONLY;
     const node = kernel_vfs.resolve(path, write_mode) catch |e| {
@@ -4805,6 +4954,7 @@ fn linuxFileIno(id: u32) u64 {
 
 /// access(path): существование в VFS (ld.so: /etc/ld.so.cache и т.п.).
 fn linuxPathExists(path: []const u8) i64 {
+    if (isSysfsDir(path) or sysfsSymlinkTarget(path) != null or sysfsContent(path) != null) return 0;
     if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
     _ = kernel_vfs.resolve(path, false) catch |e| switch (e) {
         vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
@@ -4816,6 +4966,13 @@ fn linuxPathExists(path: []const u8) i64 {
 /// v0.20.0 (CDD #12 p1): readlink по ОБЩЕМУ пути (не только /proc/self/exe):
 /// цель симлинка из initrd в user-буфер. CR3 активен — user-IO.
 fn linuxReadlinkPath(path: []const u8, buf_va: u64, bufsz: u64) i64 {
+    if (sysfsSymlinkTarget(path)) |target| {
+        if (bufsz == 0) return -linux_syscalls.EINVAL;
+        const n = @min(target.len, bufsz);
+        if (!linux_user_io.copy_out(buf_va, target[0..@intCast(n)]))
+            return -linux_syscalls.EFAULT;
+        return @intCast(n);
+    }
     if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
     const target = kernel_vfs.readlink(path) catch |e| switch (e) {
         vfs.VfsError.NotFound => return -linux_syscalls.ENOENT,
@@ -4833,6 +4990,38 @@ fn linuxReadlinkPath(path: []const u8, buf_va: u64, bufsz: u64) i64 {
 /// newfstatat: stat по пути (S_IFREG + st_size из VFS — ld.so планирует
 /// mmap библиотеки по размеру!). CR3 задачи активен — copy через user-IO.
 fn linuxStatByPath(path: []const u8, buf_va: u64) i64 {
+    if (sysfsSymlinkTarget(path)) |target| {
+        var st: [144]u8 = [_]u8{0} ** 144;
+        std.mem.writeInt(u64, st[0..8], 0, .little);
+        var hash: u64 = 0xCBF29CE484222325;
+        for (cpioCanon(path)) |c| {
+            hash ^= c;
+            hash *%= 0x100000001B3;
+        }
+        std.mem.writeInt(u64, st[8..16], hash & 0xFFFF_FFFF, .little);
+        std.mem.writeInt(u64, st[16..24], 1, .little); // nlink
+        std.mem.writeInt(u32, st[24..28], @intCast(0xA000 | 0x1FF), .little); // S_IFLNK|0777
+        std.mem.writeInt(u64, st[48..56], target.len, .little); // size
+        std.mem.writeInt(u64, st[56..64], 4096, .little);
+        if (!linux_user_io.copy_out(buf_va, &st)) return -linux_syscalls.EFAULT;
+        return 0;
+    }
+    if (sysfsContent(path)) |content| {
+        var st: [144]u8 = [_]u8{0} ** 144;
+        std.mem.writeInt(u64, st[0..8], 0, .little);
+        var hash: u64 = 0xCBF29CE484222325;
+        for (cpioCanon(path)) |c| {
+            hash ^= c;
+            hash *%= 0x100000001B3;
+        }
+        std.mem.writeInt(u64, st[8..16], hash & 0xFFFF_FFFF, .little);
+        std.mem.writeInt(u64, st[16..24], 1, .little); // nlink
+        std.mem.writeInt(u32, st[24..28], @intCast(0x8000 | 0x124), .little); // S_IFREG|0444
+        std.mem.writeInt(u64, st[48..56], content.len, .little); // size
+        std.mem.writeInt(u64, st[56..64], 4096, .little);
+        if (!linux_user_io.copy_out(buf_va, &st)) return -linux_syscalls.EFAULT;
+        return 0;
+    }
     if (!kernel_vfs_ready) return -linux_syscalls.ENOENT;
     var st: [144]u8 = [_]u8{0} ** 144;
     // CDD №12 p3: devfs-УЗЛЫ — S_IFCHR + st_rdev (libdrm stat("/dev/dri/

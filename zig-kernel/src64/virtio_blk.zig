@@ -293,9 +293,9 @@ fn submitChain(head: u16) void {
     const ring_ptr: [*]volatile u16 = @ptrFromInt(@as(usize, @intCast(vblk_state.avail_virt)) + 4);
     ring_ptr[idx % QUEUE_SIZE] = head;
     // Memory barrier before updating idx
-    asm volatile ("" ::: .{ .memory = true });
+    asm volatile ("" ::: "memory");
     avail.idx = idx + 1;
-    asm volatile ("" ::: .{ .memory = true });
+    asm volatile ("" ::: "memory");
     // Notify device
     write16(VIRTIO_PCI_QUEUE_NOTIFY, 0);
 }
@@ -828,7 +828,7 @@ pub fn isReadOnly() bool {
 }
 
 /// Handle interrupt from virtio-blk device
-pub fn handleIrq() callconv(.c) void {
+pub fn handleIrq() callconv(.C) void {
     const isr = read8(VIRTIO_PCI_ISR);
     if ((isr & 1) != 0) {
         // Queue interrupt — process completed requests
