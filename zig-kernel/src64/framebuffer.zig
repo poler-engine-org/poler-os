@@ -1,10 +1,11 @@
 // POLER-OS VBE Framebuffer Driver v2.0
 // Rewritten based on proven patterns from Graphene-Kernel and Thymos OS projects.
-// Key change: use [*]volatile u32 pointer + pixel-pitch instead of
-// recalculating @ptrFromInt on every pixel write.
+// ============================================================================
+// POLER-OS Linear Framebuffer Driver — 32bpp XRGB8888 & 8bpp Indexed
+// ============================================================================
 //
-// Works with: QEMU -vga std, NVIDIA GTX 1060, Intel HD 4000,
-//             any VBE-compatible GPU via GRUB Multiboot2
+// Supports: Multiboot2 GOP, UEFI Framebuffer, VirtIO-GPU, VBE / VESA 2.0+
+// Direct pixel manipulation with optimized 32-bit word writes.
 
 const std = @import("std");
 
@@ -456,11 +457,19 @@ pub fn puts(str: []const u8) void {
         } else if (ch == '\n') {
             cursor_x = 0;
             cursor_y += CHAR_H;
+            if (cursor_y + CHAR_H > fb_height) {
+                scroll_up();
+                cursor_y = fb_height - CHAR_H;
+            }
         } else if (ch == '\t') {
             cursor_x = (cursor_x + CHAR_W * 4) & ~@as(u32, CHAR_W * 4 - 1);
             if (cursor_x >= fb_width) {
                 cursor_x = 0;
                 cursor_y += CHAR_H;
+                if (cursor_y + CHAR_H > fb_height) {
+                    scroll_up();
+                    cursor_y = fb_height - CHAR_H;
+                }
             }
         } else if (ch == '\x08') {
             if (cursor_x >= CHAR_W) {
@@ -473,6 +482,10 @@ pub fn puts(str: []const u8) void {
             if (cursor_x >= fb_width) {
                 cursor_x = 0;
                 cursor_y += CHAR_H;
+                if (cursor_y + CHAR_H > fb_height) {
+                    scroll_up();
+                    cursor_y = fb_height - CHAR_H;
+                }
             }
         } else {
             draw_char(ch, cursor_x, cursor_y, 0xD4, 0xD4, 0xD4, 0x0B, 0x11, 0x20);
@@ -480,59 +493,133 @@ pub fn puts(str: []const u8) void {
             if (cursor_x >= fb_width) {
                 cursor_x = 0;
                 cursor_y += CHAR_H;
+                if (cursor_y + CHAR_H > fb_height) {
+                    scroll_up();
+                    cursor_y = fb_height - CHAR_H;
+                }
             }
-        }
-        
-        // Scroll if needed
-        if (cursor_y + CHAR_H >= fb_height) {
-            scroll_up();
-            cursor_y = fb_height - CHAR_H;
         }
     }
 }
 
-/// Print string with color
+var ansi_in_esc: bool = false;
+var ansi_buf: [32]u8 = undefined;
+var ansi_len: usize = 0;
+var ansi_cur_fg_r: u8 = 0xD4;
+var ansi_cur_fg_g: u8 = 0xD4;
+var ansi_cur_fg_b: u8 = 0xD4;
+
+/// Print string with color & ANSI escape sequences support
 pub fn puts_color(str: []const u8, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g: u8, bg_b: u8) void {
     if (!fb_valid) return;
     
     for (str) |ch| {
         if (ch >= 0x80 and ch <= 0xBF) continue;
+
+        if (ch == '\x1B') {
+            ansi_in_esc = true;
+            ansi_len = 0;
+            continue;
+        }
+
+        if (ansi_in_esc) {
+            if (ch == '[') continue;
+            if ((ch >= '0' and ch <= '9') or ch == ';') {
+                if (ansi_len < ansi_buf.len) {
+                    ansi_buf[ansi_len] = ch;
+                    ansi_len += 1;
+                }
+                continue;
+            }
+            if (ch == 'm') {
+                const code = ansi_buf[0..ansi_len];
+                if (std.mem.eql(u8, code, "0") or code.len == 0) {
+                    ansi_cur_fg_r = fg_r;
+                    ansi_cur_fg_g = fg_g;
+                    ansi_cur_fg_b = fg_b;
+                } else if (std.mem.endsWith(u8, code, "31")) { // Red
+                    ansi_cur_fg_r = 0xFF; ansi_cur_fg_g = 0x55; ansi_cur_fg_b = 0x55;
+                } else if (std.mem.endsWith(u8, code, "32")) { // Green
+                    ansi_cur_fg_r = 0x50; ansi_cur_fg_g = 0xFA; ansi_cur_fg_b = 0x7B;
+                } else if (std.mem.endsWith(u8, code, "33")) { // Yellow
+                    ansi_cur_fg_r = 0xF1; ansi_cur_fg_g = 0xFA; ansi_cur_fg_b = 0x8C;
+                } else if (std.mem.endsWith(u8, code, "34")) { // Blue
+                    ansi_cur_fg_r = 0xBD; ansi_cur_fg_g = 0x93; ansi_cur_fg_b = 0xF9;
+                } else if (std.mem.endsWith(u8, code, "35")) { // Magenta
+                    ansi_cur_fg_r = 0xFF; ansi_cur_fg_g = 0x79; ansi_cur_fg_b = 0xC6;
+                } else if (std.mem.endsWith(u8, code, "36")) { // Cyan
+                    ansi_cur_fg_r = 0x8B; ansi_cur_fg_g = 0xE9; ansi_cur_fg_b = 0xFD;
+                } else if (std.mem.endsWith(u8, code, "37")) { // White
+                    ansi_cur_fg_r = 0xF8; ansi_cur_fg_g = 0xF8; ansi_cur_fg_b = 0xF2;
+                }
+                ansi_in_esc = false;
+                continue;
+            }
+            if (ch == 'J') {
+                clear();
+                ansi_in_esc = false;
+                continue;
+            }
+            if (ch == 'H') {
+                cursor_x = 0;
+                cursor_y = 0;
+                ansi_in_esc = false;
+                continue;
+            }
+            ansi_in_esc = false;
+            continue;
+        }
         
+        const effective_fg_r = if (ansi_cur_fg_r != 0) ansi_cur_fg_r else fg_r;
+        const effective_fg_g = if (ansi_cur_fg_g != 0) ansi_cur_fg_g else fg_g;
+        const effective_fg_b = if (ansi_cur_fg_b != 0) ansi_cur_fg_b else fg_b;
+
         if (ch == '\r') {
             cursor_x = 0;
         } else if (ch == '\n') {
             cursor_x = 0;
             cursor_y += CHAR_H;
+            if (cursor_y + CHAR_H > fb_height) {
+                scroll_up();
+                cursor_y = fb_height - CHAR_H;
+            }
         } else if (ch == '\t') {
             cursor_x = (cursor_x + CHAR_W * 4) & ~@as(u32, CHAR_W * 4 - 1);
             if (cursor_x >= fb_width) {
                 cursor_x = 0;
                 cursor_y += CHAR_H;
+                if (cursor_y + CHAR_H > fb_height) {
+                    scroll_up();
+                    cursor_y = fb_height - CHAR_H;
+                }
             }
         } else if (ch == '\x08') {
             if (cursor_x >= CHAR_W) {
                 cursor_x -= CHAR_W;
-                draw_char(' ', cursor_x, cursor_y, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
+                draw_char(' ', cursor_x, cursor_y, effective_fg_r, effective_fg_g, effective_fg_b, bg_r, bg_g, bg_b);
             }
         } else if (ch >= 0xC0) {
-            draw_char(' ', cursor_x, cursor_y, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
+            draw_char(' ', cursor_x, cursor_y, effective_fg_r, effective_fg_g, effective_fg_b, bg_r, bg_g, bg_b);
             cursor_x += CHAR_W;
             if (cursor_x >= fb_width) {
                 cursor_x = 0;
                 cursor_y += CHAR_H;
+                if (cursor_y + CHAR_H > fb_height) {
+                    scroll_up();
+                    cursor_y = fb_height - CHAR_H;
+                }
             }
         } else {
-            draw_char(ch, cursor_x, cursor_y, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
+            draw_char(ch, cursor_x, cursor_y, effective_fg_r, effective_fg_g, effective_fg_b, bg_r, bg_g, bg_b);
             cursor_x += CHAR_W;
             if (cursor_x >= fb_width) {
                 cursor_x = 0;
                 cursor_y += CHAR_H;
+                if (cursor_y + CHAR_H > fb_height) {
+                    scroll_up();
+                    cursor_y = fb_height - CHAR_H;
+                }
             }
-        }
-        
-        if (cursor_y + CHAR_H >= fb_height) {
-            scroll_up();
-            cursor_y = fb_height - CHAR_H;
         }
     }
 }

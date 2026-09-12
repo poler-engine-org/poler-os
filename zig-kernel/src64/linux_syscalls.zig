@@ -926,7 +926,7 @@ pub fn sysRead(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64)
     if (count == 0) return 0;
     const e = fds.get(fd_i) orelse return err(EBADF);
     switch (e.kind) {
-        .input_event0, .input_event1 => {
+        .input_event0, .input_event1, .console_out => {
             // ядро ПИШЕТ в user-буфер: want_write=true
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
             const r = ops.dev_read(e.kind, buf_va, count, e.nonblock);
@@ -1063,7 +1063,7 @@ pub fn sysFcntl(ops: LinuxOps, fds: *FdTable, fd_i: i64, cmd: u64, arg: u64) u64
 pub fn sysIoctl(ops: LinuxOps, fds: *FdTable, fd_i: i64, cmd: u32, arg: u64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
     switch (e.kind) {
-        .fb0, .dri_card0, .input_event0, .input_event1 => {
+        .fb0, .dri_card0, .input_event0, .input_event1, .console_out => {
             const r = ops.dev_ioctl(e.kind, cmd, arg);
             if (r < 0) return @bitCast(r);
             return @intCast(r);
@@ -3238,6 +3238,7 @@ fn fakeDevIoctl(kind: FdKind, cmd: u32, arg: u64) i64 {
     e.ioctl_calls += 1;
     e.last_ioctl_cmd = cmd;
     e.last_ioctl_kind = kind;
+    if (kind == .console_out and (cmd < 0x5400 or cmd > 0x5450)) return -ENOTTY;
     _ = arg;
     return 0;
 }
@@ -4607,9 +4608,9 @@ test "linux: sys_read — event-устройства, EAGAIN/EOF-семанти�
     try testing.expectEqual(@as(u64, 48), sysRead(ops, &fds, 3, FakeEnv.USER_BASE, 48));
     try testing.expectEqual(@as(u64, 3), e.read_calls);
 
-    // stdin/stdout (консоль) → -EBADF: входного пути нет
-    try testing.expectEqual(err(EBADF), sysRead(ops, &fds, 0, FakeEnv.USER_BASE, 24));
-    try testing.expectEqual(err(EBADF), sysRead(ops, &fds, 1, FakeEnv.USER_BASE, 24));
+    // stdin/stdout (консоль) → dev_read (чтение из клавиатурного потока)
+    try testing.expectEqual(@as(u64, 24), sysRead(ops, &fds, 0, FakeEnv.USER_BASE, 24));
+    try testing.expectEqual(@as(u64, 24), sysRead(ops, &fds, 1, FakeEnv.USER_BASE, 24));
     // мусорный буфер → EFAULT
     try testing.expectEqual(err(EFAULT), sysRead(ops, &fds, 3, 0x30000_0000, 24));
 }

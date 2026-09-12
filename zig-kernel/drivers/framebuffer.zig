@@ -1,6 +1,5 @@
-// POLER-OS VBE Framebuffer Driver
-// VESA BIOS Extensions — linear framebuffer for HDMI/DP output
-// Works with NVIDIA GTX 1060, Intel HD 4000, any VBE-compatible GPU
+// POLER-OS Linear Framebuffer Driver
+// Standard VESA BIOS Extensions / Multiboot2 GOP / VirtIO-GPU scanout
 
 const std = @import("std");
 

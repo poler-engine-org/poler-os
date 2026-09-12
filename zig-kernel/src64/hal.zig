@@ -2030,13 +2030,9 @@ pub const PIC = struct {
         outb(PIC1_DATA, ICW4_8086);
         outb(PIC2_DATA, ICW4_8086);
 
-        // Mask ALL PIC interrupts — v0.7.3: the keyboard is routed via the
-        // IO-APIC (IRQ1 -> vector 33, see IOAPIC.init) and the timer via the
-        // Local APIC (vector 48). Keeping IRQ1 unmasked here as well caused
-        // dual delivery of every scancode (PIC + IO-APIC are both wired to the
-        // 8042 IRQ line). PIC stays initialized but fully masked.
-        outb(PIC1_DATA, 0xFF); // Mask all master lines (keyboard via IO-APIC)
-        outb(PIC2_DATA, 0xFF); // Mask all slave
+        // Unmask IRQ0 (timer) and IRQ1 (keyboard) on Master PIC for VirtualBox/bare-metal
+        outb(PIC1_DATA, 0xFC); // Unmask IRQ0 (timer) and IRQ1 (keyboard), mask IRQ2-7
+        outb(PIC2_DATA, 0xFF); // Mask all slave lines
     }
 
     pub fn sendEOI(irq: u8) void {
@@ -2343,6 +2339,16 @@ fn kbd_init() void {
     // Drain any remaining bytes after reset
     while ((inb(0x64) & 0x01) != 0) {
         _ = inb(0x60);
+    }
+
+    // Explicitly enable scanning (0xF4)
+    outb(0x60, 0xF4);
+    timeout = 0;
+    while (timeout < 100000) : (timeout += 1) {
+        if ((inb(0x64) & 0x01) != 0) {
+            const resp = inb(0x60);
+            if (resp == 0xFA) break; // ACK
+        }
     }
 
     // DO NOT send 0xF0 0x01 to set scancode set 1!

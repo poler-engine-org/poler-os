@@ -133,20 +133,7 @@ fn parseInitrdCpio(archive: []const u8, source: []const u8) void {
 
     var cpio_parser = cpio.CpioParser.init(archive);
     var file_count: usize = 0;
-    while (cpio_parser.next()) |file| {
-        puts("  - File: ");
-        puts(file.name);
-        puts(" Size: ");
-        putDecimal(file.size);
-        puts(" bytes\n");
-
-        if (std.mem.endsWith(u8, file.name, ".txt")) {
-            puts("    Content: \"");
-            const limit = if (file.data.len > 64) 64 else file.data.len;
-            puts(file.data[0..limit]);
-            if (file.data.len > 64) puts("...");
-            puts("\"\n");
-        }
+    while (cpio_parser.next()) |_| {
         file_count += 1;
     }
     puts("[INITRD] Total files parsed: ");
@@ -178,11 +165,27 @@ fn cpioNameEql(cpio_name: []const u8, query: []const u8) bool {
 /// симлинков — их резолв делает вызывающий). Возвращает CPIO-запись
 /// (data = байты файла ИЛИ цель симлинка, mode различает).
 fn initrdFindNode(name: []const u8) ?cpio.CpioFile {
-    const arch = initrd_archive orelse return null;
+    const arch = initrd_archive orelse {
+        hal.Serial.puts("[INITRD] findNode: initrd_archive is null!\n");
+        return null;
+    };
     var cpio_parser = cpio.CpioParser.init(arch);
+    var count: usize = 0;
     while (cpio_parser.next()) |file| {
+        count += 1;
         if (cpioNameEql(file.name, name)) return file;
     }
+    hal.Serial.puts("[INITRD] findNode: '");
+    hal.Serial.puts(name);
+    hal.Serial.puts("' scanned ");
+    hal.Serial.putDecimal(count);
+    hal.Serial.puts(" entries, parser offset=");
+    hal.Serial.putHex(cpio_parser.offset);
+    hal.Serial.puts(" arch len=");
+    hal.Serial.putDecimal(arch.len);
+    hal.Serial.puts(" magic: ");
+    if (arch.len >= 8) hal.Serial.puts(arch[0..8]);
+    hal.Serial.puts("\n");
     return null;
 }
 
@@ -890,7 +893,19 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     if (have_mb2) {
         const parser = multiboot2.Parser.init(multiboot_info);
         if (parser.findTag(8)) |tag_addr| {
+            hal.Serial.puts("[BOOT] Found MB2 Framebuffer Tag at: 0x");
+            hal.Serial.putHex(tag_addr);
+            hal.Serial.puts("\n");
             const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
+            hal.Serial.puts("[BOOT] FB Addr: 0x");
+            hal.Serial.putHex(fb_tag.fb_addr);
+            hal.Serial.puts(" w: ");
+            hal.Serial.putHex(fb_tag.fb_width);
+            hal.Serial.puts(" h: ");
+            hal.Serial.putHex(fb_tag.fb_height);
+            hal.Serial.puts(" bpp: ");
+            hal.Serial.putHex(fb_tag.fb_bpp);
+            hal.Serial.puts("\n");
             if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
                 framebuffer.init_from_multiboot(
                     fb_tag.fb_addr,
@@ -902,12 +917,16 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
                 );
                 framebuffer.clear();
                 use_fb = true;
+                hal.Serial.puts("[BOOT] Framebuffer initialized & cleared successfully\n");
             }
+        } else {
+            hal.Serial.puts("[BOOT] NO MB2 Framebuffer Tag found from bootloader\n");
         }
     }
 
     // 1. Initialize VGA (if framebuffer not active)
     if (!use_fb) {
+        hal.vgaSetTextMode();
         vga_init();
     }
 
@@ -1205,12 +1224,27 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 8.6. Initialize Scheduler & Preemptive Multitasking
     scheduler.init();
 
-    // Create two test tasks (which will run in Ring 3 / User space)
-    _ = scheduler.createTask(@intFromPtr(&task1)) catch |err| {
-        puts("[SCHED] Failed to create task1 (shell): ");
-        puts(@errorName(err));
-        puts("\n");
-    };
+    // Launch Linux Userspace Shell (Ring 3 POSIX) if present in initrd
+    var launched_init = false;
+    if (initrdFindFile("bin/sh") != null) {
+        puts("[INIT] Spawning /bin/sh (Linux Ring 3 POSIX Shell)...\n");
+        cmd_elfload("bin/sh");
+        launched_init = true;
+    } else if (initrdFindFile("sbin/init") != null) {
+        puts("[INIT] Spawning /sbin/init (Linux Ring 3 PID 1)...\n");
+        cmd_elfload("sbin/init");
+        launched_init = true;
+    }
+
+    if (!launched_init) {
+        // Fallback to kernel debug shell if no userspace initrd is loaded
+        _ = scheduler.createTask(@intFromPtr(&task1)) catch |err| {
+            puts("[SCHED] Failed to create task1 (debug shell): ");
+            puts(@errorName(err));
+            puts("\n");
+        };
+    }
+
     _ = scheduler.createTask(@intFromPtr(&task2)) catch |err| {
         puts("[SCHED] Failed to create task2 (bg worker): ");
         puts(@errorName(err));
@@ -1319,29 +1353,29 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  touch <f> - Create an empty file\n");
         sys_print("  write <f> <text> - Write text to a file\n");
         sys_print("  rm <f>    - Delete a file\n");
-        sys_print("  ping <ip|host> - ICMP Echo Request/Reply (RTT, статистика) через virtio-net\n");
-        sys_print("  ifconfig - Сетевые интерфейсы: IP, MAC, шлюз, DNS, счётчики RX/TX\n");
-        sys_print("  netstat - Таблица TCP-соединений мини-стека (состояния, ринг, inflight)\n");
+        sys_print("  ping <ip|host> - ICMP Echo Request/Reply (RTT, stats) via virtio-net\n");
+        sys_print("  ifconfig  - Network interfaces: IP, MAC, gateway, DNS, RX/TX counters\n");
+        sys_print("  netstat   - TCP connection table (states, ring buffer, inflight)\n");
         sys_print("  disk      - Show disk info\n");
-        sys_print("  entropy   - Show all hardware entropy pools status (PUF, Bus, IRQ, Bio)\n");
+        sys_print("  entropy   - Show hardware entropy pools status (PUF, Bus, IRQ, Bio)\n");
         sys_print("  enroll    - Enrollment-Gate status: silicon identity + bindEnrolled verdict\n");
-        sys_print("  enroll test - Forge-test: анти-клон (подделка отпечатка → MISMATCH)\n");
+        sys_print("  enroll test - Forge-test: anti-clone (tampered fingerprint -> MISMATCH)\n");
         sys_print("  peinfo <f> - Analyze PE/COFF executable from initrd (headers, sections, imports)\n");
         sys_print("  pestubs <f> - Generate Win32 stub table for PE executable (CDD: log+int3)\n");
-        sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS → cmdline (e.g. peload curl.exe -k https://example.com)\n");
-        sys_print("  drm       - DRM/KMS статус: скан-аут, dumb-буферы, flips (CDD #10)\n");
-        sys_print("  drmtest   - DRM self-test: create→map→addfb→flip→destroy + тест-паттерн (E2E)\n");
-        sys_print("  input     - Evdev статус: /dev/input/event0,1 (очереди, дропы)\n");
-        sys_print("  inputtest - Evdev self-test: живые клавиши + синт. мышь (E2E)\n");
-        sys_print("  ldevtest  - Linux POSIX-слой self-test: open/ioctl/poll/epoll/futex (E2E)\n");
-        sys_print("  elfload   - ELF-процесс Linux-ABI: PT_LOAD+стек argc/argv/auxv → Ring 3\n");
-        sys_print("  gputest   - VirtIO-GPU vring скан-аут: паттерн НА ЭКРАН (CDD #11 p2, E2E)\n");
-        sys_print("  mmapinfo  - mmap-реестры Linux-процессов: va+size+имя модуля (CDD #12 p4)\n");
-        sys_print("  tasks     - Реестр парковок: задачи/wake/fd/epoll-watches/каналы (CDD #12 p8)\n");
-        sys_print("  peek <hexva> [n] - Чтение user-VA гостя (page-walk, CDD #12 p8)\n");
+        sys_print("  peload <f> [args] - Load PE64 into Ring 3 + ARGS -> cmdline (e.g. peload curl.exe -k https://example.com)\n");
+        sys_print("  drm       - DRM/KMS status: scanout, dumb buffers, page flips (CDD #10)\n");
+        sys_print("  drmtest   - DRM self-test: create->map->addfb->flip->destroy + test pattern\n");
+        sys_print("  input     - Evdev status: /dev/input/event0,1 (event queues, drops)\n");
+        sys_print("  inputtest - Evdev self-test: live keys + synthetic mouse (E2E)\n");
+        sys_print("  ldevtest  - Linux POSIX self-test: open/ioctl/poll/epoll/futex (E2E)\n");
+        sys_print("  elfload   - ELF process Linux ABI: PT_LOAD + stack argc/argv/auxv -> Ring 3\n");
+        sys_print("  gputest   - VirtIO-GPU vring scanout: test pattern on screen (CDD #11)\n");
+        sys_print("  mmapinfo  - mmap registry of Linux processes: va + size + module name\n");
+        sys_print("  tasks     - Task registry: tasks / wake / fd / epoll-watches / channels\n");
+        sys_print("  peek <hexva> [n] - Read user VA of guest (page walk)\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.15.0 (x86_64 Long Mode)\n");
-        sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Win32 PE Runtime).\n");
+        sys_print("POLER-OS v0.20.0-rc (x86_64 Long Mode)\n");
+        sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Linux ABI + DRM/KMS).\n");
     } else if (eq(cmd, "clear")) {
         sys_clear_screen();
     } else if (eq(cmd, "poler")) {
@@ -1394,8 +1428,14 @@ fn execute_command(cmd: []const u8) void {
         cmd_elfload(cmd[8..]);
     } else if (eq(cmd, "elfload")) {
         cmd_elfload("");
-    } else if (eq(cmd, "elftest")) {
-        cmd_elfload("elftest");
+    } else if (eq(cmd, "plasma") or eq(cmd, "startx") or eq(cmd, "wayland") or eq(cmd, "gamescope") or eq(cmd, "compositor")) {
+        if (initrdFindFile("bin/compositor") != null or initrdFindFile("sbin/compositor") != null) {
+            cmd_elfload("bin/compositor");
+        } else {
+            cmd_drmtest();
+        }
+    } else if (eq(cmd, "sh") or eq(cmd, "bash")) {
+        cmd_elfload("bin/sh");
     } else if (eq(cmd, "gputest")) {
         cmd_gputest();
     } else if (eq(cmd, "ltrace")) {
@@ -2025,6 +2065,26 @@ fn linuxDevRead(kind: linux_syscalls.FdKind, va: u64, count: u64, nonblock: bool
     switch (kind) {
         .input_event0 => return hal.evdev_kbd.readBytes(buf, nonblock),
         .input_event1 => return hal.evdev_mouse.readBytes(buf, nonblock),
+        .console_out => {
+            var n: usize = 0;
+            while (n < count) {
+                const ch = hal.kbd_pop();
+                if (ch == 0) {
+                    if (n > 0 or nonblock) break;
+                    hal.sti();
+                    var i: usize = 0;
+                    while (i < 5000) : (i += 1) {
+                        asm volatile ("pause");
+                    }
+                    continue;
+                }
+                buf[n] = ch;
+                n += 1;
+                if (ch == '\n') break;
+            }
+            if (n == 0 and nonblock) return -linux_syscalls.EAGAIN;
+            return @intCast(n);
+        },
         // CDD №12 p3: DRM-события (flip-complete/vblank) — записи
         // drm_event_vblank из кольца drm_kms; пусто → -EAGAIN (poll-цикл
         // gamescope ждёт EPOLLIN — см. linuxDevReady)
@@ -2137,6 +2197,37 @@ fn linuxDevIoctl(kind: linux_syscalls.FdKind, cmd: u32, arg: u64) i64 {
             if (!linux_user_io.copy_out(arg, linux_ioctl_buf[0..size])) return -linux_syscalls.EFAULT;
             return r;
         },
+        .console_out => {
+            // TCGETS = 0x5401, TCSETS = 0x5402, TIOCGWINSZ = 0x5413, TIOCGPGRP = 0x540F
+            if (cmd == 0x5401) { // TCGETS (termios struct)
+                var termios_buf: [60]u8 = [_]u8{0} ** 60;
+                // c_iflag = ICRNL (0x0100)
+                termios_buf[0] = 0x00;
+                termios_buf[1] = 0x01;
+                // c_oflag = OPOST|ONLCR (0x0005)
+                termios_buf[4] = 0x05;
+                // c_cflag = CS8|CREAD (0x00BF)
+                termios_buf[8] = 0xBF;
+                // c_lflag = ISIG|ICANON|ECHO|ECHOE|ECHOK (0x8A3B)
+                termios_buf[12] = 0x3B;
+                termios_buf[13] = 0x8A;
+                if (!linux_user_io.copy_out(arg, termios_buf[0..36])) return -linux_syscalls.EFAULT;
+                return 0;
+            }
+            if (cmd == 0x5413) { // TIOCGWINSZ (struct winsize: 48 rows x 128 cols)
+                const ws: [8]u8 = [_]u8{ 48, 0, 128, 0, 0, 4, 0, 3 };
+                if (!linux_user_io.copy_out(arg, &ws)) return -linux_syscalls.EFAULT;
+                return 0;
+            }
+            if (cmd == 0x5402 or cmd == 0x5403 or cmd == 0x5404) return 0; // TCSETS*
+            if (cmd == 0x540F) { // TIOCGPGRP
+                const pgrp: [4]u8 = [_]u8{ 1, 0, 0, 0 };
+                if (!linux_user_io.copy_out(arg, &pgrp)) return -linux_syscalls.EFAULT;
+                return 0;
+            }
+            if (cmd == 0x5410) return 0; // TIOCSPGRP
+            return 0;
+        },
         else => return -linux_syscalls.ENOTTY,
     }
 }
@@ -2161,6 +2252,7 @@ fn linuxDevReady(kind: linux_syscalls.FdKind) u32 {
     switch (kind) {
         .input_event0 => return if (hal.evdev_kbd.pending() > 0) linux_syscalls.EPOLLIN else 0,
         .input_event1 => return if (hal.evdev_mouse.pending() > 0) linux_syscalls.EPOLLIN else 0,
+        .console_out => return linux_syscalls.EPOLLIN | linux_syscalls.EPOLLOUT,
         // CDD №12 p3: card0 читаем ТОЛЬКО при наличии событий (flip-complete);
         // иначе poll-цикл gamescope бы крутился на read → EAGAIN
         .dri_card0 => return if (drm_kms.eventsPending(&drm_state) != 0) linux_syscalls.EPOLLIN else 0,
@@ -2967,37 +3059,31 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
         "[stack]",
     );
 
-    // 5. НОВАЯ задача (тот же proc-слот/pid; старую убиваем ниже)
-    const task_id = scheduler.createUserTaskAbi(entry_va, new_pml4, stack.entry_rsp, .linux) catch
-        return -linux_syscalls.EAGAIN;
-    linux_task_proc[task_id] = reg_slot;
-    scheduler.tasks[task_id].abi = .linux; // красная строка (гонка закрыта p3)
+    // 5. In-place address space and context update
+    t.cr3 = new_pml4;
+    t.rsp = stack.entry_rsp;
+    scheduler.user_rsp = stack.entry_rsp;
     scheduler.registerUserStack(
-        task_id,
+        owner,
         elf_loader.LINUX_STACK_TOP - elf_loader.LINUX_STACK_PAGES * 4096,
         elf_loader.LINUX_STACK_TOP,
     );
-    scheduler.fs_base_tab[task_id] = 0;
+    scheduler.fs_base_tab[owner] = 0;
+    scheduler.syscall_exit_frame[owner][13] = entry_va; // rcx (RIP)
+    scheduler.syscall_exit_frame[owner][12] = 0x202;    // r11 (RFLAGS)
+    asm volatile ("movq %[pml4], %%cr3" : : [pml4] "r" (new_pml4) : "memory");
 
     hal.Serial.puts("[LINUX] execve: ");
     hal.Serial.puts(path);
-    hal.Serial.puts(" → task ");
-    hal.Serial.putDecimal(task_id);
-    hal.Serial.puts(" (pid ");
-    hal.Serial.putDecimal(1000 + @as(u64, slot));
-    hal.Serial.puts(", entry 0x");
+    hal.Serial.puts(" in-place on task ");
+    hal.Serial.putDecimal(owner);
+    hal.Serial.puts(" (entry 0x");
     hal.Serial.putHex(entry_va);
+    hal.Serial.puts(", rsp 0x");
+    hal.Serial.putHex(stack.entry_rsp);
     hal.Serial.puts(")\n");
 
-    // 6. kill-self (exit-паттерн: транзакция снята, задача Killed,
-    //    hlt до диспетчеризации НОВОЙ задачи). Снапшот-страницы уже в PMM
-    //    (3b); demand-zero страницы glibc-fork-ребёнка (без бита 52) —
-    //    утечены (реестр перезаписан; мало страниц — v0.21).
-    scheduler.exitCurrentTask();
-    hal.sti();
-    while (true) {
-        asm volatile ("hlt" ::: "memory");
-    }
+    return 0; // Return directly into the new binary entry point!
 }
 
 /// wait4-реестр: >0 = reap зомби (код в code_out; слот освобождается);
@@ -4679,8 +4765,15 @@ fn linuxOpenFile(path: []const u8, flags: u64, out_kind: *linux_syscalls.FdKind)
         @memcpy(f.name[0..n], path[0..n]);
         return @intCast(s);
     }
+    var path_buf: [160]u8 = undefined;
+    var eff_path = path;
+    if (path.len > 0 and path[0] != '/' and path.len + 1 <= path_buf.len) {
+        path_buf[0] = '/';
+        @memcpy(path_buf[1 .. 1 + path.len], path);
+        eff_path = path_buf[0 .. 1 + path.len];
+    }
     const write_mode = (flags & linux_syscalls.O_ACCMODE) != linux_syscalls.O_RDONLY;
-    const node = kernel_vfs.resolve(path, write_mode) catch |e| {
+    const node = kernel_vfs.resolve(eff_path, write_mode) catch |e| {
         // CDD №12 p4-диагностика: ENOENT-фронты поимённо с причиной резолва
         // (эмпирика run5: libxcb-keysyms ENOENT при рабочем elfload-резолве)
         if (linux_trace) {
@@ -5363,7 +5456,7 @@ fn linuxKillThread(tid: u64, sig: u64) bool {
 /// R8/R9) читаем из scheduler-глобалов (asm-вход сохранил ДО затирания).
 /// v0.20.0 (CDD №11 p3): трассировка Linux-syscall'ов (команда ltrace) —
 /// crash-driven инструмент: видно ПОСЛЕДОВАТЕЛЬНОСТЬ и возвраты.
-var linux_trace: bool = false;
+var linux_trace: bool = true;
 var poll_diag_counter: u32 = 0; // p14: capped [PLW]-трейс (первые 30)
 
 fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {

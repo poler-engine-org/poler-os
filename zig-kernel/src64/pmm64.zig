@@ -102,6 +102,7 @@ pub fn init(mbi_ptr: u64) void {
 
     // 6. Protect the Multiboot2 info structure (при PVH: mbi==0 — пропускаем)
     if (mbi_ptr != 0) {
+        const parser = multiboot2.Parser.init(mbi_ptr);
         const mbi_header: *const multiboot2.InfoHeader = @ptrFromInt(mbi_ptr);
         const mbi_size = mbi_header.total_size;
         const mbi_end = (mbi_ptr + mbi_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -109,6 +110,18 @@ pub fn init(mbi_ptr: u64) void {
         while (addr < mbi_end) : (addr += PAGE_SIZE) {
             if (addr < MAX_MEM_SUPPORTED) {
                 setPageInternal(addr);
+            }
+        }
+
+        // 7. Protect Multiboot2 modules (initrd cpio / ramdisk)
+        var mod_offset: u64 = 8;
+        while (parser.findModuleTag(&mod_offset)) |mod| {
+            var mod_addr: u64 = mod.mod_start & ~(PAGE_SIZE - 1);
+            const mod_end = (mod.mod_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            while (mod_addr < mod_end) : (mod_addr += PAGE_SIZE) {
+                if (mod_addr < MAX_MEM_SUPPORTED) {
+                    setPageInternal(mod_addr);
+                }
             }
         }
     }

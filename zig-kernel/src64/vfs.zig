@@ -253,6 +253,16 @@ pub fn libPathAliases(key: []const u8, out: *[MAX_ALIASES][]const u8, scratch: *
             break; // один ключ — один usr-merge вариант
         }
     }
+    // Если путь без каталога (напр. "libcrypt.so.2") — пробуем искать в "usr/lib/"
+    if (!std.mem.containsAtLeast(u8, key, 1, "/") and n < MAX_ALIASES) {
+        if (used + 8 + key.len <= scratch.len) {
+            @memcpy(scratch[used..][0..8], "usr/lib/");
+            @memcpy(scratch[used + 8 ..][0..key.len], key);
+            out[n] = scratch[used ..][0 .. 8 + key.len];
+            n += 1;
+            used += 8 + key.len;
+        }
+    }
     return n;
 }
 

@@ -10,7 +10,11 @@ disk.img
 # Тяжёлые рантайм-выгрузки (не для git)
 cachyos-root/pkgcache/
 cachyos-root/root/
-cachyos-root/*.cpio
+*.cpio
+userspace/init
+userspace/sh
+userspace/compositor
+userspace/test_init
 qemu-full/
 
 # e2e-артефакты

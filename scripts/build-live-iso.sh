@@ -57,63 +57,8 @@ mkdir -p "$BUILD"
 export REPO BUILD KERNEL
 
 # ─── 2. CPIO-initrd: структура Live-сессии + манифест ───────────────────────
-echo "[2/4] Building live-initrd.cpio (Live-структура + манифест)..."
-python3 - "$BUILD" <<'PYEOF'
-import os, sys
-sys.path.insert(0, os.path.join(os.environ.get("REPO", ""), "scripts", "e2e"))
-# e2e_lib.build_cpio — проверенный newc-билдер (magic 070701, ядро cpio.zig)
-REPO = os.environ["REPO"]
-sys.path.insert(0, os.path.join(REPO, "scripts", "e2e"))
-from e2e_lib import build_cpio
-
-manifest = """POLER-OS LIVE-MANIFEST v0.19.0 (CDD #10)
-mount-table (VFS Live-mode):
-  /dev      devfs: fb0, dri/card0, input/event0, input/event1
-  /tmp      tmpfs: RAM overlay (session write, Wayland sockets)
-  /         initrd-RO: CachyOS userspace (read from USB)
-userspace (CDD top-down, crash-driven):
-  wave-1: Gamescope micro-compositor (mmap /dev/dri/card0 dumb-KMS + WC)
-  wave-2: Wayland session + KWin/Plasma minimal (poll/epoll input, futex)
-  wave-3: Mesa llvmpipe/virtio-gpu (vram via DRM_IOCTL_MODE_*)
-note: перехват крашей недостающих syscall/ioctl → реализация по следам
-"""
-files = {
-    "README.txt": manifest.encode(),
-    "etc/hostname": b"poler-live\n",
-    "etc/release": b"POLER-OS v0.19.0 (CDD #10) Live-USB session\n",
-}
-# опциональный CachyOS-контент (из $CACHYOS_ROOT — см. шапку скрипта)
-root = os.environ.get("CACHYOS_ROOT", "")
-if root and os.path.isdir(root):
-    count = 0
-    budget = 256 * 1024 * 1024  # 256МБ на initrd-волну (QEMU -m 512M)
-    for base, _, names in os.walk(root):
-        for n in names:
-            p = os.path.join(base, n)
-            arc = p[len(root):].lstrip("/")
-            if arc in files or arc.startswith("proc/") or arc.startswith("sys/"):
-                continue
-            try:
-                sz = os.path.getsize(p)
-            except OSError:
-                continue
-            if sz > 32 * 1024 * 1024:  # волны: крупные бинари — на FAT32
-                continue
-            if budget - sz < 0:
-                break
-            with open(p, "rb") as f:
-                data = f.read()
-            files[arc] = data
-            budget -= sz
-            count += 1
-    print(f"      CachyOS: packed {count} files from {root}")
-
-out = os.path.join(os.environ["BUILD"], "live-initrd.cpio")
-with open(out, "wb") as f:
-    f.write(build_cpio(files))
-print(f"      initrd: {os.path.getsize(out)} bytes, {len(files)} entries")
-PYEOF
-REPO="$REPO" BUILD="$BUILD" python3 -c "pass" 2>/dev/null || true
+echo "[2/4] Building live-initrd.cpio (Live-структура + манифест + userspace)..."
+python3 "$REPO/scripts/pack-initrd.py"
 
 # ─── 3. FAT32 «USB-флешка»: ядро + манифест + RW-зона ──────────────────────
 echo "[3/4] Building live-usb.img (FAT32, RW-зона Live-сессии)..."
@@ -195,15 +140,15 @@ if command -v grub-mkrescue >/dev/null 2>&1 && command -v xorriso >/dev/null 2>&
     cp "$KERNEL" "$BUILD/iso/boot/poler-os64"
     cp "$BUILD/live-initrd.cpio" "$BUILD/iso/boot/live-initrd.cpio"
     cat > "$BUILD/iso/boot/grub/grub.cfg" <<'GRUB'
-set timeout=3
+set timeout=1
 set default=0
-menuentry "POLER-OS v0.19.0 Live-USB (64-bit, VBE graphics)" {
+menuentry "POLER-OS v0.20.0-rc (64-bit, Arch/CachyOS Substrate)" {
     insmod multiboot2
     insmod part_msdos
     insmod elf
-    echo "Loading POLER-OS v0.19.0 kernel..."
+    echo "Loading POLER-OS v0.20.0-rc kernel & CachyOS initrd..."
     multiboot2 /boot/poler-os64
-    module /boot/live-initrd.cpio
+    module2 /boot/live-initrd.cpio
     boot
 }
 GRUB
