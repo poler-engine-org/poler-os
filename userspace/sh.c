@@ -44,15 +44,24 @@ __attribute__((used)) unsigned long strlen(const char *s) {
 }
 
 __attribute__((used)) void *memset(void *s, int c, unsigned long n) {
-    unsigned char *p = (unsigned char *)s;
-    while (n--) *p++ = (unsigned char)c;
-    return s;
+    void *orig = s;
+    asm volatile (
+        "rep stosb"
+        : "+D"(s), "+c"(n)
+        : "a"((unsigned char)c)
+        : "memory"
+    );
+    return orig;
 }
 
 __attribute__((used)) void *memcpy(void *dest, const void *src, unsigned long n) {
-    unsigned char *d = (unsigned char *)dest;
-    const unsigned char *s = (const unsigned char *)src;
-    while (n--) *d++ = *s++;
+    void *d = dest;
+    asm volatile (
+        "rep movsb"
+        : "+D"(d), "+S"(src), "+c"(n)
+        :
+        : "memory"
+    );
     return dest;
 }
 
@@ -181,9 +190,7 @@ static void cmd_pacman(const char *args) {
                   "\033[1;32m:: GNOME 47 Desktop successfully staged into RAM!\033[0m\n"
                   ":: Launching Wayland compositor...\n\n");
 
-            const char *argv[2] = {"/bin/compositor", 0};
-            const char *envp[4] = {"TERM=xterm", "XDG_SESSION_TYPE=wayland", "XDG_CURRENT_DESKTOP=GNOME", 0};
-            syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
+            syscall3(SYS_execve, (long)"/bin/compositor", 0, 0);
             return;
         } else if (strcmp(target, "plasma") == 0 || strcmp(target, "kde") == 0 || strcmp(target, "kwin") == 0) {
             print("\033[1;36m:: Resolving dependencies for KDE Plasma 6...\033[0m\n"
@@ -351,27 +358,11 @@ void main_entry(void) {
             cmd_pacman(cmd + 6);
         } else if (strcmp(cmd, "gnome") == 0 || strcmp(cmd, "mutter") == 0 || strcmp(cmd, "gdm") == 0) {
             print("\033[1;36m[WAYLAND] Starting CachyOS GNOME Desktop Session on DRM/KMS...\033[0m\n");
-            const char *argv[2];
-            argv[0] = "/bin/compositor";
-            argv[1] = 0;
-            const char *envp[4];
-            envp[0] = "TERM=xterm";
-            envp[1] = "XDG_SESSION_TYPE=wayland";
-            envp[2] = "XDG_CURRENT_DESKTOP=GNOME";
-            envp[3] = 0;
-            syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
+            syscall3(SYS_execve, (long)"/bin/compositor", 0, 0);
             print("sh: failed to launch /bin/compositor\n");
         } else if (strcmp(cmd, "startx") == 0 || strcmp(cmd, "plasma") == 0 || strcmp(cmd, "kde") == 0 || strcmp(cmd, "gamescope") == 0 || strcmp(cmd, "wayland") == 0) {
             print("\033[1;36m[WAYLAND] Starting CachyOS KDE Plasma 6 Desktop Session on DRM/KMS...\033[0m\n");
-            const char *argv[2];
-            argv[0] = "/bin/compositor";
-            argv[1] = 0;
-            const char *envp[4];
-            envp[0] = "TERM=xterm";
-            envp[1] = "XDG_SESSION_TYPE=wayland";
-            envp[2] = "XDG_CURRENT_DESKTOP=KDE";
-            envp[3] = 0;
-            syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
+            syscall3(SYS_execve, (long)"/bin/compositor", 0, 0);
             print("sh: failed to launch /bin/compositor\n");
         } else if (strcmp(cmd, "exit") == 0) {
             print("Shell exit. Restarting session...\n\n");

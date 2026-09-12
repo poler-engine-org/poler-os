@@ -68,15 +68,24 @@ static inline long syscall6(long n, long a1, long a2, long a3, long a4, long a5,
 }
 
 __attribute__((used)) void *memset(void *s, int c, unsigned long n) {
-    unsigned char *p = (unsigned char *)s;
-    while (n--) *p++ = (unsigned char)c;
-    return s;
+    void *orig = s;
+    asm volatile (
+        "rep stosb"
+        : "+D"(s), "+c"(n)
+        : "a"((unsigned char)c)
+        : "memory"
+    );
+    return orig;
 }
 
 __attribute__((used)) void *memcpy(void *dest, const void *src, unsigned long n) {
-    unsigned char *d = (unsigned char *)dest;
-    const unsigned char *s = (const unsigned char *)src;
-    while (n--) *d++ = *s++;
+    void *d = dest;
+    asm volatile (
+        "rep movsb"
+        : "+D"(d), "+S"(src), "+c"(n)
+        :
+        : "memory"
+    );
     return dest;
 }
 

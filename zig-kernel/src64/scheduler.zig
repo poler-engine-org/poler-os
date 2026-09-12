@@ -213,6 +213,9 @@ pub fn syscallStackOwner(ur: u64) usize {
     }
     // idle/boot-стек (kernelMain сисколы шелла ДО создания задач)
     if (ur >= 0x108000 and ur < 0x10C000) return 0;
+    if (current_task_id < task_count and tasks[current_task_id].state != .Killed) {
+        return current_task_id;
+    }
     return 255;
 }
 
