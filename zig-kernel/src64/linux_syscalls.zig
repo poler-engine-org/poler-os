@@ -218,6 +218,9 @@ pub const ENOTTY: i64 = 25;
 pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
+pub const ENOTCONN: i64 = 107; // CDD #17: inet-сокет без connect
+pub const EISCONN: i64 = 106; // CDD #17: повторный connect
+pub const EMSGSIZE: i64 = 90; // CDD #17: send > 1МБ чанка
 pub const ETIMEDOUT: i64 = 110;
 pub const ESPIPE: i64 = 29; // lseek на не-файл (pipe/device)
 
@@ -412,7 +415,121 @@ pub const FdKind = enum {
     /// (O_WRONLY, xwayland/server.c:111) до execve; write = свалка,
     /// read = EOF(0), poll = всегда готов. major 1 / minor 3.
     devnull,
+    /// CDD #17 (pacman): AF_INET/SOCK_STREAM-сокет (TCP поверх virtio-net).
+    /// file_id = индекс в inet_slots; транспорт инъектируется глобально
+    /// (InetTransport: kernel = virtio_net, тесты = fake).
+    inet_socket,
 };
+
+// ─── CDD #17 (pacman): AF_INET/SOCK_STREAM поверх транспорт-инъекции ───────
+
+pub const AF_INET: u64 = 2;
+pub const SOCK_STREAM: u64 = 1;
+pub const SOCK_NONBLOCK_FLAG: u64 = 0o4000; // SOCK_NONBLOCK (0x8000 на Linux: O_NONBLOCK-бит)
+pub const MAX_INET_SOCKETS: usize = 8;
+
+/// Транспорт TCP (kernel: virtio_net; тесты: fake). Глобальная инъекция —
+/// НЕ в LinuxOps (конструкторов много; сетевой слой один в системе).
+pub const InetTransport = struct {
+    /// Подключиться к ip:port. Возврат: tcp-слот ≥ 0 или -errno.
+    connect: *const fn (ip: [4]u8, port: u16) i64,
+    /// Отправить все данные. Возврат: байты или -errno.
+    send: *const fn (tcp_slot: usize, data: []const u8) i64,
+    /// Принять до out.len. ≥0 байт; 0 = нет данных (EAGAIN-контекст);
+    /// -1 = соединение закрыто (FIN/RST).
+    recv: *const fn (tcp_slot: usize, out: []u8) i64,
+    /// Закрыть tcp-слот.
+    close: *const fn (tcp_slot: usize) void,
+    /// Готовность: байты в ринге или -1 (закрыто) — для poll.
+    poll: *const fn (tcp_slot: usize) i64,
+};
+
+pub var inet_transport: ?InetTransport = null;
+
+pub const InetSock = struct {
+    used: bool = false,
+    connected: bool = false,
+    tcp_slot: usize = 0,
+    peer_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    peer_port: u16 = 0,
+    /// семейство домена (для shutdown/getpeername-контрактов)
+    shutdown_wr: bool = false,
+};
+
+pub var inet_slots: [MAX_INET_SOCKETS]InetSock = [_]InetSock{.{}} ** MAX_INET_SOCKETS;
+
+fn inetAlloc() ?usize {
+    for (&inet_slots, 0..) |*s, i| {
+        if (!s.used) {
+            s.* = .{};
+            s.used = true;
+            return i;
+        }
+    }
+    return null;
+}
+
+pub fn inetReset() void {
+    inet_slots = [_]InetSock{.{}} ** MAX_INET_SOCKETS;
+}
+
+/// sockaddr_in (16Б): family(2), port(2 BE), ip(4), zero(8).
+fn inetAddrParse(ops: LinuxOps, addr_va: u64, addr_len: u64) ?struct { ip: [4]u8, port: u16 } {
+    if (addr_len < 8) return null;
+    var buf: [16]u8 = undefined;
+    const alen = @min(@as(usize, @intCast(addr_len)), 16);
+    if (!ops.validate(addr_va, alen, false)) return null;
+    if (!ops.copy_in(buf[0..alen], addr_va)) return null;
+    const family = std.mem.readInt(u16, buf[0..2], .little);
+    if (family != AF_INET) return null;
+    const port = std.mem.readInt(u16, buf[2..4], .big); // сетевой порядок!
+    return .{ .ip = .{ buf[4], buf[5], buf[6], buf[7] }, .port = port };
+}
+
+fn inetSendData(ops: LinuxOps, e: *FdEntry, buf_va: u64, count: u64) u64 {
+    const t = inet_transport orelse return err(ENOSYS);
+    if (e.file_id >= inet_slots.len) return err(EBADF);
+    const s = &inet_slots[e.file_id];
+    if (!s.used or !s.connected) return err(ENOTCONN);
+    if (s.shutdown_wr) return err(EPIPE);
+    if (count == 0) return 0;
+    if (count > 1 << 20) return err(EMSGSIZE);
+    var kbuf: [4096]u8 = undefined; // чанковая отправка
+    var sent: usize = 0;
+    while (sent < count) {
+        const take = @min(@as(usize, @intCast(count)) - sent, kbuf.len);
+        if (!ops.validate(buf_va + sent, take, false)) return err(EFAULT);
+        if (!ops.copy_in(kbuf[0..take], buf_va + sent)) return err(EFAULT);
+        const n = t.send(s.tcp_slot, kbuf[0..take]);
+        if (n < 0) {
+            if (sent > 0) return @intCast(sent); // частичная отправка
+            return @bitCast(n);
+        }
+        sent += @intCast(n);
+        if (n == 0) break;
+    }
+    return @intCast(sent);
+}
+
+fn inetRecvData(ops: LinuxOps, e: *FdEntry, buf_va: u64, count: u64) u64 {
+    const t = inet_transport orelse return err(ENOSYS);
+    if (e.file_id >= inet_slots.len) return err(EBADF);
+    const s = &inet_slots[e.file_id];
+    if (!s.used or !s.connected) return err(ENOTCONN);
+    if (count == 0) return 0;
+    var kbuf: [4096]u8 = undefined;
+    const want = @min(@as(usize, @intCast(count)), kbuf.len);
+    const n = t.recv(s.tcp_slot, kbuf[0..want]);
+    if (n < 0) return 0; // EOF: read = 0 (Linux-семантика FIN)
+    if (n == 0) {
+        // нет данных: блокирующий recv — повтор (поллинг-контракт:
+        // transport.recv блокирует сам; 0 = реально пусто) → EAGAIN
+        return err(EAGAIN);
+    }
+    if (!ops.validate(buf_va, @intCast(n), true)) return err(EFAULT);
+    if (!ops.copy_out(buf_va, kbuf[0..@intCast(n)])) return err(EFAULT);
+    return @intCast(n);
+}
 
 pub const MAX_FILE_ID: u32 = 512; // p14: глоб.реестр (ENFILE у gamescope_ei) // p14: 64 исчерпал gamescope-стек (WSI/кэш/wlserver-shm)
     // → memfd_create=-ENFILE (фабрика poler-fb + wl_linux_dmabuf_v1 format-table)
@@ -899,6 +1016,7 @@ pub fn sysWrite(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64
     // CDD №12 p2: канальные виды (pipe-писец/socket/eventfd-инкремент)
     switch (e.kind) {
         .seatd => return seatdFeed(ops, e, buf_va, count),
+        .inet_socket => return inetSendData(ops, e, buf_va, count),
         .pipe_write, .socket, .eventfd => {
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, false)) return err(EFAULT);
             const r = ops.channel_write(e.file_id, buf_va, count);
@@ -943,6 +1061,7 @@ pub fn sysRead(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64)
         // каталог: read → EISDIR (Linux-семантика; glibc opendir не читает)
         .dir => return err(EISDIR),
         .seatd => return seatdDrain(ops, e, buf_va, count),
+        .inet_socket => return inetRecvData(ops, e, buf_va, count),
         .pipe_read, .socket, .eventfd, .timerfd => {
             // канал: FIFO-чтение (pipe/socket), счётчик (eventfd), экспирации
             if (count > USER_VA_CEILING or !ops.validate(buf_va, count, true)) return err(EFAULT);
@@ -1005,6 +1124,15 @@ pub fn sysClose(ops: LinuxOps, fds: *FdTable, fd_i: i64) u64 {
         .initrd_file, .tmpfs_file => ops.release_file(e.file_id),
         .seatd => {
             if (e.file_id < seatd_slots.len) seatd_slots[e.file_id] = .{};
+        },
+        .inet_socket => {
+            if (e.file_id < inet_slots.len) {
+                const s = &inet_slots[e.file_id];
+                if (s.used and s.connected) {
+                    if (inet_transport) |t| t.close(s.tcp_slot);
+                }
+                s.* = .{};
+            }
         },
         .pipe_read, .pipe_write, .eventfd, .socket, .timerfd, .signalfd => ops.channel_unref(e.file_id),
         .dir => ops.dir_close(e.file_id), // CDD №12 p3: поток каталога
@@ -1367,6 +1495,19 @@ fn pollScanOnce(ops: LinuxOps, fds: *FdTable, fds_va: u64, nfds: u64) u64 {
             // CDD №15 p4: /dev/null — read даёт EOF (готов), write всегда
             // готов: poll на нём НИКОГДА не блокирует
             .devnull => rdy = POLLIN | POLLOUT,
+            .inet_socket => {
+                if (inet_transport) |t| {
+                    if (e.file_id < inet_slots.len and inet_slots[e.file_id].used) {
+                        const r = t.poll(inet_slots[e.file_id].tcp_slot);
+                        if (r < 0) {
+                            rdy |= EPOLLHUP;
+                        } else if (r > 0) {
+                            rdy |= POLLIN;
+                        }
+                        rdy |= EPOLLOUT;
+                    }
+                }
+            },
             .initrd_file => rdy = POLLIN, // RO-файл: читаем
             .tmpfs_file => rdy = POLLIN | POLLOUT, // RAM-файл: RW
             .dir => {}, // каталог: read недоступен (EISDIR) — не готов
@@ -1501,6 +1642,19 @@ fn epollScanOnce(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, maxeve
             .pipe_write, .socket, .eventfd => rdy = ops.channel_ready(e.file_id) | EPOLLOUT,
             .signalfd => rdy = 0, // сигналов нет
             .devnull => rdy = EPOLLIN | EPOLLOUT, // p4: EOF+свалка — всегда
+            .inet_socket => {
+                if (inet_transport) |t| {
+                    if (e.file_id < inet_slots.len and inet_slots[e.file_id].used) {
+                        const r = t.poll(inet_slots[e.file_id].tcp_slot);
+                        if (r < 0) {
+                            rdy |= EPOLLIN | EPOLLHUP; // FIN: читаем хвост + HUP
+                        } else if (r > 0) {
+                            rdy |= EPOLLIN;
+                        }
+                        rdy |= EPOLLOUT;
+                    }
+                }
+            },
             .free => unreachable,
         }
         // CDD №12 p3: HUP/ERR ТОЛЬКО из реальной готовности (channel_ready
@@ -2494,6 +2648,19 @@ pub fn sysEpollPwait(ops: LinuxOps, fds: *FdTable, epfd: i64, events_va: u64, ma
 pub fn sysSocket(ops: LinuxOps, fds: *FdTable, domain: u64, sock_type: u64, protocol: u64) u64 {
     _ = ops;
     _ = protocol; // IPPROTO_* вне фундамента
+    // CDD #17: AF_INET/SOCK_STREAM — TCP (virtio-net через InetTransport)
+    if (domain == AF_INET) {
+        if ((sock_type & 0xF) != SOCK_STREAM) return err(EAFNOSUPPORT); // только поток
+        if (inet_transport == null) return err(EAFNOSUPPORT);
+        const slot = inetAlloc() orelse return err(ENFILE);
+        const fd = fds.allocFd(.inet_socket, (sock_type & 0o4000) != 0 or (sock_type & 0x8000) != 0);
+        if (fd < 0) {
+            inet_slots[slot] = .{};
+            return @bitCast(fd);
+        }
+        fds.entries[@intCast(fd)].file_id = @intCast(slot);
+        return @intCast(fd);
+    }
     if (domain != AF_UNIX and domain != AF_NETLINK) return err(EAFNOSUPPORT);
     const slot = seatdAlloc() orelse return err(ENFILE);
     seatd_slots[slot].af = domain;
@@ -2511,6 +2678,21 @@ pub fn sysSocket(ops: LinuxOps, fds: *FdTable, domain: u64, sock_type: u64, prot
 /// libseat/logind аккуратно скипают бэкенд). AF_NETLINK → 0 (инертно).
 pub fn sysConnect(ops: LinuxOps, fds: *FdTable, fd_i: i64, addr_va: u64, addr_len: u64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
+    // CDD #17: AF_INET — TCP-транспорт
+    if (e.kind == .inet_socket) {
+        const t = inet_transport orelse return err(ENOSYS);
+        if (e.file_id >= inet_slots.len) return err(EBADF);
+        const s = &inet_slots[e.file_id];
+        if (s.connected) return err(EISCONN);
+        const pa = inetAddrParse(ops, addr_va, addr_len) orelse return err(EAFNOSUPPORT);
+        const rc = t.connect(pa.ip, pa.port);
+        if (rc < 0) return @bitCast(rc);
+        s.tcp_slot = @intCast(rc);
+        s.connected = true;
+        s.peer_ip = pa.ip;
+        s.peer_port = pa.port;
+        return 0;
+    }
     if (e.kind != .seatd) return err(ENOTSOCK);
     const s = &seatd_slots[e.file_id];
     if (s.af == AF_NETLINK) return 0;
@@ -2676,6 +2858,7 @@ pub fn sysGetsockopt(ops: LinuxOps, fds: *FdTable, fd_i: i64, level: u64, optnam
 /// ssize_t sendto(fd, buf, len, flags, addr, addrlen) — как write на .seatd.
 pub fn sysSendto(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind == .inet_socket) return inetSendData(ops, e, buf_va, count);
     if (e.kind != .seatd) return err(ENOTSOCK);
     return seatdFeed(ops, e, buf_va, count);
 }
@@ -2683,6 +2866,7 @@ pub fn sysSendto(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u6
 /// ssize_t recvfrom(fd, buf, len, flags, addr, addrlen) — как read.
 pub fn sysRecvfrom(ops: LinuxOps, fds: *FdTable, fd_i: i64, buf_va: u64, count: u64) u64 {
     const e = fds.get(fd_i) orelse return err(EBADF);
+    if (e.kind == .inet_socket) return inetRecvData(ops, e, buf_va, count);
     if (e.kind != .seatd) return err(ENOTSOCK);
     return seatdDrain(ops, e, buf_va, count);
 }
@@ -5600,4 +5784,183 @@ test "linux: p11 — prlimit64-таблица + sched_setscheduler + setpriority
     try testing.expectEqual(@as(u64, 145), SYS_sched_setscheduler);
     try testing.expectEqual(@as(u64, 141), SYS_setpriority);
     try testing.expectEqual(@as(u64, 302), SYS_prlimit64);
+}
+
+// ─── CDD #17: тесты AF_INET/SOCK_STREAM (fake-транспорт) ───────────────────
+
+const FakeTcp = struct {
+    // scripted server: connect → slot; send → эхо-накопитель; recv → выдаёт
+    rx: [512]u8 = undefined,
+    rx_len: usize = 0,
+    connected_calls: usize = 0,
+    closed: bool = false,
+};
+var ftcp: FakeTcp = .{};
+
+fn ftConnect(ip: [4]u8, port: u16) i64 {
+    ftcp.connected_calls += 1;
+    // 10.0.2.2:80 → слот 0; иное → -ECONNREFUSED (111)
+    if (ip[0] == 10 and ip[1] == 0 and ip[2] == 2 and ip[3] == 2 and port == 80) return 0;
+    return -111;
+}
+fn ftSend(slot: usize, data: []const u8) i64 {
+    if (slot != 0 or ftcp.closed) return -32; // EPIPE
+    // эхо-сервер: всё отправленное появляется в rx
+    const n = @min(data.len, ftcp.rx.len - ftcp.rx_len);
+    @memcpy(ftcp.rx[ftcp.rx_len .. ftcp.rx_len + n], data[0..n]);
+    ftcp.rx_len += n;
+    return @intCast(n);
+}
+fn ftRecv(slot: usize, out: []u8) i64 {
+    if (slot != 0) return -1;
+    if (ftcp.closed) return -1;
+    if (ftcp.rx_len == 0) return 0;
+    const n = @min(out.len, ftcp.rx_len);
+    @memcpy(out[0..n], ftcp.rx[0..n]);
+    std.mem.copyForwards(u8, ftcp.rx[0 .. ftcp.rx_len - n], ftcp.rx[n..ftcp.rx_len]);
+    ftcp.rx_len -= n;
+    return @intCast(n);
+}
+fn ftClose(slot: usize) void {
+    if (slot == 0) ftcp.closed = true;
+}
+fn ftPoll(slot: usize) i64 {
+    if (slot != 0 or ftcp.closed) return -1;
+    return @intCast(ftcp.rx_len);
+}
+
+fn fakeInetTransport() InetTransport {
+    return .{
+        .connect = ftConnect,
+        .send = ftSend,
+        .recv = ftRecv,
+        .close = ftClose,
+        .poll = ftPoll,
+    };
+}
+
+test "linux: AF_INET socket + connect + send/recv echo + close (CDD #17)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    inetReset();
+    ftcp = .{};
+    inet_transport = fakeInetTransport();
+    defer inet_transport = null;
+
+    // socket(AF_INET, SOCK_STREAM, 0)
+    const fd = sysSocket(ops, &fds, AF_INET, SOCK_STREAM, 0);
+    try testing.expect(fd >= 0);
+
+    // connect к 10.0.2.2:80 (sockaddr_in: family LE, port BE!)
+    const sa_va = FakeEnv.USER_BASE + 0x100;
+    {
+        const p = e.vaPtr(sa_va).?;
+        @memset(p[0..16], 0);
+        std.mem.writeInt(u16, p[0..2], 2, .little);
+        std.mem.writeInt(u16, p[2..4], 80, .big);
+        p[4] = 10;
+        p[5] = 0;
+        p[6] = 2;
+        p[7] = 2;
+    }
+    const rc = sysConnect(ops, &fds, @intCast(fd), sa_va, 16);
+    try testing.expectEqual(@as(u64, 0), rc);
+    try testing.expect(ftcp.connected_calls == 1);
+
+    // send "ABCDEFGH"
+    const send_va = FakeEnv.USER_BASE + 0x200;
+    {
+        const p = e.vaPtr(send_va).?;
+        @memcpy(p[0..8], "ABCDEFGH");
+    }
+    const sr = sysSendto(ops, &fds, @intCast(fd), send_va, 8);
+    try testing.expectEqual(@as(u64, 8), sr);
+    try testing.expectEqual(@as(usize, 8), ftcp.rx_len);
+
+    // recv (эхо)
+    const recv_va = FakeEnv.USER_BASE + 0x300;
+    const rr = sysRecvfrom(ops, &fds, @intCast(fd), recv_va, 8);
+    try testing.expectEqual(@as(u64, 8), rr);
+    {
+        const p = e.vaPtr(recv_va).?;
+        try testing.expectEqualStrings("ABCDEFGH", p[0..8]);
+    }
+
+    // poll: сервер ответил → POLLIN
+    _ = ftSend(0, "XY");
+    const pfd_va = FakeEnv.USER_BASE + 0x400;
+    {
+        const p = e.vaPtr(pfd_va).?;
+        const pf: *PollFd = @ptrCast(@alignCast(p));
+        pf.* = .{ .fd = @intCast(fd), .events = POLLIN | EPOLLOUT, .revents = 0 };
+    }
+    const pr = sysPoll(ops, &fds, pfd_va, 1, 0);
+    try testing.expectEqual(@as(u64, 1), pr);
+
+    // close
+    const cr2 = sysClose(ops, &fds, @intCast(fd));
+    try testing.expectEqual(@as(u64, 0), cr2);
+    try testing.expect(ftcp.closed);
+}
+
+test "linux: AF_INET connect к недоступному адресу → ECONNREFUSED (CDD #17)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    inetReset();
+    ftcp = .{};
+    inet_transport = fakeInetTransport();
+    defer inet_transport = null;
+
+    const fd = sysSocket(ops, &fds, AF_INET, SOCK_STREAM, 0);
+    try testing.expect(fd >= 0);
+    const sa_va = FakeEnv.USER_BASE + 0x100;
+    {
+        const p = e.vaPtr(sa_va).?;
+        @memset(p[0..16], 0);
+        std.mem.writeInt(u16, p[0..2], 2, .little);
+        std.mem.writeInt(u16, p[2..4], 443, .big);
+        p[4] = 1;
+        p[5] = 2;
+        p[6] = 3;
+        p[7] = 4;
+    }
+    const rc = sysConnect(ops, &fds, @intCast(fd), sa_va, 16);
+    try testing.expectEqual(err(111), rc);
+    _ = sysClose(ops, &fds, @intCast(fd));
+}
+
+test "linux: AF_INET send без connect → ENOTCONN; DGRAM → EAFNOSUPPORT (CDD #17)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    inetReset();
+    inet_transport = fakeInetTransport();
+    defer inet_transport = null;
+
+    const fd = sysSocket(ops, &fds, AF_INET, SOCK_STREAM, 0);
+    try testing.expect(fd >= 0);
+    const send_va = FakeEnv.USER_BASE + 0x200;
+    const sr = sysSendto(ops, &fds, @intCast(fd), send_va, 8);
+    try testing.expectEqual(err(107), sr); // ENOTCONN
+    _ = sysClose(ops, &fds, @intCast(fd));
+
+    // SOCK_DGRAM не поддержан
+    const fd2 = sysSocket(ops, &fds, AF_INET, 2, 0);
+    try testing.expectEqual(err(97), fd2);
+}
+
+test "linux: AF_INET без транспорта → EAFNOSUPPORT (CDD #17)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var fds = FdTable.init();
+    const ops = fakeOps();
+    inetReset();
+    inet_transport = null;
+    const fd = sysSocket(ops, &fds, AF_INET, SOCK_STREAM, 0);
+    try testing.expectEqual(err(97), fd);
 }

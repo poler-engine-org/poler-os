@@ -16,6 +16,7 @@
 #define SYS_wait4 61
 #define SYS_getpid 39
 #define SYS_uname 63
+#define SYS_pacman 1000 /* CDD #17: kernel pacman gate (POLER-specific) */
 
 struct input_event {
     long sec;
@@ -150,75 +151,31 @@ static void cmd_pacman(const char *args) {
         print("usage:  pacman <operation> [options] [targets]\n\n"
               "operations:\n"
               "    pacman {-h --help}\n"
-              "    pacman {-S --sync} [options] [targets...]\n"
-              "    pacman {-U --upgrade} <file>\n\n"
+              "    pacman {-S --sync} [options] [targets...]\n\n"
               "examples:\n"
-              "    pacman -Sy             Sync remote CachyOS repository databases\n"
-              "    pacman -S gnome        Download & stage GNOME 47 Desktop directly to RAM\n"
-              "    pacman -S plasma       Download & stage KDE Plasma 6 Desktop directly to RAM\n");
+              "    pacman -Sy             Sync remote repository databases\n"
+              "    pacman -S bash         Download & install into RAM-overlay\n"
+              "    pacman -Ss <substr>    Search repository database\n"
+              "    pacman -Q              List installed packages\n"
+              "    pacman -Ql <pkg>       List files of installed package\n");
         return;
     }
 
-    if (strcmp(args, "-Sy") == 0 || strcmp(args, "-sy") == 0 || strcmp(args, "-Syy") == 0 || strcmp(args, "-Syu") == 0 || strcmp(args, "sync") == 0) {
-        print("\033[1;36m:: Synchronizing package databases...\033[0m\n"
-              " cachyos-v3 [####################################] 100% (2.4 MiB/s)\n"
-              " cachyos-extra-v3 [##############################] 100% (4.1 MiB/s)\n"
-              " core [##########################################] 100% (1.8 MiB/s)\n"
-              " extra [#########################################] 100% (8.5 MiB/s)\n"
-              "\033[1;32m:: Package databases synchronized successfully (online mirrors active).\033[0m\n");
-        return;
+    // CDD #17: НАСТОЯЩИЙ сетевой установщик — шлюз в ядро (SYS 1000):
+    // DNS+TCP(virtio-net)+HTTP+gzip/zstd+ALPM-резолвер+RAM-overlay VFS.
+    // Транзакция длинная (десятки секунд на 2МБ пакет в TCG) — ядро
+    // держит IF=1 и не вытесняет (in_win32_syscall) на время обмена.
+    char cmdline[192];
+    unsigned long i = 0;
+    while (args[i] && i < sizeof(cmdline) - 1) {
+        cmdline[i] = args[i];
+        i++;
     }
-
-    if (strncmp(args, "-S ", 3) == 0 || strncmp(args, "-s ", 3) == 0 || strncmp(args, "-Sy ", 4) == 0 || strncmp(args, "-sy ", 4) == 0 || strncmp(args, "install ", 8) == 0 || strncmp(args, "get ", 4) == 0) {
-        const char *target = args;
-        while (*target && *target != ' ') target++;
-        while (*target == ' ' || *target == 'y' || *target == 'Y') target++;
-        while (*target == ' ') target++;
-
-        if (strcmp(target, "gnome") == 0 || strcmp(target, "mutter") == 0 || strcmp(target, "gnome-shell") == 0) {
-            print("\033[1;36m:: Resolving dependencies for GNOME Desktop...\033[0m\n"
-                  "Packages (45) mutter-50.4 gnome-shell-50.4 gnome-session-50.1\n"
-                  "              gtk4-4.22 libadwaita-1.7 adwaita-icon-theme-50.0\n"
-                  "              gnome-terminal-3.60 nautilus-50.1 cantarell-fonts-0.311\n\n"
-                  "Total Download Size:    121.36 MiB\n"
-                  "Total Installed Size:   480.44 MiB (In-Memory tmpfs Overlay)\n\n"
-                  ":: Proceed with dynamic installation? [Y/n] Y\n"
-                  ":: Fetching packages from mirror.cachyos.org...\n"
-                  " (45/45) downloading mutter + gnome-shell [########################] 100%\n"
-                  ":: Processing package changes...\n"
-                  " (45/45) installing into rootfs overlay  [########################] 100%\n"
-                  "\033[1;32m:: GNOME 47 Desktop successfully staged into RAM!\033[0m\n"
-                  ":: Launching Wayland compositor...\n\n");
-
-            syscall3(SYS_execve, (long)"/bin/compositor", 0, 0);
-            return;
-        } else if (strcmp(target, "plasma") == 0 || strcmp(target, "kde") == 0 || strcmp(target, "kwin") == 0) {
-            print("\033[1;36m:: Resolving dependencies for KDE Plasma 6...\033[0m\n"
-                  "Packages (52) kwin-6.4 plasma-desktop-6.4 dolphin-25.04 konsole-25.04\n\n"
-                  ":: Fetching packages from mirror.cachyos.org...\n"
-                  " (52/52) downloading plasma packages    [########################] 100%\n"
-                  "\033[1;32m:: KDE Plasma 6 successfully staged into RAM!\033[0m\n"
-                  ":: Launching Wayland compositor...\n\n");
-
-            const char *argv[2] = {"/bin/compositor", 0};
-            const char *envp[4] = {"TERM=xterm", "XDG_SESSION_TYPE=wayland", "XDG_CURRENT_DESKTOP=KDE", 0};
-            syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
-            return;
-        } else {
-            print(":: Resolving dependencies for ");
-            print(target);
-            print("...\n:: Fetching package from mirror.cachyos.org...\n");
-            print(" (1/1) downloading ");
-            print(target);
-            print(" [########################] 100%\n:: Staging package into /usr/...\n");
-            print("\033[1;32m:: Package installed successfully.\033[0m\n");
-            return;
-        }
+    cmdline[i] = '\0';
+    long rc = syscall3(SYS_pacman, (long)cmdline, 0, 0);
+    if (rc < 0) {
+        print("pacman: kernel gate error\n");
     }
-
-    print("pacman: invalid operation '");
-    print(args);
-    print("' (type 'pacman --help')\n");
 }
 
 static void cmd_fetch(void) {

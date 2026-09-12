@@ -119,7 +119,7 @@ const RTO_MAX_TICKS: u32 = 300; // 3с — потолок экспоненциа
 const RTX_MAX_ATTEMPTS: u8 = 8; // далее — abort соединения
 const KA_IDLE_TICKS: u64 = 100; // 1с без встречного трафика → проба
 const KA_MAX_PROBES: u8 = 5; // далее — соединение мертво
-const WIN_UPDATE_THRESHOLD: u16 = 16384; // окно открылось → window-update ACK
+const WIN_UPDATE_THRESHOLD: u16 = 16384; // legacy-порог (CDD #17: заменён агрессивным update)
 
 const TcpState = enum(u8) {
     unused,
@@ -1374,12 +1374,15 @@ pub fn tcpRecv(slot: usize, out: []u8, wait: bool) VnetError!usize {
         out[i] = rp[c.ring_head];
         c.ring_head = (c.ring_head + 1) % RX_RING_SIZE;
     }
-    // v0.15.0: window-update — окно открылось после дренажа
-    if (c.win_advertised < WIN_UPDATE_THRESHOLD and recvWindow(c) >= WIN_UPDATE_THRESHOLD) {
+    // v0.15.0 + CDD #17 (эмперия прошлой сессии): АГРЕССИВНЫЙ window-update.
+    // Пороговый вариант (win_advertised < 16КБ) давал классический deadlock
+    // sliding-window: при объявленном ~20КБ окне устаревшее окно НИКОГДА не
+    // переоткрывалось → сервер стоял навсегда. Теперь: окно открылось на
+    // ≥ MSS ИЛИ кольцо полностью пустое → гарантированный ACK-уведомление
+    // после КАЖДОГО дренажа (лишние ACK в SLIRP-сети дешевле дедлока).
+    const win_now = recvWindow(c);
+    if (@as(u32, win_now) >= @as(u32, c.win_advertised) + MSS or win_now == RX_RING_SIZE) {
         sendTcpAck(c);
-        hal.Serial.puts("[VNET] TCP: window-update (slot ");
-        hal.Serial.putDecimal(slot);
-        hal.Serial.puts(")\n");
     }
     return n;
 }

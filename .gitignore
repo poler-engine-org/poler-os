@@ -36,3 +36,4 @@ token*.txt
 .vscode/
 .idea/
 .DS_Store
+.tex3/

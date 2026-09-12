@@ -20,6 +20,7 @@ const enroll_gate = @import("enroll_gate.zig");
 const pmm = @import("pmm64.zig");
 const vmm = @import("vmm64.zig");
 const heap = @import("heap64.zig");
+const pacman = @import("pacman.zig");
 const cpio = @import("cpio.zig");
 const scheduler = @import("scheduler.zig");
 const multiboot2 = @import("multiboot2.zig");
@@ -1131,6 +1132,8 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         // сисколов): ACKи уходят, окно не зависает, сервер не ретранзмитит.
         // pollRx самонебезопасен (in_poll-гард) и быстр (≤8 фреймов).
         hal.net_irq_sink = virtio_net.pollRx;
+        // CDD #17: AF_INET/SOCK_STREAM-транспорт для POSIX-сокетов Ring 3
+        linux_syscalls.inet_transport = kernelInetTransport();
         puts("[VNET] IRQ Network Worker: pollRx+TCP-таймеры на каждом тике (CDD №7)\n");
     } else {
         puts("[VNET] No virtio-net device (expected without -netdev)\n");
@@ -1387,6 +1390,9 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  mmapinfo  - mmap registry of Linux processes: va + size + module name\n");
         sys_print("  tasks     - Task registry: tasks / wake / fd / epoll-watches / channels\n");
         sys_print("  peek <hexva> [n] - Read user VA of guest (page walk)\n");
+        sys_print("  pacman -Sy       - Sync repo DBs (real HTTP via virtio-net, CDD #17)\n");
+        sys_print("  pacman -S <pkg>  - Download+install Arch package to RAM-overlay /usr\n");
+        sys_print("  pacman -Q/-Ql/-Ss - Query installed / list files / search repo\n");
     } else if (eq(cmd, "about")) {
         sys_print("POLER-OS v0.20.0-rc (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment (PUF + Enrollment-Gate + Linux ABI + DRM/KMS).\n");
@@ -1448,6 +1454,10 @@ fn execute_command(cmd: []const u8) void {
         } else {
             cmd_drmtest();
         }
+    } else if (eq(cmd, "pacman")) {
+        _ = pacmanTransaction("");
+    } else if (startsWith(cmd, "pacman ")) {
+        _ = pacmanTransaction(cmd[7..]);
     } else if (eq(cmd, "sh") or eq(cmd, "bash")) {
         cmd_elfload("bin/sh");
     } else if (eq(cmd, "gputest")) {
@@ -2973,7 +2983,22 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
     hal.Serial.puts(" (len ");
     hal.Serial.putDecimal(path.len);
     hal.Serial.puts(")\n");
-    const data = initrdFindFile(path) orelse {
+    // CDD #17: overlay-резолв ПЕРВЫМ — бинарши из pacman-установок
+    // (/usr/bin/*) запускаемы; initrd — фолбэк.
+    var exec_data: ?[]const u8 = null;
+    if (kernel_vfs_ready) {
+        if (kernel_vfs.resolve(path, false)) |node| {
+            switch (node.kind) {
+                .tmpfs_file => {
+                    const f = node.tmp.?;
+                    if (f.data) |d| exec_data = d.ptr[0..@intCast(f.size)];
+                },
+                .initrd_file => exec_data = node.initrd_data,
+                .dev => {},
+            }
+        } else |_| {}
+    }
+    const data = exec_data orelse initrdFindFile(path) orelse {
         hal.Serial.puts("[LINUX] execve: FILE NOT FOUND in initrd\n");
         return -linux_syscalls.ENOENT;
     };
@@ -4565,7 +4590,56 @@ fn isDirPath(path: []const u8) bool {
     if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/dev") or
         std.mem.eql(u8, path, "/dev/dri") or std.mem.eql(u8, path, "/dev/input")) return true;
     if (initrdIsDir(path)) return true;
-    return initrdHasChildren(path);
+    if (initrdHasChildren(path)) return true;
+    // CDD #17: каталоги RAM-overlay (pacman-установки: /usr/bin и др.)
+    if (kernel_vfs_ready and tmpfsHasChildren(path)) return true;
+    return false;
+}
+
+/// CDD #17: есть ли у пути детей в tmpfs-overlay (usr/bin → usr/bin/*).
+fn tmpfsHasChildren(path: []const u8) bool {
+    var norm_buf: [160]u8 = undefined;
+    var prefix_buf: [160]u8 = undefined;
+    const norm = vfs.normalizePath(path, &norm_buf) orelse return false;
+    if (norm.len == 1) {
+        // корень: любые tmpfs-файлы = дети
+        return kernel_vfs.tmp.files[0].used;
+    }
+    const plen = @min(norm.len - 1, prefix_buf.len);
+    @memcpy(prefix_buf[0..plen], norm[1..norm.len]);
+    for (&kernel_vfs.tmp.files) |*f| {
+        if (!f.used) continue;
+        const nm = f.nameSlice();
+        if (nm.len > plen + 1 and std.mem.startsWith(u8, nm, prefix_buf[0..plen]) and
+            nm[plen] == '/')
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// CDD #17: наполнить DirStream детьми из tmpfs-overlay.
+fn tmpfsDirFill(path: []const u8, d: *DirStream) void {
+    var norm_buf: [160]u8 = undefined;
+    const norm = vfs.normalizePath(path, &norm_buf) orelse return;
+    var prefix_buf: [160]u8 = undefined;
+    var plen: usize = 0;
+    if (norm.len > 1) {
+        plen = @min(norm.len - 1, prefix_buf.len);
+        @memcpy(prefix_buf[0..plen], norm[1..norm.len]);
+    }
+    for (&kernel_vfs.tmp.files) |*f| {
+        if (!f.used) continue;
+        const nm = f.nameSlice();
+        // имя внутри каталога: prefix + "/" + child (child без '/')
+        if (nm.len <= plen + 1) continue;
+        if (!std.mem.startsWith(u8, nm, prefix_buf[0..plen])) continue;
+        if (nm[plen] != '/') continue;
+        const child = nm[plen + 1 ..];
+        if (std.mem.indexOfScalar(u8, child, '/') != null) continue; // это глубже
+        dirPush(d, child, if (f.isSymlink()) linux_syscalls.DT_LNK else linux_syscalls.DT_REG);
+    }
 }
 
 /// Открыть поток каталога (слот DirStream) — вызывается из linuxOpenFile
@@ -4605,6 +4679,8 @@ fn linuxOpenDir(path: []const u8) i64 {
     } else {
         initrdDirFill(path, d);
     }
+    // CDD #17: дети из tmpfs-overlay (pacman-установки)
+    if (kernel_vfs_ready) tmpfsDirFill(path, d);
     return @intCast(s);
 }
 
@@ -4709,6 +4785,177 @@ fn kernelVfsOps() vfs.VfsOps {
 /// Глобальный VFS Live-режима: /dev (устройства) + initrd-RO + /tmp (RAM).
 var kernel_vfs: vfs.Vfs = undefined;
 var kernel_vfs_ready = false;
+
+// ─── CDD #17 (pacman): платформенные PacOps (virtio-net + VFS + heap64) ───
+
+/// Печать pacman: VGA + serial (маяки [PAC] для e2e).
+fn pacPrint(s: []const u8) void {
+    puts(s);
+}
+
+fn pacTcpConnect(ip: [4]u8, port: u16) i64 {
+    const slot = virtio_net.tcpConnect(ip, port) catch |e| {
+        return switch (e) {
+            error.Timeout => -110, // ETIMEDOUT
+            error.ConnClosed => -111, // ECONNREFUSED
+            error.NoFreeConn => -24, // EMFILE
+            error.BadState => -22, // EINVAL
+            else => -5, // EIO
+        };
+    };
+    return @intCast(slot);
+}
+
+fn pacTcpSend(slot: usize, data: []const u8) i64 {
+    const n = virtio_net.tcpSend(slot, data) catch return -5;
+    return @intCast(n);
+}
+
+/// Приём с hlt-ожиданием: pacman-транзакция идёт с IF=1 (gate снял маску
+/// SYSCALL) — таймер дышит: IRQ pollRx + TCP-таймеры; hlt просыпается на
+/// любом IRQ. Эмпирика прошлых сессий: IF=0 → tick_count замерзает, а
+/// recv-спин 4M итераций = TCG-катастрофа. Здесь — честный парк.
+fn pacTcpRecv(slot: usize, out: []u8) i64 {
+    const deadline = hal.tick_count + 9000; // 90с на вызов (пакеты ≤ 9МБ)
+    while (true) {
+        const n = virtio_net.tcpRecv(slot, out, false) catch return -1;
+        if (n > 0) return @intCast(n);
+        const st = virtio_net.tcpState(slot);
+        const rb = virtio_net.tcpRingBytes(slot);
+        if ((st == .closed or st == .time_wait) and rb == 0) return -1; // EOF
+        if (hal.tick_count >= deadline) return 0; // таймаут: данных нет
+        asm volatile ("hlt" ::: "memory"); // ждём IRQ (таймер/сеть)
+    }
+}
+
+fn pacTcpClose(slot: usize) void {
+    virtio_net.tcpClose(slot);
+}
+
+fn pacDnsResolve(host: []const u8) ?[4]u8 {
+    return virtio_net.dnsResolve(host);
+}
+
+/// Запись ПОЛНОГО файла в VFS overlay (create-or-replace; RO-ноду initrd
+/// НЕ перезаписываем — p13-инвариант «тень только для новых путей»).
+fn pacWriteFile(path: []const u8, data: []const u8) bool {
+    if (!kernel_vfs_ready) return false;
+    const node = kernel_vfs.resolve(path, true) catch return false;
+    switch (node.kind) {
+        .tmpfs_file => {
+            const f = node.tmp.?;
+            const n = kernel_vfs.tmp.write(f, 0, data) catch return false;
+            if (n != data.len) return false;
+            f.size = data.len; // replace-семантика (усечение при перезаписи)
+            return true;
+        },
+        .initrd_file => return false,
+        .dev => return false,
+    }
+}
+
+fn pacMakeSymlink(path: []const u8, target: []const u8) bool {
+    if (!kernel_vfs_ready) return false;
+    if (path.len == 0 or path[0] != '/') return false;
+    kernel_vfs.tmp.makeSymlink(path[1..], target) catch return false;
+    return true;
+}
+
+fn pacAlloc(n: usize) ?[*]u8 {
+    return heap.kmalloc(n);
+}
+
+fn pacFree(ptr: [*]u8, n: usize) void {
+    _ = n;
+    heap.kfree(ptr);
+}
+
+fn kernelPacOps() pacman.PacOps {
+    return .{
+        .tcp_connect = pacTcpConnect,
+        .tcp_send = pacTcpSend,
+        .tcp_recv = pacTcpRecv,
+        .tcp_close = pacTcpClose,
+        .dns_resolve = pacDnsResolve,
+        .write_file = pacWriteFile,
+        .make_symlink = pacMakeSymlink,
+        .alloc = pacAlloc,
+        .free = pacFree,
+        .print = pacPrint,
+    };
+}
+
+/// CDD #17: POSIX AF_INET-сокеты Ring 3 поверх virtio-net (полноценность:
+/// socket/connect/send/recv/poll/close; блокировка — ограниченный поллинг).
+fn kInetConnect(ip: [4]u8, port: u16) i64 {
+    return pacTcpConnect(ip, port);
+}
+fn kInetSend(slot: usize, data: []const u8) i64 {
+    return pacTcpSend(slot, data);
+}
+fn kInetRecv(slot: usize, out: []u8) i64 {
+    // syscall-контекст (IF может быть 0): pollRx работает (MMIO-поллинг);
+    // ограниченный спин ~40мс → 0 (EAGAIN-контракт слоя)
+    var spins: u32 = 0;
+    while (spins < 400_000) : (spins += 1) {
+        const n = virtio_net.tcpRecv(slot, out, false) catch return -1;
+        if (n > 0) return @intCast(n);
+        const st = virtio_net.tcpState(slot);
+        if ((st == .closed or st == .time_wait) and virtio_net.tcpRingBytes(slot) == 0) return -1;
+        asm volatile ("pause");
+    }
+    return 0;
+}
+fn kInetClose(slot: usize) void {
+    pacTcpClose(slot);
+}
+fn kInetPoll(slot: usize) i64 {
+    return virtio_net.tcpPoll(slot);
+}
+fn kernelInetTransport() linux_syscalls.InetTransport {
+    return .{
+        .connect = kInetConnect,
+        .send = kInetSend,
+        .recv = kInetRecv,
+        .close = kInetClose,
+        .poll = kInetPoll,
+    };
+}
+
+/// CDD #17: транзакция pacman — атомарность + «дышащие» прерывания.
+fn pacmanTransaction(args: []const u8) i32 {
+    const saved = scheduler.in_win32_syscall;
+    hal.cli();
+    scheduler.in_win32_syscall = 1;
+    hal.sti();
+    const rc = pacman.pacmanMain(args, kernelPacOps());
+    hal.cli();
+    scheduler.in_win32_syscall = saved;
+    hal.sti();
+    return rc;
+}
+
+/// CDD #17: syscall-gate pacman для Ring 3 (sh.c: SYS 1000).
+fn sysPacmanGate(cmd_va: u64) u64 {
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    {
+        const owner = scheduler.syscallStackOwner(scheduler.user_rsp);
+        if (owner >= scheduler.MAX_TASKS) return @bitCast(@as(i64, -14)); // EFAULT
+        while (len < buf.len) : (len += 1) {
+            const va = cmd_va + len;
+            const page = va & ~@as(u64, 4095);
+            if (!linux_user_io.validate(page, 1, false)) break;
+            const p: [*]const u8 = @ptrFromInt(va);
+            const c = p[0];
+            if (c == 0) break;
+            buf[len] = c;
+        }
+    }
+    if (len == 0) return @bitCast(@as(i64, -22)); // EINVAL
+    const rc = pacmanTransaction(buf[0..len]);
+    return @bitCast(@as(i64, rc));
+}
 
 fn vfsInit() void {
     // p14-ФИКС: Vfs.init возвращал 35КБ-структуру через BOOT-стек (мал!)
@@ -5535,6 +5782,11 @@ fn linuxSyscallEntry(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) u64 {
             hal.Serial.putHex(scheduler.syscall_frame[7]);
             hal.Serial.puts("\n");
         }
+    }
+    // CDD #17: pacman-шлюз (SYS 1000): долгая СЕТЕВАЯ транзакция —
+    // IF=1 + запрет вытеснения на время обмена (см. pacmanTransaction)
+    if (num == 1000) {
+        return sysPacmanGate(a1);
     }
     const r = linux_syscalls.dispatch(kernelLinuxOps(), linuxFdsCurrent(), num, .{
 
@@ -6958,6 +7210,7 @@ fn fdKindName(k: linux_syscalls.FdKind) void {
         .eventfd => sys_print("eventfd"),
         .socket => sys_print("socket"),
         .seatd => sys_print("seatd"),
+        .inet_socket => sys_print("inet"),
         .timerfd => sys_print("timerfd"),
         .signalfd => sys_print("signalfd"),
         .dir => sys_print("dir"),
