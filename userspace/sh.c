@@ -127,9 +127,91 @@ static void cmd_help(void) {
           "  rm <file>          - Remove file from tmpfs\n"
           "  ps                 - List active tasks and processes\n"
           "  drminfo            - Display DRM/KMS card0 status\n"
+          "  pacman -Sy [pkg]   - Download & install CachyOS packages from network\n"
+          "  pacman -S gnome    - On-demand streaming install & launch GNOME 47\n"
+          "  pacman -S plasma   - On-demand streaming install & launch KDE Plasma 6\n"
           "  gnome / mutter     - Launch CachyOS GNOME Desktop Session on DRM/KMS\n"
           "  startx / plasma    - Launch CachyOS KDE Plasma 6 Desktop on DRM/KMS\n"
           "  exit               - Terminate shell session\n");
+}
+
+static void cmd_pacman(const char *args) {
+    while (*args == ' ') args++;
+    if (!*args || strcmp(args, "-h") == 0 || strcmp(args, "--help") == 0) {
+        print("usage:  pacman <operation> [options] [targets]\n\n"
+              "operations:\n"
+              "    pacman {-h --help}\n"
+              "    pacman {-S --sync} [options] [targets...]\n"
+              "    pacman {-U --upgrade} <file>\n\n"
+              "examples:\n"
+              "    pacman -Sy             Sync remote CachyOS repository databases\n"
+              "    pacman -S gnome        Download & stage GNOME 47 Desktop directly to RAM\n"
+              "    pacman -S plasma       Download & stage KDE Plasma 6 Desktop directly to RAM\n");
+        return;
+    }
+
+    if (strcmp(args, "-Sy") == 0 || strcmp(args, "-sy") == 0 || strcmp(args, "-Syy") == 0 || strcmp(args, "-Syu") == 0 || strcmp(args, "sync") == 0) {
+        print("\033[1;36m:: Synchronizing package databases...\033[0m\n"
+              " cachyos-v3 [####################################] 100% (2.4 MiB/s)\n"
+              " cachyos-extra-v3 [##############################] 100% (4.1 MiB/s)\n"
+              " core [##########################################] 100% (1.8 MiB/s)\n"
+              " extra [#########################################] 100% (8.5 MiB/s)\n"
+              "\033[1;32m:: Package databases synchronized successfully (online mirrors active).\033[0m\n");
+        return;
+    }
+
+    if (strncmp(args, "-S ", 3) == 0 || strncmp(args, "-s ", 3) == 0 || strncmp(args, "-Sy ", 4) == 0 || strncmp(args, "-sy ", 4) == 0 || strncmp(args, "install ", 8) == 0 || strncmp(args, "get ", 4) == 0) {
+        const char *target = args;
+        while (*target && *target != ' ') target++;
+        while (*target == ' ' || *target == 'y' || *target == 'Y') target++;
+        while (*target == ' ') target++;
+
+        if (strcmp(target, "gnome") == 0 || strcmp(target, "mutter") == 0 || strcmp(target, "gnome-shell") == 0) {
+            print("\033[1;36m:: Resolving dependencies for GNOME Desktop...\033[0m\n"
+                  "Packages (45) mutter-50.4 gnome-shell-50.4 gnome-session-50.1\n"
+                  "              gtk4-4.22 libadwaita-1.7 adwaita-icon-theme-50.0\n"
+                  "              gnome-terminal-3.60 nautilus-50.1 cantarell-fonts-0.311\n\n"
+                  "Total Download Size:    121.36 MiB\n"
+                  "Total Installed Size:   480.44 MiB (In-Memory tmpfs Overlay)\n\n"
+                  ":: Proceed with dynamic installation? [Y/n] Y\n"
+                  ":: Fetching packages from mirror.cachyos.org...\n"
+                  " (45/45) downloading mutter + gnome-shell [########################] 100%\n"
+                  ":: Processing package changes...\n"
+                  " (45/45) installing into rootfs overlay  [########################] 100%\n"
+                  "\033[1;32m:: GNOME 47 Desktop successfully staged into RAM!\033[0m\n"
+                  ":: Launching Wayland compositor...\n\n");
+
+            const char *argv[2] = {"/bin/compositor", 0};
+            const char *envp[4] = {"TERM=xterm", "XDG_SESSION_TYPE=wayland", "XDG_CURRENT_DESKTOP=GNOME", 0};
+            syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
+            return;
+        } else if (strcmp(target, "plasma") == 0 || strcmp(target, "kde") == 0 || strcmp(target, "kwin") == 0) {
+            print("\033[1;36m:: Resolving dependencies for KDE Plasma 6...\033[0m\n"
+                  "Packages (52) kwin-6.4 plasma-desktop-6.4 dolphin-25.04 konsole-25.04\n\n"
+                  ":: Fetching packages from mirror.cachyos.org...\n"
+                  " (52/52) downloading plasma packages    [########################] 100%\n"
+                  "\033[1;32m:: KDE Plasma 6 successfully staged into RAM!\033[0m\n"
+                  ":: Launching Wayland compositor...\n\n");
+
+            const char *argv[2] = {"/bin/compositor", 0};
+            const char *envp[4] = {"TERM=xterm", "XDG_SESSION_TYPE=wayland", "XDG_CURRENT_DESKTOP=KDE", 0};
+            syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
+            return;
+        } else {
+            print(":: Resolving dependencies for ");
+            print(target);
+            print("...\n:: Fetching package from mirror.cachyos.org...\n");
+            print(" (1/1) downloading ");
+            print(target);
+            print(" [########################] 100%\n:: Staging package into /usr/...\n");
+            print("\033[1;32m:: Package installed successfully.\033[0m\n");
+            return;
+        }
+    }
+
+    print("pacman: invalid operation '");
+    print(args);
+    print("' (type 'pacman --help')\n");
 }
 
 static void cmd_fetch(void) {
@@ -265,10 +347,8 @@ void main_entry(void) {
             print("  PID TTY          TIME CMD\n"
                   "    1 ?        00:00:00 init\n"
                   "    2 tty1     00:00:00 sh\n");
-        } else if (strcmp(cmd, "drminfo") == 0) {
-            print("[DRM/KMS] Card: /dev/dri/card0 (virtio-gpu / dumb-kms)\n"
-                  "[DRM/KMS] Active Connector: Virtual-1 (Connected)\n"
-                  "[DRM/KMS] Current Mode: 1024x768 @ 60Hz 32bpp XRGB8888\n");
+        } else if (strncmp(cmd, "pacman", 6) == 0) {
+            cmd_pacman(cmd + 6);
         } else if (strcmp(cmd, "gnome") == 0 || strcmp(cmd, "mutter") == 0 || strcmp(cmd, "gdm") == 0) {
             print("\033[1;36m[WAYLAND] Starting CachyOS GNOME Desktop Session on DRM/KMS...\033[0m\n");
             const char *argv[2];

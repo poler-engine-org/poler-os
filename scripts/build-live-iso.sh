@@ -136,13 +136,10 @@ PYEOF
 # ─── 4. GRUB-ISO (если инструменты есть) ────────────────────────────────────
 echo "[4/4] GRUB ISO (optional)..."
 if command -v grub-mkrescue >/dev/null 2>&1 && command -v xorriso >/dev/null 2>&1; then
+    rm -rf "$BUILD/iso"
     mkdir -p "$BUILD/iso/boot/grub"
     cp "$KERNEL" "$BUILD/iso/boot/poler-os64"
     cp "$BUILD/live-initrd.cpio" "$BUILD/iso/boot/live-initrd.cpio"
-    if [ -f "$BUILD/gnome-rootfs.sfs" ]; then
-        cp "$BUILD/gnome-rootfs.sfs" "$BUILD/iso/boot/gnome-rootfs.sfs"
-        echo "      gnome-sfs: $(du -h "$BUILD/gnome-rootfs.sfs" | cut -f1) included in ISO"
-    fi
     cp "$KERNEL_DIR/iso/boot/grub/grub.cfg" "$BUILD/iso/boot/grub/grub.cfg"
     ( cd "$BUILD" && grub-mkrescue -o poler-os64.iso iso ) >/dev/null 2>&1 \
         && echo "      iso: $BUILD/poler-os64.iso ($(du -h "$BUILD/poler-os64.iso" | cut -f1))" \
