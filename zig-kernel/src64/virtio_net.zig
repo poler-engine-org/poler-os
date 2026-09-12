@@ -1578,6 +1578,7 @@ fn tcpTimers() void {
 /// dnsResolve: A-запись host через UDP→10.0.2.3 (блокирующий поллинг).
 /// Возврат: 4 байта IP (BE-порядок в байтах: ip[0].ip[1]...) или null.
 pub fn dnsResolve(host: []const u8) ?[4]u8 {
+    hal.Serial.puts("[VNET] dnsResolve enter\n");
     if (!vn.initialized) return null;
     if (!resolveGateway()) return null;
     if (host.len == 0 or host.len > 128) return null;
@@ -1597,13 +1598,20 @@ pub fn dnsResolve(host: []const u8) ?[4]u8 {
     vn.dns_have = false;
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
+        hal.Serial.puts("[VNET] dns attempt\n");
         if (sendIp(IP_PROTO_UDP, udp[0..ulen], .{ 10, 0, 2, 3 })) {
             var spins: u32 = 0;
             while (spins < 6_000_000) : (spins += 1) {
                 pollRx();
                 if (vn.dns_have) {
+                    hal.Serial.puts("[VNET] dns reply OK\n");
                     dnsCachePut(host, vn.dns_last_ip); // v0.15.0: кэш для netstat
                     return vn.dns_last_ip;
+                }
+                if ((spins & 0xFFFFF) == 0) {
+                    hal.Serial.puts("[VNET] dns spin ");
+                    hal.Serial.putDecimal(spins);
+                    hal.Serial.puts("\n");
                 }
                 asm volatile ("pause");
             }

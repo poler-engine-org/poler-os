@@ -800,6 +800,18 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
             if (tick_count % 50 == 0) {
                 pageWatch(); // p4-forensics (тротл: 2Гц, только переходы)
             }
+            // e2e-ДИАГНОСТИКА (pacman): пульс таймера — 1 раз в секунду.
+            // Если пульс пропадает после транзакции — IF=0/CPU-dead; если
+            // пульс есть, а [KBD] нет — сломан путь клавиатуры/парка.
+            if (tick_count % 100 == 7) {
+                Serial.puts("[TICK] t=");
+                Serial.putDecimal(tick_count);
+                Serial.puts(" cur=");
+                Serial.putDecimal(@import("scheduler.zig").current_task_id);
+                Serial.puts(" fl=");
+                Serial.putDecimal(@import("scheduler.zig").in_win32_syscall);
+                Serial.puts("\n");
+            }
             if (tick_count % 100 == 0 and (frame.cs & 0x3) != 0) {
                 Serial.puts("[URIP] cur=");
                 Serial.putDecimal(@import("scheduler.zig").current_task_id);

@@ -290,12 +290,16 @@ fn ogrow(buf: []u8, need: usize) HttpError![]u8 {
 /// caller освобождает через ofree. Content-Length ИЛИ chunked, ИЛИ до-EOF.
 fn httpFetchUrl(host: []const u8, port: u16, path: []const u8, max_bytes: usize) HttpError![]u8 {
     // 1. DNS
+    p("[PAC] stage: dns ");
+    p(host);
+    p("\n");
     const ip = g_ops.dns_resolve(host) orelse {
         p("[PAC] http: DNS fail: ");
         p(host);
         p("\n");
         return HttpError.DnsFail;
     };
+    p("[PAC] stage: dns OK\n");
     // 2. TCP connect
     const slot64 = g_ops.tcp_connect(ip, port);
     if (slot64 < 0) {
@@ -2930,9 +2934,21 @@ fn cmdSearch(substr: []const u8) i32 {
 
 fn cmdInstall(target: []const u8, download_only: bool) i32 {
     // план
+    p("[PAC] stage: resolve ");
+    p(target);
+    p("\n");
     var plan: Plan = .{};
     var q: [MAX_TXN_PACKAGES * 4]usize = undefined;
     resolveDeps(target, &plan, &q);
+    p("[PAC] stage: resolved ");
+    printDecimal(plan.n);
+    p(" pkgs");
+    if (plan.missing_n > 0) {
+        p(" (missing ");
+        printDecimal(plan.missing_n);
+        p(")");
+    }
+    p("\n");
 
     if (plan.n == 0) {
         p("error: target not found: ");
@@ -2964,6 +2980,9 @@ fn cmdInstall(target: []const u8, download_only: bool) i32 {
     p("\n:: Proceed with installation? [Y/n] y\n");
 
     // транзакция
+    p("[PAC] stage: transaction ");
+    printDecimal(plan.n);
+    p(" pkgs\n");
     var ok_files: usize = 0;
     var ok_pkgs: usize = 0;
     for (0..plan.n) |k| {

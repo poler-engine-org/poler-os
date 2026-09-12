@@ -4794,7 +4794,20 @@ fn pacPrint(s: []const u8) void {
 }
 
 fn pacTcpConnect(ip: [4]u8, port: u16) i64 {
+    // ДИАГНОСТИКА e2e: каждая попытка коннекта видна в serial-логе
+    hal.Serial.puts("[PAC] tcp conn: ");
+    hal.Serial.putDecimal(ip[0]);
+    hal.Serial.puts(".");
+    hal.Serial.putDecimal(ip[1]);
+    hal.Serial.puts(".");
+    hal.Serial.putDecimal(ip[2]);
+    hal.Serial.puts(".");
+    hal.Serial.putDecimal(ip[3]);
+    hal.Serial.puts(".");
+    hal.Serial.putDecimal(port);
+    hal.Serial.puts("\n");
     const slot = virtio_net.tcpConnect(ip, port) catch |e| {
+        hal.Serial.puts("[PAC] tcp conn FAIL\n");
         return switch (e) {
             error.Timeout => -110, // ETIMEDOUT
             error.ConnClosed => -111, // ECONNREFUSED
@@ -4803,6 +4816,9 @@ fn pacTcpConnect(ip: [4]u8, port: u16) i64 {
             else => -5, // EIO
         };
     };
+    hal.Serial.puts("[PAC] tcp slot=");
+    hal.Serial.putDecimal(slot);
+    hal.Serial.puts("\n");
     return @intCast(slot);
 }
 
@@ -4928,6 +4944,11 @@ fn pacmanTransaction(args: []const u8) i32 {
     hal.cli();
     scheduler.in_win32_syscall = 1;
     hal.sti();
+    // ДИАГНОСТИКА e2e: вход в транзакцию (маяк [PAC] gate: — видно даже
+    // если зависание случится до первого сетевого пакета)
+    hal.Serial.puts("[PAC] gate: ");
+    hal.Serial.puts(args);
+    hal.Serial.puts("\n");
     const rc = pacman.pacmanMain(args, kernelPacOps());
     hal.cli();
     scheduler.in_win32_syscall = saved;

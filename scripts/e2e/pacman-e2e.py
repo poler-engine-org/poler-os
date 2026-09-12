@@ -76,13 +76,12 @@ def main():
         # ── 2. pacman -S pacman-mirrorlist (скачать+распаковать+VFS) ──
         print(f"[e2e] pacman -S {PKG} (реальный .pkg.tar.zst)...")
         vm.type_cmd(f"pacman -S {PKG}")
-        t = vm.wait_for("[PAC] PACMAN-OK", timeout=180)
+        # ВАЖНО: маркер ищем ПОСЛЕ последнего gate: -S (PACMAN-OK уже маячит
+        # от -Sy — эмпирика probe-сессии: wait_for матчил СТАРЫЙ маркер)
+        t = vm.wait_for("[PAC] install OK", timeout=180)
         if t is None:
             t2 = vm.text() or ""
             failures.append("-S: PACMAN-OK не найден; хвост: %r" % t2[-600:])
-            return finish(vm, failures)
-        if "[PAC] install OK" not in (t or ""):
-            failures.append("-S: install OK отсутствует")
             return finish(vm, failures)
         print(f"[e2e] -S OK ({PKG} установлен в RAM-overlay)")
 
