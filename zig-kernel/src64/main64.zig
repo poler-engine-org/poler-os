@@ -38,6 +38,8 @@ const drm_kms = @import("drm_kms.zig");
 const virtio_gpu = @import("virtio_gpu.zig");
 const evdev = @import("evdev.zig");
 const vfs = @import("vfs.zig");
+const squashfs = @import("squashfs.zig");
+const live_orchestrator = @import("live_orchestrator.zig");
 const win32_crt = @import("win32_crt.zig");
 
 
@@ -1155,20 +1157,32 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     if (have_mb2) {
         const mb_parser = multiboot2.Parser.init(multiboot_info);
         var mod_offset: u64 = 8;
-        if (mb_parser.findModuleTag(&mod_offset)) |mod| {
+        while (mb_parser.findModuleTag(&mod_offset)) |mod| {
             const mod_size = mod.mod_end - mod.mod_start;
             if (mod_size == 0 or mod.mod_start == 0) {
-                puts("[INITRD] Empty initrd module, skipping.\n");
-            } else {
-                puts("[INITRD] Module found: ");
+                puts("[INITRD] Empty module, skipping.\n");
+                continue;
+            }
+            const data = @as([*]const u8, @ptrFromInt(mod.mod_start))[0..mod_size];
+            puts("[MODULE] Found payload: ");
+            puts(mod.getCmdline());
+            puts(" (");
+            putDecimal(mod_size);
+            puts(" bytes) at 0x");
+            putHex(mod.mod_start);
+            puts("\n");
+            if (data.len >= 6 and std.mem.eql(u8, data[0..6], "070701")) {
+                if (initrd_archive == null) {
+                    initrd_archive = data;
+                }
+            } else if (data.len >= 4 and std.mem.readInt(u32, data[0..4], .little) == squashfs.SQUASHFS_MAGIC) {
+                puts("[SQUASHFS] Discovered SquashFS rootfs/desktop module: ");
                 puts(mod.getCmdline());
                 puts("\n");
-                puts("[INITRD] Start Phys: ");
-                putHex(mod.mod_start);
-                puts(", End Phys: ");
-                putHex(mod.mod_end);
-                puts("\n");
-                initrd_archive = @as([*]const u8, @ptrFromInt(mod.mod_start))[0..mod_size];
+            } else {
+                if (initrd_archive == null) {
+                    initrd_archive = data;
+                }
             }
         }
     }

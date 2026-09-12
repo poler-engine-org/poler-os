@@ -139,21 +139,13 @@ if command -v grub-mkrescue >/dev/null 2>&1 && command -v xorriso >/dev/null 2>&
     mkdir -p "$BUILD/iso/boot/grub"
     cp "$KERNEL" "$BUILD/iso/boot/poler-os64"
     cp "$BUILD/live-initrd.cpio" "$BUILD/iso/boot/live-initrd.cpio"
-    cat > "$BUILD/iso/boot/grub/grub.cfg" <<'GRUB'
-set timeout=1
-set default=0
-menuentry "POLER-OS v0.20.0-rc (64-bit, Arch/CachyOS Substrate)" {
-    insmod multiboot2
-    insmod part_msdos
-    insmod elf
-    echo "Loading POLER-OS v0.20.0-rc kernel & CachyOS initrd..."
-    multiboot2 /boot/poler-os64
-    module2 /boot/live-initrd.cpio
-    boot
-}
-GRUB
+    if [ -f "$BUILD/gnome-rootfs.sfs" ]; then
+        cp "$BUILD/gnome-rootfs.sfs" "$BUILD/iso/boot/gnome-rootfs.sfs"
+        echo "      gnome-sfs: $(du -h "$BUILD/gnome-rootfs.sfs" | cut -f1) included in ISO"
+    fi
+    cp "$KERNEL_DIR/iso/boot/grub/grub.cfg" "$BUILD/iso/boot/grub/grub.cfg"
     ( cd "$BUILD" && grub-mkrescue -o poler-os64.iso iso ) >/dev/null 2>&1 \
-        && echo "      iso: $BUILD/poler-os64.iso" \
+        && echo "      iso: $BUILD/poler-os64.iso ($(du -h "$BUILD/poler-os64.iso" | cut -f1))" \
         || echo "      iso: SKIP (grub-mkrescue failed)"
 else
     echo "      iso: SKIP (нет grub-mkrescue/xorriso — QEMU-режимы работают через -kernel)"
