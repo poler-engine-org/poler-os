@@ -254,24 +254,49 @@ static int str_eq(const char *a, const char *b) {
     return *(const unsigned char*)a == *(const unsigned char*)b;
 }
 
+// Window States
+static int win_konsole_open = 1;
+static int win_sysmon_open = 0;
+static int win_dolphin_open = 0;
+
+static int sysmon_win_x = 420;
+static int sysmon_win_y = 120;
+static int sysmon_win_w = 460;
+static int sysmon_win_h = 320;
+
+static int dolphin_win_x = 180;
+static int dolphin_win_y = 160;
+static int dolphin_win_w = 520;
+static int dolphin_win_h = 340;
+
+static int dragging_win = 0; // 0=none, 1=konsole, 2=sysmon, 3=dolphin
+static int drag_off_x = 0;
+static int drag_off_y = 0;
+
 static void term_exec(const char *cmd) {
     while (*cmd == ' ') cmd++;
     if (!*cmd) return;
 
     if (str_eq(cmd, "help")) {
-        term_puts("Commands: help, fetch, uname, clear, ls, ps, drminfo, date\n");
+        term_puts("Commands: help, fetch, uname, clear, ls, ps, sysmon, dolphin, drminfo, date\n");
     } else if (str_eq(cmd, "fetch") || str_eq(cmd, "neofetch")) {
         term_puts("  OS: CachyOS Plasma 6 / Gamescope on POLER-OS\n");
         term_puts("  Kernel: POLER-Microkernel 0.20.0-rc (x86_64)\n");
         term_puts("  Compositor: Wayland / DRM-KMS Direct Scanout\n");
         term_puts("  Resolution: 1024x768 @ 60 FPS XRGB8888\n");
         term_puts("  Memory: 2048 MB / PMM + VMM Buddy Allocator\n");
+    } else if (str_eq(cmd, "sysmon") || str_eq(cmd, "top") || str_eq(cmd, "htop")) {
+        win_sysmon_open = 1;
+        term_puts("[WAYLAND] Opened Plasma System Monitor\n");
+    } else if (str_eq(cmd, "dolphin") || str_eq(cmd, "files")) {
+        win_dolphin_open = 1;
+        term_puts("[WAYLAND] Opened Dolphin File Manager\n");
     } else if (str_eq(cmd, "uname") || str_eq(cmd, "uname -a")) {
         term_puts("Linux poler-cachyos 6.12.0-cachyos-poler #1 SMP PREEMPT x86_64\n");
     } else if (str_eq(cmd, "clear")) {
         term_clear();
     } else if (str_eq(cmd, "ls")) {
-        term_puts("Desktop/  Downloads/  Music/  Pictures/  Videos/  poler-engine/\n");
+        term_puts("Desktop/  Downloads/  Music/  Pictures/  Videos/  poler-engine/  airootfs.sfs\n");
     } else if (str_eq(cmd, "ps")) {
         term_puts("  PID TTY      TIME CMD\n");
         term_puts("    1 ?    00:00:01 init\n");
@@ -282,7 +307,7 @@ static void term_exec(const char *cmd) {
         term_puts("[DRM/KMS] Card0: virtio-gpu-pci / Dumb-buffer KMS\n");
         term_puts("[DRM/KMS] Primary Plane: XRGB8888 1024x768 Active Scanout\n");
     } else if (str_eq(cmd, "date")) {
-        term_puts("Sat Sep 12 04:45:00 UTC 2026\n");
+        term_puts("Sat Sep 12 04:55:00 UTC 2026\n");
     } else {
         term_puts("sh: command not found: ");
         term_puts(cmd);
@@ -314,61 +339,153 @@ static void render_desktop(int mx, int my, unsigned int frame_cnt) {
         }
     }
 
-    // 2. Plasma 6 Bottom Panel / Taskbar (44px height)
-    int panel_y = FB_H - 44;
-    fill_rect(back_buffer, 0, panel_y, FB_W, 44, 0x001B1E24); // Dark charcoal
-    fill_rect(back_buffer, 0, panel_y, FB_W, 1, 0x003A4452);  // Panel top border
+    // Desktop Icons
+    fill_rect(back_buffer, 24, 24, 48, 48, 0x0023262E);
+    draw_string(back_buffer, 28, 40, "ROOT", 0xFFFFFFFF);
+    draw_string(back_buffer, 20, 78, "Home", 0xFFE0E0E0);
 
-    // Kickoff Application Launcher Button (Plasma Logo)
-    fill_rect(back_buffer, 8, panel_y + 6, 36, 32, 0x001D99F3); // Plasma Blue
-    draw_string(back_buffer, 14, panel_y + 14, "KDE", 0xFFFFFFFF);
+    fill_rect(back_buffer, 24, 110, 48, 48, 0x0023262E);
+    draw_string(back_buffer, 28, 126, "CPIO", 0xFF1D99F3);
+    draw_string(back_buffer, 20, 164, "RootFS", 0xFFE0E0E0);
 
-    // Active Task: "Konsole (bash)"
-    fill_rect(back_buffer, 54, panel_y + 6, 170, 32, 0x002A303C);
-    fill_rect(back_buffer, 54, panel_y + 36, 170, 2, 0x001D99F3); // Active accent line
-    draw_string(back_buffer, 64, panel_y + 14, "Konsole: /bin/sh", 0xFFE0E0E0);
+    fill_rect(back_buffer, 24, 196, 48, 48, 0x0023262E);
+    draw_string(back_buffer, 28, 212, "SFS", 0xFF27AE60);
+    draw_string(back_buffer, 16, 250, "CachyOS", 0xFFE0E0E0);
 
-    // Active Task 2: "Hardware Info"
-    fill_rect(back_buffer, 230, panel_y + 6, 150, 32, 0x00222730);
-    draw_string(back_buffer, 240, panel_y + 14, "DRM/KMS: 60 FPS", 0xFF9E9E9E);
+    // 2. Konsole Terminal Window (if open)
+    if (win_konsole_open) {
+        fill_rect(back_buffer, term_win_x + 4, term_win_y + 4, term_win_w, term_win_h, 0x000A0C10); // Shadow
+        fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x0016181D);        // Window BG
+        draw_rect_outline(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x00383E4C);
 
-    // System Tray & Digital Clock on right side of panel
-    draw_string(back_buffer, FB_W - 240, panel_y + 14, "[LAN: 10.0.2.15]", 0xFF4CAF50);
-    draw_string(back_buffer, FB_W - 100, panel_y + 14, "04:45 AM", 0xFFFFFFFF);
+        // Titlebar (32px)
+        fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, 32, 0x0023262E);
+        draw_string(back_buffer, term_win_x + 14, term_win_y + 8, "root@cachyos-live : /bin/sh - Plasma Konsole", 0xFFEAEAEA);
 
-    // 3. Konsole Terminal Window
-    // Window Shadow & Border
-    fill_rect(back_buffer, term_win_x + 4, term_win_y + 4, term_win_w, term_win_h, 0x000A0C10); // Shadow
-    fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x0016181D);        // Window BG
-    draw_rect_outline(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x00383E4C);
+        // Buttons
+        fill_rect(back_buffer, term_win_x + term_win_w - 28, term_win_y + 8, 16, 16, 0x00ED1515); // Close
+        fill_rect(back_buffer, term_win_x + term_win_w - 52, term_win_y + 8, 16, 16, 0x0027AE60); // Max
+        fill_rect(back_buffer, term_win_x + term_win_w - 76, term_win_y + 8, 16, 16, 0x00F67400); // Min
 
-    // Window Titlebar (32px)
-    fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, 32, 0x0023262E);
-    draw_string(back_buffer, term_win_x + 14, term_win_y + 8, "root@cachyos-live : /bin/sh - Plasma Konsole", 0xFFEAEAEA);
-
-    // Window Buttons (Close, Maximize, Minimize)
-    fill_rect(back_buffer, term_win_x + term_win_w - 28, term_win_y + 8, 16, 16, 0x00ED1515); // Red Close
-    fill_rect(back_buffer, term_win_x + term_win_w - 52, term_win_y + 8, 16, 16, 0x0027AE60); // Green Max
-    fill_rect(back_buffer, term_win_x + term_win_w - 76, term_win_y + 8, 16, 16, 0x00F67400); // Orange Min
-
-    // Terminal Grid Text Output
-    int text_start_x = term_win_x + 12;
-    int text_start_y = term_win_y + 40;
-    for (int r = 0; r < TERM_ROWS; r++) {
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch = term_grid[r][c];
-            if (ch != ' ') {
-                draw_char(back_buffer, text_start_x + c * 8, text_start_y + r * 16, ch, 0xFF00FF7F); // Spring green
+        int text_start_x = term_win_x + 12;
+        int text_start_y = term_win_y + 40;
+        for (int r = 0; r < TERM_ROWS; r++) {
+            for (int c = 0; c < TERM_COLS; c++) {
+                char ch = term_grid[r][c];
+                if (ch != ' ') {
+                    draw_char(back_buffer, text_start_x + c * 8, text_start_y + r * 16, ch, 0xFF00FF7F);
+                }
             }
+        }
+        if ((frame_cnt / 15) % 2 == 0) {
+            fill_rect(back_buffer, text_start_x + term_cursor_col * 8, text_start_y + term_cursor_row * 16, 8, 16, 0xFF00FF7F);
         }
     }
 
-    // Terminal Blinking Cursor
-    if ((frame_cnt / 15) % 2 == 0) {
-        fill_rect(back_buffer, text_start_x + term_cursor_col * 8, text_start_y + term_cursor_row * 16, 8, 16, 0xFF00FF7F);
+    // 3. Plasma System Monitor Window (if open)
+    if (win_sysmon_open) {
+        fill_rect(back_buffer, sysmon_win_x + 4, sysmon_win_y + 4, sysmon_win_w, sysmon_win_h, 0x000A0C10);
+        fill_rect(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, sysmon_win_h, 0x001B1E24);
+        draw_rect_outline(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, sysmon_win_h, 0x001D99F3);
+
+        // Titlebar
+        fill_rect(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, 32, 0x0023262E);
+        draw_string(back_buffer, sysmon_win_x + 14, sysmon_win_y + 8, "Plasma System Monitor - Hardware Activity", 0xFFFFFFFF);
+        fill_rect(back_buffer, sysmon_win_x + sysmon_win_w - 28, sysmon_win_y + 8, 16, 16, 0x00ED1515);
+
+        // Content
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 48, "CPU Utilization: 0.8% (x86_64 8 Cores)", 0xFF27AE60);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 68, 400, 12, 0x0016181D);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 68, 14, 12, 0x0027AE60);
+
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 92, "Physical Memory: 42 MB / 2048 MB Used", 0xFF1D99F3);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 112, 400, 12, 0x0016181D);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 112, 28, 12, 0x001D99F3);
+
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 138, "DRM/KMS: VirtIO-GPU 3D (60 FPS VSYNC)", 0xFFE0E0E0);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 162, "VFS Mode: SquashFS v4 + tmpfs RAM Overlay", 0xFFE0E0E0);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 186, "IPC Substrate: Wayland-0 AF_UNIX Active", 0xFF4CAF50);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 210, "Dual-ABI: Linux POSIX + Win32 Ready", 0xFFF67400);
+
+        // Live Performance Graph
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 236, 420, 60, 0x00101216);
+        draw_rect_outline(back_buffer, sysmon_win_x + 16, sysmon_win_y + 236, 420, 60, 0x003A4452);
+        for (int i = 0; i < 400; i += 8) {
+            int gh = 10 + ((i * 3 + frame_cnt * 2) % 35);
+            fill_rect(back_buffer, sysmon_win_x + 20 + i, sysmon_win_y + 290 - gh, 6, gh, 0x001D99F3);
+        }
     }
 
-    // 4. Start Menu / Application Menu (if open)
+    // 4. Dolphin File Manager Window (if open)
+    if (win_dolphin_open) {
+        fill_rect(back_buffer, dolphin_win_x + 4, dolphin_win_y + 4, dolphin_win_w, dolphin_win_h, 0x000A0C10);
+        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, dolphin_win_h, 0x001B1E24);
+        draw_rect_outline(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, dolphin_win_h, 0x00F67400);
+
+        // Titlebar
+        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, 32, 0x0023262E);
+        draw_string(back_buffer, dolphin_win_x + 14, dolphin_win_y + 8, "Dolphin - File Manager [/root]", 0xFFFFFFFF);
+        fill_rect(back_buffer, dolphin_win_x + dolphin_win_w - 28, dolphin_win_y + 8, 16, 16, 0x00ED1515);
+
+        // Places Sidebar (left 130px)
+        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y + 32, 130, dolphin_win_h - 32, 0x0016181D);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 48, "> Home", 0xFFFFFFFF);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 72, "> RootFS", 0xFFB0B0B0);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 96, "> Desktop", 0xFFB0B0B0);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 120, "> Downloads", 0xFFB0B0B0);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 144, "> CachyOS SFS", 0xFF1D99F3);
+
+        // Folder Icons & Files (right)
+        int fx = dolphin_win_x + 150;
+        int fy = dolphin_win_y + 50;
+
+        fill_rect(back_buffer, fx, fy, 40, 36, 0x001D99F3);
+        draw_string(back_buffer, fx + 50, fy + 10, "Desktop/ (folder)", 0xFFFFFFFF);
+
+        fill_rect(back_buffer, fx, fy + 50, 40, 36, 0x001D99F3);
+        draw_string(back_buffer, fx + 50, fy + 60, "Downloads/ (folder)", 0xFFFFFFFF);
+
+        fill_rect(back_buffer, fx, fy + 100, 40, 36, 0x0027AE60);
+        draw_string(back_buffer, fx + 50, fy + 110, "airootfs.sfs (2.94 GB SquashFS)", 0xFF27AE60);
+
+        fill_rect(back_buffer, fx, fy + 150, 40, 36, 0x00F67400);
+        draw_string(back_buffer, fx + 50, fy + 160, "poler-os64 (13 MB Microkernel)", 0xFFF67400);
+
+        fill_rect(back_buffer, fx, fy + 200, 40, 36, 0x00E0E0E0);
+        draw_string(back_buffer, fx + 50, fy + 210, "live-initrd.cpio (7.3 MB Staging)", 0xFFE0E0E0);
+    }
+
+    // 5. Plasma 6 Bottom Panel / Taskbar (44px height)
+    int panel_y = FB_H - 44;
+    fill_rect(back_buffer, 0, panel_y, FB_W, 44, 0x001B1E24);
+    fill_rect(back_buffer, 0, panel_y, FB_W, 1, 0x003A4452);
+
+    // Launcher Button
+    fill_rect(back_buffer, 8, panel_y + 6, 36, 32, 0x001D99F3);
+    draw_string(back_buffer, 14, panel_y + 14, "KDE", 0xFFFFFFFF);
+
+    // Taskbar Items
+    if (win_konsole_open) {
+        fill_rect(back_buffer, 54, panel_y + 6, 140, 32, 0x002A303C);
+        fill_rect(back_buffer, 54, panel_y + 36, 140, 2, 0x001D99F3);
+        draw_string(back_buffer, 64, panel_y + 14, "Konsole: sh", 0xFFE0E0E0);
+    }
+    if (win_sysmon_open) {
+        fill_rect(back_buffer, 200, panel_y + 6, 140, 32, 0x002A303C);
+        fill_rect(back_buffer, 200, panel_y + 36, 140, 2, 0x0027AE60);
+        draw_string(back_buffer, 210, panel_y + 14, "System Monitor", 0xFF27AE60);
+    }
+    if (win_dolphin_open) {
+        fill_rect(back_buffer, 346, panel_y + 6, 140, 32, 0x002A303C);
+        fill_rect(back_buffer, 346, panel_y + 36, 140, 2, 0x00F67400);
+        draw_string(back_buffer, 356, panel_y + 14, "Dolphin Files", 0xFFF67400);
+    }
+
+    // System Tray & Clock
+    draw_string(back_buffer, FB_W - 240, panel_y + 14, "[DRM: 60 FPS]", 0xFF4CAF50);
+    draw_string(back_buffer, FB_W - 100, panel_y + 14, "04:55 AM", 0xFFFFFFFF);
+
+    // 6. Start Menu (if open)
     if (menu_open) {
         int menu_x = 8;
         int menu_y = panel_y - 220;
@@ -377,17 +494,17 @@ static void render_desktop(int mx, int my, unsigned int frame_cnt) {
         draw_string(back_buffer, menu_x + 16, menu_y + 14, "CachyOS / Plasma 6", 0xFFFFFFFF);
         fill_rect(back_buffer, menu_x + 10, menu_y + 34, 200, 1, 0x003A4452);
         draw_string(back_buffer, menu_x + 16, menu_y + 46, "> Konsole Terminal", 0xFFE0E0E0);
-        draw_string(back_buffer, menu_x + 16, menu_y + 76, "> System Monitor", 0xFFB0B0B0);
-        draw_string(back_buffer, menu_x + 16, menu_y + 106, "> Dolphin File Manager", 0xFFB0B0B0);
+        draw_string(back_buffer, menu_x + 16, menu_y + 76, "> System Monitor", 0xFF27AE60);
+        draw_string(back_buffer, menu_x + 16, menu_y + 106, "> Dolphin File Manager", 0xFFF67400);
         draw_string(back_buffer, menu_x + 16, menu_y + 136, "> System Settings", 0xFFB0B0B0);
         draw_string(back_buffer, menu_x + 16, menu_y + 166, "> Gamescope Session", 0xFF1D99F3);
         draw_string(back_buffer, menu_x + 16, menu_y + 192, "> Exit to POSIX Shell", 0xFFED1515);
     }
 
-    // 5. Hardware Mouse Pointer
+    // 7. Hardware Mouse Pointer
     draw_cursor(back_buffer, mx, my);
 
-    // 6. Copy Back Buffer to Scanout VRAM (Zero tearing)
+    // 8. Copy Back Buffer to Scanout VRAM (Zero tearing)
     if (fb_mem) {
         for (int i = 0; i < FB_W * FB_H; i++) {
             fb_mem[i] = back_buffer[i];
@@ -502,16 +619,72 @@ void main_entry(void) {
                     if (mouse_x >= FB_W) mouse_x = FB_W - 1;
                     if (mouse_y < 0) mouse_y = 0;
                     if (mouse_y >= FB_H) mouse_y = FB_H - 1;
+
+                    // Handle Window Dragging
+                    if (dragging_win == 1) { // Konsole
+                        term_win_x = mouse_x - drag_off_x;
+                        term_win_y = mouse_y - drag_off_y;
+                    } else if (dragging_win == 2) { // Sysmon
+                        sysmon_win_x = mouse_x - drag_off_x;
+                        sysmon_win_y = mouse_y - drag_off_y;
+                    } else if (dragging_win == 3) { // Dolphin
+                        dolphin_win_x = mouse_x - drag_off_x;
+                        dolphin_win_y = mouse_y - drag_off_y;
+                    }
                 } else if (mev.type == 1) { // EV_KEY
-                    if (mev.code == 272 && mev.value == 1) { // BTN_LEFT click
-                        if (mouse_x >= 8 && mouse_x <= 44 && mouse_y >= FB_H - 44) {
-                            menu_open = !menu_open;
-                        } else if (menu_open && mouse_x >= 8 && mouse_x <= 228 && mouse_y >= FB_H - 264 && mouse_y <= FB_H - 44) {
-                            // Clicked in menu item
-                            if (mouse_y >= FB_H - 80) { // Exit
-                                syscall1(SYS_exit, 0);
+                    if (mev.code == 272) { // BTN_LEFT
+                        if (mev.value == 1) { // Mouse Down / Click
+                            // Check Taskbar Launcher (KDE button)
+                            if (mouse_x >= 8 && mouse_x <= 44 && mouse_y >= FB_H - 44) {
+                                menu_open = !menu_open;
                             }
-                            menu_open = 0;
+                            // Check Taskbar Items
+                            else if (mouse_y >= FB_H - 44) {
+                                if (mouse_x >= 54 && mouse_x <= 194) win_konsole_open = !win_konsole_open;
+                                else if (mouse_x >= 200 && mouse_x <= 340) win_sysmon_open = !win_sysmon_open;
+                                else if (mouse_x >= 346 && mouse_x <= 486) win_dolphin_open = !win_dolphin_open;
+                            }
+                            // Check Start Menu Click
+                            else if (menu_open && mouse_x >= 8 && mouse_x <= 228 && mouse_y >= FB_H - 264 && mouse_y <= FB_H - 44) {
+                                if (mouse_y >= FB_H - 80) syscall1(SYS_exit, 0); // Exit
+                                else if (mouse_y <= FB_H - 190) win_konsole_open = 1;
+                                else if (mouse_y <= FB_H - 160) win_sysmon_open = 1;
+                                else if (mouse_y <= FB_H - 130) win_dolphin_open = 1;
+                                menu_open = 0;
+                            }
+                            // Check Close Buttons & Titlebars for dragging
+                            // Konsole
+                            else if (win_konsole_open && mouse_x >= term_win_x && mouse_x <= term_win_x + term_win_w && mouse_y >= term_win_y && mouse_y <= term_win_y + 32) {
+                                if (mouse_x >= term_win_x + term_win_w - 28) {
+                                    win_konsole_open = 0;
+                                } else {
+                                    dragging_win = 1;
+                                    drag_off_x = mouse_x - term_win_x;
+                                    drag_off_y = mouse_y - term_win_y;
+                                }
+                            }
+                            // Sysmon
+                            else if (win_sysmon_open && mouse_x >= sysmon_win_x && mouse_x <= sysmon_win_x + sysmon_win_w && mouse_y >= sysmon_win_y && mouse_y <= sysmon_win_y + 32) {
+                                if (mouse_x >= sysmon_win_x + sysmon_win_w - 28) {
+                                    win_sysmon_open = 0;
+                                } else {
+                                    dragging_win = 2;
+                                    drag_off_x = mouse_x - sysmon_win_x;
+                                    drag_off_y = mouse_y - sysmon_win_y;
+                                }
+                            }
+                            // Dolphin
+                            else if (win_dolphin_open && mouse_x >= dolphin_win_x && mouse_x <= dolphin_win_x + dolphin_win_w && mouse_y >= dolphin_win_y && mouse_y <= dolphin_win_y + 32) {
+                                if (mouse_x >= dolphin_win_x + dolphin_win_w - 28) {
+                                    win_dolphin_open = 0;
+                                } else {
+                                    dragging_win = 3;
+                                    drag_off_x = mouse_x - dolphin_win_x;
+                                    drag_off_y = mouse_y - dolphin_win_y;
+                                }
+                            }
+                        } else if (mev.value == 0) { // Mouse Up / Release
+                            dragging_win = 0;
                         }
                     }
                 }

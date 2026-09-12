@@ -283,6 +283,22 @@ void main_entry(void) {
             print("Shell exit. Restarting session...\n\n");
             print_banner();
         } else {
+            char full_path[64] = "/bin/";
+            int p_idx = 5;
+            const char *c_ptr = cmd;
+            while (*c_ptr && *c_ptr != ' ' && p_idx < 60) {
+                full_path[p_idx++] = *c_ptr++;
+            }
+            full_path[p_idx] = '\0';
+            const char *argv[3] = {full_path, 0, 0};
+            if (*c_ptr == ' ') {
+                while (*c_ptr == ' ') c_ptr++;
+                if (*c_ptr) argv[1] = c_ptr;
+            }
+            const char *envp[3] = {"PATH=/bin:/usr/bin:/usr/lib", "TERM=linux", 0};
+            const char *exec_target = (cmd[0] == '/') ? cmd : full_path;
+            syscall3(SYS_execve, (long)exec_target, (long)argv, (long)envp);
+
             print("sh: command not found: ");
             print(cmd);
             print(" (type 'help' for available commands)\n");

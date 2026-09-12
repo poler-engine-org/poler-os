@@ -37,11 +37,35 @@ DRM/KMS: /dev/dri/card0 (1024x768 XRGB8888)
 Input: /dev/input/event0, /dev/input/event1
 """
 
+# Host glibc dynamic runtime binaries
+with open("/usr/lib/ld-linux-x86-64.so.2", "rb") as f:
+    ld_so = f.read()
+
+with open("/usr/lib/libc.so.6", "rb") as f:
+    libc_so = f.read()
+
+uname_bin = b""
+if os.path.isfile("/usr/bin/uname"):
+    with open("/usr/bin/uname", "rb") as f:
+        uname_bin = f.read()
+
+echo_bin = b""
+if os.path.isfile("/usr/bin/echo"):
+    with open("/usr/bin/echo", "rb") as f:
+        echo_bin = f.read()
+
 files = {
     "sbin/init": init_bin,
     "bin/sh": sh_bin,
     "bin/init": init_bin,
     "bin/compositor": comp_bin,
+    "lib64/ld-linux-x86-64.so.2": ld_so,
+    "usr/lib/ld-linux-x86-64.so.2": ld_so,
+    "usr/lib/libc.so.6": libc_so,
+    "lib/libc.so.6": libc_so,
+    "lib64/libc.so.6": libc_so,
+    "bin/uname": uname_bin,
+    "bin/echo": echo_bin,
     "etc/os-release": os_release,
     "etc/hostname": b"poler-cachyos\n",
     "etc/issue": issue,
