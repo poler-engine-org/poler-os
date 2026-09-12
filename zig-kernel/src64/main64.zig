@@ -5830,8 +5830,58 @@ fn drmBootInit() void {
         puts(" @0x");
         putHex(framebuffer.getAddr());
         puts("\n");
-    } else if (drm_state.mode == .inactive) {
-        puts("[DRM] no scanout source (PVH headless): dumb-KMS armed, /dev on demand\n");
+    } else {
+        // Проверка BGA I/O (VirtualBox VBoxVGA / QEMU -vga std)
+        const VBE_DISPI_IOPORT_INDEX: u16 = 0x01CE;
+        const VBE_DISPI_IOPORT_DATA: u16 = 0x01CF;
+        hal.outw(VBE_DISPI_IOPORT_INDEX, 0); // VBE_DISPI_INDEX_ID
+        const bga_id = hal.inw(VBE_DISPI_IOPORT_DATA);
+        if (bga_id >= 0xB0C0 and bga_id <= 0xB0C6) {
+            puts("[BGA] Hardware VirtualBox/Bochs/QEMU VGA adapter detected (ID=0x");
+            putHex(bga_id);
+            puts(")\n");
+            hal.outw(VBE_DISPI_IOPORT_INDEX, 4); // VBE_DISPI_INDEX_ENABLE
+            hal.outw(VBE_DISPI_IOPORT_DATA, 0); // Disable
+
+            hal.outw(VBE_DISPI_IOPORT_INDEX, 1); // XRES
+            hal.outw(VBE_DISPI_IOPORT_DATA, 1024);
+
+            hal.outw(VBE_DISPI_IOPORT_INDEX, 2); // YRES
+            hal.outw(VBE_DISPI_IOPORT_DATA, 768);
+
+            hal.outw(VBE_DISPI_IOPORT_INDEX, 3); // BPP
+            hal.outw(VBE_DISPI_IOPORT_DATA, 32);
+
+            var vga_bar0: u64 = 0xE0000000;
+            var pci_bus: u16 = 0;
+            pci_loop: while (pci_bus < 256) : (pci_bus += 1) {
+                var pci_slot: u8 = 0;
+                while (pci_slot < 32) : (pci_slot += 1) {
+                    const vendor = pci.pciRead16(@intCast(pci_bus), pci_slot, 0, 0);
+                    if (vendor == 0xFFFF or vendor == 0) continue;
+                    const class_code = pci.pciRead8(@intCast(pci_bus), pci_slot, 0, 0x0B);
+                    if (class_code == 0x03) {
+                        const b0 = pci.pciRead32(@intCast(pci_bus), pci_slot, 0, 0x10) & 0xFFFFFFF0;
+                        if (b0 != 0) {
+                            vga_bar0 = b0;
+                            break :pci_loop;
+                        }
+                    }
+                }
+            }
+            puts("[BGA] Hardware switched to 1024x768x32 LFB mode (VRAM Phys @0x");
+            putHex(vga_bar0);
+            puts(")\n");
+            drm_kms.initLinearFb(&drm_state, .{
+                .phys = vga_bar0,
+                .width = 1024,
+                .height = 768,
+                .pitch = 4096,
+                .bpp = 32,
+            });
+        } else if (drm_state.mode == .inactive) {
+            puts("[DRM] no scanout source (PVH headless): dumb-KMS armed, /dev on demand\n");
+        }
     }
     puts("[DRM] /dev/fb0 + /dev/dri/card0 registered (dumb-KMS, CDD #10)\n");
 }
