@@ -127,6 +127,7 @@ static void cmd_help(void) {
           "  rm <file>          - Remove file from tmpfs\n"
           "  ps                 - List active tasks and processes\n"
           "  drminfo            - Display DRM/KMS card0 status\n"
+          "  gnome / mutter     - Launch CachyOS GNOME Desktop Session on DRM/KMS\n"
           "  startx / plasma    - Launch CachyOS KDE Plasma 6 Desktop on DRM/KMS\n"
           "  exit               - Terminate shell session\n");
 }
@@ -268,37 +269,59 @@ void main_entry(void) {
             print("[DRM/KMS] Card: /dev/dri/card0 (virtio-gpu / dumb-kms)\n"
                   "[DRM/KMS] Active Connector: Virtual-1 (Connected)\n"
                   "[DRM/KMS] Current Mode: 1024x768 @ 60Hz 32bpp XRGB8888\n");
-        } else if (strcmp(cmd, "startx") == 0 || strcmp(cmd, "plasma") == 0 || strcmp(cmd, "gamescope") == 0 || strcmp(cmd, "wayland") == 0) {
+        } else if (strcmp(cmd, "gnome") == 0 || strcmp(cmd, "mutter") == 0 || strcmp(cmd, "gdm") == 0) {
+            print("\033[1;36m[WAYLAND] Starting CachyOS GNOME Desktop Session on DRM/KMS...\033[0m\n");
+            const char *argv[2];
+            argv[0] = "/bin/compositor";
+            argv[1] = 0;
+            const char *envp[4];
+            envp[0] = "TERM=xterm";
+            envp[1] = "XDG_SESSION_TYPE=wayland";
+            envp[2] = "XDG_CURRENT_DESKTOP=GNOME";
+            envp[3] = 0;
+            syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
+            print("sh: failed to launch /bin/compositor\n");
+        } else if (strcmp(cmd, "startx") == 0 || strcmp(cmd, "plasma") == 0 || strcmp(cmd, "kde") == 0 || strcmp(cmd, "gamescope") == 0 || strcmp(cmd, "wayland") == 0) {
             print("\033[1;36m[WAYLAND] Starting CachyOS KDE Plasma 6 Desktop Session on DRM/KMS...\033[0m\n");
             const char *argv[2];
             argv[0] = "/bin/compositor";
             argv[1] = 0;
-            const char *envp[3];
+            const char *envp[4];
             envp[0] = "TERM=xterm";
             envp[1] = "XDG_SESSION_TYPE=wayland";
-            envp[2] = 0;
+            envp[2] = "XDG_CURRENT_DESKTOP=KDE";
+            envp[3] = 0;
             syscall3(SYS_execve, (long)"/bin/compositor", (long)argv, (long)envp);
             print("sh: failed to launch /bin/compositor\n");
         } else if (strcmp(cmd, "exit") == 0) {
             print("Shell exit. Restarting session...\n\n");
             print_banner();
         } else {
-            char full_path[64] = "/bin/";
-            int p_idx = 5;
+            char full_path1[64] = "/bin/";
+            char full_path2[64] = "/usr/bin/";
+            int p_idx1 = 5;
+            int p_idx2 = 9;
             const char *c_ptr = cmd;
-            while (*c_ptr && *c_ptr != ' ' && p_idx < 60) {
-                full_path[p_idx++] = *c_ptr++;
+            while (*c_ptr && *c_ptr != ' ' && p_idx1 < 60 && p_idx2 < 60) {
+                full_path1[p_idx1++] = *c_ptr;
+                full_path2[p_idx2++] = *c_ptr++;
             }
-            full_path[p_idx] = '\0';
-            const char *argv[3] = {full_path, 0, 0};
+            full_path1[p_idx1] = '\0';
+            full_path2[p_idx2] = '\0';
+            const char *argv[3] = {full_path1, 0, 0};
             if (*c_ptr == ' ') {
                 while (*c_ptr == ' ') c_ptr++;
                 if (*c_ptr) argv[1] = c_ptr;
             }
             const char *envp[3] = {"PATH=/bin:/usr/bin:/usr/lib", "TERM=linux", 0};
-            const char *exec_target = (cmd[0] == '/') ? cmd : full_path;
-            syscall3(SYS_execve, (long)exec_target, (long)argv, (long)envp);
-
+            if (cmd[0] == '/') {
+                argv[0] = cmd;
+                syscall3(SYS_execve, (long)cmd, (long)argv, (long)envp);
+            } else {
+                syscall3(SYS_execve, (long)full_path1, (long)argv, (long)envp);
+                argv[0] = full_path2;
+                syscall3(SYS_execve, (long)full_path2, (long)argv, (long)envp);
+            }
             print("sh: command not found: ");
             print(cmd);
             print(" (type 'help' for available commands)\n");
