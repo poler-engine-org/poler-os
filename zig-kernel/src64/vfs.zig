@@ -48,6 +48,8 @@ pub const VfsOps = struct {
     /// Поиск УЗЛА initrd-CPIO по одиночному ключу (БЕЗ алиасов/симлинков —
     /// их резолвит VFS). null = нет.
     initrd_find: *const fn (name: []const u8) ?InitrdNode,
+    /// Опциональный поиск в SquashFS airootfs.sfs (CachyOS/Arch Live)
+    squashfs_find: ?*const fn (name: []const u8) ?InitrdNode = null,
 };
 
 /// Узел initrd: данные + режим (S_IFLNK — симлинк, data = цель).
@@ -344,7 +346,11 @@ pub const Vfs = struct {
         const key = norm[1..]; // без ведущего '/'
         const n = libPathAliases(key, &aliases, &scratch);
         for (aliases[0..n]) |cand| {
-            const node = self.ops.initrd_find(cand) orelse continue;
+            var node_opt = self.ops.initrd_find(cand);
+            if (node_opt == null and self.ops.squashfs_find != null) {
+                node_opt = self.ops.squashfs_find.?(cand);
+            }
+            const node = node_opt orelse continue;
             if (!node.isSymlink()) {
                 return .{ .kind = .initrd_file, .initrd_data = node.data };
             }
@@ -384,7 +390,11 @@ pub const Vfs = struct {
         const key = norm[1..];
         const n = libPathAliases(key, &aliases, &scratch);
         for (aliases[0..n]) |cand| {
-            const node = self.ops.initrd_find(cand) orelse continue;
+            var node_opt = self.ops.initrd_find(cand);
+            if (node_opt == null and self.ops.squashfs_find != null) {
+                node_opt = self.ops.squashfs_find.?(cand);
+            }
+            const node = node_opt orelse continue;
             if (node.isSymlink()) return node.data;
             return VfsError.NotASymlink;
         }
@@ -722,4 +732,24 @@ test "vfs: readlink — цель симлинка (абс/отн), NotASymlink, 
     try testing.expectError(VfsError.NotASymlink, v.readlink("/etc/hostname"));
     // нет пути → NotFound
     try testing.expectError(VfsError.NotFound, v.readlink("/usr/lib/libNOPE.so"));
+}
+
+fn fakeSquashFsFind(name: []const u8) ?InitrdNode {
+    if (std.mem.eql(u8, name, "usr/lib/libQt6Core.so.6")) {
+        return .{ .data = "QT6_CORE_SQUASHFS_DATA", .mode = 0o100644 };
+    }
+    return null;
+}
+
+test "vfs: layered SquashFS fallback lookup" {
+    const e = try vfsSetup();
+    defer vfsTeardown(e);
+    var ops = vfsOps();
+    ops.squashfs_find = fakeSquashFsFind;
+    var v = Vfs.init(ops);
+
+    // Look up file residing only in SquashFS layer
+    const r = try v.resolve("/usr/lib/libQt6Core.so.6", false);
+    try testing.expectEqual(NodeKind.initrd_file, r.kind);
+    try testing.expectEqualStrings("QT6_CORE_SQUASHFS_DATA", r.initrd_data.?);
 }
