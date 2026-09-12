@@ -2353,16 +2353,16 @@ test "net: rtx-бэкофф — экспоненциальный рост с п�
 //  v0.18.0 (CDD №9 hardening): RX-bounds против враждебного DMA
 // ============================================================================
 
-test "net: RX-bounds — битый elem.id (k >= 8) отбрасывается без ре-поста" {
-    // rx_bufs/rx_posted имеют 8 записей; elem.id маскируется до 10 бит.
-    // k=8..1023 → validateRxElem = null → буфер НЕ индексируется и НЕ
-    // ре-постится (v0.17: postRxBuffer(k) стоял ВНЕ проверки → OOB).
-    try testing.expect(validateRxElem(8, 1600) == null);
+test "net: RX-bounds — битый elem.id (k >= NUM_RX_BUFS) отбрасывается без ре-поста" {
+    // rx_bufs/rx_posted имеют NUM_RX_BUFS (32) записей; elem.id маскируется до 10 бит.
+    // k=NUM_RX_BUFS..1023 → validateRxElem = null → буфер НЕ индексируется и НЕ
+    // ре-постится.
+    try testing.expect(validateRxElem(NUM_RX_BUFS, 1600) == null);
     try testing.expect(validateRxElem(64, 1600) == null);
     try testing.expect(validateRxElem(1023, 0xFFFF_FFFF) == null);
-    // Граничный валидный индекс 7 — проходит
-    try testing.expect(validateRxElem(7, 1600) != null);
-    try testing.expectEqual(@as(u16, 7), validateRxElem(7, 1600).?.k);
+    // Граничный валидный индекс (NUM_RX_BUFS - 1) — проходит
+    try testing.expect(validateRxElem(NUM_RX_BUFS - 1, 1600) != null);
+    try testing.expectEqual(@as(u16, NUM_RX_BUFS - 1), validateRxElem(NUM_RX_BUFS - 1, 1600).?.k);
     // Пустышки (len <= 10Б hdr + 14Б ETH) — кадра нет, ре-пост валидного k
     try testing.expect(validateRxElem(0, 0) == null);
     try testing.expect(validateRxElem(0, 24) == null);

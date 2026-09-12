@@ -588,7 +588,8 @@ pub fn httpGet(host: []const u8, port: u16, path: []const u8, max_bytes: usize) 
         http_redirect_hops = 0;
         if (httpFetchUrl(host, port, path, max_bytes)) |body| {
             return body;
-        } else |_| {
+        } else |err| {
+            if (err == HttpError.HttpsNotSupported) return err;
             if (attempt == 0) {
                 p("[PAC] http: ретрай ");
                 p(host);
