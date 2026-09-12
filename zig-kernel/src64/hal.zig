@@ -203,6 +203,25 @@ pub fn interruptsEnabled() bool {
     return (f & 0x200) != 0;
 }
 
+/// CDD #17: полный RFLAGS-снапшот для атомарных критсекций (cli-обёртки).
+/// Пара save/restore сохраняет IF (и др. флаги) — IRQ-контекст с IF=0 не
+/// получит случайный sti() при выходе (урон CDD №8 p5 — см. выше).
+pub fn saveFlags() u64 {
+    return asm volatile ("pushfq; popq %[out]"
+        : [out] "=r" (-> u64),
+    );
+}
+
+pub fn restoreFlags(f: u64) void {
+    asm volatile (
+        \\pushq %%rax
+        \\popfq
+        :
+        : [f] "{rax}" (f)
+        : "rax", "memory"
+    );
+}
+
 pub fn hlt() void {
     asm volatile ("hlt");
 }
@@ -810,6 +829,31 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                 Serial.putDecimal(@import("scheduler.zig").current_task_id);
                 Serial.puts(" fl=");
                 Serial.putDecimal(@import("scheduler.zig").in_win32_syscall);
+                // CDD #17-форензика «мёртвого RX»: динамика pollRx
+                {
+                    const vn = @import("virtio_net.zig");
+                    Serial.puts(" pc=");
+                    Serial.putDecimal(vn.dbg_poll_calls);
+                    Serial.puts(" g=");
+                    Serial.putDecimal(vn.dbg_poll_guard);
+                    Serial.puts(" fr=");
+                    Serial.putDecimal(vn.dbg_poll_frames);
+                    Serial.puts(" rp=");
+                    Serial.putDecimal(vn.dbg_poll_repost);
+                    Serial.puts(" txdr=");
+                    Serial.putDecimal(vn.dbg_tx_dropped());
+                    const rs = vn.dbgRxRingState();
+                    Serial.puts(" ai=");
+                    Serial.putDecimal(rs.avail_idx);
+                    Serial.puts(" pa=");
+                    Serial.putDecimal(rs.pub_avail);
+                    Serial.puts(" lu=");
+                    Serial.putDecimal(rs.last_used);
+                    Serial.puts(" du=");
+                    Serial.putDecimal(rs.dev_used);
+                    Serial.puts(" pm=0x");
+                    Serial.putHex(rs.posted_mask);
+                }
                 Serial.puts("\n");
             }
             if (tick_count % 100 == 0 and (frame.cs & 0x3) != 0) {
@@ -857,6 +901,9 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
                 }
                 cli();
                 if (net_irq_sink) |nsink| {
+                    // CDD #17-эксперимент: 100Гц (каждый тик) УХУДШАЛ картину
+                    // (тяжёлый pollRx в каждом IRQ душил vCPU) — возврат к 10Гц
+                    // (CDD №7). Услуга RX = таймер 10Гц + poll-точки потребителей.
                     if (tick_count % 10 == 0) nsink();
                 }
                 const next_rsp = cb(@intFromPtr(frame));

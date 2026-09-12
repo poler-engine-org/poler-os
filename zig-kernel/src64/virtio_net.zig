@@ -106,8 +106,12 @@ const SLIRP_OUR_IP: u32 = 0x0A00_020F; // 10.0.2.15 — гость
 // ─── TCP-соединение (мини-стейт) ────────────────────────────────────────────
 
 pub const MAX_TCP_CONNS: usize = 8;
-const RX_RING_PAGES: usize = 16; // 64КБ приёма на соединение
+const RX_RING_PAGES: usize = 64; // 256КБ приёма на соединение (CDD #17: 64КБ давало ring-full режим — эмпирика e2e: именно на границе кольца начинается 40-секундный SLIRP-застой SendQ при живом WIN=65535)
 const RX_RING_SIZE: usize = RX_RING_PAGES * 4096;
+
+/// CDD #17: RX-буферы (posted дескрипторы) — 8 → 32: девайс поглощает
+/// SLIRP-берсты без дропа между poll-тактами таймера (10Гц).
+const NUM_RX_BUFS: usize = 32;
 
 // v0.15.0 (CDD №6): ретрансмит-буфер [snd_una..snd_nxt) — 32КБ на соединение
 const RTX_PAGES: usize = 8;
@@ -136,6 +140,9 @@ pub const TcpConn = struct {
     peer_ip: [4]u8 = .{ 0, 0, 0, 0 },
     peer_port: u16 = 0,
     src_port: u16 = 0,
+    /// CDD #17: тик перехода в .closed — зомби-период (RST на чужие
+    /// ретрансмиты) отсчитывается от него.
+    closed_tick: u64 = 0,
     iss: u32 = 0, // initial send seq
     snd_nxt: u32 = 0, // следующий seq для отправки
     snd_una: u32 = 0, // v0.15.0: старейший неподтверждённый seq (RTX-движок)
@@ -202,12 +209,26 @@ var vn: struct {
     tx_num_free: u16 = QUEUE_SIZE,
     tx_avail_idx: u16 = 0,
 
-    // RX-буферы: NUM_RX_BUFS страниц, posted в avail-ring
-    rx_bufs: [8]u64 = [_]u64{0} ** 8, // phys(=virt) каждой
-    rx_posted: [8]bool = [_]bool{false} ** 8,
+    // RX-буферы: NUM_RX_BUFS страниц, posted в avail-ring (CDD #17: 8 → 32 —
+    // девайс поглощает SLIRP-берсты без дропа между poll-тактами)
+    rx_bufs: [32]u64 = [_]u64{0} ** 32, // phys(=virt) каждой
+    rx_posted: [32]bool = [_]bool{false} ** 32,
 
     // TX-буфер (по одному на фрейм — обмен один-за-раз, поллинг завершения)
     tx_buf: u64 = 0,
+
+    /// e2e-ФИКС (CDD #17, «пропавшие кадры»): TX-лок. sendFrame РЕЕНТЕРАБЕЛЕН
+    /// через таймер-IRQ (pacman-контекст сидит в spins2-ожидании → IRQ →
+    /// pollRx → отложенный ACK → sendFrame) — вложенный вызов ПЕРЕЗАПИСЫВАЕТ
+    /// tx_buf/дескриптор-0 ЗА СПИНОЙ ВНЕШНЕГО ОЖИДАНИЯ и ломает не-атомарную
+    /// пару ring[]/availIdx (запись + инкремент): кадр уходит ДВАЖДЫ чужими
+    /// байтами, а кадр внешнего отправителя ИСЧЕЗАЕТ (PCAP: DNS-запрос,
+    /// handshake-ACK и GET не появлялись на проводе при живом sendIp=true).
+    /// Лечение: busy-флаг — вложенный sendFrame КАПИТулирует (false). Всё,
+    /// что переносит sendFrame, ретрансмитабельно TCP-семантикой: данные —
+    /// RTX-буфером, ACK/FIN/KA — таймерами, DNS/ARP — повтором попыток.
+    tx_busy: bool = false,
+    tx_dropped: u64 = 0,
 
     // ARP-кэш (SLIRP-шлюз)
     gw_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
@@ -278,6 +299,19 @@ fn usedIdxPtr(base: u64) *volatile u16 {
 }
 fn usedRingPtr(base: u64) [*]volatile VirtQueueUsedElem {
     return @ptrFromInt(@as(usize, @intCast(base + 4)));
+}
+
+
+/// CDD #17: мягкий парк спин-лупов. IF=1 (pacman-гейт) → hlt: vCPU спит до
+/// таймер-IRQ (100Гц) — pollRx дышит в такт, НЕ молотит 100К/с (эмпирика:
+/// именно плотный pollRx-спин переводил QEMU-virtio в «мёртвый RX»).
+/// IF=0 (syscall-контекст curl/legacy) → pause: поведение прежнее.
+inline fn parkOne() void {
+    if (hal.interruptsEnabled()) {
+        asm volatile ("hlt" ::: "memory");
+    } else {
+        asm volatile ("pause");
+    }
 }
 
 fn memBarrier() void {
@@ -639,7 +673,7 @@ pub fn init() VnetError!void {
     try setupQueue(0, &vn.rx_vq_phys, &vn.rx_desc, &vn.rx_avail, &vn.rx_used);
     try setupQueue(1, &vn.tx_vq_phys, &vn.tx_desc, &vn.tx_avail, &vn.tx_used);
 
-    // RX-буферы: 8 страниц, posted в avail-ring (WRITE-дескрипторы)
+    // RX-буферы: NUM_RX_BUFS страниц, posted в avail-ring (WRITE-дескрипторы)
     for (&vn.rx_bufs, 0..) |*bufp, k| {
         const p = pmm.allocPage() orelse return VnetError.InitFailed;
         bufp.* = p;
@@ -738,10 +772,10 @@ fn setupQueue(idx: u16, out_phys: *u64, out_desc: *u64, out_avail: *u64, out_use
 /// ВРАЖДЕБНЫЙ вход). Возвращает индекс буфера (0..8) и безопасную длину
 /// кадра, либо null — и тогда буфер НЕ переиспользуется и НЕ ре-постится.
 pub fn validateRxElem(elem_id: u32, elem_len: u32) ?struct { k: u16, safe_len: usize } {
-    // 1) elem.id маскируется до 10 бит, но rx_bufs имеет всего 8 записей:
-    //    k >= 8 → OOB-индексация rx_bufs[k]/rx_posted[k] в postRxBuffer.
+    // 1) elem.id маскируется до 10 бит, но rx_bufs имеет NUM_RX_BUFS записей:
+    //    k >= NUM_RX_BUFS → OOB-индексация rx_bufs[k]/rx_posted[k] в postRxBuffer.
     const k: u16 = @intCast(elem_id & 0x3FF);
-    if (k >= 8) return null;
+    if (k >= NUM_RX_BUFS) return null;
     // 2) Пустышки/мусор: 10Б virtio-hdr + минимум Ethernet-заголовок.
     if (elem_len <= VNET_HDR_LEN + ETH_HDR_LEN) return null;
     // 3) elem.len не ограничен (u32 от устройства): срез по frame_len мог
@@ -783,6 +817,30 @@ const VNET_HDR_LEN: usize = 10;
 /// в pcap уходили обрезанные 32Б-фреймы вместо 42Б ARP).
 pub fn sendFrame(frame: []const u8) bool {
     if (!vn.initialized or frame.len > 1600) return false;
+    // CDD #17-ФИКС: TX-критсекция. Захват под cli() — пара ring[]/availIdx
+    // и захват tx_busy атомарны; ожидание завершения ИДЁТ с IF=1 (девайс
+    // внешний — used-кольцо двигается без IRQ-контекста гостя).
+    {
+        const saved_flags = hal.saveFlags();
+        hal.cli();
+        if (vn.tx_busy) {
+            // вложенный вызов (IRQ поверх спина внешнего sendFrame):
+            // НЕ трогаем tx_buf/дескриптор — кадр дропнут, TCP дожмёт
+            // ретрансмитом, ACK повторится по need_ack/повторному сегменту.
+            vn.tx_dropped += 1;
+            hal.restoreFlags(saved_flags);
+            return false;
+        }
+        vn.tx_busy = true;
+        hal.restoreFlags(saved_flags);
+    }
+    defer {
+        const saved_flags = hal.saveFlags();
+        hal.cli();
+        vn.tx_busy = false;
+        hal.restoreFlags(saved_flags);
+    }
+
     // ждём свободный дескриптор TX
     var spins: u32 = 0;
     while (spins < 200_000) : (spins += 1) {
@@ -850,7 +908,11 @@ pub fn sendFrame(frame: []const u8) bool {
 /// keep-alive — гоняется в poll-точках, не из IRQ) + статистика RX.
 pub fn pollRx() void {
     if (!vn.initialized) return;
-    if (vn.in_poll) return; // анти-реентерабельность
+    dbg_poll_calls += 1;
+    if (vn.in_poll) {
+        dbg_poll_guard += 1;
+        return; // анти-реентерабельность
+    }
     vn.in_poll = true;
     defer vn.in_poll = false;
 
@@ -861,6 +923,7 @@ pub fn pollRx() void {
 
     var handled_any = false;
     var guard: u8 = 0;
+    var seen_this_call: u32 = 0;
     while (guard < 8) : (guard += 1) {
         const used_idx = usedIdxPtr(vn.rx_used).*;
         if (used_idx == vn.rx_last_used) break;
@@ -872,18 +935,22 @@ pub fn pollRx() void {
         // null: буфер не индексируется и НЕ ре-постится (ре-пост
         // postRxBuffer(k) теперь строго внутри валидного k < 8 — раньше
         // он стоял ВНЕ проверки и OOB-писал rx_bufs[k]/дескриптор).
-        if (k < 8) {
+        if (k < NUM_RX_BUFS) {
             if (validateRxElem(elem.id, elem.len)) |ve| {
                 vn.rx_frames += 1; // v0.15.0: статистика
                 vn.rx_bytes += ve.safe_len;
                 const buf: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(vn.rx_bufs[ve.k])));
                 handleFrame(buf[VNET_HDR_LEN .. VNET_HDR_LEN + ve.safe_len]);
                 handled_any = true;
+                seen_this_call += 1;
+                dbg_poll_frames += 1;
             }
             // ре-пост буфера — строго под проверкой k < 8
             postRxBuffer(k);
+            dbg_poll_repost += 1;
         }
     }
+    if (seen_this_call == 0) dbg_poll_empty += 1;
     if (handled_any) {
         // отложенные ACKи: по одному на соединение (после цикла приёма)
         for (&vn.conns) |*c| {
@@ -1017,6 +1084,48 @@ fn handleUdp(udp: []const u8) void {
 
 var vn_dns_txn: u16 = 0;
 
+/// CDD #17: DNS-кэш зеркал (SLIRP-DNS под нагрузкой флакает).
+const DNS_CACHE_N: usize = 4;
+var dns_c_host: [DNS_CACHE_N][64]u8 = undefined;
+var dns_c_len: [DNS_CACHE_N]usize = .{0} ** DNS_CACHE_N;
+var dns_c_ip: [DNS_CACHE_N][4]u8 = .{.{0, 0, 0, 0}} ** DNS_CACHE_N;
+var dns_c_tick: [DNS_CACHE_N]u64 = .{0} ** DNS_CACHE_N;
+var dns_c_n: usize = 0;
+
+/// e2e-тротл диагностики: счётчик принятых RX-чанков (печать 1/256).
+var vn_dbg_rx_chunks: u32 = 0;
+
+/// e2e-ФОРЕНЗИКА «мёртвого RX»: счётчики pollRx (гварды/кадры/репосты) —
+/// дамп через [TICK] в hal. Расхождение «pollRx жив, а кадров нет» =
+/// дроп на уровне девайса/колец; «pollRx мёртв» =调度/контекст.
+pub var dbg_poll_calls: u64 = 0;
+pub var dbg_poll_guard: u64 = 0;
+pub var dbg_poll_frames: u64 = 0;
+pub var dbg_poll_repost: u64 = 0;
+pub var dbg_poll_empty: u64 = 0; // заходов в pollRx с пустым used-ring
+
+/// Счётчик дропнутых вложенных TX-кадров (TX-лок CDD #17).
+pub fn dbg_tx_dropped() u64 {
+    return vn.tx_dropped;
+}
+
+/// CDD #17-форензика: живое состояние RX-колец (кто виноват — драйвер или
+/// девайс): rx_avail_idx (наш u16), rx_last_used (наш consumed), published
+/// availIdx (живое MMIO), device used_idx (живое MMIO), rx_posted-маска.
+pub fn dbgRxRingState() struct { avail_idx: u16, last_used: u16, pub_avail: u16, dev_used: u16, posted_mask: u32 } {
+    var mask: u32 = 0;
+    for (vn.rx_posted, 0..) |p, i| {
+        if (p) mask |= @as(u32, 1) << @intCast(i);
+    }
+    return .{
+        .avail_idx = vn.rx_avail_idx,
+        .last_used = vn.rx_last_used,
+        .pub_avail = availIdxPtr(vn.rx_avail).*,
+        .dev_used = usedIdxPtr(vn.rx_used).*,
+        .posted_mask = mask,
+    };
+}
+
 /// TCP-вход: сегменты для наших соединений.
 /// v0.15.0 (CDD №6): полная ACK-машина (snd_una-продвижение → сброс RTO +
 /// KA-таймера), sliding window (окно исчерпано → сегмент НЕ принимается,
@@ -1031,11 +1140,58 @@ fn handleTcp(seg: []const u8) void {
     const payload = if (seg.len > data_off) seg[data_off..] else seg[0..0];
     const now = hal.tick_count;
 
+    var matched = false;
     for (&vn.conns, 0..) |*c, ci| {
         const active = c.state == .syn_sent or c.state == .established or
             c.state == .fin_wait_1 or c.state == .fin_wait_2 or c.state == .time_wait;
-        if (!active) continue;
+        // CDD #17-ЗОМБИ: closed-конн в льготном окне (600 тиков = 6с —
+        // запас на SLIRP-бэкофф) отвечает RST на ЛЮБОЙ сегмент — вражий
+        // ретрансмит-шторм (SendQ-хвост, который мы уже не читаем) убивается
+        // мгновенно: RST → сл  p abort → тишина. Без этого: сл p ретра
+        // битит хвост МИНУТАМИ, кадры сыпятся nomatch-дропами и отравляют
+        // следующую транзакцию (эмпирика e2e: -S болеет от -Sy-остатков).
+        const zombie = c.state == .closed and
+            (now -% c.closed_tick) < 1800;
+        if (!active and !zombie) continue;
         if (c.src_port != dst_port or c.peer_port != src_port) continue;
+        matched = true;
+        if (zombie) {
+            // CDD #17: закрытый конн отвечает DUP-ACK (seq=snd_nxt,
+            // ack=rcv_nxt — «всё до rcv_nxt получил»). DUP-ACK принимается
+            // ЛЮБЫМ состоянием TCP-пира (LAST-ACK: завершает его close;
+            // ESTABLISHED: глушит ретрансмит-шторм — «данные дошли»).
+            // Эмпирика: RST slirp игнорировал в TIME_WAIT/LAST-ACK — шторм
+            // ретрансмитов хвоста длился минутами и травил -S-транзакцию.
+            c.need_ack = false; // не копим — отвечаем прямо
+            sendTcpAck(c);
+            hal.Serial.puts("[VNET] ZOMBIE-ACK slot=");
+            hal.Serial.putDecimal(ci);
+            hal.Serial.puts(" (закрыт ");
+            hal.Serial.putDecimal(now -% c.closed_tick);
+            hal.Serial.puts(" тиков назад)\n");
+            return;
+        }
+        // e2e-ФОРЕНЗИКА: каждый ДРОП сегмента с данными — с причиной
+        const rel0 = seq -% c.rcv_nxt;
+        if (payload.len > 0 and rel0 != 0) {
+            hal.Serial.puts("[VNET] DROP gap: slot=");
+            hal.Serial.putDecimal(ci);
+            hal.Serial.puts(" st=");
+            hal.Serial.putDecimal(@intFromEnum(c.state));
+            hal.Serial.puts(" seq=");
+            hal.Serial.putDecimal(seq);
+            hal.Serial.puts(" rcv_nxt=");
+            hal.Serial.putDecimal(c.rcv_nxt);
+            hal.Serial.puts(" rel=");
+            hal.Serial.putDecimal(rel0);
+            hal.Serial.puts("\n");
+        } else if (payload.len > 0 and c.state == .established and ringSpace(c) <= payload.len) {
+            hal.Serial.puts("[VNET] DROP full: slot=");
+            hal.Serial.putDecimal(ci);
+            hal.Serial.puts(" ring=");
+            hal.Serial.putDecimal(ringBytes(c));
+            hal.Serial.puts("\n");
+        }
 
         // любая активность пира = жив (keep-alive reset)
         c.last_ack_tick = now;
@@ -1044,6 +1200,7 @@ fn handleTcp(seg: []const u8) void {
         if ((flags & TCP_RST) != 0) {
             hal.Serial.puts("[VNET] TCP RST — соединение закрыто\n");
             c.state = .closed;
+            c.closed_tick = hal.tick_count;
             c.aborted = true;
             return;
         }
@@ -1103,11 +1260,17 @@ fn handleTcp(seg: []const u8) void {
                         c.fin_received = true;
                     }
                     c.need_ack = true; // отложенный ACK (анти-реентерабельность)
-                    hal.Serial.puts("[VNET] TCP: данные ");
-                    hal.Serial.putDecimal(payload.len);
-                    hal.Serial.puts("Б → ring (slot ");
-                    hal.Serial.putDecimal(ci);
-                    hal.Serial.puts(")\n");
+                    // e2e-производительность: печать на КАЖДЫЙ чанк (1440Б)
+                    // убивала TCG-пропускную способность (сериал — самый
+                    // дорогой вывод под эмуляцией). Тротл: 1/256 чанков.
+                    vn_dbg_rx_chunks +%= 1;
+                    if (vn_dbg_rx_chunks % 256 == 1) {
+                        hal.Serial.puts("[VNET] TCP: данные ~");
+                        hal.Serial.putDecimal(vn_dbg_rx_chunks);
+                        hal.Serial.puts(" чанков (slot ");
+                        hal.Serial.putDecimal(ci);
+                        hal.Serial.puts(")\n");
+                    }
                 } else if ((flags & TCP_FIN) != 0) {
                     c.rcv_nxt +%= 1;
                     c.fin_received = true;
@@ -1130,6 +1293,18 @@ fn handleTcp(seg: []const u8) void {
             return;
         }
     }
+    // e2e-ФОРЕНЗИКА: сегмент с данными БЕЗ коннекта — кто и куда
+    if (!matched and payload.len > 0) {
+        hal.Serial.puts("[VNET] DROP nomatch: ");
+        hal.Serial.putDecimal(src_port);
+        hal.Serial.puts(">");
+        hal.Serial.putDecimal(dst_port);
+        hal.Serial.puts(" seq=");
+        hal.Serial.putDecimal(seq);
+        hal.Serial.puts(" plen=");
+        hal.Serial.putDecimal(payload.len);
+        hal.Serial.puts("\n");
+    }
 }
 
 /// Запись в RX-кольцо соединения.
@@ -1141,9 +1316,6 @@ fn ringWrite(c: *TcpConn, data: []const u8) void {
         c.ring_tail = (c.ring_tail + 1) % RX_RING_SIZE;
         // переполнение: голова догоняет (теряем старое — CDD-упрощение)
     }
-    hal.Serial.puts("[VNET] ring-write: ");
-    hal.Serial.putDecimal(data.len);
-    hal.Serial.puts("Б\n");
 }
 
 pub fn ringBytes(c: *const TcpConn) usize {
@@ -1180,14 +1352,15 @@ pub fn resolveGateway() bool {
     var attempt: u8 = 0;
     while (attempt < 5) : (attempt += 1) {
         if (!sendFrame(&frame)) continue;
-        var spins: u32 = 0;
-        while (spins < 3_000_000) : (spins += 1) {
+        const attempt_deadline = hal.tick_count + 30; // 300мс на попытку
+        while (true) {
             pollRx();
             if (vn.gw_resolved) {
                 hal.Serial.puts("[VNET] gateway MAC resolved\n");
                 return true;
             }
-            asm volatile ("pause");
+            if (hal.tick_count >= attempt_deadline) break;
+            parkOne();
         }
     }
     hal.Serial.puts("[VNET] ARP gateway: TIMEOUT\n");
@@ -1218,11 +1391,19 @@ pub fn tcpConnect(peer_ip: [4]u8, peer_port: u16) VnetError!usize {
     if (!resolveGateway()) return VnetError.Timeout;
 
     // свободный слот
+    // CDD #17: .closed-слот переиспользуем ТОЛЬКО после зомби-окна (18с):
+    // мгновенный реюзд перезаписывал порты → ретрансмит-шторм прошлой
+    // транзакции оставался без адресата (nomatch) и отравлял всё дальше.
     var slot: ?usize = null;
-    for (&vn.conns, 0..) |*c, i| {
-        if (c.state == .unused or c.state == .closed) {
-            slot = i;
-            break;
+    {
+        const now = hal.tick_count;
+        for (&vn.conns, 0..) |*c, i| {
+            if (c.state == .unused or
+                (c.state == .closed and (now -% c.closed_tick) >= 1800))
+            {
+                slot = i;
+                break;
+            }
         }
     }
     const si = slot orelse return VnetError.NoFreeConn;
@@ -1278,15 +1459,18 @@ pub fn tcpConnect(peer_ip: [4]u8, peer_port: u16) VnetError!usize {
     hal.Serial.putDecimal(peer_port);
     hal.Serial.puts(")\n");
 
-    // ждём SYN-ACK (поллинг RX; ~3 попытки ретрансмита)
+    // ждём SYN-ACK (поллинг RX; ~4 попытки ретрансмита; CDD #17: тик-
+    // дедлайн + мягкий парк — плотный 8М-спин молотил pollRx 100К/с и
+    // переводил virtio-девайс в мёртвый RX-режим)
     var attempt: u8 = 0;
     while (attempt < 4) : (attempt += 1) {
-        var spins: u32 = 0;
-        while (spins < 8_000_000) : (spins += 1) {
+        const attempt_deadline = hal.tick_count + 50; // 500мс на попытку
+        while (true) {
             pollRx();
             if (c.state == .established) return si;
             if (c.state == .closed) return VnetError.ConnClosed;
-            asm volatile ("pause");
+            if (hal.tick_count >= attempt_deadline) break;
+            parkOne();
         }
         // ретрансмит SYN
         c.syn_retries += 1;
@@ -1345,16 +1529,49 @@ pub fn tcpSend(slot: usize, data: []const u8) VnetError!usize {
 /// tcpRecv: данные из RX-кольца (поллинг с таймаутом ~150мс; 0 = нет данных).
 /// v0.15.0 (CDD №6): после дренажа ринга — window-update ACK (открываем
 /// окно отправителю) + EOF по fin_received (FIN сервера уже принят).
+/// CDD #17: DRAIN-ONLY приём — без pollRx! Для hlt-ожидания pacman-гейта:
+/// RX-обработка остаётся ЗА таймер-IRQ (CDD №7 — известно-рабочая модель),
+/// поток потребителя лишь вычитывает кольцо. Эмпирика e2e: агрессивный
+/// pollRx из hlt-петли (4.5К/с + рёентерабельность гвардом) переводил
+/// девайс в режим «стёплой повторной доставки кадров» — кернель парсил
+/// СТАРЫЕ сегменты (gap-дропы), rcv_nxt замирал на 40-60с.
+pub fn tcpRecvDrain(slot: usize, out: []u8) VnetError!usize {
+    if (slot >= MAX_TCP_CONNS) return VnetError.BadState;
+    const c = &vn.conns[slot];
+    if (c.state == .closed and c.aborted) return VnetError.ConnClosed;
+    const avail = ringBytes(c);
+    if (avail == 0) {
+        if (c.fin_received or c.state == .closed or c.state == .time_wait) {
+            return VnetError.ConnClosed;
+        }
+        return 0;
+    }
+    const n = @min(avail, out.len);
+    const rp: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(c.ring_virt)));
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        out[i] = rp[c.ring_head];
+        c.ring_head = (c.ring_head + 1) % RX_RING_SIZE;
+    }
+    // агрессивный window-update (как в tcpRecv — дренаж обязан открывать окно)
+    const win_now = recvWindow(c);
+    if (@as(u32, win_now) >= @as(u32, c.win_advertised) + MSS or win_now == RX_RING_SIZE) {
+        sendTcpAck(c);
+    }
+    return n;
+}
+
 pub fn tcpRecv(slot: usize, out: []u8, wait: bool) VnetError!usize {
     if (slot >= MAX_TCP_CONNS) return VnetError.BadState;
     const c = &vn.conns[slot];
     if (c.state == .closed and c.aborted) return VnetError.ConnClosed; // RST/timeout
     if (wait) {
-        var spins: u32 = 0;
-        while (spins < 4_000_000) : (spins += 1) {
+        const wait_deadline = hal.tick_count + 15; // 150мс поллинга
+        while (true) {
             pollRx();
             if (ringBytes(c) > 0 or (c.state == .closed or c.fin_received)) break;
-            asm volatile ("pause");
+            if (hal.tick_count >= wait_deadline) break;
+            parkOne();
         }
     } else {
         pollRx();
@@ -1432,6 +1649,7 @@ pub fn tcpClose(slot: usize) void {
         hal.Serial.puts(")\n");
     } else {
         c.state = .closed;
+        c.closed_tick = hal.tick_count;
         c.aborted = true;
     }
 }
@@ -1526,6 +1744,7 @@ fn tcpTimers() void {
             .time_wait => {
                 if (now -% c.last_xmit_tick > 30) { // ~300мс TIME_WAIT
                     c.state = .closed;
+                    c.closed_tick = hal.tick_count;
                 }
                 continue;
             },
@@ -1546,6 +1765,7 @@ fn tcpTimers() void {
                     hal.Serial.putDecimal(si);
                     hal.Serial.puts(")\n");
                     c.state = .closed;
+                    c.closed_tick = hal.tick_count;
                     c.aborted = true;
                 }
             }
@@ -1564,6 +1784,7 @@ fn tcpTimers() void {
                     hal.Serial.putDecimal(si);
                     hal.Serial.puts(")\n");
                     c.state = .closed;
+                    c.closed_tick = hal.tick_count;
                     c.aborted = true;
                 }
             }
@@ -1586,6 +1807,28 @@ pub fn dnsResolve(host: []const u8) ?[4]u8 {
     // IP-литерал? (a.b.c.d) — без DNS
     if (parseIpLiteral(host)) |ip| return ip;
 
+    // CDD #17: DNS-КЭШ — SLIRP-DNS (10.0.2.3 → хостовый резолвер) под
+    // нагрузкой отвечает СЕКУНДАМИ/таймаутами (эмпирика e2e: ретраи
+    // транзакций умирали на DNS, а не на TCP). Хост один и тот же —
+    // кэшируем на 600 тиков (6с — гео-днс ротация нас не волнует: любой
+    // из IP-адресов зеркала валиден).
+    if (host.len <= 64) {
+        if (dns_c_n > 0) {
+            var k: usize = 0;
+            while (k < dns_c_n) : (k += 1) {
+                if (dns_c_len[k] == host.len and
+                    std.mem.eql(u8, dns_c_host[k][0..host.len], host))
+                {
+                    if (hal.tick_count -% dns_c_tick[k] < 600) {
+                        hal.Serial.puts("[VNET] DNS из кэша\n");
+                        return dns_c_ip[k];
+                    }
+                    break; // протух — обновим этим резолвом
+                }
+            }
+        }
+    }
+
     var query: [256]u8 = undefined;
     const txn: u16 = @as(u16, @truncate(hal.readMsr(0x10) >> 8)) | 1;
     vn_dns_txn = txn;
@@ -1600,20 +1843,33 @@ pub fn dnsResolve(host: []const u8) ?[4]u8 {
     while (attempt < 3) : (attempt += 1) {
         hal.Serial.puts("[VNET] dns attempt\n");
         if (sendIp(IP_PROTO_UDP, udp[0..ulen], .{ 10, 0, 2, 3 })) {
-            var spins: u32 = 0;
-            while (spins < 6_000_000) : (spins += 1) {
+            const attempt_deadline = hal.tick_count + 300; // 3с на попытку
+            while (true) {
                 pollRx();
                 if (vn.dns_have) {
                     hal.Serial.puts("[VNET] dns reply OK\n");
+                    // запись в кэш
+                    if (host.len <= 64) {
+                        var k: usize = 0;
+                        var slot: usize = dns_c_n;
+                        while (k < dns_c_n) : (k += 1) {
+                            if (dns_c_len[k] == host.len and
+                                std.mem.eql(u8, dns_c_host[k][0..host.len], host)) { slot = k; break; }
+                        }
+                        if (slot >= DNS_CACHE_N) slot = 0; // простая замена
+                        if (slot < DNS_CACHE_N) {
+                            @memcpy(dns_c_host[slot][0..host.len], host);
+                            dns_c_len[slot] = host.len;
+                            dns_c_ip[slot] = vn.dns_last_ip;
+                            dns_c_tick[slot] = hal.tick_count;
+                            if (slot == dns_c_n) dns_c_n += 1;
+                        }
+                    }
                     dnsCachePut(host, vn.dns_last_ip); // v0.15.0: кэш для netstat
                     return vn.dns_last_ip;
                 }
-                if ((spins & 0xFFFFF) == 0) {
-                    hal.Serial.puts("[VNET] dns spin ");
-                    hal.Serial.putDecimal(spins);
-                    hal.Serial.puts("\n");
-                }
-                asm volatile ("pause");
+                if (hal.tick_count >= attempt_deadline) break;
+                parkOne();
             }
         }
     }

@@ -3012,9 +3012,26 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
     var at_base: u64 = 0;
     var interp_pages: u64 = 0;
     if (img.interp) |interp_path| {
-        const interp_data = initrdFindFile(interp_path) orelse
+        // CDD #17: PT_INTERP сначала из tmpfs-overlay (pacman-установки —
+        // ld-linux из пакета glibc: /usr/lib/ld-linux-x86-64.so.2), initrd —
+        // фолбэк. Без этого реальные Arch-бинарники не запускаемы после
+        // установки: их интерпретатор лежит в VFS, не в initrd.
+        var interp_data: ?[]const u8 = null;
+        if (kernel_vfs_ready) {
+            if (kernel_vfs.resolve(interp_path, false)) |node| {
+                switch (node.kind) {
+                    .tmpfs_file => {
+                        const f = node.tmp.?;
+                        if (f.data) |d| interp_data = d.ptr[0..@intCast(f.size)];
+                    },
+                    .initrd_file => interp_data = node.initrd_data,
+                    .dev => {},
+                }
+            } else |_| {}
+        }
+        const idata = interp_data orelse initrdFindFile(interp_path) orelse
             return -linux_syscalls.ENOENT; // интерпретатор обязателен
-        const interp_img = elf_loader.loadElf(ops, new_pml4, interp_data, elf_loader.LINUX_INTERP_BASE) catch
+        const interp_img = elf_loader.loadElf(ops, new_pml4, idata, elf_loader.LINUX_INTERP_BASE) catch
             return -linux_syscalls.ENOEXEC;
         entry_va = interp_img.entry_va; // HANDOFF: старт с ld.so
         at_base = interp_img.base_va;
@@ -4831,10 +4848,14 @@ fn pacTcpSend(slot: usize, data: []const u8) i64 {
 /// SYSCALL) — таймер дышит: IRQ pollRx + TCP-таймеры; hlt просыпается на
 /// любом IRQ. Эмпирика прошлых сессий: IF=0 → tick_count замерзает, а
 /// recv-спин 4M итераций = TCG-катастрофа. Здесь — честный парк.
+/// CDD #17-ФИКС: tcpRecvDrain (БЕЗ pollRx!) — RX-обработка только за
+/// таймер-IRQ (известно-рабочая модель CDD №7): агрессивный pollRx из
+/// этой петли (4.5К/с) переводил virtio-девайс в режим стёплой повторной
+/// доставки (кернель парсил СТАРЫЕ сегменты, rcv_nxt замирал на 40-60с).
 fn pacTcpRecv(slot: usize, out: []u8) i64 {
     const deadline = hal.tick_count + 9000; // 90с на вызов (пакеты ≤ 9МБ)
     while (true) {
-        const n = virtio_net.tcpRecv(slot, out, false) catch return -1;
+        const n = virtio_net.tcpRecvDrain(slot, out) catch return -1;
         if (n > 0) return @intCast(n);
         const st = virtio_net.tcpState(slot);
         const rb = virtio_net.tcpRingBytes(slot);

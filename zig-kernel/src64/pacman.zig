@@ -271,6 +271,7 @@ pub const HttpError = error{
     RedirectLoop,
     HttpsNotSupported,
     Status,
+    DownloadFailed,
 };
 
 var http_redirect_hops: usize = 0;
@@ -545,7 +546,20 @@ fn httpFetchUrl(host: []const u8, port: u16, path: []const u8, max_bytes: usize)
                 body = try ogrow(body, have + 65536);
             }
             const n = g_ops.tcp_recv(slot, body[have..]);
-            if (n < 0) break; // EOF
+            if (n < 0) {
+                // EOF: если Content-Length НЕ ДОСТИГНУТ — обрыв (KA-abort /
+                // ретрансмит-таймаут) → ТРУНКАЯ НЕ УСПЕХ: ретрай на верхнем
+                // уровне (эмпирика e2e: «получено 3KiB» + zstd BadBlockHeader)
+                if (content_length != null and total < content_length.?) {
+                    p("[PAC] http: обрыв (получено ");
+                    printKib(total);
+                    p(" из ");
+                    printKib(content_length.?);
+                    p(")\n");
+                    return HttpError.Closed;
+                }
+                break; // до-EOF режим: честный конец потока
+            }
             if (n == 0) continue; // пустой recv — поллинг
             have += @intCast(n);
             total += @intCast(n);
@@ -563,7 +577,31 @@ fn httpFetchUrl(host: []const u8, port: u16, path: []const u8, max_bytes: usize)
 /// Публичный GET: сброс редирект-счётчика + лимит загрузки.
 pub fn httpGet(host: []const u8, port: u16, path: []const u8, max_bytes: usize) HttpError![]u8 {
     http_redirect_hops = 0;
-    return httpFetchUrl(host, port, path, max_bytes);
+    // CDD #17-НАДЁЖНОСТЬ: TCP-слой не гарантирует доставку КАЖДОГО сегмента
+    // (эмпирика e2e: первый сегмент ответа теряется при перекрёстном
+    // ретрансмит-шторме прошлой транзакции → gap-дропы → порча пакета).
+    // HTTP-клиент ДОЛЖЕН ретраить — как реальные клиенты: свежая попытка =
+    // свежий коннект (новый порт) + сервер шлёт ответ заново. Пауза между
+    // попытками даёт SLIRP-таймерам осесть (retx-шторм утихает).
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        http_redirect_hops = 0;
+        if (httpFetchUrl(host, port, path, max_bytes)) |body| {
+            return body;
+        } else |_| {
+            if (attempt == 0) {
+                p("[PAC] http: ретрай ");
+                p(host);
+                p(" (");
+                p(path);
+                p(")\n");
+            }
+            // пауза ~500мс: пропускаем шум ретрансмитов прошлой транзакции
+            var spins: u32 = 0;
+            while (spins < 25_000_000) : (spins += 1) asm volatile ("pause");
+        }
+    }
+    return HttpError.DownloadFailed;
 }
 
 // ============================================================================
