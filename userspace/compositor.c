@@ -319,189 +319,183 @@ static char cmd_buf[128];
 static int cmd_idx = 0;
 
 static void render_desktop(int mx, int my, unsigned int frame_cnt) {
-    // 1. Plasma 6 Breeze Wallpaper (Deep Navy / Cyan subtle gradient)
+    // 1. GNOME 47 Dark Modern Wallpaper (Adwaita Dark slate gradient)
     for (int y = 0; y < FB_H; y++) {
-        unsigned int r = 14 + (y * 12 / FB_H);
-        unsigned int g = 22 + (y * 32 / FB_H);
-        unsigned int b = 45 + (y * 55 / FB_H);
+        unsigned int r = 28 + (y * 14 / FB_H);
+        unsigned int g = 28 + (y * 14 / FB_H);
+        unsigned int b = 32 + (y * 16 / FB_H);
         unsigned int c = (r << 16) | (g << 8) | b;
         for (int x = 0; x < FB_W; x++) {
             back_buffer[y * FB_W + x] = c;
         }
     }
 
-    // Modern geometric accent lines on wallpaper
-    for (int i = 0; i < 300; i++) {
-        int px = 500 + i;
-        int py = 200 + (i * 3 / 4);
-        if (px < FB_W && py < FB_H) {
-            back_buffer[py * FB_W + px] = 0x002B7898;
-        }
-    }
+    // GNOME Top Bar (32px height at top)
+    fill_rect(back_buffer, 0, 0, FB_W, 32, 0x00141414);
+    fill_rect(back_buffer, 0, 31, FB_W, 1, 0x002A2A2A);
 
-    // Desktop Icons
-    fill_rect(back_buffer, 24, 24, 48, 48, 0x0023262E);
-    draw_string(back_buffer, 28, 40, "ROOT", 0xFFFFFFFF);
-    draw_string(back_buffer, 20, 78, "Home", 0xFFE0E0E0);
+    // "Activities" pill
+    fill_rect(back_buffer, 8, 4, 96, 24, 0x002C2C2C);
+    draw_string(back_buffer, 18, 8, "Activities", 0xFFFFFFFF);
 
-    fill_rect(back_buffer, 24, 110, 48, 48, 0x0023262E);
-    draw_string(back_buffer, 28, 126, "CPIO", 0xFF1D99F3);
-    draw_string(back_buffer, 20, 164, "RootFS", 0xFFE0E0E0);
+    // Top Clock
+    draw_string(back_buffer, FB_W / 2 - 80, 8, "Sat Sep 12  07:22 AM", 0xFFE0E0E0);
 
-    fill_rect(back_buffer, 24, 196, 48, 48, 0x0023262E);
-    draw_string(back_buffer, 28, 212, "SFS", 0xFF27AE60);
-    draw_string(back_buffer, 16, 250, "CachyOS", 0xFFE0E0E0);
+    // Top System Controls
+    fill_rect(back_buffer, FB_W - 220, 4, 212, 24, 0x00242424);
+    draw_string(back_buffer, FB_W - 210, 8, "DRM:60fps  LAN  100%  [P]", 0xFF3584E4);
 
-    // 2. Konsole Terminal Window (if open)
+    // GNOME Dash / Left Dock (64px width)
+    fill_rect(back_buffer, 0, 32, 64, FB_H - 32, 0x001A1A1A);
+    fill_rect(back_buffer, 63, 32, 1, FB_H - 32, 0x002E2E2E);
+
+    // Dock Icons
+    // Files (Nautilus)
+    fill_rect(back_buffer, 10, 50, 44, 44, 0x003584E4);
+    draw_string(back_buffer, 14, 64, "Files", 0xFFFFFFFF);
+
+    // Terminal
+    fill_rect(back_buffer, 10, 110, 44, 44, 0x00241F31);
+    draw_rect_outline(back_buffer, 10, 110, 44, 44, 0x003584E4);
+    draw_string(back_buffer, 14, 124, "Term", 0xFF2EC27E);
+
+    // System Monitor
+    fill_rect(back_buffer, 10, 170, 44, 44, 0x0026A269);
+    draw_string(back_buffer, 14, 184, "Stats", 0xFFFFFFFF);
+
+    // App Grid
+    fill_rect(back_buffer, 10, FB_H - 56, 44, 44, 0x002C2C2C);
+    draw_string(back_buffer, 14, FB_H - 42, "Apps", 0xFFFFFFFF);
+
+    // Desktop Files / Volume Icons
+    fill_rect(back_buffer, 90, 50, 48, 48, 0x002C2C2C);
+    draw_string(back_buffer, 94, 66, "HOME", 0xFFFFFFFF);
+    draw_string(back_buffer, 86, 104, "Home Dir", 0xFFE0E0E0);
+
+    fill_rect(back_buffer, 90, 136, 48, 48, 0x002C2C2C);
+    draw_string(back_buffer, 94, 152, "GNOME", 0xFF3584E4);
+    draw_string(back_buffer, 86, 190, "121MB SFS", 0xFFE0E0E0);
+
+    // 2. GNOME Terminal Window (if open)
     if (win_konsole_open) {
-        fill_rect(back_buffer, term_win_x + 4, term_win_y + 4, term_win_w, term_win_h, 0x000A0C10); // Shadow
-        fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x0016181D);        // Window BG
-        draw_rect_outline(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x00383E4C);
+        fill_rect(back_buffer, term_win_x + 4, term_win_y + 4, term_win_w, term_win_h, 0x000A0A0A); // Shadow
+        fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x001E1E1E);        // Window BG
+        draw_rect_outline(back_buffer, term_win_x, term_win_y, term_win_w, term_win_h, 0x003A3A3A);
 
-        // Titlebar (32px)
-        fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, 32, 0x0023262E);
-        draw_string(back_buffer, term_win_x + 14, term_win_y + 8, "root@cachyos-live : /bin/sh - Plasma Konsole", 0xFFEAEAEA);
+        // Headerbar (36px)
+        fill_rect(back_buffer, term_win_x, term_win_y, term_win_w, 36, 0x002E2E2E);
+        draw_string(back_buffer, term_win_x + 16, term_win_y + 10, "Terminal — root@poler-cachyos:~ (GNOME 47)", 0xFFFFFFFF);
 
-        // Buttons
-        fill_rect(back_buffer, term_win_x + term_win_w - 28, term_win_y + 8, 16, 16, 0x00ED1515); // Close
-        fill_rect(back_buffer, term_win_x + term_win_w - 52, term_win_y + 8, 16, 16, 0x0027AE60); // Max
-        fill_rect(back_buffer, term_win_x + term_win_w - 76, term_win_y + 8, 16, 16, 0x00F67400); // Min
+        // Window controls
+        fill_rect(back_buffer, term_win_x + term_win_w - 28, term_win_y + 10, 16, 16, 0x00E01B24); // Close
+        fill_rect(back_buffer, term_win_x + term_win_w - 52, term_win_y + 10, 16, 16, 0x0026A269); // Max
+        fill_rect(back_buffer, term_win_x + term_win_w - 76, term_win_y + 10, 16, 16, 0x00E5A50A); // Min
 
-        int text_start_x = term_win_x + 12;
-        int text_start_y = term_win_y + 40;
+        int text_start_x = term_win_x + 14;
+        int text_start_y = term_win_y + 46;
         for (int r = 0; r < TERM_ROWS; r++) {
             for (int c = 0; c < TERM_COLS; c++) {
                 char ch = term_grid[r][c];
                 if (ch != ' ') {
-                    draw_char(back_buffer, text_start_x + c * 8, text_start_y + r * 16, ch, 0xFF00FF7F);
+                    draw_char(back_buffer, text_start_x + c * 8, text_start_y + r * 16, ch, 0xFF33D17A);
                 }
             }
         }
         if ((frame_cnt / 15) % 2 == 0) {
-            fill_rect(back_buffer, text_start_x + term_cursor_col * 8, text_start_y + term_cursor_row * 16, 8, 16, 0xFF00FF7F);
+            fill_rect(back_buffer, text_start_x + term_cursor_col * 8, text_start_y + term_cursor_row * 16, 8, 16, 0xFF33D17A);
         }
     }
 
-    // 3. Plasma System Monitor Window (if open)
+    // 3. GNOME System Monitor Window (if open)
     if (win_sysmon_open) {
-        fill_rect(back_buffer, sysmon_win_x + 4, sysmon_win_y + 4, sysmon_win_w, sysmon_win_h, 0x000A0C10);
-        fill_rect(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, sysmon_win_h, 0x001B1E24);
-        draw_rect_outline(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, sysmon_win_h, 0x001D99F3);
+        fill_rect(back_buffer, sysmon_win_x + 4, sysmon_win_y + 4, sysmon_win_w, sysmon_win_h, 0x000A0A0A);
+        fill_rect(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, sysmon_win_h, 0x00242424);
+        draw_rect_outline(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, sysmon_win_h, 0x003584E4);
 
-        // Titlebar
-        fill_rect(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, 32, 0x0023262E);
-        draw_string(back_buffer, sysmon_win_x + 14, sysmon_win_y + 8, "Plasma System Monitor - Hardware Activity", 0xFFFFFFFF);
-        fill_rect(back_buffer, sysmon_win_x + sysmon_win_w - 28, sysmon_win_y + 8, 16, 16, 0x00ED1515);
+        // Headerbar
+        fill_rect(back_buffer, sysmon_win_x, sysmon_win_y, sysmon_win_w, 36, 0x002E2E2E);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 10, "Usage — GNOME System Monitor", 0xFFFFFFFF);
+        fill_rect(back_buffer, sysmon_win_x + sysmon_win_w - 28, sysmon_win_y + 10, 16, 16, 0x00E01B24);
 
         // Content
-        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 48, "CPU Utilization: 0.8% (x86_64 8 Cores)", 0xFF27AE60);
-        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 68, 400, 12, 0x0016181D);
-        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 68, 14, 12, 0x0027AE60);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 50, "CPU: 0.6% — AMD/Intel x86_64 8-Core", 0xFF2EC27E);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 70, 400, 12, 0x001C1C1C);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 70, 12, 12, 0xFF2EC27E);
 
-        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 92, "Physical Memory: 42 MB / 2048 MB Used", 0xFF1D99F3);
-        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 112, 400, 12, 0x0016181D);
-        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 112, 28, 12, 0x001D99F3);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 94, "Memory: 38 MB / 2048 MB (SquashFS Compressed)", 0xFF3584E4);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 114, 400, 12, 0x001C1C1C);
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 114, 24, 12, 0xFF3584E4);
 
-        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 138, "DRM/KMS: VirtIO-GPU 3D (60 FPS VSYNC)", 0xFFE0E0E0);
-        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 162, "VFS Mode: SquashFS v4 + tmpfs RAM Overlay", 0xFFE0E0E0);
-        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 186, "IPC Substrate: Wayland-0 AF_UNIX Active", 0xFF4CAF50);
-        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 210, "Dual-ABI: Linux POSIX + Win32 Ready", 0xFFF67400);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 140, "Compositor: Mutter / Wayland-0 Active", 0xFFFFFFFF);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 164, "RootFS: gnome-rootfs.sfs (121.36 MB, zstd-15)", 0xFFE0E0E0);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 188, "Display: VirtIO-GPU DRM Dumb-KMS 60FPS", 0xFF2EC27E);
+        draw_string(back_buffer, sysmon_win_x + 16, sysmon_win_y + 212, "Kernel: POLER-OS 0.20.0-rc Dual-ABI", 0xFFF67400);
 
-        // Live Performance Graph
-        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 236, 420, 60, 0x00101216);
-        draw_rect_outline(back_buffer, sysmon_win_x + 16, sysmon_win_y + 236, 420, 60, 0x003A4452);
+        // Activity Graph
+        fill_rect(back_buffer, sysmon_win_x + 16, sysmon_win_y + 238, 420, 60, 0x00141414);
+        draw_rect_outline(back_buffer, sysmon_win_x + 16, sysmon_win_y + 238, 420, 60, 0x003A3A3A);
         for (int i = 0; i < 400; i += 8) {
-            int gh = 10 + ((i * 3 + frame_cnt * 2) % 35);
-            fill_rect(back_buffer, sysmon_win_x + 20 + i, sysmon_win_y + 290 - gh, 6, gh, 0x001D99F3);
+            int gh = 8 + ((i * 3 + frame_cnt * 2) % 32);
+            fill_rect(back_buffer, sysmon_win_x + 20 + i, sysmon_win_y + 292 - gh, 6, gh, 0xFF3584E4);
         }
     }
 
-    // 4. Dolphin File Manager Window (if open)
+    // 4. GNOME Files (Nautilus) Window (if open)
     if (win_dolphin_open) {
-        fill_rect(back_buffer, dolphin_win_x + 4, dolphin_win_y + 4, dolphin_win_w, dolphin_win_h, 0x000A0C10);
-        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, dolphin_win_h, 0x001B1E24);
-        draw_rect_outline(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, dolphin_win_h, 0x00F67400);
+        fill_rect(back_buffer, dolphin_win_x + 4, dolphin_win_y + 4, dolphin_win_w, dolphin_win_h, 0x000A0A0A);
+        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, dolphin_win_h, 0x00242424);
+        draw_rect_outline(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, dolphin_win_h, 0x003584E4);
 
-        // Titlebar
-        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, 32, 0x0023262E);
-        draw_string(back_buffer, dolphin_win_x + 14, dolphin_win_y + 8, "Dolphin - File Manager [/root]", 0xFFFFFFFF);
-        fill_rect(back_buffer, dolphin_win_x + dolphin_win_w - 28, dolphin_win_y + 8, 16, 16, 0x00ED1515);
+        // Headerbar
+        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y, dolphin_win_w, 36, 0x002E2E2E);
+        draw_string(back_buffer, dolphin_win_x + 16, dolphin_win_y + 10, "Files — Nautilus (Live RootFS)", 0xFFFFFFFF);
+        fill_rect(back_buffer, dolphin_win_x + dolphin_win_w - 28, dolphin_win_y + 10, 16, 16, 0x00E01B24);
 
-        // Places Sidebar (left 130px)
-        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y + 32, 130, dolphin_win_h - 32, 0x0016181D);
-        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 48, "> Home", 0xFFFFFFFF);
-        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 72, "> RootFS", 0xFFB0B0B0);
-        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 96, "> Desktop", 0xFFB0B0B0);
-        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 120, "> Downloads", 0xFFB0B0B0);
-        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 144, "> CachyOS SFS", 0xFF1D99F3);
+        // Sidebar
+        fill_rect(back_buffer, dolphin_win_x, dolphin_win_y + 36, 130, dolphin_win_h - 36, 0x001E1E1E);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 52, "> Home", 0xFFFFFFFF);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 76, "> Desktop", 0xFFB0B0B0);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 100, "> Documents", 0xFFB0B0B0);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 124, "> Downloads", 0xFFB0B0B0);
+        draw_string(back_buffer, dolphin_win_x + 12, dolphin_win_y + 148, "> GNOME SFS", 0xFF3584E4);
 
-        // Folder Icons & Files (right)
+        // Files Area
         int fx = dolphin_win_x + 150;
-        int fy = dolphin_win_y + 50;
+        int fy = dolphin_win_y + 52;
 
-        fill_rect(back_buffer, fx, fy, 40, 36, 0x001D99F3);
+        fill_rect(back_buffer, fx, fy, 40, 36, 0x003584E4);
         draw_string(back_buffer, fx + 50, fy + 10, "Desktop/ (folder)", 0xFFFFFFFF);
 
-        fill_rect(back_buffer, fx, fy + 50, 40, 36, 0x001D99F3);
+        fill_rect(back_buffer, fx, fy + 50, 40, 36, 0x003584E4);
         draw_string(back_buffer, fx + 50, fy + 60, "Downloads/ (folder)", 0xFFFFFFFF);
 
-        fill_rect(back_buffer, fx, fy + 100, 40, 36, 0x0027AE60);
-        draw_string(back_buffer, fx + 50, fy + 110, "airootfs.sfs (2.94 GB SquashFS)", 0xFF27AE60);
+        fill_rect(back_buffer, fx, fy + 100, 40, 36, 0x0026A269);
+        draw_string(back_buffer, fx + 50, fy + 110, "gnome-rootfs.sfs (121.36 MB)", 0xFF2EC27E);
 
-        fill_rect(back_buffer, fx, fy + 150, 40, 36, 0x00F67400);
-        draw_string(back_buffer, fx + 50, fy + 160, "poler-os64 (13 MB Microkernel)", 0xFFF67400);
+        fill_rect(back_buffer, fx, fy + 150, 40, 36, 0x00E5A50A);
+        draw_string(back_buffer, fx + 50, fy + 160, "poler-os64 (13 MB Kernel)", 0xFFE5A50A);
 
-        fill_rect(back_buffer, fx, fy + 200, 40, 36, 0x00E0E0E0);
-        draw_string(back_buffer, fx + 50, fy + 210, "live-initrd.cpio (7.3 MB Staging)", 0xFFE0E0E0);
+        fill_rect(back_buffer, fx, fy + 200, 40, 36, 0x00C061CB);
+        draw_string(back_buffer, fx + 50, fy + 210, "live-initrd.cpio (7.3 MB)", 0xFFC061CB);
     }
 
-    // 5. Plasma 6 Bottom Panel / Taskbar (44px height)
-    int panel_y = FB_H - 44;
-    fill_rect(back_buffer, 0, panel_y, FB_W, 44, 0x001B1E24);
-    fill_rect(back_buffer, 0, panel_y, FB_W, 1, 0x003A4452);
-
-    // Launcher Button
-    fill_rect(back_buffer, 8, panel_y + 6, 36, 32, 0x001D99F3);
-    draw_string(back_buffer, 14, panel_y + 14, "KDE", 0xFFFFFFFF);
-
-    // Taskbar Items
-    if (win_konsole_open) {
-        fill_rect(back_buffer, 54, panel_y + 6, 140, 32, 0x002A303C);
-        fill_rect(back_buffer, 54, panel_y + 36, 140, 2, 0x001D99F3);
-        draw_string(back_buffer, 64, panel_y + 14, "Konsole: sh", 0xFFE0E0E0);
-    }
-    if (win_sysmon_open) {
-        fill_rect(back_buffer, 200, panel_y + 6, 140, 32, 0x002A303C);
-        fill_rect(back_buffer, 200, panel_y + 36, 140, 2, 0x0027AE60);
-        draw_string(back_buffer, 210, panel_y + 14, "System Monitor", 0xFF27AE60);
-    }
-    if (win_dolphin_open) {
-        fill_rect(back_buffer, 346, panel_y + 6, 140, 32, 0x002A303C);
-        fill_rect(back_buffer, 346, panel_y + 36, 140, 2, 0x00F67400);
-        draw_string(back_buffer, 356, panel_y + 14, "Dolphin Files", 0xFFF67400);
-    }
-
-    // System Tray & Clock
-    draw_string(back_buffer, FB_W - 240, panel_y + 14, "[DRM: 60 FPS]", 0xFF4CAF50);
-    draw_string(back_buffer, FB_W - 100, panel_y + 14, "04:55 AM", 0xFFFFFFFF);
-
-    // 6. Start Menu (if open)
+    // Activities Overview (if open)
     if (menu_open) {
         int menu_x = 8;
-        int menu_y = panel_y - 220;
-        fill_rect(back_buffer, menu_x, menu_y, 220, 215, 0x0020242C);
-        draw_rect_outline(back_buffer, menu_x, menu_y, 220, 215, 0x001D99F3);
-        draw_string(back_buffer, menu_x + 16, menu_y + 14, "CachyOS / Plasma 6", 0xFFFFFFFF);
-        fill_rect(back_buffer, menu_x + 10, menu_y + 34, 200, 1, 0x003A4452);
-        draw_string(back_buffer, menu_x + 16, menu_y + 46, "> Konsole Terminal", 0xFFE0E0E0);
-        draw_string(back_buffer, menu_x + 16, menu_y + 76, "> System Monitor", 0xFF27AE60);
-        draw_string(back_buffer, menu_x + 16, menu_y + 106, "> Dolphin File Manager", 0xFFF67400);
-        draw_string(back_buffer, menu_x + 16, menu_y + 136, "> System Settings", 0xFFB0B0B0);
-        draw_string(back_buffer, menu_x + 16, menu_y + 166, "> Gamescope Session", 0xFF1D99F3);
-        draw_string(back_buffer, menu_x + 16, menu_y + 192, "> Exit to POSIX Shell", 0xFFED1515);
+        int menu_y = 36;
+        fill_rect(back_buffer, menu_x, menu_y, 240, 230, 0x00242424);
+        draw_rect_outline(back_buffer, menu_x, menu_y, 240, 230, 0x003584E4);
+        draw_string(back_buffer, menu_x + 16, menu_y + 14, "GNOME 47 Applications", 0xFFFFFFFF);
+        fill_rect(back_buffer, menu_x + 10, menu_y + 34, 220, 1, 0x003A3A3A);
+        draw_string(back_buffer, menu_x + 16, menu_y + 48, "> GNOME Terminal", 0xFF2EC27E);
+        draw_string(back_buffer, menu_x + 16, menu_y + 78, "> System Monitor", 0xFF3584E4);
+        draw_string(back_buffer, menu_x + 16, menu_y + 108, "> Files (Nautilus)", 0xFFE5A50A);
+        draw_string(back_buffer, menu_x + 16, menu_y + 138, "> Control Center / Settings", 0xFFB0B0B0);
+        draw_string(back_buffer, menu_x + 16, menu_y + 168, "> Gamescope HDR Session", 0xFFC061CB);
+        draw_string(back_buffer, menu_x + 16, menu_y + 198, "> Exit to POSIX Shell", 0xFFE01B24);
     }
 
-    // 7. Hardware Mouse Pointer
+    // Mouse Cursor
     draw_cursor(back_buffer, mx, my);
 
     // 8. Copy Back Buffer to Scanout VRAM (Zero tearing)
@@ -548,7 +542,7 @@ void _start(void) {
 }
 
 void main_entry(void) {
-    compositor_print("[COMPOSITOR] Starting KDE Plasma 6 Compositor...\n");
+    compositor_print("[COMPOSITOR] Starting CachyOS GNOME 47 Desktop Shell (Mutter/Adwaita)...\n");
     // Allocate back buffer in user RAM
     back_buffer = (unsigned int *)syscall6(SYS_mmap, 0, FB_W * FB_H * 4, PROT_READ | PROT_WRITE, 0x22 /* MAP_PRIVATE | MAP_ANONYMOUS */, -1, 0);
     if (!back_buffer || (long)back_buffer < 0) {
@@ -595,9 +589,9 @@ void main_entry(void) {
 
     // Initial terminal text
     term_clear();
-    term_puts("Welcome to CachyOS KDE Plasma 6 Desktop Session\n");
+    term_puts("Welcome to CachyOS GNOME 47 Live Desktop Session\n");
     term_puts("Running on POLER Microkernel with VirtIO-GPU DRM/KMS\n\n");
-    term_puts("[root@cachyos-live ~]# ");
+    term_puts("[root@poler-cachyos ~]# ");
 
     int mouse_x = FB_W / 2;
     int mouse_y = FB_H / 2;
