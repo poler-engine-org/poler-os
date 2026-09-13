@@ -162,6 +162,10 @@ pub const CHAN_SOCKETPAIR: u32 = 2;
 pub const CHAN_TIMERFD: u32 = 3;
 pub const SYS_readlink: u64 = 89; // 87 = unlink (!коллизия)
 pub const SYS_prlimit64: u64 = 302;
+
+/// CDD #18 (e2e-bash): getrlimit (109) — glibc/bash зовут при старте;
+/// ENOSYS оставлял процесс в спине. Формат идентичен prlimit64-старому.
+pub const SYS_getrlimit: u64 = 109;
 pub const SYS_getrandom: u64 = 318;
 pub const SYS_clone: u64 = 56;
 pub const SYS_wait4: u64 = 61; // v0.20 (CDD №15): НАСТОЯЩИЕ fork-зомби
@@ -1878,6 +1882,19 @@ var rlimit_table: [16][2]u64 = blk: {
     break :blk t;
 };
 
+/// CDD #18 (e2e-bash): getrlimit(resource, rlim*) — чтение таблицы.
+pub fn sysGetrlimit(ops: LinuxOps, res: u64, rlim_va: u64) u64 {
+    if (res >= RLIMIT_COUNT) return err(EINVAL);
+    if (rlim_va == 0) return 0;
+    if (!ops.validate(rlim_va, 16, true)) return err(EFAULT);
+    const ri: usize = @intCast(res);
+    var b: [16]u8 = undefined;
+    std.mem.writeInt(u64, b[0..8], rlimit_table[ri][0], .little);
+    std.mem.writeInt(u64, b[8..16], rlimit_table[ri][1], .little);
+    if (!ops.copy_out(rlim_va, &b)) return err(EFAULT);
+    return 0;
+}
+
 pub fn sysPrlimit64(ops: LinuxOps, pid: u64, res: u64, new_va: u64, old_va: u64) u64 {
     if (pid != 0) return err(EPERM); // только о себе
     if (res >= RLIMIT_COUNT) return err(EINVAL);
@@ -2003,6 +2020,17 @@ pub var execve_argv_buf: [12][128]u8 = [_][128]u8{[_]u8{0} ** 128} ** 12;
 /// ENOENT → смерть. sysExecve теперь пропускает до 64.
 pub var execve_envp_buf: [64][192]u8 = [_][192]u8{[_]u8{0} ** 192} ** 64;
 
+
+
+// ─── CDD #18-ДИАГ (врем.): execve EFAULT-хук ──────────────────────────────
+/// Точка печати для e2e-диагностики EFAULT в sysExecve. В ядре — hal.Serial
+/// (main64 присваивает), в нативных тестах — null (диагностика не нужна).
+pub var diag_execve_print: ?*const fn (s: []const u8) void = null;
+
+fn diagExecve(s: []const u8) void {
+    if (diag_execve_print) |f| f(s);
+}
+
 /// execve(path, argv, envp): argv/envp — NULL-терминированные массивы
 /// указателей на C-строки; NULL argv → argv[0]=path (допустимо по спеке);
 /// envp=NULL → пустое окружение. Копируем В .bss-буферы ДО разрушения
@@ -2010,7 +2038,10 @@ pub var execve_envp_buf: [64][192]u8 = [_][192]u8{[_]u8{0} ** 192} ** 64;
 /// ВОЗВРАЩАЕТСЯ (runtime: kill-self + respawn на новом образе).
 pub fn sysExecve(ops: LinuxOps, path_va: u64, argv_va: u64, envp_va: u64) u64 {
     if (path_va == 0) return err(EFAULT);
-    const path = ops.copy_in_str(path_va, 256) orelse return err(EFAULT);
+    const path = ops.copy_in_str(path_va, 256) orelse {
+        diagExecve("[EXECVE] EFAULT: path\n");
+        return err(EFAULT);
+    };
     if (path.len == 0) return err(ENOENT);
     const pn = @min(path.len, execve_path_buf.len);
     @memcpy(execve_path_buf[0..pn], path[0..pn]);
@@ -2021,10 +2052,16 @@ pub fn sysExecve(ops: LinuxOps, path_va: u64, argv_va: u64, envp_va: u64) u64 {
         var i: usize = 0;
         while (i < argv_slices.len) : (i += 1) {
             var pva: [8]u8 = undefined;
-            if (!ops.copy_in(&pva, argv_va + i * 8)) return err(EFAULT);
+            if (!ops.copy_in(&pva, argv_va + i * 8)) {
+                diagExecve("[EXECVE] EFAULT: argv table\n");
+                return err(EFAULT);
+            }
             const p = std.mem.readInt(u64, &pva, .little);
             if (p == 0) break;
-            const s = ops.copy_in_str(p, 128) orelse return err(EFAULT);
+            const s = ops.copy_in_str(p, 128) orelse {
+                diagExecve("[EXECVE] EFAULT: argv string\n");
+                return err(EFAULT);
+            };
             const sn = @min(s.len, execve_argv_buf[i].len);
             @memcpy(execve_argv_buf[i][0..sn], s[0..sn]);
             argv_slices[i] = execve_argv_buf[i][0..sn];
@@ -2044,10 +2081,16 @@ pub fn sysExecve(ops: LinuxOps, path_va: u64, argv_va: u64, envp_va: u64) u64 {
         var i: usize = 0;
         while (i < envp_slices.len) : (i += 1) {
             var pva: [8]u8 = undefined;
-            if (!ops.copy_in(&pva, envp_va + i * 8)) return err(EFAULT);
+            if (!ops.copy_in(&pva, envp_va + i * 8)) {
+                diagExecve("[EXECVE] EFAULT: envp table\n");
+                return err(EFAULT);
+            }
             const p = std.mem.readInt(u64, &pva, .little);
             if (p == 0) break;
-            const s = ops.copy_in_str(p, 192) orelse return err(EFAULT);
+            const s = ops.copy_in_str(p, 192) orelse {
+                diagExecve("[EXECVE] EFAULT: envp string\n");
+                return err(EFAULT);
+            };
             const sn = @min(s.len, execve_envp_buf[i].len);
             @memcpy(execve_envp_buf[i][0..sn], s[0..sn]);
             envp_slices[i] = execve_envp_buf[i][0..sn];
@@ -2609,6 +2652,111 @@ pub fn sysGetcwd(ops: LinuxOps, buf_va: u64, size: u64) u64 {
     if (!ops.validate(buf_va, 2, true)) return err(EFAULT);
     if (!ops.copy_out(buf_va, "/\x00")) return err(EFAULT);
     return 2; // записано байт: «/» + NUL
+}
+
+/// CDD #18 (e2e-bash): pselect6(nfds, readfds, writefds, exceptfds, tmo,
+/// sigmask) — ЧЕСТНАЯ fd_set-семантика. readline/bash ждут stdin именно
+/// им; раньше 270 маршрутизировался в sysPpoll (чужие структуры) → EINVAL
+/// → «exit». Готовность — как в pollScanOnce; select-семантика: out-наборы
+/// ЗАМЕНЯЮТСЯ готовыми fd; tmo=NULL — блок; слайс-парковка 20мс.
+pub const SELECT_MAX_FDS: u64 = 1024;
+const SELECT_BYTES: usize = 128; // 1024 / 8
+
+fn selectBitGet(bits: *const [SELECT_BYTES]u8, fd: u64) bool {
+    return (bits[@intCast(fd / 8)] >> @intCast(fd % 8)) & 1 != 0;
+}
+
+fn selectBitSet(bits: *[SELECT_BYTES]u8, fd: u64) void {
+    bits[@intCast(fd / 8)] |= @as(u8, 1) << @intCast(fd % 8);
+}
+
+/// готовность fd к чтению/записи (компактный аналог pollScanOnce-веток).
+fn selectReady(e: *const FdEntry, want_write: bool) bool {
+    switch (e.kind) {
+        .console_out => return true, // read блокирует внутри (kbd-цикл), write всегда
+        .fb0, .dri_card0 => return want_write or e.kind == .dri_card0,
+        .input_event0, .input_event1 => return !want_write, // dev_ready уточнит ниже
+        .epoll => return want_write,
+        .pipe_read => return !want_write, // консервативно (channel_ready в pollScan)
+        .pipe_write => return true,
+        .eventfd => return true,
+        .seatd => return true,
+        .socket => return true,
+        .timerfd => return !want_write,
+        .signalfd => return false,
+        .devnull => return true,
+        .initrd_file, .tmpfs_file, .dir => return !want_write, // файлы: читаемы всегда
+        .inet_socket => return true, // транспорт решает в poll-пути
+        .free => return false,
+    }
+}
+
+pub fn sysPselect6(ops: LinuxOps, fds: *FdTable, nfds: u64, rfd_va: u64, wfd_va: u64, efd_va: u64, tmo_va: u64, sigmask_va: u64) u64 {
+    _ = efd_va; // except-наборы: готовность не сообщаем (Linux-допуск)
+    _ = sigmask_va;
+    if (nfds > SELECT_MAX_FDS) return err(EINVAL);
+    const bytes: usize = @intCast((nfds + 7) / 8);
+    var timeout: i64 = -1; // NULL = блок до готовности
+    if (tmo_va != 0) {
+        if (!ops.validate(tmo_va, 16, false)) return err(EFAULT);
+        var ts: [16]u8 = undefined;
+        if (!ops.copy_in(&ts, tmo_va)) return err(EFAULT);
+        const sec = std.mem.readInt(i64, ts[0..8], .little);
+        const nsec = std.mem.readInt(i64, ts[8..16], .little);
+        if (nsec < 0 or nsec >= 1_000_000_000) return err(EINVAL);
+        if (sec < 0) return err(EINVAL);
+        timeout = sec * 1000 + @divTrunc(nsec, 1_000_000);
+    }
+    var rbits: [SELECT_BYTES]u8 = [_]u8{0} ** SELECT_BYTES;
+    var wbits: [SELECT_BYTES]u8 = [_]u8{0} ** SELECT_BYTES;
+    const has_r = rfd_va != 0;
+    const has_w = wfd_va != 0;
+    if (has_r) {
+        if (!ops.validate(rfd_va, bytes, false)) return err(EFAULT);
+        var tmp: [SELECT_BYTES]u8 = undefined;
+        if (!ops.copy_in(tmp[0..bytes], rfd_va)) return err(EFAULT);
+        @memcpy(rbits[0..bytes], tmp[0..bytes]);
+    }
+    if (has_w) {
+        if (!ops.validate(wfd_va, bytes, false)) return err(EFAULT);
+        var tmp: [SELECT_BYTES]u8 = undefined;
+        if (!ops.copy_in(tmp[0..bytes], wfd_va)) return err(EFAULT);
+        @memcpy(wbits[0..bytes], tmp[0..bytes]);
+    }
+    const t0_ns = ops.time_ns();
+    while (true) {
+        var ready_n: u64 = 0;
+        var rout: [SELECT_BYTES]u8 = [_]u8{0} ** SELECT_BYTES;
+        var wout: [SELECT_BYTES]u8 = [_]u8{0} ** SELECT_BYTES;
+        var fd: u64 = 0;
+        while (fd < nfds) : (fd += 1) {
+            if (has_r and selectBitGet(&rbits, fd)) {
+                if (fds.get(@intCast(fd))) |e| {
+                    if (selectReady(e, false)) {
+                        selectBitSet(&rout, fd);
+                        ready_n += 1;
+                    }
+                }
+            }
+            if (has_w and selectBitGet(&wbits, fd)) {
+                if (fds.get(@intCast(fd))) |e| {
+                    if (selectReady(e, true)) {
+                        selectBitSet(&wout, fd);
+                        ready_n += 1;
+                    }
+                }
+            }
+        }
+        if (ready_n > 0) {
+            // Linux-семантика: out-наборы замещают входные
+            if (has_r and !ops.copy_out(rfd_va, rout[0..bytes])) return err(EFAULT);
+            if (has_w and !ops.copy_out(wfd_va, wout[0..bytes])) return err(EFAULT);
+            return ready_n;
+        }
+        if (timeout == 0) return 0;
+        if (timeout > 0 and ops.time_ns() - t0_ns > @as(u64, @intCast(timeout)) * 1_000_000) return 0;
+        ops.task_park(20); // слайс-парковка (как sysPoll)
+    }
 }
 
 /// ppoll(fds, nfds, tmo, sigmask, size): poll + сигмаска (игнор) + ЧЕСТНЫЙ
@@ -3241,11 +3389,12 @@ pub fn dispatch(ops: LinuxOps, fds: *FdTable, num: u64, args: Args) u64 {
         SYS_fstatfs => return sysFstatfs(ops, fds, @bitCast(args.a1), args.a2),
         SYS_getcwd => return sysGetcwd(ops, args.a1, args.a2),
         SYS_ppoll => return sysPpoll(ops, fds, args.a1, args.a2, args.a3, args.a4, args.a5),
-        SYS_pselect6 => return sysPpoll(ops, fds, args.a1, args.a2, args.a3, args.a4, args.a5), // тот же layout (fds,nfds,tsp,sigmask,size)
+        SYS_pselect6 => return sysPselect6(ops, fds, args.a1, args.a2, args.a3, args.a4, args.a5, args.a6),
         SYS_epoll_pwait => return sysEpollPwait(ops, fds, @bitCast(args.a1), args.a2, args.a3, @bitCast(args.a4), args.a5),
         SYS_readlinkat => return sysReadlinkat(ops, args.a1, args.a2, args.a3, args.a4),
         SYS_readlink => return sysReadlinkat(ops, @bitCast(@as(i64, -100)), args.a1, args.a2, args.a3),
         SYS_prlimit64 => return sysPrlimit64(ops, args.a1, args.a2, args.a3, args.a4),
+        SYS_getrlimit => return sysGetrlimit(ops, args.a1, args.a2),
         SYS_getrandom => return sysGetrandom(ops, args.a1, args.a2, args.a3),
         SYS_clock_gettime => return sysClockGettime(ops, args.a1, args.a2),
         SYS_wait4 => return sysWait4(ops, @bitCast(args.a1), args.a2, args.a3, args.a4),

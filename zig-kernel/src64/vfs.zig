@@ -66,7 +66,11 @@ pub const InitrdNode = struct {
 // ─── Tmpfs: RAM-файлы Live-сессии ──────────────────────────────────────────
 
 pub const MAX_NAME: usize = 200; // CDD #17: пути пакетов usr/share/... длиннее 96Б
-pub const MAX_TMP_FILES: usize = 3072; // CDD #17: pacman-установки (256 мало!)
+/// CDD #18 (e2e-bash): 3072 → 8192. Полная bash-цепочка: glibc ~1508
+/// файлов + ncurses ~2.3К (terminfo!) + readline/bash/etc → упор в
+/// TooManyFiles на /usr/share/terminfo/c/c108-rv (e2e: install FAILED
+/// ncurses — VfsWriteFailed). 8192 × ~224Б ≈ 1.9МБ BSS — приемлемо.
+pub const MAX_TMP_FILES: usize = 8192;
 /// Бюджет tmpfs: 512МБ RAM (CDD #17: пакеты в RAM-overlay, QEMU -m 2G).
 pub const MAX_TMP_TOTAL: usize = 512 * 1024 * 1024;
 /// Максимальный размер одного файла (CDD #17: муттер ~4МБ, локали ~40МБ).
@@ -102,6 +106,15 @@ pub const TmpFs = struct {
     files: [MAX_TMP_FILES]TmpFile = [_]TmpFile{.{}} ** MAX_TMP_FILES,
     total: usize = 0, // занято байт (сумма cap)
     ops: VfsOps,
+
+    /// CDD #18-ДИАГ (врем.): число занятых записей.
+    pub fn countUsed(self: *TmpFs) usize {
+        var n: usize = 0;
+        for (&self.files) |*f| {
+            if (f.used) n += 1;
+        }
+        return n;
+    }
 
     /// Найти файл по имени.
     pub fn find(self: *TmpFs, name: []const u8) ?*TmpFile {
@@ -227,7 +240,10 @@ pub const TmpFs = struct {
 
 /// CDD #17: префиксы overlay-записи (RAM-модель pacman-установок).
 pub fn isWritableOverlay(norm: []const u8) bool {
-    const prefixes = [_][]const u8{ "/tmp", "/usr", "/etc", "/var", "/opt", "/root" };
+    // CDD #18 (e2e-bash): корневые usr-merge симлинки (bin/lib/lib64/sbin)
+    // создаются pacman'ом из пакета filesystem — без них PT_INTERP
+    // /lib64/ld-linux… не резолвится.
+    const prefixes = [_][]const u8{ "/tmp", "/usr", "/etc", "/var", "/opt", "/root", "/bin", "/lib", "/lib64", "/sbin" };
     for (prefixes) |p| {
         if (std.mem.startsWith(u8, norm, p)) {
             // "/usr2" не должен считаться "/usr" — проверим границу
@@ -378,9 +394,17 @@ pub const Vfs = struct {
 
         // чтение: tmpfs-файл ЕСТЬ? → он (overlay: RAM поверх initrd).
         // CDD #17: tmpfs-симлинк — разыменовываем (open-семантика Linux).
+        // CDD #18 (e2e-bash): tmpfs — ПЛОСКАЯ модель, find ПОЛНОГО пути;
+        // usr-merge пути (/lib64/x, /usr/lib64/x) от пакетов живут в tmpfs
+        // под каноничным "usr/lib/x" → ищем и по libPathAliases.
         {
+            var aliases: [MAX_ALIASES][]const u8 = undefined;
+            var scratch: [ALIAS_SCRATCH]u8 = undefined;
             const name = norm[1..];
-            if (self.tmp.find(name)) |f| {
+            const n_cand = libPathAliases(name, &aliases, &scratch);
+            var cand_i: usize = 0;
+            while (cand_i < n_cand) : (cand_i += 1) {
+            if (self.tmp.find(aliases[cand_i])) |f| {
                 if (f.isSymlink()) {
                     if (depth >= MAX_SYMLINK_DEPTH) return VfsError.TooManyLinks;
                     const target = f.linkSlice();
@@ -411,6 +435,7 @@ pub const Vfs = struct {
                     return self.resolveNorm(joined, write, depth + 1);
                 }
                 return .{ .kind = .tmpfs_file, .tmp = f };
+            }
             }
         }
         // затем initrd (RO) — с usr-merge алиасами и симлинками

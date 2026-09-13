@@ -189,6 +189,8 @@ pub const ElfImage = struct {
     /// PT_INTERP обнаружен: путь интерпретатора (slice в буфере данных
     /// ЗАГРУЖАЕМОГО бинарника — валиден до конца загрузки). null = статик.
     interp: ?[]const u8 = null,
+    /// CDD #18: применённых R_X86_64_RELATIVE (static-PIE .data.rel.ro).
+    relative_relocs: u32 = 0,
 };
 
 // ─── p_flags → PTE ─────────────────────────────────────────────────────────
@@ -369,6 +371,13 @@ pub fn loadElf(ops: ElfOps, pml4: u64, data: []const u8, dyn_base: u64) ElfError
         }
     }
 
+    // Проход 4 (CDD #18, e2e-bash): static-PIE релокации R_X86_64_RELATIVE.
+    // gcc/clang static-pie кладёт массивы указателей (.data.rel.ro) со
+    // значениями preferred-base; при загрузке ET_DYN на иной базис они
+    // ОБЯЗАНЫ быть переставлены (иначе envp/argv-указатели смотрят в
+    // немапнутую зону → execve EFAULT — эмпирика pacman-bash-e2e).
+    const rel_n = applyPieRelocations(ops, data, ehdr, base, img_lo, backing);
+
     return ElfImage{
         .base_va = base + seg_lo,
         .entry_va = base + ehdr.e_entry,
@@ -379,7 +388,105 @@ pub fn loadElf(ops: ElfOps, pml4: u64, data: []const u8, dyn_base: u64) ElfError
         .pages = total_pages,
         .is_pie = ehdr.e_type == ET_DYN,
         .interp = interp,
+        .relative_relocs = rel_n,
     };
+}
+
+// ─── CDD #18 (e2e-bash): static-PIE релокации ──────────────────────────────
+
+pub const PT_DYNAMIC: u32 = 2;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+/// R_X86_64_RELATIVE: *(base + r_offset) = base + r_addend.
+const R_X86_64_RELATIVE: u64 = 8;
+const ELF_RELA_ENT: usize = 24; // Elf64_Rela: offset + info + addend
+
+/// Применить R_X86_64_RELATIVE static-PIE образа. Читает PT_DYNAMIC и
+/// .rela.dyn ПРЯМО из файловых байтов (маппинг ещё не обязан быть
+/// доступен по VA в текущем CR3), пишет через backing (page_ptr).
+/// Возврат: число применённых релокаций.
+fn applyPieRelocations(
+    ops: ElfOps,
+    data: []const u8,
+    ehdr: *const Elf64_Ehdr,
+    base: u64,
+    img_lo: u64,
+    backing: u64,
+) u32 {
+    // 1) PT_DYNAMIC: файловое смещение + длина + VA
+    var dyn_off: u64 = 0;
+    var dyn_len: u64 = 0;
+    var have_dyn = false;
+    {
+        var i: usize = 0;
+        while (i < ehdr.e_phnum) : (i += 1) {
+            const ph = phdrAt(data, ehdr, i);
+            if (ph.p_type == PT_DYNAMIC) {
+                dyn_off = ph.p_offset;
+                dyn_len = ph.p_filesz;
+                have_dyn = true;
+                break;
+            }
+        }
+    }
+    if (!have_dyn) return 0;
+    if (dyn_off + dyn_len > data.len) return 0;
+
+    // 2) Dyn-таблица (файловые байты): ищем DT_RELA/DT_RELASZ/DT_RELAENT
+    var rela_va: ?u64 = null;
+    var rela_sz: u64 = 0;
+    var rela_ent: u64 = ELF_RELA_ENT;
+    {
+        var off: u64 = dyn_off;
+        const end = dyn_off + dyn_len;
+        while (off + 16 <= end and off + 16 <= data.len) : (off += 16) {
+            const tag = std.mem.readInt(u64, data[@intCast(off)..][0..8], .little);
+            const val = std.mem.readInt(u64, data[@intCast(off + 8) ..][0..8], .little);
+            if (tag == 0) break; // DT_NULL
+            if (tag == DT_RELA) rela_va = val;
+            if (tag == DT_RELASZ) rela_sz = val;
+            if (tag == DT_RELAENT and val > 0) rela_ent = val;
+        }
+    }
+    const rva = rela_va orelse return 0;
+    if (rela_sz == 0 or rela_ent < ELF_RELA_ENT) return 0;
+
+    // 3) .rela VA → файл-офсет (через покрывающий PT_LOAD)
+    var rela_off: ?u64 = null;
+    {
+        var i: usize = 0;
+        while (i < ehdr.e_phnum) : (i += 1) {
+            const ph = phdrAt(data, ehdr, i);
+            if (ph.p_type != PT_LOAD) continue;
+            if (rva >= ph.p_vaddr and rva < ph.p_vaddr + ph.p_filesz) {
+                rela_off = rva - ph.p_vaddr + ph.p_offset;
+                break;
+            }
+        }
+    }
+    const roff = rela_off orelse return 0;
+    if (roff + rela_sz > data.len) return 0;
+
+    // 4) применение: для каждого RELATIVE — запись base+addend в backing
+    var applied: u32 = 0;
+    var n: u64 = 0;
+    while (n + ELF_RELA_ENT <= rela_sz) : (n += rela_ent) {
+        const o = roff + n;
+        const r_offset = std.mem.readInt(u64, data[@intCast(o)..][0..8], .little);
+        const r_info = std.mem.readInt(u64, data[@intCast(o + 8)..][0..8], .little);
+        const r_addend: i64 = @bitCast(std.mem.readInt(u64, data[@intCast(o + 16)..][0..8], .little));
+        if (r_info & 0xFFFFFFFF != R_X86_64_RELATIVE) continue; // прочие типы — не static-pie профиль
+        const dst_va = base + r_offset;
+        if (dst_va < img_lo) continue;
+        const page_idx = (dst_va - img_lo) / PAGE_SIZE;
+        const in_page = dst_va % PAGE_SIZE;
+        const val: u64 = @bitCast(@as(i64, @bitCast(base)) +% r_addend);
+        const dst = ops.page_ptr(backing + page_idx * PAGE_SIZE)[@intCast(in_page)..][0..8];
+        std.mem.writeInt(u64, dst[0..8], val, .little);
+        applied += 1;
+    }
+    return applied;
 }
 
 /// PTE-флаги для страницы va: сегмент, ВЛАДЕЮЩИЙ началом страницы.
@@ -1056,6 +1163,52 @@ test "layout: константы зон не пересекаются" {
     try testing.expect(MIN_USER_VA == 0x1_0000_0000);
 }
 
+
+test "loadElf: static-PIE R_X86_64_RELATIVE — указатели .data.rel.ro переставляются на базис" {
+    mockReset();
+    var te = TestElf{};
+    te.init(ET_DYN, 0, 0x2000);
+    // phnum 3→4: PT_DYNAMIC на RW-сегменте (vaddr 0x2000, file off 0x300).
+    // данные сегмента: 8Б «DATADAT1» + динамик (с 0x308) + rela (с 0x348).
+    const ehdr: *Elf64_Ehdr = @ptrCast(@alignCast(&te.buf));
+    ehdr.e_phnum = 4;
+    const ph: [*]Elf64_Phdr = @ptrCast(@alignCast(te.buf[64..].ptr));
+    ph[1].p_filesz = 0xC0; // 0x300..0x3C0: dyn + rela в файле
+    ph[1].p_memsz = 0xC0 + 0x100;
+    ph[3] = .{
+        .p_type = PT_DYNAMIC,
+        .p_flags = PF_R,
+        .p_offset = 0x308,
+        .p_vaddr = 0x2008,
+        .p_paddr = 0,
+        .p_filesz = 0x40,
+        .p_memsz = 0x40,
+        .p_align = 8,
+    };
+    // DT_RELA → VA 0x2048 (файл 0x348), DT_RELASZ=48 (2 записи), DT_RELAENT=24
+    const dyn_area = te.buf[0x308..0x348];
+    std.mem.writeInt(u64, dyn_area[0..8], 7, .little); // DT_RELA
+    std.mem.writeInt(u64, dyn_area[8..16], 0x2048, .little);
+    std.mem.writeInt(u64, dyn_area[16..24], 8, .little); // DT_RELASZ
+    std.mem.writeInt(u64, dyn_area[24..32], 48, .little);
+    std.mem.writeInt(u64, dyn_area[32..40], 9, .little); // DT_RELAENT
+    std.mem.writeInt(u64, dyn_area[40..48], 24, .little);
+    // .rela: 2 × RELATIVE: r_offset=0x2000 (addend 0x208 → строка кода),
+    //                          r_offset=0x2010 (addend 0x300 → строка данных)
+    const rela_area = te.buf[0x348..0x378];
+    std.mem.writeInt(u64, rela_area[0..8], 0x2000, .little); // r_offset
+    std.mem.writeInt(u64, rela_area[8..16], R_X86_64_RELATIVE, .little); // r_info
+    std.mem.writeInt(u64, rela_area[16..24], 0x208, .little); // r_addend
+    std.mem.writeInt(u64, rela_area[24..32], 0x2010, .little); // r_offset
+    std.mem.writeInt(u64, rela_area[32..40], R_X86_64_RELATIVE, .little);
+    std.mem.writeInt(u64, rela_area[40..48], 0x300, .little);
+
+    const img = try loadElf(mockOps(), 0x777, te.data(), LINUX_IMAGE_BASE);
+    try testing.expectEqual(@as(u32, 2), img.relative_relocs);
+    // значения переставлены на НОВЫЙ базис (не preferred 0x…!):
+    try testing.expectEqual(LINUX_IMAGE_BASE + 0x208, mockReadWord(img.base_va + 0x2000));
+    try testing.expectEqual(LINUX_IMAGE_BASE + 0x300, mockReadWord(img.base_va + 0x2010));
+}
 
 test "loadElf: PT_INTERP — путь интерпретатора (динамические бинарники)" {
     mockReset();

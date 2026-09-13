@@ -56,8 +56,11 @@ const VIRTIO_NET_F_CSUM: u32 = 1 << 0;
 
 // ─── Очереди ────────────────────────────────────────────────────────────────
 
-const QUEUE_SIZE: u16 = 64; // хватит для SLIRP-трафика
-const DESC_TABLE_SIZE: u32 = QUEUE_SIZE * 16; // 1024 = 1 страница (Q=64)
+/// CDD #18: 64 → 256. Согласование с NUM_RX_BUFS=128: avail/used-кольца
+/// и дескрипторная таблица обязаны вмещать ВСЕ posted-буферы, иначе
+/// посты k≥64 затирали чужие слоты (musor в avail → тихие потери кадров).
+const QUEUE_SIZE: u16 = 256;
+const DESC_TABLE_SIZE: u32 = QUEUE_SIZE * 16; // 4096 = 1 страница (Q=256)
 const AVAIL_RING_SIZE: u32 = 4 + QUEUE_SIZE * 2 + 2;
 const USED_RING_SIZE: u32 = 4 + QUEUE_SIZE * 8 + 2;
 
@@ -111,7 +114,14 @@ const RX_RING_SIZE: usize = RX_RING_PAGES * 4096;
 
 /// CDD #17: RX-буферы (posted дескрипторы) — 8 → 32: девайс поглощает
 /// SLIRP-берсты без дропа между poll-тактами таймера (10Гц).
-const NUM_RX_BUFS: usize = 32;
+/// CDD #18 (e2e-bash): 32 → 128. Пул posted RX-буферов — единственная
+/// пружина между SLIRP-берстами (штормы ретрансмитов: 40+ сегментов за
+/// доли секунды) и pollRx-потреблением. При 32 берст > 24-32 кадров
+/// ронял QEMU-virtio МОЛЧА (нет свободных дескрипторов) → дыры в
+/// rcv_nxt, не закрываемые ретранзитами сервера (pcap: DUP-ACKи гостя
+/// уходят, сервер ретранмитит, кадры до SLIRP доходят — ядро их не
+/// видит). 128 буферов = 512КБ PMM.
+const NUM_RX_BUFS: usize = 128;
 
 // v0.15.0 (CDD №6): ретрансмит-буфер [snd_una..snd_nxt) — 32КБ на соединение
 const RTX_PAGES: usize = 8;
@@ -922,9 +932,9 @@ pub fn pollRx() void {
     tcpTimers();
 
     var handled_any = false;
-    var guard: u8 = 0;
+    var guard: u8 = 0; // CDD #18: 8 → 32 кадра за вызов (см. NUM_RX_BUFS)
     var seen_this_call: u32 = 0;
-    while (guard < 8) : (guard += 1) {
+    while (guard < 32) : (guard += 1) { // CDD #18: берсты вычищаем сразу
         const used_idx = usedIdxPtr(vn.rx_used).*;
         if (used_idx == vn.rx_last_used) break;
         const elem = usedRingPtr(vn.rx_used)[vn.rx_last_used % QUEUE_SIZE];
@@ -2354,11 +2364,12 @@ test "net: rtx-бэкофф — экспоненциальный рост с п�
 // ============================================================================
 
 test "net: RX-bounds — битый elem.id (k >= NUM_RX_BUFS) отбрасывается без ре-поста" {
-    // rx_bufs/rx_posted имеют NUM_RX_BUFS (32) записей; elem.id маскируется до 10 бит.
+    // CDD #18: NUM_RX_BUFS = 128 (RX-ёмкость под берсты SLIRP-ретрансмитов).
+    // rx_bufs/rx_posted имеют NUM_RX_BUFS записей; elem.id маскируется до 10 бит.
     // k=NUM_RX_BUFS..1023 → validateRxElem = null → буфер НЕ индексируется и НЕ
     // ре-постится.
     try testing.expect(validateRxElem(NUM_RX_BUFS, 1600) == null);
-    try testing.expect(validateRxElem(64, 1600) == null);
+    try testing.expect(validateRxElem(NUM_RX_BUFS + 64, 1600) == null);
     try testing.expect(validateRxElem(1023, 0xFFFF_FFFF) == null);
     // Граничный валидный индекс (NUM_RX_BUFS - 1) — проходит
     try testing.expect(validateRxElem(NUM_RX_BUFS - 1, 1600) != null);

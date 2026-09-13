@@ -2136,6 +2136,20 @@ var linux_user_io: LinuxUserIo = .{
     .copy_out = linuxCopyOut,
 };
 
+fn linuxDiagExecvePrint(s: []const u8) void {
+    hal.Serial.puts(s);
+}
+
+// CDD #18-ДИАГ (врем.): execve EFAULT-печать для e2e-отладки —
+// подключается в runtime-инициализации (см. kernel_main / Linux-слой boot)
+var linux_diag_execve_wired: bool = false;
+
+fn linuxWireDiagExecve() void {
+    if (linux_diag_execve_wired) return;
+    linux_diag_execve_wired = true;
+    linux_syscalls.diag_execve_print = linuxDiagExecvePrint;
+}
+
 /// Индирекция user-IO (переключаемая): kernelLinuxOps захватывает ЭТИ
 /// обёртки, чтобы переключение linux_user_io действовало и на семантический
 /// слой (validate/copy), а не только на dev-мосты.
@@ -3029,8 +3043,29 @@ fn linuxDoExecve(path: []const u8, argv: []const []const u8, envp: []const []con
                 }
             } else |_| {}
         }
-        const idata = interp_data orelse initrdFindFile(interp_path) orelse
+        const idata = interp_data orelse initrdFindFile(interp_path) orelse {
+            // CDD #18-ДИАГ (врем.): interp не найден — вскрытие tmpfs
+            hal.Serial.puts("[LINUX] EXECVE-DIAG: interp MISS: ");
+            hal.Serial.puts(interp_path);
+            hal.Serial.puts(" — tmp files: ");
+            hal.Serial.putDecimal(kernel_vfs.tmp.countUsed());
+            const direct = kernel_vfs.tmp.find(interp_path[1..]);
+            hal.Serial.puts(", direct find: ");
+            hal.Serial.puts(if (direct != null) "YES" else "NO");
+            if (direct) |df| {
+                if (df.isSymlink()) {
+                    hal.Serial.puts(" (symlink -> ");
+                    hal.Serial.puts(df.linkSlice());
+                    hal.Serial.puts(")");
+                } else {
+                    hal.Serial.puts(" (file, size ");
+                    hal.Serial.putDecimal(df.size);
+                    hal.Serial.puts(")");
+                }
+            }
+            hal.Serial.puts("\n");
             return -linux_syscalls.ENOENT; // интерпретатор обязателен
+        };
         const interp_img = elf_loader.loadElf(ops, new_pml4, idata, elf_loader.LINUX_INTERP_BASE) catch
             return -linux_syscalls.ENOEXEC;
         entry_va = interp_img.entry_va; // HANDOFF: старт с ld.so
@@ -5007,6 +5042,7 @@ fn vfsInit() void {
     kernel_vfs.tmp.ops = kernelVfsOps();
     for (&kernel_vfs.tmp.files) |*f| f.* = .{};
     kernel_vfs_ready = true;
+    linuxWireDiagExecve(); // CDD #18-ДИАГ (врем.): execve EFAULT-печать
     puts("[VFS] Live-mode VFS: /dev (devfs) + initrd (RO) + /tmp (tmpfs RAM overlay)\n");
 }
 

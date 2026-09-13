@@ -2600,9 +2600,21 @@ pub fn installedFind(name: []const u8) ?usize {
 
 /// Пути, куда устанавливаются файлы пакетов (RAM-overlay whitelist).
 fn installableRoot(name: []const u8) bool {
+    // CDD #18 (e2e-bash): корневые usr-merge симлинки пакетов (filesystem:
+    // bin→usr/bin, lib→usr/lib, lib64→usr/lib, sbin→usr/bin) ОБЯЗАНЫ
+    // ставиться: PT_INTERP реальных Arch-бинарников = /lib64/ld-linux…
+    // — без lib64-симлинка execve получает ENOENT.
     const roots = [_][]const u8{ "usr/", "etc/", "opt/", "var/", "root/" };
     for (roots) |r| {
         if (startsWith(name, r)) return true;
+    }
+    // CDD #18: КОРНЕВЫЕ usr-merge симлинки — записи "bin", "lib", "lib64",
+    // "sbin" (пакет filesystem) — БЕЗ хвостового слеша (это симлинки, не
+    // каталоги). startsWith("lib64", "lib64/") = false — отдельная ветка.
+    const root_links = [_][]const u8{ "bin", "lib", "lib64", "sbin" };
+    for (root_links) |r| {
+        if (eqStr(name, r)) return true;
+        if (name.len > r.len and startsWith(name, r) and name[r.len] == '/') return true; // глубже: lib64/foo
     }
     return false;
 }
